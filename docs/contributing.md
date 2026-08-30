@@ -56,6 +56,14 @@ built-in optional [pytest-xdist adapter](coordinator.md#optional-pytest-xdist-ad
 this contract for positive `-n` modes; use `--maxprocesses` when several automatic controllers
 should reserve room for one another.
 
+The cgroup lifecycle suite uses real subprocesses with a deterministic, test-owned kernel seam
+by default, so it is safe on hosts whose cgroup hierarchy is not delegated. To exercise the real
+kernel boundary, provision an exclusive disposable subtree that satisfies the
+[delegated cgroup contract](coordinator.md#delegated-cgroup-v2-lifecycle), set
+`AGCOORD_TEST_CGROUP_ROOT` to it, run the test process inside that delegation boundary, and run
+`tests/test_cgroup.py`. The test removes only its own owner and run leaves; it never creates,
+changes ownership of, or removes the configured root.
+
 Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is a barrier for its repository, not an undeclared
 machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside

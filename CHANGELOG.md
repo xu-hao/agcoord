@@ -18,6 +18,11 @@ versioning; dates use ISO 8601.
   positive worker counts from the admitted run's child CPU budget. Plain pytest and `-n 0` stay
   serial, outside-run behavior stays upstream, workers never lease recursively, and controller
   crash or cancellation returns the complete lease.
+- Add a rootless Linux cgroup v2 lifecycle backend for an explicit delegated subtree. It probes
+  namespace-safe delegation, attaches the blocked launcher before user code, contains later
+  descendants behind an `nsdelegate` boundary, kills the full tree, and recovers or cleans only
+  identity-verified run leaves across broker restarts, with explicit required and best-effort
+  fallback.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 

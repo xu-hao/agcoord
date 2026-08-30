@@ -28,6 +28,12 @@ import time
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
 
+from .cgroup import (
+    CGROUP_BACKEND,
+    CGROUP_ISOLATE_ENV,
+    CGROUP_ROOT_ENV,
+    CgroupV2Backend,
+)
 from .resources import (
     ResourceBackend,
     ResourceContractError,
@@ -72,12 +78,21 @@ _RESOURCE_NAME = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _WORKER_LAUNCHER = (
     "import os, sys\n"
     "release_fd = int(sys.argv[1])\n"
+    f"isolate_cgroup = os.environ.pop({CGROUP_ISOLATE_ENV!r}, None) == '1'\n"
     "try:\n"
     "    admitted = os.read(release_fd, 1)\n"
     "finally:\n"
     "    os.close(release_fd)\n"
     "if admitted != b'1':\n"
     "    raise SystemExit(125)\n"
+    "if isolate_cgroup:\n"
+    "    try:\n"
+    "        from agcoord.cgroup import isolate_current_cgroup\n"
+    "        isolate_current_cgroup()\n"
+    "    except Exception as exc:\n"
+    "        print(f'AGCoord: could not isolate worker cgroup: {exc}', "
+    "file=sys.stderr, flush=True)\n"
+    "        raise SystemExit(125)\n"
     "try:\n"
     "    os.execvpe(sys.argv[2], sys.argv[2:], os.environ)\n"
     "except OSError as exc:\n"
@@ -827,6 +842,18 @@ class CoordinatorBroker:
                 else resource_bindings
             )
             self.resource_backends = validate_resource_backends(resource_backends)
+            referenced_backends = {
+                binding["backend"]
+                for binding in self.resource_bindings.values()
+                if binding["backend"] is not None
+            }
+            if (
+                CGROUP_BACKEND in referenced_backends
+                and CGROUP_BACKEND not in self.resource_backends
+            ):
+                self.resource_backends[CGROUP_BACKEND] = CgroupV2Backend.from_environment(
+                    state_dir=self.paths.state_dir
+                )
             self.resource_capabilities = probe_resource_backends(
                 self.resource_backends,
                 self.resource_bindings,
@@ -3030,6 +3057,8 @@ class CoordinatorBroker:
         environment[RUN_ID_ENV] = run_id
         environment[RUN_KIND_ENV] = row["kind"]
         environment[STATE_DIR_ENV] = str(self.paths.state_dir)
+        environment.pop(CGROUP_ROOT_ENV, None)
+        environment.pop(CGROUP_ISOLATE_ENV, None)
         worker_tmp = self._worker_tmp_path(run_id)
         release_read = -1
         release_write = -1
@@ -3037,6 +3066,17 @@ class CoordinatorBroker:
         released = False
         try:
             self._prepare_resources(db, row)
+            prepared_row = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            prepared_state = self._row_resource_state(prepared_row)
+            cgroup_backend = self.resource_backends.get(CGROUP_BACKEND)
+            if (
+                CGROUP_BACKEND in prepared_state
+                and isinstance(cgroup_backend, CgroupV2Backend)
+                and cgroup_backend.isolate_workers
+            ):
+                environment[CGROUP_ISOLATE_ENV] = "1"
             if row["kind"] in {"full", "merge", "land"}:
                 _assert_clean_head(Path(row["checkout"]), row["head_sha"])
             worker_command = command

@@ -103,10 +103,68 @@ blocked worker launcher. A binding does not create capacity; its name must still
 Backends expose a sanitized capability probe and the idempotent lifecycle `prepare`, `attach`,
 `usage`, `finish`, `cancel`, and `cleanup`. Attach happens before user code can start; usage,
 finish, cancellation, and cleanup remain owned by the broker. The core currently defines this
-backend-neutral seam but does not ship an OS limiter, so a named backend that is not installed
-is reported as `backend-unavailable`. The cgroup, filesystem, process-specific, and container
-backends are separate implementation work; a configured backend is never silently treated as
-successful.
+backend-neutral seam and a Linux cgroup v2 lifecycle backend. Controller values, provisioned
+filesystems, process-specific adapters, and containers remain separate implementations; a
+configured backend is never silently treated as successful.
+
+### Delegated cgroup v2 lifecycle
+
+The built-in `cgroup-v2` backend currently owns process-tree lifecycle only. Bind an explicitly
+named generic capacity and configure one exclusive delegated root before the broker starts:
+
+```bash
+export AGCOORD_CAPACITIES='jobs=2,cgroup-slot=2'
+export AGCOORD_RESOURCE_BINDINGS='{
+  "cgroup-slot": {
+    "kind": "generic",
+    "unit": "admission-unit",
+    "mode": "required",
+    "backend": "cgroup-v2"
+  }
+}'
+export AGCOORD_CGROUP_ROOT=/sys/fs/cgroup/user.slice/example.slice/agcoord.service
+agc run --resource cgroup-slot=1 -- python -m pytest -q
+```
+
+The root must be an absolute, real directory on the unified cgroup v2 hierarchy, writable by
+the broker, dedicated to that state directory's owner, and an ancestor of the broker so its
+children can be moved within the delegation boundary. Its cgroup2 mount must be read-write with
+`nsdelegate`; unprivileged user, cgroup, and mount namespaces must also be available. The probe
+creates and removes an empty child to verify delegation, `cgroup.kill`, namespace rooting, and
+controller-file protection. It publishes only stable refusal codes and controller
+capabilities—never the configured path or an operating-system exception. An unavailable backend
+fails a `required` run before user code with exit status 125; `best-effort` records the refusal
+and runs without claiming application.
+
+For systemd-managed hosts, place the broker in a dedicated service or scope with `Delegate=yes`
+and give AGCoord that unit's delegated cgroup, rather than a slice or the hierarchy root. On
+systemd 254 or newer, `DelegateSubgroup=supervisor` keeps the broker out of the inner node that
+will later distribute controllers. Keep systemd as the single writer above that boundary. For
+direct delegation, a privileged manager must create one exclusive subtree, place the broker in
+that boundary, and grant only the delegatable directory and membership files to the broker user;
+do not recursively change ownership of controller files. The kernel's
+[cgroup v2 delegation contract](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#delegation)
+and systemd's
+[delegation guidance](https://systemd.io/CGROUP_DELEGATION/) are the authoritative host setup
+references.
+
+For each run, AGCoord creates an owner-specific, collision-safe leaf and records device/inode
+identities plus a random ownership token in the private spool. The existing launcher stays
+blocked while the broker moves it into that leaf and verifies membership. On real cgroupfs, the
+launcher then creates private cgroup and mount namespace views rooted at the leaf; `nsdelegate`
+keeps the parent controller files kernel-unwritable while descendants may only redistribute
+resources beneath the run boundary. The configured root and internal isolation marker are
+removed from the job environment.
+
+Normal finish and cancellation use `cgroup.kill`, wait for `cgroup.events` to report
+`populated 0`, and remove only the identity recorded for that run. A replacement broker adopts a
+still-live durable handle without creating a second leaf. Missing partial state is cleaned
+idempotently, while a changed device/inode, mismatched token, unrecorded collision, or populated
+stale leaf is refused and never removed as if it were owned.
+
+This lifecycle does not yet translate typed CPU, memory, PID, or I/O units into controller
+values, and cgroups remain resource controls rather than a filesystem, credential, network, or
+general security sandbox.
 
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an

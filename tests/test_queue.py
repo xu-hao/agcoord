@@ -401,7 +401,7 @@ def test_resource_binding_environment_is_frozen_in_broker_metadata(monkeypatch, 
                 "available": False,
                 "kinds": [],
                 "operations": [],
-                "reason": "backend-unavailable",
+                "reason": "delegation-unconfigured",
                 "units": [],
             }
         }
@@ -414,7 +414,7 @@ def test_resource_binding_environment_is_frozen_in_broker_metadata(monkeypatch, 
         )
         row = _row(client, run_id, "passed")
         assert row["resource_contract"]["memory"] == snapshot["resource_bindings"]["memory"]
-        assert row["resource_receipt"]["events"][0]["code"] == "backend-unavailable"
+        assert row["resource_receipt"]["events"][0]["code"] == "delegation-unconfigured"
     finally:
         running.stop()
 
