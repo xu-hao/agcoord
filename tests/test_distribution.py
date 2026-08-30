@@ -44,6 +44,12 @@ def test_distribution_import_and_console_identity_are_exact():
 
     assert distribution.metadata["Name"] == "agcoord"
     assert console_scripts == {"agc": "agcoord.cli:main"}
+    assert {
+        entry.name: entry.value
+        for entry in distribution.entry_points
+        if entry.group == "pytest11"
+    } == {"agcoord-xdist": "agcoord.pytest_xdist"}
+    assert "xdist" in (distribution.metadata.get_all("Provides-Extra") or [])
     assert not Path(sys.executable).with_name("agcoord").exists()
     assert importlib.metadata.version("agcoord")
 

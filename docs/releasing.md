@@ -39,7 +39,8 @@ smoke-tested from the built wheel.
 4. Create a fresh virtual environment outside the checkout. Install the wheel, with each
    supported optional extra in at least one smoke environment, and exercise both
    `python -m agcoord --help` and `agc --help`. Verify that no `agcoord` console executable
-   is installed.
+   is installed. For the `xdist` extra, verify pytest discovers the `agcoord-xdist` entry point,
+   plain pytest remains serial, and an admitted `-n auto` run starts its leased worker count.
 5. In that clean environment, start a temporary explicit state directory, run a check, read
    its log, clear terminal history, and verify that importing the core does not require a
    forge executable or credentials.
