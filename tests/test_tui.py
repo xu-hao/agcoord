@@ -36,6 +36,7 @@ def _row(
     phase: str | None = None,
     gate_exit_status: int | None = None,
     position: int | None = None,
+    resource_receipt: dict[str, object] | None = None,
 ) -> dict[str, object]:
     created = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
     started = created + timedelta(seconds=5) if status != "queued" else None
@@ -44,6 +45,17 @@ def _row(
     selected_phase = phase or (
         "queued" if status == "queued" else ("complete" if terminal else "running")
     )
+    resources = (
+        {"jobs": 1, "cpu": 1, "browser": 1}
+        if sequence == 1
+        else {"jobs": 1, "cpu": 1}
+    )
+    selected_receipt = resource_receipt or {
+        "requested": resources,
+        "applied": {},
+        "peak": {},
+        "events": [],
+    }
     return {
         "run_id": run_id,
         "sequence": sequence,
@@ -58,11 +70,17 @@ def _row(
         "branch": f"feature/{sequence}",
         "head_sha": head_sha,
         "barrier": kind in {"full", "merge", "land"},
-        "resources": (
-            {"jobs": 1, "cpu": 1, "browser": 1}
-            if sequence == 1
-            else {"jobs": 1, "cpu": 1}
-        ),
+        "resources": resources,
+        "resource_contract": {
+            name: {
+                "backend": None,
+                "kind": "generic",
+                "mode": "admission-only",
+                "unit": "admission-unit",
+            }
+            for name in resources
+        },
+        "resource_receipt": selected_receipt,
         "blocked_by": [],
         "gate_run_id": gate_run_id,
         "publication": publication,
@@ -89,6 +107,8 @@ def _snapshot() -> dict[str, object]:
         "captured_at": "2026-08-30T12:00:45+00:00",
         "capacities": {"jobs": 2, "cpu": 4, "browser": 1},
         "allocations": {"jobs": 1, "cpu": 1, "browser": 1},
+        "resource_bindings": {},
+        "resource_capabilities": {},
         "active": [_row("check-active", 1, "running")],
         "queued": [
             _row(
@@ -232,6 +252,7 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
             "agent-7",
             "cpu",
             "browser",
+            "admission-only",
             "2026-08-30T12:00:00+00:00",
             "2026-08-30T12:00:05+00:00",
         ):
@@ -249,6 +270,57 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
             "stale-main",
         ):
             assert fact in merge_detail
+
+
+@pytest.mark.asyncio
+async def test_resource_enforcement_failure_is_inspectable_without_backend_paths():
+    snapshot = _snapshot()
+    row = _row("check-resource-failed", 1, "failed")
+    row["resource_contract"]["cpu"] = {
+        "backend": "cgroup-v2",
+        "kind": "cpu",
+        "mode": "required",
+        "unit": "logical-cpu",
+    }
+    row["resource_receipt"] = {
+        "requested": row["resources"],
+        "applied": {},
+        "peak": {},
+        "events": [
+            {
+                "at": "2026-08-30T12:00:01+00:00",
+                "backend": "cgroup-v2",
+                "resource": "cpu",
+                "stage": "probe",
+                "status": "failed",
+                "code": "backend-unavailable",
+            }
+        ],
+    }
+    snapshot["active"] = []
+    snapshot["queued"] = []
+    snapshot["recent"] = [row]
+    snapshot["resource_bindings"] = {"cpu": row["resource_contract"]["cpu"]}
+    snapshot["resource_capabilities"] = {
+        "cgroup-v2": {
+            "available": False,
+            "kinds": [],
+            "units": [],
+            "operations": [],
+            "reason": "backend-unavailable",
+        }
+    }
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        selected = _screen_text(app)
+        assert "enforcement: failed" in selected
+        await pilot.press("enter")
+        await pilot.pause()
+        detail = _screen_text(app)
+        assert "backend-unavailable" in detail
+        assert "/sys/fs/cgroup" not in detail
 
 
 @pytest.mark.asyncio

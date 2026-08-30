@@ -28,8 +28,25 @@ import time
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
 
+from .resources import (
+    ResourceBackend,
+    ResourceContractError,
+    ResourceRequest,
+    capability_issue,
+    default_resource_bindings,
+    initial_resource_receipt,
+    probe_resource_backends,
+    resource_contract,
+    validate_backend_state,
+    validate_resource_backends,
+    validate_resource_bindings,
+    validate_resource_capabilities,
+    validate_resource_contract,
+    validate_resource_receipt,
+)
 
-PROTOCOL = 2
+
+PROTOCOL = 3
 TERMINAL_STATUSES = frozenset({
     "passed", "failed", "cancelled", "interrupted",
 })
@@ -39,6 +56,7 @@ DEFAULT_RECENT_LIMIT = 50
 DEFAULT_IDLE_SECONDS = 60.0
 DEFAULT_JOB_CAPACITY = 2
 MAX_LOG_BYTES = 64 * 1024
+MAX_OWNER_METADATA_BYTES = 1024 * 1024
 CANCEL_GRACE_SECONDS = 5.0
 RUN_ID_ENV = "AGCOORD_RUN_ID"
 RUN_KIND_ENV = "AGCOORD_RUN_KIND"
@@ -72,6 +90,10 @@ class CoordinatorError(RuntimeError):
 
 class _OwnerMetadataError(CoordinatorError):
     """A live owner whose one startup metadata write is not readable yet or is invalid."""
+
+
+class _ResourceEnforcementError(CoordinatorError):
+    """A required backend contract failed before the blocked launcher was released."""
 
 
 @dataclass(frozen=True)
@@ -403,7 +425,11 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             try:
-                raw = os.pread(descriptor, 4096, 0).decode("utf-8", errors="strict")
+                raw = os.pread(
+                    descriptor,
+                    MAX_OWNER_METADATA_BYTES,
+                    0,
+                ).decode("utf-8", errors="strict")
             except (OSError, UnicodeDecodeError) as exc:
                 raise _OwnerMetadataError(
                     f"live gate broker ownership metadata is unreadable in "
@@ -423,28 +449,47 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             )
         fields[key] = value
     try:
-        capacities = json.loads(fields["capacities"])
-        owner: dict[str, Any] = {
-            "pid": int(fields["pid"]),
-            "protocol": int(fields["protocol"]),
-            "capacities": _positive_mapping(
-                capacities,
-                subject="owner capacity",
-                include_job=False,
-            ),
-        }
+        protocol = int(fields["protocol"])
+        owner_pid = int(fields["pid"])
+        capacities = _positive_mapping(
+            json.loads(fields["capacities"]),
+            subject="owner capacity",
+            include_job=False,
+        )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, CoordinatorError) as exc:
         raise _OwnerMetadataError(
             f"live gate broker wrote incomplete ownership metadata in {paths.owner_lock}"
         ) from exc
-    if owner["protocol"] != PROTOCOL:
+    if protocol != PROTOCOL:
         raise CoordinatorError(
-            f"gate coordinator protocol mismatch: broker has {owner['protocol']}, "
+            f"gate coordinator protocol mismatch: broker has {protocol}, "
             f"client needs {PROTOCOL}"
         )
-    if owner["pid"] <= 0:
+    try:
+        bindings = validate_resource_bindings(
+            json.loads(fields["resource_bindings"])
+        )
+        capabilities = validate_resource_capabilities(
+            json.loads(fields["resource_capabilities"])
+        )
+    except (
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        ResourceContractError,
+    ) as exc:
+        raise _OwnerMetadataError(
+            f"live gate broker wrote incomplete resource metadata in {paths.owner_lock}"
+        ) from exc
+    if owner_pid <= 0:
         raise _OwnerMetadataError("live gate broker wrote invalid numeric metadata")
-    return owner
+    return {
+        "pid": owner_pid,
+        "protocol": protocol,
+        "capacities": capacities,
+        "resource_bindings": bindings,
+        "resource_capabilities": capabilities,
+    }
 
 
 def migrate_queue(
@@ -504,17 +549,23 @@ def migrate_queue(
                     "gate queue database has no protocol value"
                 )
             previous = int(stored["value"])
+            original_protocol = previous
             changed = False
-            if previous == 1:
+            if previous not in {1, 2, PROTOCOL}:
+                raise CoordinatorError(
+                    f"queue protocol is {previous}; no migration to {PROTOCOL} is defined"
+                )
+            if previous in {1, 2}:
                 live = db.execute(
                     "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
                     "ORDER BY sequence"
                 ).fetchall()
                 if live:
                     raise CoordinatorError(
-                        "cannot migrate protocol 1 with live runs: "
+                        f"cannot migrate protocol {previous} with live runs: "
                         + ", ".join(row["run_id"] for row in live)
                     )
+            if previous == 1:
                 db.execute(
                     """
                     CREATE TABLE runs_v2 (
@@ -594,17 +645,63 @@ def migrate_queue(
                 )
                 db.execute(
                     "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
+                    ("2",),
+                )
+                previous = 2
+                changed = True
+            if previous == 2:
+                db.execute(
+                    "ALTER TABLE runs ADD COLUMN resource_contract_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
+                db.execute(
+                    "ALTER TABLE runs ADD COLUMN resource_receipt_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
+                db.execute(
+                    "ALTER TABLE runs ADD COLUMN resource_state_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
+                rows = db.execute(
+                    "SELECT run_id, resources_json FROM runs ORDER BY sequence"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        resources = _positive_mapping(
+                            json.loads(row["resources_json"]),
+                            subject="legacy stored resource",
+                            include_job=False,
+                        )
+                        contract = resource_contract(resources, {})
+                        receipt = initial_resource_receipt(resources)
+                    except (
+                        TypeError,
+                        json.JSONDecodeError,
+                        CoordinatorError,
+                        ResourceContractError,
+                    ) as exc:
+                        raise CoordinatorError(
+                            f"cannot migrate run {row['run_id']}: invalid stored resources"
+                        ) from exc
+                    db.execute(
+                        "UPDATE runs SET resource_contract_json = ?, "
+                        "resource_receipt_json = ?, resource_state_json = '{}' "
+                        "WHERE run_id = ?",
+                        (
+                            json.dumps(contract, separators=(",", ":")),
+                            json.dumps(receipt, separators=(",", ":")),
+                            row["run_id"],
+                        ),
+                    )
+                db.execute(
+                    "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
                     (str(PROTOCOL),),
                 )
                 changed = True
-            elif previous != PROTOCOL:
-                raise CoordinatorError(
-                    f"queue protocol is {previous}; no migration to {PROTOCOL} is defined"
-                )
         paths.database.chmod(0o600)
         return {
             "changed": changed,
-            "from_protocol": previous,
+            "from_protocol": original_protocol,
             "to_protocol": PROTOCOL,
         }
     finally:
@@ -629,6 +726,8 @@ class CoordinatorBroker:
         idle_timeout: float | None = DEFAULT_IDLE_SECONDS,
         recent_limit: int = DEFAULT_RECENT_LIMIT,
         capacities: Mapping[str, int] | None = None,
+        resource_bindings: Mapping[str, Mapping[str, object]] | None = None,
+        resource_backends: Mapping[str, ResourceBackend] | None = None,
     ):
         if recent_limit < 1:
             raise ValueError("recent_limit must be positive")
@@ -644,6 +743,19 @@ class CoordinatorBroker:
         )
         if "jobs" not in self.capacities:
             raise ValueError("capacities must include a positive 'jobs' capacity")
+        try:
+            self.resource_bindings = validate_resource_bindings(
+                default_resource_bindings()
+                if resource_bindings is None
+                else resource_bindings
+            )
+            self.resource_backends = validate_resource_backends(resource_backends)
+            self.resource_capabilities = probe_resource_backends(
+                self.resource_backends,
+                self.resource_bindings,
+            )
+        except ResourceContractError as exc:
+            raise CoordinatorError(str(exc)) from exc
         self._db_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._stop = threading.Event()
@@ -745,6 +857,9 @@ class CoordinatorBroker:
                         head_sha TEXT,
                         barrier INTEGER NOT NULL CHECK (barrier IN (0, 1)),
                         resources_json TEXT NOT NULL,
+                        resource_contract_json TEXT NOT NULL,
+                        resource_receipt_json TEXT NOT NULL,
+                        resource_state_json TEXT NOT NULL,
                         gate_run_id TEXT,
                         publication_adapter TEXT,
                         publication_request TEXT,
@@ -801,6 +916,7 @@ class CoordinatorBroker:
             required = {
                 "kind", "phase", "agent", "repository_id", "repository", "worktree_id",
                 "head_sha", "barrier", "resources_json", "gate_run_id",
+                "resource_contract_json", "resource_receipt_json", "resource_state_json",
                 "publication_adapter", "publication_request", "failure_reason",
                 "gate_exit_status", "reported_exit_status",
                 "created_at", "finished_at",
@@ -853,6 +969,10 @@ class CoordinatorBroker:
                     f"pid={os.getpid()}\n"
                     f"protocol={PROTOCOL}\n"
                     f"capacities={json.dumps(self.capacities, separators=(',', ':'))}\n"
+                    f"resource_bindings="
+                    f"{json.dumps(self.resource_bindings, separators=(',', ':'))}\n"
+                    f"resource_capabilities="
+                    f"{json.dumps(self.resource_capabilities, separators=(',', ':'))}\n"
                     f"started_at={_now()}\n"
                 ).encode(),
             )
@@ -872,7 +992,8 @@ class CoordinatorBroker:
             self.ready.set()
             self._append_daemon_log(
                 f"broker {os.getpid()} started; protocol={PROTOCOL}; "
-                f"capacities={self.capacities}"
+                f"capacities={self.capacities}; resource backends="
+                f"{sorted(self.resource_capabilities)}"
             )
         try:
             self._pump()
@@ -941,6 +1062,7 @@ class CoordinatorBroker:
                     "WHERE run_id = ?",
                     (now, row["run_id"]),
                 )
+                self._cancel_resources(db, row)
                 self._signal_worker(row, signal.SIGTERM)
 
         while True:
@@ -1032,6 +1154,11 @@ class CoordinatorBroker:
         owner = _broker_owner(self.paths)
         capacities = owner["capacities"] if owner is not None else self.capacities
         selected_resources = _validate_resources(resources, capacities)
+        selected_bindings = (
+            owner["resource_bindings"] if owner is not None else self.resource_bindings
+        )
+        selected_contract = resource_contract(selected_resources, selected_bindings)
+        selected_resource_receipt = initial_resource_receipt(selected_resources)
         selected_environment = _validate_environment(environment)
         run_id = f"{kind}-{uuid4().hex[:12]}"
         with self._db_lock, self._connect() as db:
@@ -1040,8 +1167,10 @@ class CoordinatorBroker:
                 INSERT INTO runs (
                     run_id, status, kind, phase, label, agent, repository_id, repository,
                     worktree_id, checkout, branch, head_sha, barrier, resources_json,
+                    resource_contract_json, resource_receipt_json, resource_state_json,
                     caller_pid, command_json, environment_json, created_at
-                ) VALUES (?, 'queued', ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'queued', ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          '{}', ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -1056,6 +1185,8 @@ class CoordinatorBroker:
                     selected_head,
                     int(kind == "full"),
                     json.dumps(selected_resources, separators=(",", ":")),
+                    json.dumps(selected_contract, separators=(",", ":")),
+                    json.dumps(selected_resource_receipt, separators=(",", ":")),
                     selected_pid,
                     json.dumps(selected_command, separators=(",", ":")),
                     json.dumps(selected_environment, separators=(",", ":")),
@@ -1106,6 +1237,11 @@ class CoordinatorBroker:
         owner = _broker_owner(self.paths)
         capacities = owner["capacities"] if owner is not None else self.capacities
         selected_resources = _validate_resources(resources, capacities)
+        selected_bindings = (
+            owner["resource_bindings"] if owner is not None else self.resource_bindings
+        )
+        selected_contract = resource_contract(selected_resources, selected_bindings)
+        selected_resource_receipt = initial_resource_receipt(selected_resources)
         selected_environment = _validate_environment(environment)
         executable_path = Path(worker_python or sys.executable).expanduser()
         if not executable_path.is_absolute():
@@ -1177,15 +1313,17 @@ class CoordinatorBroker:
                         f"gate receipt {gate_run_id} does not match "
                         + ", ".join(mismatches)
                     )
-            selected_receipt = receipt["run_id"]
+            selected_gate_receipt = receipt["run_id"]
             db.execute(
                 """
                 INSERT INTO runs (
                     run_id, status, kind, phase, label, agent, repository_id, repository,
                     worktree_id, checkout, branch, head_sha, barrier, resources_json,
+                    resource_contract_json, resource_receipt_json, resource_state_json,
                     gate_run_id, publication_adapter, publication_request, caller_pid,
                     command_json, environment_json, created_at
-                ) VALUES (?, 'queued', 'merge', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'queued', 'merge', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?,
+                          ?, '{}', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -1198,7 +1336,9 @@ class CoordinatorBroker:
                     selected_branch,
                     selected_head,
                     json.dumps(selected_resources, separators=(",", ":")),
-                    selected_receipt,
+                    json.dumps(selected_contract, separators=(",", ":")),
+                    json.dumps(selected_resource_receipt, separators=(",", ":")),
+                    selected_gate_receipt,
                     adapter,
                     json.dumps(request, separators=(",", ":")),
                     selected_pid,
@@ -1260,6 +1400,11 @@ class CoordinatorBroker:
         owner = _broker_owner(self.paths)
         capacities = owner["capacities"] if owner is not None else self.capacities
         selected_resources = _validate_resources(resources, capacities)
+        selected_bindings = (
+            owner["resource_bindings"] if owner is not None else self.resource_bindings
+        )
+        selected_contract = resource_contract(selected_resources, selected_bindings)
+        selected_receipt = initial_resource_receipt(selected_resources)
         selected_environment = _validate_environment(environment)
         run_id = f"land-{uuid4().hex[:12]}"
         with self._db_lock, self._connect() as db:
@@ -1268,10 +1413,11 @@ class CoordinatorBroker:
                 INSERT INTO runs (
                     run_id, status, kind, phase, label, agent, repository_id,
                     repository, worktree_id, checkout, branch, head_sha, barrier,
-                    resources_json, publication_adapter, publication_request,
+                    resources_json, resource_contract_json, resource_receipt_json,
+                    resource_state_json, publication_adapter, publication_request,
                     caller_pid, command_json, environment_json, created_at
                 ) VALUES (?, 'queued', 'land', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 1,
-                          ?, ?, ?, ?, ?, ?, ?)
+                          ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -1284,6 +1430,8 @@ class CoordinatorBroker:
                     selected_branch,
                     selected_head,
                     json.dumps(selected_resources, separators=(",", ":")),
+                    json.dumps(selected_contract, separators=(",", ":")),
+                    json.dumps(selected_receipt, separators=(",", ":")),
                     adapter,
                     json.dumps(request, separators=(",", ":")),
                     selected_pid,
@@ -1328,6 +1476,8 @@ class CoordinatorBroker:
             "captured_at": _now(),
             "capacities": owner["capacities"],
             "allocations": allocations,
+            "resource_bindings": owner["resource_bindings"],
+            "resource_capabilities": owner["resource_capabilities"],
             "active": [self._public(row, position=None) for row in active_rows],
             "queued": queued,
             "recent": [self._public(row, position=None) for row in recent_rows],
@@ -1676,6 +1826,38 @@ class CoordinatorBroker:
                 f"run {row['run_id']} has invalid stored resources"
             ) from exc
 
+    def _row_resource_contract(self, row: sqlite3.Row) -> dict[str, dict[str, object]]:
+        resources = self._row_resources(row)
+        try:
+            return validate_resource_contract(
+                json.loads(row["resource_contract_json"]),
+                resources,
+            )
+        except (TypeError, json.JSONDecodeError, ResourceContractError) as exc:
+            raise CoordinatorError(
+                f"run {row['run_id']} has an invalid stored resource contract"
+            ) from exc
+
+    def _row_resource_receipt(self, row: sqlite3.Row) -> dict[str, object]:
+        resources = self._row_resources(row)
+        try:
+            return validate_resource_receipt(
+                json.loads(row["resource_receipt_json"]),
+                resources,
+            )
+        except (TypeError, json.JSONDecodeError, ResourceContractError) as exc:
+            raise CoordinatorError(
+                f"run {row['run_id']} has an invalid stored resource receipt"
+            ) from exc
+
+    def _row_resource_state(self, row: sqlite3.Row) -> dict[str, dict[str, object]]:
+        try:
+            return validate_backend_state(json.loads(row["resource_state_json"]))
+        except (TypeError, json.JSONDecodeError, ResourceContractError) as exc:
+            raise CoordinatorError(
+                f"run {row['run_id']} has invalid private resource state"
+            ) from exc
+
     def _allocations(self, rows: Sequence[sqlite3.Row]) -> dict[str, int]:
         allocated: dict[str, int] = {}
         for row in rows:
@@ -1772,6 +1954,8 @@ class CoordinatorBroker:
             "head_sha": row["head_sha"],
             "barrier": bool(row["barrier"]),
             "resources": self._row_resources(row),
+            "resource_contract": self._row_resource_contract(row),
+            "resource_receipt": self._row_resource_receipt(row),
             "blocked_by": self._blocked_by(
                 row,
                 active=active,
@@ -1984,6 +2168,419 @@ class CoordinatorBroker:
                     f"repository {repository_id} has a barrier overlap: {identities}"
                 )
 
+    def _resource_request(
+        self,
+        row: sqlite3.Row,
+        backend: str,
+        names: Sequence[str],
+    ) -> ResourceRequest:
+        resources = self._row_resources(row)
+        contract = self._row_resource_contract(row)
+        selected_resources: dict[str, int] = {}
+        selected_bindings: dict[str, Mapping[str, object]] = {}
+        for name in names:
+            binding = contract.get(name)
+            if binding is None or binding["backend"] != backend:
+                raise CoordinatorError(
+                    f"run {row['run_id']} has inconsistent private resource state"
+                )
+            selected_resources[name] = resources[name]
+            selected_bindings[name] = binding
+        return ResourceRequest.build(
+            row["run_id"],
+            backend,
+            selected_resources,
+            selected_bindings,
+        )
+
+    def _append_resource_event(
+        self,
+        receipt: dict[str, object],
+        *,
+        backend: str,
+        resource: str,
+        stage: str,
+        status: str,
+        code: str,
+    ) -> None:
+        events = receipt["events"]
+        if not isinstance(events, list):
+            raise CoordinatorError("resource receipt events are not mutable")
+        events.append(
+            {
+                "at": _now(),
+                "backend": backend,
+                "resource": resource,
+                "stage": stage,
+                "status": status,
+                "code": code,
+            }
+        )
+
+    def _save_resource_records(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        receipt: Mapping[str, object],
+        state: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        resources = self._row_resources(row)
+        try:
+            selected_receipt = validate_resource_receipt(receipt, resources)
+            selected_state = validate_backend_state(state)
+        except ResourceContractError as exc:
+            raise CoordinatorError(
+                f"run {row['run_id']} produced invalid resource lifecycle data"
+            ) from exc
+        db.execute(
+            "UPDATE runs SET resource_receipt_json = ?, resource_state_json = ? "
+            "WHERE run_id = ?",
+            (
+                json.dumps(selected_receipt, separators=(",", ":")),
+                json.dumps(selected_state, separators=(",", ":")),
+                row["run_id"],
+            ),
+        )
+
+    def _cleanup_resource_records(
+        self,
+        row: sqlite3.Row,
+        receipt: dict[str, object],
+        state: dict[str, dict[str, object]],
+        *,
+        only: set[str] | None = None,
+    ) -> None:
+        for backend_name in list(state):
+            if only is not None and backend_name not in only:
+                continue
+            record = state[backend_name]
+            names = record["resources"]
+            request = self._resource_request(row, backend_name, names)
+            backend = self.resource_backends.get(backend_name)
+            try:
+                if backend is None:
+                    raise ResourceContractError("backend unavailable")
+                backend.cleanup(request, record["handle"])
+            except Exception as exc:
+                self._append_daemon_log(
+                    f"resource cleanup failed for {row['run_id']} via "
+                    f"{backend_name}: {type(exc).__name__}"
+                )
+                for name in names:
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="cleanup",
+                        status="failed",
+                        code="cleanup-failed",
+                    )
+            else:
+                for name in names:
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="cleanup",
+                        status="recorded",
+                        code="cleaned",
+                    )
+            del state[backend_name]
+
+    def _prepare_resources(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
+        receipt = self._row_resource_receipt(row)
+        state = self._row_resource_state(row)
+        if state:
+            raise CoordinatorError(
+                f"run {row['run_id']} already has prepared resource state"
+            )
+        contract = self._row_resource_contract(row)
+        eligible: dict[str, list[str]] = {}
+        required_failure = False
+        for name, binding in contract.items():
+            mode = binding["mode"]
+            if mode == "admission-only":
+                continue
+            backend_name = str(binding["backend"])
+            issue = capability_issue(
+                binding,
+                self.resource_capabilities.get(backend_name),
+            )
+            if issue is not None:
+                self._append_resource_event(
+                    receipt,
+                    backend=backend_name,
+                    resource=name,
+                    stage="probe",
+                    status="failed" if mode == "required" else "unapplied",
+                    code=issue,
+                )
+                required_failure = required_failure or mode == "required"
+            else:
+                eligible.setdefault(backend_name, []).append(name)
+        if required_failure:
+            self._save_resource_records(db, row, receipt, state)
+            raise _ResourceEnforcementError(
+                "a required resource backend or unit is unavailable"
+            )
+
+        for backend_name, names in sorted(eligible.items()):
+            request = self._resource_request(row, backend_name, names)
+            backend = self.resource_backends[backend_name]
+            try:
+                handle = backend.prepare(request)
+                candidate = {
+                    "handle": handle,
+                    "resources": list(names),
+                    "finished": False,
+                    "cancelled": False,
+                }
+                selected = validate_backend_state({backend_name: candidate})
+                state[backend_name] = selected[backend_name]
+            except Exception as exc:
+                self._append_daemon_log(
+                    f"resource prepare failed for {row['run_id']} via "
+                    f"{backend_name}: {type(exc).__name__}"
+                )
+                for name in names:
+                    mode = contract[name]["mode"]
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="prepare",
+                        status="failed" if mode == "required" else "unapplied",
+                        code="prepare-failed",
+                    )
+                    required_failure = required_failure or mode == "required"
+            else:
+                for name in names:
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="prepare",
+                        status="recorded",
+                        code="prepared",
+                    )
+        if required_failure:
+            self._cleanup_resource_records(row, receipt, state)
+            self._save_resource_records(db, row, receipt, state)
+            raise _ResourceEnforcementError("a required resource could not be prepared")
+        self._save_resource_records(db, row, receipt, state)
+
+    def _attach_resources(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        worker_pid: int,
+    ) -> None:
+        receipt = self._row_resource_receipt(row)
+        state = self._row_resource_state(row)
+        contract = self._row_resource_contract(row)
+        required_failure = False
+        failed_best_effort: set[str] = set()
+        applied = receipt["applied"]
+        if not isinstance(applied, dict):
+            raise CoordinatorError("resource receipt application record is not mutable")
+        for backend_name, record in state.items():
+            names = record["resources"]
+            request = self._resource_request(row, backend_name, names)
+            backend = self.resource_backends.get(backend_name)
+            try:
+                if backend is None:
+                    raise ResourceContractError("backend unavailable")
+                backend.attach(request, record["handle"], worker_pid)
+            except Exception as exc:
+                self._append_daemon_log(
+                    f"resource attach failed for {row['run_id']} via "
+                    f"{backend_name}: {type(exc).__name__}"
+                )
+                for name in names:
+                    mode = contract[name]["mode"]
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="attach",
+                        status="failed" if mode == "required" else "unapplied",
+                        code="attach-failed",
+                    )
+                    required_failure = required_failure or mode == "required"
+                if not any(contract[name]["mode"] == "required" for name in names):
+                    failed_best_effort.add(backend_name)
+            else:
+                for name, units in request.resources.items():
+                    applied[name] = units
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="attach",
+                        status="applied",
+                        code="applied",
+                    )
+        if required_failure:
+            self._cleanup_resource_records(row, receipt, state)
+        elif failed_best_effort:
+            self._cleanup_resource_records(
+                row,
+                receipt,
+                state,
+                only=failed_best_effort,
+            )
+        self._save_resource_records(db, row, receipt, state)
+        if required_failure:
+            raise _ResourceEnforcementError("a required resource could not be attached")
+
+    def _resource_measurement(
+        self,
+        value: object,
+        *,
+        expected: set[str],
+    ) -> dict[str, int]:
+        if not isinstance(value, Mapping):
+            raise ResourceContractError("resource usage must be a resource mapping")
+        measured: dict[str, int] = {}
+        for name, units in value.items():
+            if name not in expected:
+                raise ResourceContractError("resource usage names an unexpected resource")
+            if not isinstance(units, int) or isinstance(units, bool) or units < 0:
+                raise ResourceContractError("resource usage must be non-negative integers")
+            measured[name] = units
+        return measured
+
+    def _capture_resource_usage(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        final: bool,
+    ) -> None:
+        receipt = self._row_resource_receipt(row)
+        state = self._row_resource_state(row)
+        peak = receipt["peak"]
+        if not isinstance(peak, dict):
+            raise CoordinatorError("resource receipt peak record is not mutable")
+        changed = False
+        for backend_name, record in state.items():
+            if record["finished"]:
+                continue
+            names = record["resources"]
+            request = self._resource_request(row, backend_name, names)
+            backend = self.resource_backends.get(backend_name)
+            stage = "finish" if final else "usage"
+            try:
+                if backend is None:
+                    raise ResourceContractError("backend unavailable")
+                raw = (
+                    backend.finish(request, record["handle"])
+                    if final
+                    else backend.usage(request, record["handle"])
+                )
+                measured = self._resource_measurement(raw, expected=set(names))
+            except Exception as exc:
+                already_recorded = any(
+                    event["backend"] == backend_name
+                    and event["stage"] == stage
+                    and event["code"] == f"{stage}-failed"
+                    for event in receipt["events"]
+                )
+                if not already_recorded:
+                    self._append_daemon_log(
+                        f"resource {stage} failed for {row['run_id']} via "
+                        f"{backend_name}: {type(exc).__name__}"
+                    )
+                    for name in names:
+                        self._append_resource_event(
+                            receipt,
+                            backend=backend_name,
+                            resource=name,
+                            stage=stage,
+                            status="failed",
+                            code=f"{stage}-failed",
+                        )
+                    changed = True
+            else:
+                for name, units in measured.items():
+                    if units > peak.get(name, -1):
+                        peak[name] = units
+                        changed = True
+                if final:
+                    for name in names:
+                        self._append_resource_event(
+                            receipt,
+                            backend=backend_name,
+                            resource=name,
+                            stage="finish",
+                            status="recorded",
+                            code="finished",
+                        )
+                    changed = True
+            if final:
+                record["finished"] = True
+                changed = True
+        if changed:
+            self._save_resource_records(db, row, receipt, state)
+
+    def _finish_and_cleanup_resources(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> None:
+        self._capture_resource_usage(db, row, final=True)
+        refreshed = db.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)
+        ).fetchone()
+        receipt = self._row_resource_receipt(refreshed)
+        state = self._row_resource_state(refreshed)
+        if state:
+            self._cleanup_resource_records(refreshed, receipt, state)
+            self._save_resource_records(db, refreshed, receipt, state)
+
+    def _cancel_resources(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
+        receipt = self._row_resource_receipt(row)
+        state = self._row_resource_state(row)
+        changed = False
+        for backend_name, record in state.items():
+            if record["cancelled"]:
+                continue
+            names = record["resources"]
+            request = self._resource_request(row, backend_name, names)
+            backend = self.resource_backends.get(backend_name)
+            try:
+                if backend is None:
+                    raise ResourceContractError("backend unavailable")
+                backend.cancel(request, record["handle"])
+            except Exception as exc:
+                self._append_daemon_log(
+                    f"resource cancel failed for {row['run_id']} via "
+                    f"{backend_name}: {type(exc).__name__}"
+                )
+                for name in names:
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="cancel",
+                        status="failed",
+                        code="cancel-failed",
+                    )
+            else:
+                for name in names:
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=name,
+                        stage="cancel",
+                        status="recorded",
+                        code="cancelled",
+                    )
+            record["cancelled"] = True
+            changed = True
+        if changed:
+            self._save_resource_records(db, row, receipt, state)
+
     def _start_worker(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
         run_id = row["run_id"]
         command = json.loads(row["command_json"])
@@ -2006,6 +2603,7 @@ class CoordinatorBroker:
         process: subprocess.Popen[bytes] | None = None
         released = False
         try:
+            self._prepare_resources(db, row)
             if row["kind"] in {"full", "merge", "land"}:
                 _assert_clean_head(Path(row["checkout"]), row["head_sha"])
             worker_command = command
@@ -2061,6 +2659,10 @@ class CoordinatorBroker:
                 raise CoordinatorError(
                     f"could not identify gate launcher process {process.pid}"
                 )
+            prepared_row = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._attach_resources(db, prepared_row, process.pid)
             db.execute(
                 "UPDATE runs SET worker_pid = ?, worker_start_token = ?, "
                 "environment_json = '{}' WHERE run_id = ?",
@@ -2087,6 +2689,29 @@ class CoordinatorBroker:
                     except ProcessLookupError:
                         pass
                     process.wait(timeout=1.0)
+            refreshed = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            try:
+                receipt = self._row_resource_receipt(refreshed)
+                resource_state = self._row_resource_state(refreshed)
+                if resource_state:
+                    self._cleanup_resource_records(
+                        refreshed,
+                        receipt,
+                        resource_state,
+                    )
+                    self._save_resource_records(
+                        db,
+                        refreshed,
+                        receipt,
+                        resource_state,
+                    )
+            except Exception as cleanup_exc:
+                self._append_daemon_log(
+                    f"resource rollback failed for {run_id}: "
+                    f"{type(cleanup_exc).__name__}"
+                )
             with log_path.open("a", encoding="utf-8") as output:
                 output.write(f"Gate coordinator: could not start worker: {exc}\n")
             log_path.chmod(0o600)
@@ -2096,12 +2721,17 @@ class CoordinatorBroker:
                     (run_id,),
                 )
                 return
-            failure_reason = "merge-error" if row["kind"] == "merge" else None
+            resource_failure = isinstance(exc, _ResourceEnforcementError)
+            failure_reason = (
+                "resource-enforcement-failed"
+                if resource_failure
+                else ("merge-error" if row["kind"] == "merge" else None)
+            )
             db.execute(
                 "UPDATE runs SET status = 'failed', phase = 'complete', "
-                "finished_at = ?, exit_status = 127, "
+                "finished_at = ?, exit_status = ?, "
                 "failure_reason = ?, environment_json = '{}' WHERE run_id = ?",
-                (_now(), failure_reason, run_id),
+                (_now(), 125 if resource_failure else 127, failure_reason, run_id),
             )
             self._prune(db)
         finally:
@@ -2135,10 +2765,15 @@ class CoordinatorBroker:
         if child is not None:
             returncode = child.poll()
             if returncode is None:
-                self._escalate_cancel(row)
+                self._capture_resource_usage(db, row, final=False)
+                refreshed = db.execute(
+                    "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                self._escalate_cancel(db, refreshed)
                 return
             if not self._drain_finished_process_group(row):
                 return
+            self._finish_and_cleanup_resources(db, row)
             if not self._remove_worker_tmp(run_id):
                 return
             self._children.pop(run_id, None)
@@ -2167,10 +2802,15 @@ class CoordinatorBroker:
         # not launch a second worker: it observes the exact pid+start token until the old
         # group ends, preserving the coordinator as the sole exclusion boundary.
         if _same_process(row["worker_pid"], row["worker_start_token"]):
-            self._escalate_cancel(row)
+            self._capture_resource_usage(db, row, final=False)
+            refreshed = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._escalate_cancel(db, refreshed)
             return
         if not self._drain_finished_process_group(row):
             return
+        self._finish_and_cleanup_resources(db, row)
         if not self._remove_worker_tmp(run_id):
             return
         self._group_drain_started.pop(run_id, None)
@@ -2200,9 +2840,10 @@ class CoordinatorBroker:
         )
         self._prune(db)
 
-    def _escalate_cancel(self, row: sqlite3.Row) -> None:
+    def _escalate_cancel(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
         if not row["cancel_requested"]:
             return
+        self._cancel_resources(db, row)
         requested = _parse_time(row["cancel_requested_at"])
         if requested is None:
             return
@@ -2332,6 +2973,8 @@ class CoordinatorClient:
                 "protocol": owner["protocol"],
                 "broker_pid": owner["pid"],
                 "capacities": owner["capacities"],
+                "resource_bindings": owner["resource_bindings"],
+                "resource_capabilities": owner["resource_capabilities"],
             }
         if not self.autostart:
             if last_metadata_error is not None:
@@ -2519,14 +3162,17 @@ class CoordinatorClient:
             "protocol": owner["protocol"],
             "broker_pid": owner["pid"],
             "capacities": owner["capacities"],
+            "resource_bindings": owner["resource_bindings"],
+            "resource_capabilities": owner["resource_capabilities"],
         }
 
     def _start_broker(self) -> None:
         # Prepare and protocol-check the private spool before a detached process is born.
         # This also closes the interval in which its redirected log could inherit loose
         # permissions from a pre-existing operator-selected directory.
-        self._catalogue()
+        catalogue = self._catalogue()
         capacities = default_capacities()
+        bindings = catalogue.resource_bindings
         try:
             log = self.paths.daemon_log.open("ab", buffering=0)
         except OSError as exc:
@@ -2543,6 +3189,8 @@ class CoordinatorClient:
             str(self.paths.state_dir),
             "--capacities-json",
             json.dumps(capacities, separators=(",", ":")),
+            "--resource-bindings-json",
+            json.dumps(bindings, separators=(",", ":")),
         ]
         try:
             subprocess.Popen(
@@ -2640,6 +3288,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--capacities-json",
         default=json.dumps(default_capacities(), separators=(",", ":")),
     )
+    serve.add_argument("--resource-bindings-json", default="{}")
     submit = commands.add_parser("submit", help=argparse.SUPPRESS)
     submit.add_argument("--state-dir")
     submit.add_argument("--checkout", required=True)
@@ -2667,14 +3316,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command_name == "serve":
         try:
             capacities = json.loads(args.capacities_json)
-        except json.JSONDecodeError as exc:
-            print(f"AGCoord: invalid capacities JSON: {exc}", file=sys.stderr)
+            bindings = json.loads(args.resource_bindings_json)
+            broker = CoordinatorBroker(
+                args.state_dir,
+                idle_timeout=args.idle_seconds,
+                capacities=capacities,
+                resource_bindings=bindings,
+            )
+        except (json.JSONDecodeError, CoordinatorError) as exc:
+            print(f"AGCoord: invalid broker configuration: {exc}", file=sys.stderr)
             return 2
-        broker = CoordinatorBroker(
-            args.state_dir,
-            idle_timeout=args.idle_seconds,
-            capacities=capacities,
-        )
 
         def stop(_signum, _frame):
             threading.Thread(target=broker.close, daemon=True).start()

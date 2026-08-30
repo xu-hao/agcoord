@@ -41,6 +41,8 @@ ROW_KEYS = {
     "head_sha",
     "barrier",
     "resources",
+    "resource_contract",
+    "resource_receipt",
     "blocked_by",
     "gate_run_id",
     "publication",
@@ -65,6 +67,8 @@ SNAPSHOT_KEYS = {
     "captured_at",
     "capacities",
     "allocations",
+    "resource_bindings",
+    "resource_capabilities",
     "active",
     "queued",
     "recent",
@@ -364,22 +368,101 @@ def test_absent_capacity_configuration_defaults_to_two_job_slots(monkeypatch, tm
         running.stop()
 
 
-def test_protocol_one_history_requires_explicit_migration_for_land_fields(
+def test_resource_binding_environment_is_frozen_in_broker_metadata(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv(
+        "AGCOORD_RESOURCE_BINDINGS",
+        json.dumps(
+            {
+                "memory": {
+                    "backend": "cgroup-v2",
+                    "kind": "memory",
+                    "mode": "best-effort",
+                    "unit": "bytes",
+                }
+            }
+        ),
+    )
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "memory": 1024},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    try:
+        snapshot = client.snapshot()
+        assert snapshot["resource_bindings"]["memory"] == {
+            "backend": "cgroup-v2",
+            "kind": "memory",
+            "mode": "best-effort",
+            "unit": "bytes",
+        }
+        assert snapshot["resource_capabilities"] == {
+            "cgroup-v2": {
+                "available": False,
+                "kinds": [],
+                "operations": [],
+                "reason": "backend-unavailable",
+                "units": [],
+            }
+        }
+        monkeypatch.setenv("AGCOORD_RESOURCE_BINDINGS", "{}")
+        run_id = _submit(
+            client,
+            _python("print('frozen binding')"),
+            repository,
+            resources={"memory": 512},
+        )
+        row = _row(client, run_id, "passed")
+        assert row["resource_contract"]["memory"] == snapshot["resource_bindings"]["memory"]
+        assert row["resource_receipt"]["events"][0]["code"] == "backend-unavailable"
+    finally:
+        running.stop()
+
+
+def test_resource_binding_rejects_ambiguous_kind_unit_pairs(tmp_path: Path):
+    with pytest.raises(CoordinatorError, match="unit|kind|cpu|bytes"):
+        CoordinatorBroker(
+            tmp_path / "state",
+            capacities={"jobs": 1, "cpu": 1},
+            resource_bindings={
+                "cpu": {
+                    "backend": "test",
+                    "kind": "cpu",
+                    "mode": "required",
+                    "unit": "bytes",
+                }
+            },
+            idle_timeout=None,
+        )
+
+
+@pytest.mark.parametrize("legacy_protocol", [1, 2])
+def test_legacy_history_requires_explicit_migration_without_inventing_enforcement(
     tmp_path: Path,
+    legacy_protocol: int,
 ):
     state_dir = tmp_path / "legacy-state"
     state_dir.mkdir(mode=0o700)
     database = state_dir / "queue.sqlite3"
+    phase_column = "phase TEXT NOT NULL," if legacy_protocol == 2 else ""
+    gate_columns = (
+        "gate_exit_status INTEGER, reported_exit_status INTEGER,"
+        if legacy_protocol == 2
+        else ""
+    )
+    phase_name = ", phase" if legacy_protocol == 2 else ""
+    phase_value = ", 'complete'" if legacy_protocol == 2 else ""
     with sqlite3.connect(database) as db:
         db.executescript(
-            """
+            f"""
             CREATE TABLE coordinator_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO coordinator_meta(key, value) VALUES ('protocol', '1');
+            INSERT INTO coordinator_meta(key, value) VALUES ('protocol', '{legacy_protocol}');
             CREATE TABLE runs (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL,
                 kind TEXT NOT NULL,
+                {phase_column}
                 label TEXT NOT NULL,
                 agent TEXT NOT NULL,
                 repository_id TEXT NOT NULL,
@@ -394,6 +477,7 @@ def test_protocol_one_history_requires_explicit_migration_for_land_fields(
                 publication_adapter TEXT,
                 publication_request TEXT,
                 failure_reason TEXT,
+                {gate_columns}
                 caller_pid INTEGER NOT NULL,
                 command_json TEXT NOT NULL,
                 environment_json TEXT NOT NULL,
@@ -410,14 +494,15 @@ def test_protocol_one_history_requires_explicit_migration_for_land_fields(
                 run_id, status, kind, label, agent, repository_id, repository,
                 worktree_id, checkout, branch, head_sha, barrier, resources_json,
                 caller_pid, command_json, environment_json, created_at, started_at,
-                finished_at, exit_status
+                finished_at, exit_status{phase_name}
             ) VALUES (
                 'full-legacy', 'passed', 'full', 'legacy full', 'legacy-agent',
                 'repo-legacy', '/repos/legacy.git', 'worktree-legacy',
                 '/worktrees/legacy', 'main',
-                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, '{"jobs":1}',
-                42, '["true"]', '{}', '2026-08-30T12:00:00+00:00',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, '{{"jobs":1}}',
+                42, '["true"]', '{{}}', '2026-08-30T12:00:00+00:00',
                 '2026-08-30T12:00:01+00:00', '2026-08-30T12:00:02+00:00', 0
+                {phase_value}
             );
             """
         )
@@ -432,7 +517,7 @@ def test_protocol_one_history_requires_explicit_migration_for_land_fields(
 
     assert migrate_queue(state_dir=state_dir) == {
         "changed": True,
-        "from_protocol": 1,
+        "from_protocol": legacy_protocol,
         "to_protocol": PROTOCOL,
     }
     running = RunningCoordinator(state_dir, capacities={"jobs": 1})
@@ -444,6 +529,20 @@ def test_protocol_one_history_requires_explicit_migration_for_land_fields(
         assert legacy["phase"] == "complete"
         assert legacy["gate_exit_status"] is None
         assert legacy["publication"] is None
+        assert legacy["resource_contract"] == {
+            "jobs": {
+                "backend": None,
+                "kind": "generic",
+                "mode": "admission-only",
+                "unit": "admission-unit",
+            }
+        }
+        assert legacy["resource_receipt"] == {
+            "requested": {"jobs": 1},
+            "applied": {},
+            "peak": {},
+            "events": [],
+        }
     finally:
         running.stop()
 
@@ -471,6 +570,22 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
     assert row["label"] == "small check"
     assert row["agent"] == "pytest"
     assert row["resources"] == {"jobs": 1}
+    assert row["resource_contract"] == {
+        "jobs": {
+            "backend": None,
+            "kind": "generic",
+            "mode": "admission-only",
+            "unit": "admission-unit",
+        }
+    }
+    assert row["resource_receipt"] == {
+        "requested": {"jobs": 1},
+        "applied": {},
+        "peak": {},
+        "events": [],
+    }
+    assert snapshot["resource_bindings"] == {}
+    assert snapshot["resource_capabilities"] == {}
     assert row["barrier"] is False
     assert row["head_sha"] is None
     assert row["gate_run_id"] is None
@@ -481,6 +596,296 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
     assert isinstance(row["repository_id"], str) and row["repository_id"]
     assert isinstance(row["worktree_id"], str) and row["worktree_id"]
     assert row["checkout"] == str(repository.resolve())
+
+
+RESOURCE_BINDING = {
+    "cpu": {
+        "kind": "cpu",
+        "unit": "logical-cpu",
+        "mode": "required",
+        "backend": "test",
+    }
+}
+
+
+class RecordingResourceBackend:
+    def __init__(self, *, units: tuple[str, ...] = ("logical-cpu",)) -> None:
+        self.units = units
+        self.calls: list[tuple[str, object]] = []
+
+    def probe(self) -> dict[str, object]:
+        self.calls.append(("probe", None))
+        return {
+            "available": True,
+            "kinds": ["cpu"],
+            "units": list(self.units),
+            "operations": [
+                "prepare",
+                "attach",
+                "usage",
+                "finish",
+                "cancel",
+                "cleanup",
+            ],
+            "reason": None,
+        }
+
+    def prepare(self, request) -> dict[str, object]:
+        self.calls.append(("prepare", request))
+        return {"token": request.run_id}
+
+    def attach(self, request, state: dict[str, object], worker_pid: int) -> None:
+        self.calls.append(("attach", (request, dict(state), worker_pid)))
+
+    def usage(self, request, state: dict[str, object]) -> dict[str, int]:
+        self.calls.append(("usage", (request, dict(state))))
+        return {name: 1 for name in request.resources}
+
+    def finish(self, request, state: dict[str, object]) -> dict[str, int]:
+        self.calls.append(("finish", (request, dict(state))))
+        return {name: 1 for name in request.resources}
+
+    def cancel(self, request, state: dict[str, object]) -> None:
+        self.calls.append(("cancel", (request, dict(state))))
+
+    def cleanup(self, request, state: dict[str, object]) -> None:
+        self.calls.append(("cleanup", (request, dict(state))))
+
+
+def test_unbound_resource_names_keep_admission_only_meaning(tmp_path: Path):
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "browser": 1},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    try:
+        run_id = _submit(
+            client,
+            _python("print('generic')"),
+            repository,
+            resources={"browser": 1},
+        )
+        row = _row(client, run_id, "passed")
+        assert row["resource_contract"]["browser"] == {
+            "backend": None,
+            "kind": "generic",
+            "mode": "admission-only",
+            "unit": "admission-unit",
+        }
+        assert row["resource_receipt"] == {
+            "requested": {"browser": 1, "jobs": 1},
+            "applied": {},
+            "peak": {},
+            "events": [],
+        }
+    finally:
+        running.stop()
+
+
+def test_required_unavailable_resource_backend_refuses_before_user_code(tmp_path: Path):
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    marker = tmp_path / "user-code-ran"
+    try:
+        run_id = _submit(
+            client,
+            _python("from pathlib import Path; Path(__import__('sys').argv[1]).touch()", marker),
+            repository,
+            resources={"cpu": 1},
+        )
+        row = _row(client, run_id, "failed")
+        assert not marker.exists()
+        assert row["exit_status"] == 125
+        assert row["failure_reason"] == "resource-enforcement-failed"
+        assert row["resource_receipt"]["applied"] == {}
+        assert {
+            (event["resource"], event["stage"], event["status"], event["code"])
+            for event in row["resource_receipt"]["events"]
+        } == {("cpu", "probe", "failed", "backend-unavailable")}
+    finally:
+        running.stop()
+
+
+def test_best_effort_unavailable_resource_is_visible_without_claiming_application(
+    tmp_path: Path,
+):
+    binding = {
+        "cpu": {
+            **RESOURCE_BINDING["cpu"],
+            "mode": "best-effort",
+        }
+    }
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=binding,
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    try:
+        run_id = _submit(client, _python("print('ran')"), repository, resources={"cpu": 1})
+        row = _row(client, run_id, "passed")
+        assert row["resource_receipt"]["applied"] == {}
+        event = row["resource_receipt"]["events"][0]
+        assert (event["resource"], event["status"], event["code"]) == (
+            "cpu",
+            "unapplied",
+            "backend-unavailable",
+        )
+    finally:
+        running.stop()
+
+
+def test_backend_lifecycle_applies_and_measures_a_typed_resource(tmp_path: Path):
+    backend = RecordingResourceBackend()
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": backend},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    try:
+        run_id = _submit(client, _python("print('enforced')"), repository, resources={"cpu": 1})
+        row = _row(client, run_id, "passed")
+        assert row["resource_contract"]["cpu"] == RESOURCE_BINDING["cpu"]
+        assert row["resource_receipt"]["applied"] == {"cpu": 1}
+        assert row["resource_receipt"]["peak"] == {"cpu": 1}
+        stages = [name for name, _detail in backend.calls]
+        assert stages[0] == "probe"
+        assert stages.index("prepare") < stages.index("attach")
+        assert stages.index("attach") < stages.index("finish")
+        assert stages.index("finish") < stages.index("cleanup")
+    finally:
+        running.stop()
+
+
+def test_typed_resource_receipt_survives_an_idle_broker_restart(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    repository = _repository(tmp_path / "repository")
+    first_backend = RecordingResourceBackend()
+    first = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": first_backend},
+    )
+    first_client = first.start()
+    try:
+        run_id = _submit(
+            first_client,
+            _python("print('durable receipt')"),
+            repository,
+            resources={"cpu": 1},
+        )
+        original = _row(first_client, run_id, "passed")
+    finally:
+        first.stop()
+
+    replacement = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": RecordingResourceBackend()},
+    )
+    replacement_client = replacement.start()
+    try:
+        restored = replacement_client.status(run_id)
+        assert restored["resource_contract"] == original["resource_contract"]
+        assert restored["resource_receipt"] == original["resource_receipt"]
+    finally:
+        replacement.stop()
+
+
+def test_backend_lifecycle_receives_cancellation_before_cleanup(tmp_path: Path):
+    backend = RecordingResourceBackend()
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": backend},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    try:
+        run_id = _submit(
+            client,
+            _blocking_command(entered, release, "enforced blocker"),
+            repository,
+            resources={"cpu": 1},
+        )
+        wait_for(entered.exists, "the enforced blocker never started")
+        client.cancel(run_id)
+        row = _row(client, run_id, "cancelled")
+        stages = [name for name, _detail in backend.calls]
+        assert stages.index("attach") < stages.index("cancel")
+        assert stages.index("cancel") < stages.index("finish")
+        assert stages.index("finish") < stages.index("cleanup")
+        assert any(
+            event["stage"] == "cancel" and event["code"] == "cancelled"
+            for event in row["resource_receipt"]["events"]
+        )
+    finally:
+        release.touch()
+        running.stop()
+
+
+def test_backend_exception_paths_are_not_exposed_in_public_receipts(tmp_path: Path):
+    class FailingBackend(RecordingResourceBackend):
+        def prepare(self, request):
+            raise RuntimeError("/sys/fs/cgroup/private-machine-path")
+
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": FailingBackend()},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    try:
+        run_id = _submit(client, _python("print('must not run')"), repository, resources={"cpu": 1})
+        row = _row(client, run_id, "failed")
+        public_json = json.dumps(row, sort_keys=True)
+        assert "private-machine-path" not in public_json
+        assert "prepare-failed" in public_json
+    finally:
+        running.stop()
+
+
+def test_required_binding_fails_when_backend_does_not_support_its_unit(tmp_path: Path):
+    backend = RecordingResourceBackend(units=("bytes",))
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": backend},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    marker = tmp_path / "user-code-ran"
+    try:
+        run_id = _submit(
+            client,
+            _python("from pathlib import Path; Path(__import__('sys').argv[1]).touch()", marker),
+            repository,
+            resources={"cpu": 1},
+        )
+        row = _row(client, run_id, "failed")
+        assert not marker.exists()
+        assert row["resource_receipt"]["events"][0]["code"] == "unit-unsupported"
+        assert all(name not in {"prepare", "attach"} for name, _detail in backend.calls)
+    finally:
+        running.stop()
 
 
 def test_discovered_repository_names_are_readable_for_remote_and_local_checkouts(
