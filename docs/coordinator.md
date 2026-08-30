@@ -6,9 +6,10 @@ authority for the current OS user. Clients communicate through a private durable
 do not launch a job merely because they inserted a row.
 
 The public Python surface uses `CoordinatorBroker` and `CoordinatorClient`. The public CLI is
-available as either `agcoord` or `python -m agcoord` and exposes `run`, `full`, `list`, `show`,
-`log`, `cancel`, `tui`, `land`, `migrate`, and `clear`. Worker and broker verbs used to detach
-or validate an admitted process are internal interfaces, not alternate user workflows.
+installed as `agc`; `python -m agcoord` remains an equivalent module entry point. Both expose
+`run`, `full`, `list`, `show`, `log`, `cancel`, `tui`, `land`, `migrate`, and `clear`. Worker
+and broker verbs used to detach or validate an admitted process are internal interfaces, not
+alternate user workflows.
 
 ## Machine state and ownership
 
@@ -171,7 +172,7 @@ verdict.
 Submit a check and follow its combined output to completion:
 
 ```bash
-agcoord run \
+agc run \
   --label "API unit tests" \
   --resource cpu=2 \
   -- python -m pytest -q tests/api
@@ -180,7 +181,7 @@ agcoord run \
 Use `full` for an exact-head verdict that is useful independently of publication:
 
 ```bash
-agcoord full \
+agc full \
   --label "full repository gate" \
   --checkout /absolute/path/to/worktree \
   --resource cpu=4 \
@@ -239,12 +240,12 @@ The normal landing operation is one durable request containing the forge adapter
 exact checkout/branch/head, gate command, private caller environment, and resource claim:
 
 ```bash
-agcoord land 123 \
+agc land 123 \
   --label "gate and publish PR 123" \
   --checkout /absolute/path/to/worktree \
   --resource cpu=4 \
   -- ./scripts/test.sh
-agcoord land 123 --adapter github -- ./scripts/test.sh
+agc land 123 --adapter github -- ./scripts/test.sh
 ```
 
 The CLI defaults `--adapter` to `github` as a convenience, while the client API and durable
@@ -279,7 +280,7 @@ even if forge metadata still says open or an auto-delete removed the source refe
 
 AGCoord never fetches a replacement branch into the worktree, refreshes, rebases, amends, or
 mutates the ticket branch. A stale or changed-head refusal hands control back to the agent:
-update the branch explicitly, push, and submit a fresh `agcoord land` request so the new head
+update the branch explicitly, push, and submit a fresh `agc land` request so the new head
 is gated and published together. Do not substitute a separate full-plus-merge sequence or
 direct target update.
 
@@ -293,11 +294,11 @@ earlier phases but waits for publishing and records its authoritative result.
 Every accepted job has one stable ID, durable row, and combined stdout/stderr log. Use:
 
 ```bash
-agcoord list
-agcoord list --json
-agcoord show <run-id>
-agcoord log <run-id> [--follow]
-agcoord cancel <run-id>
+agc list
+agc list --json
+agc show <run-id>
+agc log <run-id> [--follow]
+agc cancel <run-id>
 ```
 
 The non-JSON `list` table summarizes each row as `admission-only`, `applied`, `partial`,
@@ -309,14 +310,14 @@ receive process-group cancellation and become terminal only after every descenda
 Publishing land jobs refuse cancellation as described above. Unknown IDs and terminal jobs
 produce named errors rather than silently changing another row.
 
-`agcoord clear` is intentionally narrow. It refuses while any job is queued or running. Once
+`agc clear` is intentionally narrow. It refuses while any job is queued or running. Once
 the coordinator is inactive, it removes terminal rows and their run logs but preserves the
 spool, ownership protocol, broker diagnostics, and migration records. There is no `--all`
 shortcut that deletes coordinator state.
 
 ## Terminal UI
 
-`agcoord tui` is a credential-free live view over the same client API. It shows active,
+`agc tui` is a credential-free live view over the same client API. It shows active,
 queued, and recent terminal jobs across repositories; kind, lane/repository identity,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
 remain inspectable without truncating the durable values. Persistent selection detail includes
@@ -377,13 +378,13 @@ closed on an older spool and names the required command; it never mutates schema
 path. With no live old owner or jobs, run:
 
 ```bash
-agcoord migrate
+agc migrate
 # or, for an intentionally isolated spool
-agcoord --state-dir /path/to/state migrate
+agc --state-dir /path/to/state migrate
 ```
 
 Back up the owner-only state directory first when its history matters. After migration,
-`agcoord list` starts or joins a broker using the new protocol. Migration preserves only
+`agc list` starts or joins a broker using the new protocol. Migration preserves only
 facts represented by the old schema; it never upgrades a legacy label into an exact-head
 receipt, fuses separate full and merge rows into a land, or invents a gate phase/status that
 the legacy row did not record. Protocol-1 and protocol-2 resource maps migrate as generic

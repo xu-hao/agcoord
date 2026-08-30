@@ -17,7 +17,7 @@ procedures listed in [docs/index.md](docs/index.md).
   behavior belong in optional adapters.
 - After bootstrap, route checks and publication through the local coordinator, declare
   every scarce resource, and never submit coordinated work from an admitted job. Gate
-  and publish through one `agcoord land` request; never bypass or separate its verdict
+  and publish through one `agc land` request; never bypass or separate its verdict
   from publication.
 - Never upload an AGCoord distribution to PyPI unless the user explicitly requests it.
   Permission to implement, test, commit, push, merge, tag, or create a GitHub release

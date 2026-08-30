@@ -38,7 +38,10 @@ jobs:
       - run: python -m venv /tmp/agcoord-wheel
       - run: /tmp/agcoord-wheel/bin/pip install dist/*.whl
       - run: /tmp/agcoord-wheel/bin/python -c "import agcoord"
-      - run: /tmp/agcoord-wheel/bin/agcoord --help
+      - run: /tmp/agcoord-wheel/bin/agc --help
+      - run: test ! -e /tmp/agcoord-wheel/bin/agcoord
       - run: python -m venv /tmp/agcoord-sdist
       - run: /tmp/agcoord-sdist/bin/pip install dist/*.tar.gz
+      - run: /tmp/agcoord-sdist/bin/agc --help
+      - run: test ! -e /tmp/agcoord-sdist/bin/agcoord
       - run: /tmp/agcoord-sdist/bin/python -m agcoord --help
