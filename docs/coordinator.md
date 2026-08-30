@@ -283,6 +283,42 @@ minimum and granted counts, whether the grant is full, owner PID, timestamps, an
 position. Terminal lease records are omitted unless `include_terminal=True`; none appear as
 child jobs in `list`, `show`, the TUI, or ordinary run history.
 
+#### Optional pytest-xdist adapter
+
+Install the process-specific integration with its dependency:
+
+```bash
+python -m pip install 'agcoord[xdist]'
+agc run --label "distributed tests" --resource cpu=4 -- \
+  python -m pytest -n auto
+```
+
+The installed pytest plugin is inert unless xdist is present, a positive `-n` mode is selected,
+and the process is the controller inside an admitted AGCoord run. Plain pytest and `-n 0` stay
+serial and acquire no lease; installing the extra never enables distribution by itself. Xdist
+workers, including replacements after a worker crash, recognize their worker context and never
+acquire recursively. Outside an admitted run the hook returns control to xdist unchanged.
+
+Inside an admitted run, precedence is deliberate:
+
+- `-n N` for a positive integer acquires exactly `N` tokens. The adapter never rewrites it;
+  a permanently impossible request fails with a pytest usage error before workers start, while
+  temporarily busy tokens follow the generic fair wait.
+- `-n auto` and `-n logical` request a partial lease up to the parent's declared CPU count and
+  start exactly the granted number of workers. `--maxprocesses=N` caps that request. The lease
+  grant takes precedence over xdist's host detection and `PYTEST_XDIST_AUTO_NUM_WORKERS`; AGCoord
+  does not set or copy a gate-wide worker count for parallel controllers.
+- A distributed mode without a parent `cpu=N` declaration fails clearly. `--collect-only` and
+  xdist's `--pdb` serial fallback do not lease worker tokens.
+
+The controller holds its lease until pytest has torn down the worker session. Normal and
+exceptional pytest shutdown releases it; controller exit, crash, or AGCoord cancellation lets
+the broker reclaim it from durable process identity. If a gate deliberately starts several
+controllers and wants them to overlap instead of allowing the first automatic controller to
+take the complete budget, give each an appropriate `--maxprocesses` cap. Across all cases the
+adapter only sizes worker processes; cgroup CPU and PID limits remain the aggregate enforcement
+boundary.
+
 ## Atomic landing
 
 The normal landing operation is one durable request containing the forge adapter/request,

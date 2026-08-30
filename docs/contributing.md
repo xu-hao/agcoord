@@ -51,7 +51,10 @@ When one admitted gate starts multiple worker-owning tools concurrently, each co
 must acquire a [child CPU lease](coordinator.md#child-cpu-leases-for-parallel-tools) and use
 the granted count. Do not give every tool the gate's complete CPU allocation through one
 gate-wide environment value. Tool-specific translation, such as mapping a lease to a test
-runner's worker option, belongs in that tool's adapter rather than the coordinator core.
+runner's worker option, belongs in that tool's adapter rather than the coordinator core. The
+built-in optional [pytest-xdist adapter](coordinator.md#optional-pytest-xdist-adapter) applies
+this contract for positive `-n` modes; use `--maxprocesses` when several automatic controllers
+should reserve room for one another.
 
 Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is a barrier for its repository, not an undeclared

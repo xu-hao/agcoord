@@ -14,6 +14,10 @@ versioning; dates use ISO 8601.
   divide its declared CPU budget with exact or partial grants, cancellation, crash reclamation,
   and broker recovery without nested jobs or extra history rows. Protocol 3 requires an explicit
   migration that preserves terminal history while adding the durable lease catalogue.
+- Add an optional `agcoord[xdist]` pytest plugin that sizes `-n auto`, `-n logical`, and explicit
+  positive worker counts from the admitted run's child CPU budget. Plain pytest and `-n 0` stay
+  serial, outside-run behavior stays upstream, workers never lease recursively, and controller
+  crash or cancellation returns the complete lease.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 

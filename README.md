@@ -54,6 +54,10 @@ If a gate starts several worker-owning tools concurrently, admitted subprocesses
 the public Python [child CPU lease API](docs/coordinator.md#child-cpu-leases-for-parallel-tools)
 to divide the job's declared CPU budget fairly. Leases support exact or partial grants,
 waiting, cancellation, crash reclamation, and broker recovery without creating nested jobs.
+Install `agcoord[xdist]` to activate the optional
+[pytest-xdist adapter](docs/coordinator.md#optional-pytest-xdist-adapter): positive `-n` modes
+then lease their worker count inside admitted runs, while plain pytest, `-n 0`, and pytest
+outside AGCoord keep their upstream behavior.
 
 Run a standalone full validation for an exact clean Git head when publication is not part of
 the request:
