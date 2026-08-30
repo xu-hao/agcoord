@@ -18,6 +18,7 @@ from .queue import (
     parse_resource_claims,
     wait,
 )
+from .resources import resource_enforcement_summary
 
 
 def _resources(values: list[str]) -> dict[str, int]:
@@ -38,10 +39,20 @@ def _table(rows: list[dict]) -> str:
             "resources": ",".join(
                 f"{name}={units}" for name, units in row["resources"].items()
             ),
+            "enforcement": resource_enforcement_summary(row["resource_receipt"]),
         }
         for row in rows
     ]
-    columns = ["status", "kind", "run", "repository", "agent", "label", "resources"]
+    columns = [
+        "status",
+        "kind",
+        "run",
+        "repository",
+        "agent",
+        "label",
+        "resources",
+        "enforcement",
+    ]
     widths = [max(len(name), *(len(str(row[name])) for row in display)) for name in columns]
     lines = [
         "  ".join(name.ljust(width) for name, width in zip(columns, widths)),

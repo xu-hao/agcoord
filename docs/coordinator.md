@@ -67,6 +67,46 @@ allocation is held until the complete worker process group is gone. A request th
 fit is rejected rather than left queued forever. Scheduling does not infer resource use from
 labels or commands.
 
+Capacity and enforcement are separate contracts. An unbound name is always a generic
+`admission-unit`, even when it is spelled `cpu`, `memory`, or `disk`: AGCoord schedules it but
+does not claim to have constrained or measured the process. Bind selected capacity names before
+the broker starts with the JSON-only `AGCOORD_RESOURCE_BINDINGS` setting:
+
+```bash
+export AGCOORD_RESOURCE_BINDINGS='{
+  "cpu": {
+    "kind": "cpu",
+    "unit": "logical-cpu",
+    "mode": "required",
+    "backend": "cgroup-v2"
+  },
+  "memory": {
+    "kind": "memory",
+    "unit": "bytes",
+    "mode": "best-effort",
+    "backend": "cgroup-v2"
+  }
+}'
+```
+
+A binding contains exactly `kind`, `unit`, `mode`, and `backend`. The supported typed pairs are
+`cpu/logical-cpu`; `memory`, `tmpfs`, or `storage` with `bytes`;
+`io-bandwidth/bytes-per-second`; `io-operations/operations-per-second`; `inodes/inodes`; and
+`processes/processes`. `generic/admission-unit` remains available for an explicitly typed
+admission-only resource. `admission-only` requires a null backend, `best-effort` runs when its
+backend or unit is unavailable but records that it was not applied, and `required` fails the
+row with exit status 125 and `failure_reason=resource-enforcement-failed` before releasing the
+blocked worker launcher. A binding does not create capacity; its name must still be present in
+`AGCOORD_CAPACITIES` before a job can request it.
+
+Backends expose a sanitized capability probe and the idempotent lifecycle `prepare`, `attach`,
+`usage`, `finish`, `cancel`, and `cleanup`. Attach happens before user code can start; usage,
+finish, cancellation, and cleanup remain owned by the broker. The core currently defines this
+backend-neutral seam but does not ship an OS limiter, so a named backend that is not installed
+is reported as `backend-unavailable`. The cgroup, filesystem, process-specific, and container
+backends are separate implementation work; a configured backend is never silently treated as
+successful.
+
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an
 older request indefinitely.
@@ -77,19 +117,23 @@ The snapshot top level is strict:
 
 ```text
 protocol · broker_pid · captured_at · capacities · allocations
+resource_bindings · resource_capabilities
 active · queued · recent
 ```
 
 `capacities` maps each configured resource to a positive integer; `allocations` maps it to
-the nonnegative units currently held. Active and queued jobs appear in scheduling order;
-recent contains retained terminal history.
+the nonnegative units currently held. `resource_bindings` is the exact machine binding map
+frozen by the live broker. `resource_capabilities` maps each installed or referenced backend to
+its `available`, `kinds`, `units`, `operations`, and stable `reason` fields. It contains no host
+paths or backend exception text. Active and queued jobs appear in scheduling order; recent
+contains retained terminal history.
 
 Each row contains exactly:
 
 ```text
 run_id · sequence · status · kind · label · agent
 repository_id · repository · worktree_id · checkout · branch · head_sha
-barrier · resources · blocked_by
+barrier · resources · resource_contract · resource_receipt · blocked_by
 gate_run_id · publication · failure_reason · phase · gate_exit_status
 caller_pid · command · created_at · started_at · finished_at
 exit_status · worker_pid · cancel_requested · log_bytes · position
@@ -99,7 +143,14 @@ exit_status · worker_pid · cancel_requested · log_bytes · position
 existing receipt-backed history while new public landing uses `land`. `publication` is
 either null or the normalized `{adapter, request}` record for publication work. `resources`
 is the immutable requested-unit mapping,
-including implicit `jobs=1`;
+including implicit `jobs=1`. `resource_contract` freezes each requested name's exact
+`{backend, kind, mode, unit}` meaning when the row is accepted. `resource_receipt` has exactly
+`requested`, `applied`, `peak`, and `events`: the first three are resource-to-integer maps, and
+each event has exactly `at`, `backend`, `resource`, `stage`, `status`, and a stable `code`.
+Applied values are recorded only after a successful pre-release attach; peak values are
+backend measurements in the bound unit. Admission-only claims have empty applied, peak, and
+event fields. Backend handles and host paths remain private spool state and never enter the
+public row;
 `blocked_by` identifies durable predecessors currently preventing admission. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
 operators. Missing times and kind-specific values are null rather than guessed. A queued
@@ -249,6 +300,10 @@ agcoord log <run-id> [--follow]
 agcoord cancel <run-id>
 ```
 
+The non-JSON `list` table summarizes each row as `admission-only`, `applied`, `partial`,
+`unapplied`, or `failed`. `list --json` and `show` retain the complete binding, capability, and
+receipt fields so automation can distinguish scheduling, actual application, and measurement.
+
 Queued work is cancellable. Running checks and full gates, plus land preflight and gating,
 receive process-group cancellation and become terminal only after every descendant is gone.
 Publishing land jobs refuse cancellation as described above. Unknown IDs and terminal jobs
@@ -264,7 +319,9 @@ shortcut that deletes coordinator state.
 `agcoord tui` is a credential-free live view over the same client API. It shows active,
 queued, and recent terminal jobs across repositories; kind, lane/repository identity,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
-remain inspectable without truncating the durable values.
+remain inspectable without truncating the durable values. Persistent selection detail includes
+the enforcement summary; the modal detail includes the exact resource contract and sanitized
+receipt events.
 
 The expected key map is:
 
@@ -329,4 +386,6 @@ Back up the owner-only state directory first when its history matters. After mig
 `agcoord list` starts or joins a broker using the new protocol. Migration preserves only
 facts represented by the old schema; it never upgrades a legacy label into an exact-head
 receipt, fuses separate full and merge rows into a land, or invents a gate phase/status that
-the legacy row did not record.
+the legacy row did not record. Protocol-1 and protocol-2 resource maps migrate as generic
+admission-only contracts with empty applied, peak, and event fields. Familiar legacy names are
+not reinterpreted as typed or enforced resources.

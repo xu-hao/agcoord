@@ -43,6 +43,12 @@ agcoord run --label "unit tests" --resource cpu=2 -- python -m pytest -q
 
 Every job implicitly holds one `jobs` slot. Repeatable `--resource` options add only named,
 configured resources; unknown or impossible requests fail instead of waiting forever.
+Those names are admission accounting by default. Optional JSON
+`AGCOORD_RESOURCE_BINDINGS` entries give selected names explicit units and
+`admission-only`, `best-effort`, or `required` backend semantics; every run then reports what
+was requested, actually applied, and measured. See the
+[resource contract](docs/coordinator.md#repository-lanes-and-resources) for the strict binding
+shape and current backend availability.
 
 Run a standalone full validation for an exact clean Git head when publication is not part of
 the request:

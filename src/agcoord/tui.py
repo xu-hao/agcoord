@@ -12,6 +12,7 @@ from typing import Callable
 from rich.text import Text
 
 from .queue import CoordinatorError, CoordinatorClient, TERMINAL_STATUSES
+from .resources import resource_enforcement_summary
 from . import frame
 
 try:
@@ -157,6 +158,7 @@ def _detail(row: dict | None) -> str:
         else ""
     )
     resources = ", ".join(f"{name}={units}" for name, units in row["resources"].items())
+    enforcement = resource_enforcement_summary(row["resource_receipt"])
     blockers = ", ".join(row["blocked_by"]) or "—"
     publication = row["publication"]
     target = (
@@ -168,7 +170,8 @@ def _detail(row: dict | None) -> str:
         f"{row['run_id']} · {row['kind']} · {row['repository']}{target}\n"
         f"phase: {row['phase']} · gate exit: "
         f"{row['gate_exit_status'] if row['gate_exit_status'] is not None else '—'}\n"
-        f"agent: {row['agent']} · resources: {resources} · blocked: {blockers}\n"
+        f"agent: {row['agent']} · resources: {resources} · enforcement: "
+        f"{enforcement} · blocked: {blockers}\n"
         f"branch: {row['branch']}\n"
         f"checkout: {row['checkout']}\n"
         f"{process}{result}{failure}{cancel}{publication_cancel} · log {row['log_bytes']} bytes\n"
@@ -190,6 +193,8 @@ def _modal_detail(row: dict) -> str:
         f"Agent: {row['agent']}\n"
         f"Barrier: {'yes' if row['barrier'] else 'no'}\n"
         f"Resources: {json.dumps(row['resources'], sort_keys=True)}\n"
+        f"Resource contract: {json.dumps(row['resource_contract'], sort_keys=True)}\n"
+        f"Resource receipt: {json.dumps(row['resource_receipt'], sort_keys=True)}\n"
         f"Blocked by: {', '.join(row['blocked_by']) or '—'}\n"
         f"Label: {row['label']}\n"
         f"Run: {row['run_id']}\n"

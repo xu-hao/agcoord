@@ -51,6 +51,21 @@ def _row(
         "head_sha": head_sha,
         "barrier": kind in {"full", "merge", "land"},
         "resources": {"jobs": 1, "cpu": 1},
+        "resource_contract": {
+            name: {
+                "backend": None,
+                "kind": "generic",
+                "mode": "admission-only",
+                "unit": "admission-unit",
+            }
+            for name in ("jobs", "cpu")
+        },
+        "resource_receipt": {
+            "requested": {"jobs": 1, "cpu": 1},
+            "applied": {},
+            "peak": {},
+            "events": [],
+        },
         "blocked_by": [],
         "gate_run_id": gate_run_id,
         "publication": publication,
@@ -77,6 +92,23 @@ def _snapshot() -> dict[str, object]:
         "captured_at": "2026-08-30T12:00:03+00:00",
         "capacities": {"jobs": 2, "cpu": 4, "browser": 1},
         "allocations": {"jobs": 1, "cpu": 1, "browser": 0},
+        "resource_bindings": {
+            "memory": {
+                "backend": "cgroup-v2",
+                "kind": "memory",
+                "mode": "best-effort",
+                "unit": "bytes",
+            }
+        },
+        "resource_capabilities": {
+            "cgroup-v2": {
+                "available": False,
+                "kinds": [],
+                "units": [],
+                "operations": [],
+                "reason": "backend-unavailable",
+            }
+        },
         "active": [_row("check-active", "running", "check", "unit tests")],
         "queued": [
             _row(
@@ -206,7 +238,16 @@ def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_
     )
     assert "check" in rendered and "land" in rendered and "full" in rendered
     assert "/repos/example.git" in rendered
+    assert "admission-only" in rendered
     assert fake_client["constructed"][0]["state_dir"] == str(state_dir)
+
+    listed_json = StringIO()
+    assert cli.run(_args("--json", "list"), out=listed_json) == 0
+    machine = json.loads(listed_json.getvalue())
+    assert machine["resource_bindings"]["memory"]["unit"] == "bytes"
+    assert machine["resource_capabilities"]["cgroup-v2"]["reason"] == (
+        "backend-unavailable"
+    )
 
     shown = StringIO()
     assert cli.run(_args("show", "land-failed"), out=shown) == 0
@@ -217,6 +258,7 @@ def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_
     assert shown_row["phase"] == "complete"
     assert shown_row["gate_exit_status"] == 0
     assert shown_row["failure_reason"] == "stale-main"
+    assert shown_row["resource_receipt"]["requested"] == {"cpu": 1, "jobs": 1}
 
     log = StringIO()
     assert cli.run(_args("log", "check-active"), out=log) == 0
