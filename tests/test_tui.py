@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import re
 import threading
 import time
 
@@ -251,6 +252,44 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
 
 
 @pytest.mark.asyncio
+async def test_rendered_table_separates_columns_and_marks_truncated_detail_value():
+    full_label = "LONGLABEL-abcdefghijklmnopqrstuvwxyz"
+    snapshot = _snapshot()
+    snapshot["active"] = [
+        _row(
+            "check-0123456789",
+            1,
+            "running",
+            kind="check",
+            label=full_label,
+            repository_id="repo-123456",
+        )
+    ]
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _settled(pilot)
+
+        table = _table(app)
+        rendered_row = table.render_line(table.header_height).text
+        has_column_gutter = bool(
+            re.search(r"\bcheck +repo-123456\b", rendered_row)
+        )
+        has_label_ellipsis = bool(
+            re.search(r"LONGLABEL-\S*… +45s\b", rendered_row)
+        )
+        assert full_label not in rendered_row
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert full_label in _screen_text(app)
+        assert (has_column_gutter, has_label_ellipsis) == (True, True), rendered_row
+
+
+@pytest.mark.asyncio
 async def test_repository_table_and_filter_show_remote_and_local_names_not_internal_ids():
     snapshot = _snapshot()
     snapshot["active"] = [
@@ -371,7 +410,7 @@ async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists(
         )
         await pilot.pause()
         before = (table.scroll_x, table.scroll_y)
-        assert before[1] > 0
+        assert before[0] > 0 and before[1] > 0
 
         changed = deepcopy(snapshot)
         changed["active"] = [_row("check-new", 100, "running", repository_id="repo-new")]

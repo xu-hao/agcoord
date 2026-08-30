@@ -9,6 +9,8 @@ import shlex
 import threading
 from typing import Callable
 
+from rich.text import Text
+
 from .queue import CoordinatorError, CoordinatorClient, TERMINAL_STATUSES
 from . import frame
 
@@ -89,6 +91,11 @@ def _duration(row: dict, now: datetime | None = None) -> str:
         return "—"
     now = now or datetime.now(timezone.utc)
     return _elapsed(started, _moment(row["finished_at"]) or now)
+
+
+def _compact_cell(value: object) -> Text:
+    """Render one fixed-width table value with an explicit overflow marker."""
+    return Text(str(value), no_wrap=True, overflow="ellipsis")
 
 
 def _repository_label(repository: object) -> str:
@@ -320,13 +327,13 @@ def build_app(
 
         def on_mount(self) -> None:
             table = self.query_one("#gates", DataTable)
-            table.cell_padding = 0
+            table.cell_padding = 1
             for label, width in (
                 ("STATE", 10),
                 ("KIND", 5),
                 ("REPO", 11),
-                ("RUN", 16),
-                ("LABEL", 14),
+                ("RUN", 15),
+                ("LABEL", 12),
                 ("AGE", 6),
                 ("DUR", 6),
             ):
@@ -416,13 +423,13 @@ def build_app(
             now = _moment(snapshot["captured_at"]) or datetime.now(timezone.utc)
             for row in ordered:
                 table.add_row(
-                    row["status"],
-                    row["kind"],
-                    _repository_label(row["repository"]),
-                    row["run_id"],
-                    row["label"],
-                    _age(row, now),
-                    _duration(row, now),
+                    _compact_cell(row["status"]),
+                    _compact_cell(row["kind"]),
+                    _compact_cell(_repository_label(row["repository"])),
+                    _compact_cell(row["run_id"]),
+                    _compact_cell(row["label"]),
+                    _compact_cell(_age(row, now)),
+                    _compact_cell(_duration(row, now)),
                     key=row["run_id"],
                 )
             if selected in self._rows:

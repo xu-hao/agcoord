@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Separate compact TUI columns with visible gutters and mark every clipped value with an
+  ellipsis while retaining the complete value in the detail view.
 - Show compact human-readable remote or local repository names in the TUI table and full
   readable identities in its filter header while retaining hashes as internal lane keys.
 
