@@ -483,6 +483,36 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
     assert row["checkout"] == str(repository.resolve())
 
 
+def test_discovered_repository_names_are_readable_for_remote_and_local_checkouts(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    remote = _repository(tmp_path / "remote-checkout")
+    _git(remote, "remote", "add", "origin", "git@github.com:example/widgets.git")
+    local = _repository(tmp_path / "local-widgets")
+
+    remote_id = _submit(
+        client,
+        _python("print('remote')"),
+        remote,
+        label="remote",
+    )
+    local_id = _submit(
+        client,
+        _python("print('local')"),
+        local,
+        label="local",
+    )
+    remote_row = _row(client, remote_id, "passed")
+    local_row = _row(client, local_id, "passed")
+
+    assert remote_row["repository"] == "github.com/example/widgets"
+    assert local_row["repository"] == str((local / ".git").resolve())
+    assert remote_row["repository_id"].startswith("repo-")
+    assert local_row["repository_id"].startswith("repo-")
+
+
 def test_unrelated_repositories_share_state_but_keep_stable_distinct_identities(
     coordinator,
     tmp_path: Path,

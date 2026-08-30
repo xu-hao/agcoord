@@ -91,6 +91,16 @@ def _duration(row: dict, now: datetime | None = None) -> str:
     return _elapsed(started, _moment(row["finished_at"]) or now)
 
 
+def _repository_label(repository: object) -> str:
+    """Keep the compact REPO column readable across remote and local identities."""
+    identity = str(repository).strip().rstrip("/")
+    if identity.endswith("/.git"):
+        identity = identity[:-5].rstrip("/")
+    elif identity.endswith(".git"):
+        identity = identity[:-4]
+    return identity.rsplit("/", 1)[-1] or str(repository)
+
+
 def _detail(row: dict | None) -> str:
     if row is None:
         return "no coordinated runs"
@@ -386,6 +396,11 @@ def build_app(
             selected = self._selected_id()
             table = self.query_one("#gates", DataTable)
             viewport = (table.scroll_x, table.scroll_y)
+            all_rows = [
+                *snapshot["active"],
+                *snapshot["queued"],
+                *snapshot["recent"],
+            ]
             ordered = [*snapshot["active"], *snapshot["queued"]]
             if self._show_history:
                 ordered.extend(snapshot["recent"])
@@ -403,7 +418,7 @@ def build_app(
                 table.add_row(
                     row["status"],
                     row["kind"],
-                    row["repository_id"],
+                    _repository_label(row["repository"]),
                     row["run_id"],
                     row["label"],
                     _age(row, now),
@@ -432,7 +447,16 @@ def build_app(
             active = len(snapshot["active"])
             queued = len(snapshot["queued"])
             history = "shown · h hide" if self._show_history else "hidden · h show"
-            repository = self._repository_filter or "all repos"
+            repository = "all repos"
+            if self._repository_filter is not None:
+                repository = next(
+                    (
+                        str(row["repository"])
+                        for row in all_rows
+                        if row["repository_id"] == self._repository_filter
+                    ),
+                    "selected repo",
+                )
             agent = self._agent_filter or "all agents"
             self.query_one("#gate-subject", Static).update(
                 f"MACHINE │ AGCOORD │ {active} active · {queued} queued · "
