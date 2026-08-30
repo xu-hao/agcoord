@@ -18,6 +18,7 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.events import Resize
     from textual.screen import ModalScreen
     from textual.widgets import Button, DataTable, Footer, Label, Static
 except ImportError:  # pragma: no cover - the package declares Textual; CLI guard is tested
@@ -28,6 +29,14 @@ _MISSING = (
     "the gate TUI needs Textual — install agcoord\n"
     "(the scriptable view is: python -m agcoord list)"
 )
+
+_COMPACT_TABLE_WIDTH = 80
+_COMPACT_LABEL_WIDTH = 12
+
+
+def _label_width(viewport_width: int) -> int:
+    """Give LABEL all width beyond the compact 80-column table."""
+    return _COMPACT_LABEL_WIDTH + max(0, viewport_width - _COMPACT_TABLE_WIDTH)
 
 
 async def _off_loop(operation: Callable[[], object]) -> object:
@@ -268,6 +277,11 @@ def build_app(
             Binding("enter", "select_cursor", "details"),
             *DataTable.BINDINGS[1:],
         ]
+        resize_callback: Callable[[], None] | None = None
+
+        def on_resize(self, _event: Resize) -> None:
+            if self.resize_callback is not None:
+                self.call_after_refresh(self.resize_callback)
 
     class CoordinatorApp(App):
         TITLE = "AGCoord"
@@ -326,20 +340,25 @@ def build_app(
             yield Footer()
 
         def on_mount(self) -> None:
-            table = self.query_one("#gates", DataTable)
+            table = self.query_one("#gates", RunTable)
+            table.resize_callback = self._render_resized_table
             table.cell_padding = 1
             for label, width in (
                 ("STATE", 10),
                 ("KIND", 5),
                 ("REPO", 11),
                 ("RUN", 15),
-                ("LABEL", 12),
+                ("LABEL", _label_width(table.size.width)),
                 ("AGE", 6),
                 ("DUR", 6),
             ):
                 table.add_column(label, width=width)
             self.action_refresh()
             self.set_interval(refresh_interval, self.action_refresh)
+
+        def _render_resized_table(self) -> None:
+            if self._snapshot is not None:
+                self._render_snapshot(self._snapshot)
 
         def _client_for_worker(self) -> CoordinatorClient:
             with self._client_lock:
@@ -403,6 +422,7 @@ def build_app(
             selected = self._selected_id()
             table = self.query_one("#gates", DataTable)
             viewport = (table.scroll_x, table.scroll_y)
+            table.ordered_columns[4].width = _label_width(table.size.width)
             all_rows = [
                 *snapshot["active"],
                 *snapshot["queued"],
