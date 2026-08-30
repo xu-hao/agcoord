@@ -9,8 +9,8 @@ Contributors follow the issue, worktree, test, and indivisible gate-and-publicat
 
 - [Coordinator contract and operations](coordinator.md) — machine-local topology, resource
   scheduling, repository lanes, atomic landing, cleanup, recovery, CLI, and TUI.
-- [Packaging and release](releasing.md) — PyPI identity, build validation, optional adapters,
-  and release posture.
+- [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
+  publication, optional adapters, and release posture.
 
 ## Assets
 

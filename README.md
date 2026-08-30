@@ -103,9 +103,8 @@ The full operating contract, recovery behavior, TUI keys, and resource model are
 
 ## Project status
 
-AGCoord targets distribution as the `agcoord` project on PyPI, with import package `agcoord`
-and both `agcoord` and `python -m agcoord` command forms. Until a release is published, build
-and install the checkout into an isolated environment rather than copying modules into
-another project.
+AGCoord is distributed as the `agcoord` project on PyPI, with import package `agcoord` and
+both `agcoord` and `python -m agcoord` command forms. Build and install development checkouts
+in an isolated environment rather than copying modules into another project.
 
 The gourd mascot and its asset notes live under [docs/assets](docs/assets/README.md).
