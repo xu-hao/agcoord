@@ -24,11 +24,15 @@ jobs:
       - run: python -m venv /tmp/agcoord-wheel
       - run: /tmp/agcoord-wheel/bin/pip install dist/*.whl
       - run: /tmp/agcoord-wheel/bin/python -c "import agcoord"
-      - run: test "$(/tmp/agcoord-wheel/bin/agcoord --version)" = "agcoord ${GITHUB_REF_NAME#v}"
-      - run: /tmp/agcoord-wheel/bin/agcoord --help
+      - run: test "$(/tmp/agcoord-wheel/bin/agc --version)" = "agc ${GITHUB_REF_NAME#v}"
+      - run: /tmp/agcoord-wheel/bin/agc --help
+      - run: test ! -e /tmp/agcoord-wheel/bin/agcoord
       - run: python -m venv /tmp/agcoord-sdist
       - run: /tmp/agcoord-sdist/bin/pip install dist/*.tar.gz
-      - run: test "$(/tmp/agcoord-sdist/bin/python -m agcoord --version)" = "agcoord ${GITHUB_REF_NAME#v}"
+      - run: test "$(/tmp/agcoord-sdist/bin/agc --version)" = "agc ${GITHUB_REF_NAME#v}"
+      - run: /tmp/agcoord-sdist/bin/agc --help
+      - run: test ! -e /tmp/agcoord-sdist/bin/agcoord
+      - run: test "$(/tmp/agcoord-sdist/bin/python -m agcoord --version)" = "agc ${GITHUB_REF_NAME#v}"
       - run: /tmp/agcoord-sdist/bin/python -m agcoord --help
       - uses: actions/upload-artifact@v4
         with:

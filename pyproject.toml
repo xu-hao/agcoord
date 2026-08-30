@@ -35,7 +35,7 @@ test = [
 ]
 
 [project.scripts]
-agcoord = "agcoord.cli:main"
+agc = "agcoord.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/xu-hao/agcoord"

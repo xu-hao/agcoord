@@ -43,7 +43,8 @@ def test_distribution_import_and_console_identity_are_exact():
     }
 
     assert distribution.metadata["Name"] == "agcoord"
-    assert console_scripts["agcoord"].startswith("agcoord.")
+    assert console_scripts == {"agc": "agcoord.cli:main"}
+    assert not Path(sys.executable).with_name("agcoord").exists()
     assert importlib.metadata.version("agcoord")
 
 
@@ -51,6 +52,7 @@ def test_module_entrypoint_exposes_the_complete_public_command_set():
     completed = _module("--help")
 
     assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("usage: agc")
     help_text = completed.stdout.lower()
     exposed = set(re.findall(r"\b[a-z][a-z-]*\b", help_text))
     assert PUBLIC_COMMANDS <= exposed
@@ -107,7 +109,7 @@ print(json.dumps({
 def test_console_script_and_module_entrypoint_report_the_same_version():
     module = _module("--version")
     console = subprocess.run(
-        [str(Path(sys.executable).with_name("agcoord")), "--version"],
+        [str(Path(sys.executable).with_name("agc")), "--version"],
         check=False,
         capture_output=True,
         text=True,
@@ -116,4 +118,5 @@ def test_console_script_and_module_entrypoint_report_the_same_version():
     assert module.returncode == 0, module.stderr
     assert console.returncode == 0, console.stderr
     assert console.stdout.strip() == module.stdout.strip()
+    assert module.stdout.startswith("agc ")
     assert importlib.metadata.version("agcoord") in module.stdout

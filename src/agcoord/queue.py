@@ -910,7 +910,7 @@ class CoordinatorBroker:
             if stored["value"] != str(PROTOCOL):
                 raise CoordinatorError(
                     f"gate queue database protocol is {stored['value']}; need {PROTOCOL}; "
-                    "after the old broker exits run `python -m agcoord "
+                    "after the old broker exits run `agc "
                     f"migrate --state-dir {self.paths.state_dir}`"
                 )
             required = {
@@ -3279,7 +3279,7 @@ def wait(client: CoordinatorClient, run_id: str, *, poll_interval: float = 0.1) 
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agcoord queue")
+    parser = argparse.ArgumentParser(prog="agc queue")
     commands = parser.add_subparsers(dest="command_name", required=True)
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
     serve.add_argument("--state-dir", required=True)

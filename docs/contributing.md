@@ -37,23 +37,23 @@ Once AGCoord is installed, submit every check through the local coordinator and 
 each scarce resource it consumes:
 
 ```bash
-agcoord run \
+agc run \
   --label "focused tests" \
   --resource cpu=1 \
   -- python -m pytest -q tests/test_area.py
-agcoord full \
+agc full \
   --label "standalone full validation" \
   --resource cpu=4 \
   -- python -m pytest -q
 ```
 
-Use `agcoord full` from a clean checkout when an exact-head verdict is useful
+Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is a barrier for its repository, not an undeclared
-machine-global lock. Do not invoke `agcoord`, a gate wrapper, or publication from inside
+machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside
 an admitted AGCoord job; nested submissions are rejected to prevent self-deadlock.
 
 In a fresh AGCoord development environment, direct package installation and focused
-tests are allowed only long enough to make `agcoord run` available. Bootstrap is never
+tests are allowed only long enough to make `agc run` available. Bootstrap is never
 an exception for a direct full gate or publication.
 
 ## Land and clean up
@@ -63,7 +63,7 @@ whose gate validates that exact clean 40-character head and publishes it without
 releasing the repository lane or declared resources:
 
 ```bash
-agcoord land <request> \
+agc land <request> \
   --label "gate and publish" \
   --resource cpu=4 \
   -- python -m pytest -q
@@ -74,7 +74,7 @@ full-plus-merge sequence, or any equivalent path that separates the landing verd
 from publication.
 
 A stale-target or changed-head refusal hands the work back to the contributor. Update
-the branch explicitly, push it, and submit a fresh `agcoord land` request. AGCoord does
+the branch explicitly, push it, and submit a fresh `agc land` request. AGCoord does
 not refresh, rebase, or rewrite the worktree, and a moved reference invalidates the
 earlier gate result.
 

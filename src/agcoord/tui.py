@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - the package declares Textual; CLI guar
 
 _MISSING = (
     "the gate TUI needs Textual — install agcoord\n"
-    "(the scriptable view is: python -m agcoord list)"
+    "(the scriptable view is: agc list)"
 )
 
 _COMPACT_TABLE_WIDTH = 80

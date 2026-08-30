@@ -66,7 +66,7 @@ def _table(rows: list[dict]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agcoord", description=__doc__)
+    parser = argparse.ArgumentParser(prog="agc", description=__doc__)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--json", action="store_true", help="emit strict JSON")
     parser.add_argument("--state-dir", help="override the user-scoped machine spool")
@@ -215,7 +215,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
     if command and command[0] == "--":
         command.pop(0)
     if not command:
-        raise CoordinatorError(f"agcoord {args.command} needs a command after --")
+        raise CoordinatorError(f"agc {args.command} needs a command after --")
     if args.command == "land":
         run_id = client.submit_land(
             args.adapter,

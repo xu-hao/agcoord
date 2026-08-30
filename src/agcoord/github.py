@@ -790,7 +790,7 @@ class GitHubMergePublisher:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agcoord github worker")
+    parser = argparse.ArgumentParser(prog="agc github worker")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--state-dir")
     parser.add_argument("--checkout", required=True)

@@ -228,6 +228,15 @@ def _args(*argv: str):
     return cli.build_parser().parse_args(list(argv))
 
 
+def test_parser_and_submission_validation_use_agc_command_name(fake_client):
+    parser = cli.build_parser()
+
+    assert parser.prog == "agc"
+    assert parser.format_usage().startswith("usage: agc")
+    with pytest.raises(CoordinatorError, match=r"^agc run needs a command after --$"):
+        cli.run(parser.parse_args(["run"]), out=StringIO())
+
+
 def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_path: Path):
     state_dir = tmp_path / "state"
     listed = StringIO()

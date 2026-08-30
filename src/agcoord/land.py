@@ -167,7 +167,7 @@ def execute(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agcoord land worker")
+    parser = argparse.ArgumentParser(prog="agc land worker")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--checkout", required=True)
