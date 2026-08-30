@@ -1,6 +1,6 @@
 # AGCoord
 
-![AGCoord gourd mascot](https://raw.githubusercontent.com/xu-hao/agcoord/main/docs/assets/agcoord-gourd-mascot.png)
+<img src="https://raw.githubusercontent.com/xu-hao/agcoord/main/docs/assets/agcoord-gourd-mascot.png" alt="AGCoord gourd mascot" width="240">
 
 AGCoord is a machine-local coordinator for developers and coding agents that share a
 workstation. It gives every check, standalone full gate, and atomic gate-and-publication
