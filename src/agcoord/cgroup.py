@@ -1,0 +1,1071 @@
+"""Delegated Linux cgroup v2 ownership and per-run leaf lifecycle."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import ctypes
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import time
+from typing import Mapping, Protocol
+from uuid import uuid4
+
+from .resources import (
+    RESOURCE_OPERATIONS,
+    ResourceContractError,
+    ResourceRequest,
+)
+
+
+CGROUP_ROOT_ENV = "AGCOORD_CGROUP_ROOT"
+CGROUP_BACKEND = "cgroup-v2"
+CGROUP_ISOLATE_ENV = "_AGCOORD_CGROUP_ISOLATE"
+_CGROUP_V2_FILES = frozenset({"cgroup.procs", "cgroup.events"})
+_OWNER_KEYS = frozenset(
+    {
+        "version",
+        "root",
+        "root_device",
+        "root_inode",
+        "owner",
+        "owner_device",
+        "owner_inode",
+    }
+)
+_HANDLE_KEYS = frozenset(
+    {
+        "version",
+        "owner",
+        "owner_device",
+        "owner_inode",
+        "leaf",
+        "leaf_device",
+        "leaf_inode",
+        "token",
+    }
+)
+_MANIFEST_KEYS = frozenset({"version", "run_id", "handle"})
+_OWNER_NAME = re.compile(r"^agcoord-u[0-9]+-[0-9a-f]{16}$")
+_LEAF_NAME = re.compile(r"^run-[0-9a-f]{16}-[0-9a-f]{12}$")
+_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+_TOKEN_OR_REASON = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_CONTROLLER = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_MAX_METADATA_BYTES = 64 * 1024
+_CLONE_NEWNS = 0x00020000
+_CLONE_NEWCGROUP = 0x02000000
+_CLONE_NEWUSER = 0x10000000
+_MS_NOSUID = 2
+_MS_NODEV = 4
+_MS_NOEXEC = 8
+_MS_REC = 16384
+_MS_PRIVATE = 1 << 18
+
+
+class CgroupV2Error(ResourceContractError):
+    """A stable cgroup refusal whose host details remain broker-private."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class CgroupOwnershipError(CgroupV2Error):
+    """A configured path no longer names the cgroup AGCoord created."""
+
+
+class CgroupIsolationError(CgroupV2Error):
+    """The worker could not hide and protect its cgroup control boundary."""
+
+
+@dataclass(frozen=True)
+class CgroupIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class CgroupProbe:
+    available: bool
+    reason: str | None
+    controllers: frozenset[str]
+
+
+@dataclass(frozen=True)
+class CgroupMount:
+    path: Path
+    options: frozenset[str]
+
+
+class CgroupV2System(Protocol):
+    """Small kernel seam used by the backend and deterministic subprocess tests."""
+
+    def probe(self, root: Path) -> CgroupProbe: ...
+
+    def identity(self, path: Path) -> CgroupIdentity | None: ...
+
+    def create_group(self, parent: Path, name: str) -> CgroupIdentity: ...
+
+    def attach(self, path: Path, pid: int) -> None: ...
+
+    def members(self, path: Path) -> set[int]: ...
+
+    def populated(self, path: Path) -> bool: ...
+
+    def kill(self, path: Path) -> None: ...
+
+    def remove_group(self, path: Path) -> None: ...
+
+
+def _decode_mount_path(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:  # pragma: no cover - write(2) contract
+            raise OSError(errno.EIO, "write made no progress")
+        view = view[written:]
+
+
+def _write_kernel_file(path: Path, value: str) -> None:
+    flags = os.O_WRONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        _write_all(descriptor, value.encode("ascii"))
+    finally:
+        os.close(descriptor)
+
+
+def _cgroup2_mounts(mountinfo: Path) -> list[CgroupMount]:
+    try:
+        lines = mountinfo.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise CgroupIsolationError(
+            "mountinfo-unreadable",
+            "cgroup mount information is unavailable",
+        ) from exc
+    mounts: list[CgroupMount] = []
+    for line in lines:
+        try:
+            left, right = line.split(" - ", 1)
+            fields = left.split()
+            right_fields = right.split()
+            if right_fields[0] != "cgroup2":
+                continue
+            mounted = Path(_decode_mount_path(fields[4]))
+            if not mounted.is_absolute():
+                continue
+            options = frozenset(
+                fields[5].split(",") + right_fields[2].split(",")
+            )
+        except (IndexError, ValueError):
+            continue
+        mounts.append(CgroupMount(mounted, options))
+    return mounts
+
+
+def _covering_mounts(mounts: list[CgroupMount]) -> list[CgroupMount]:
+    """Select mounts whose replacement hides every visible cgroup2 mount."""
+
+    selected: list[CgroupMount] = []
+    for candidate in sorted(mounts, key=lambda mount: len(mount.path.parts)):
+        if any(
+            os.path.commonpath((str(candidate.path), str(parent.path)))
+            == str(parent.path)
+            for parent in selected
+        ):
+            continue
+        selected.append(candidate)
+    return selected
+
+
+def _call_libc(name: str, *arguments: object) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, name)
+    function.restype = ctypes.c_int
+    if name == "unshare":
+        function.argtypes = [ctypes.c_int]
+    elif name == "mount":
+        function.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+        ]
+    if function(*arguments) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _write_namespace_map(path: Path, value: str) -> None:
+    try:
+        _write_kernel_file(path, value)
+    except OSError as exc:
+        raise CgroupIsolationError(
+            "namespace-mapping-failed",
+            "worker user namespace identity could not be mapped",
+        ) from exc
+
+
+def isolate_current_cgroup(
+    *,
+    mountinfo: Path = Path("/proc/self/mountinfo"),
+) -> None:
+    """Root the current worker's cgroup view at its already-attached leaf.
+
+    The initial cgroup2 mount must use ``nsdelegate``. A private user, cgroup,
+    and mount namespace then hides every host cgroup2 mount behind a new view
+    rooted at the worker's current cgroup. The kernel makes controller files at
+    that namespace root unwritable while descendant limits remain hierarchical.
+    """
+
+    mounts = _cgroup2_mounts(mountinfo)
+    covering = _covering_mounts(mounts)
+    if not covering or any("nsdelegate" not in mount.options for mount in covering):
+        raise CgroupIsolationError(
+            "namespace-delegation-unavailable",
+            "cgroup2 mounts do not provide namespace delegation",
+        )
+    uid = os.getuid()
+    gid = os.getgid()
+    try:
+        _call_libc(
+            "unshare",
+            _CLONE_NEWUSER | _CLONE_NEWCGROUP | _CLONE_NEWNS,
+        )
+    except OSError as exc:
+        raise CgroupIsolationError(
+            "namespace-isolation-unavailable",
+            "worker cgroup namespace isolation is unavailable",
+        ) from exc
+
+    setgroups = Path("/proc/self/setgroups")
+    if setgroups.exists():
+        _write_namespace_map(setgroups, "deny\n")
+    _write_namespace_map(Path("/proc/self/uid_map"), f"{uid} {uid} 1\n")
+    _write_namespace_map(Path("/proc/self/gid_map"), f"{gid} {gid} 1\n")
+    try:
+        _call_libc("mount", None, b"/", None, _MS_REC | _MS_PRIVATE, None)
+        for mount in covering:
+            _call_libc(
+                "mount",
+                b"none",
+                os.fsencode(mount.path),
+                b"cgroup2",
+                _MS_NOSUID | _MS_NODEV | _MS_NOEXEC,
+                None,
+            )
+    except OSError as exc:
+        raise CgroupIsolationError(
+            "namespace-mount-failed",
+            "worker cgroup namespace mounts could not be isolated",
+        ) from exc
+
+    try:
+        cgroup_lines = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise CgroupIsolationError(
+            "namespace-verification-failed",
+            "worker cgroup namespace could not be verified",
+        ) from exc
+    if "0::/" not in cgroup_lines or not all(
+        (mount.path / "cgroup.events").is_file() for mount in covering
+    ):
+        raise CgroupIsolationError(
+            "namespace-verification-failed",
+            "worker cgroup namespace is not rooted at the run cgroup",
+        )
+
+
+class LinuxCgroupV2System:
+    """Raw cgroup v2 filesystem operations for an explicitly delegated subtree."""
+
+    def __init__(self, *, mountinfo: Path = Path("/proc/self/mountinfo")) -> None:
+        self.mountinfo = mountinfo
+
+    def probe(self, root: Path) -> CgroupProbe:
+        try:
+            details = root.lstat()
+        except FileNotFoundError:
+            return CgroupProbe(False, "root-missing", frozenset())
+        except OSError:
+            return CgroupProbe(False, "root-unreadable", frozenset())
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+            return CgroupProbe(False, "root-invalid", frozenset())
+
+        try:
+            mounts = _cgroup2_mounts(self.mountinfo)
+        except CgroupIsolationError:
+            return CgroupProbe(False, "mountinfo-unreadable", frozenset())
+        mount = self._mount_for(root, mounts)
+        if mount is None or mount[0] != "cgroup2":
+            return CgroupProbe(False, "not-cgroup-v2", frozenset())
+        if "ro" in mount[1]:
+            return CgroupProbe(False, "delegation-read-only", frozenset())
+        if "nsdelegate" not in mount[1]:
+            return CgroupProbe(
+                False,
+                "namespace-delegation-unavailable",
+                frozenset(),
+            )
+        if not all((root / name).is_file() for name in _CGROUP_V2_FILES):
+            return CgroupProbe(False, "delegation-invalid", frozenset())
+        try:
+            controllers = frozenset(
+                (root / "cgroup.controllers").read_text(encoding="utf-8").split()
+            )
+        except (FileNotFoundError, OSError, UnicodeError):
+            return CgroupProbe(False, "controllers-unreadable", frozenset())
+        if any(not _CONTROLLER.fullmatch(name) for name in controllers):
+            return CgroupProbe(False, "controllers-invalid", frozenset())
+
+        probe_name = f".agcoord-probe-{uuid4().hex[:12]}"
+        probe_path = root / probe_name
+        created = False
+        reason: str | None = None
+        try:
+            self.create_group(root, probe_name)
+            created = True
+            if not all((probe_path / name).is_file() for name in _CGROUP_V2_FILES):
+                reason = "delegation-invalid"
+            elif not (probe_path / "cgroup.kill").is_file():
+                reason = "kill-unsupported"
+            else:
+                reason = self._probe_isolation(probe_path)
+                if reason is None:
+                    self.kill(probe_path)
+                    if self.populated(probe_path):
+                        reason = "kill-failed"
+        except PermissionError:
+            reason = "delegation-undelegated"
+        except OSError as exc:
+            reason = (
+                "delegation-read-only"
+                if exc.errno == errno.EROFS
+                else "delegation-unavailable"
+            )
+        finally:
+            if created:
+                try:
+                    self.remove_group(probe_path)
+                except OSError:
+                    reason = "probe-cleanup-failed"
+        return CgroupProbe(reason is None, reason, controllers if reason is None else frozenset())
+
+    def _mount_for(
+        self,
+        root: Path,
+        mounts: list[CgroupMount] | None = None,
+    ) -> tuple[str, frozenset[str]] | None:
+        selected: tuple[int, str, frozenset[str]] | None = None
+        root_text = str(root)
+        try:
+            candidates = _cgroup2_mounts(self.mountinfo) if mounts is None else mounts
+        except CgroupIsolationError:
+            return None
+        for mount in candidates:
+            try:
+                mounted = str(mount.path)
+                common = os.path.commonpath((root_text, mounted))
+            except ValueError:
+                continue
+            if common != mounted:
+                continue
+            candidate = (len(mounted), "cgroup2", mount.options)
+            if selected is None or candidate[0] > selected[0]:
+                selected = candidate
+        if selected is None:
+            return None
+        return selected[1], selected[2]
+
+    def _probe_isolation(self, probe_path: Path) -> str | None:
+        release_read, release_write = os.pipe()
+        result_read, result_write = os.pipe()
+        child = -1
+        try:
+            child = os.fork()
+            if child == 0:  # pragma: no branch - child exits through os._exit
+                os.close(release_write)
+                os.close(result_read)
+                code = "namespace-isolation-failed"
+                try:
+                    if os.read(release_read, 1) != b"1":
+                        raise CgroupIsolationError(
+                            "namespace-isolation-failed",
+                            "cgroup isolation probe was not released",
+                        )
+                    isolate_current_cgroup(mountinfo=self.mountinfo)
+                    try:
+                        _write_kernel_file(
+                            _covering_mounts(_cgroup2_mounts(self.mountinfo))[0].path
+                            / "cgroup.kill",
+                            "1\n",
+                        )
+                    except PermissionError:
+                        code = "ok"
+                    else:
+                        code = "controller-files-exposed"
+                except CgroupV2Error as exc:
+                    code = exc.code
+                except OSError:
+                    code = "namespace-isolation-failed"
+                try:
+                    _write_all(result_write, code.encode("ascii"))
+                except OSError:
+                    pass
+                os._exit(0 if code == "ok" else 1)
+
+            os.close(release_read)
+            release_read = -1
+            os.close(result_write)
+            result_write = -1
+            self.attach(probe_path, child)
+            if child not in self.members(probe_path):
+                return "attach-unverified"
+            _write_all(release_write, b"1")
+            os.close(release_write)
+            release_write = -1
+            readable, _writable, _exceptional = select.select(
+                [result_read],
+                [],
+                [],
+                5.0,
+            )
+            if not readable:
+                return "namespace-isolation-timeout"
+            payload = os.read(result_read, 256).decode("ascii", errors="replace")
+            _pid, status = os.waitpid(child, 0)
+            child = -1
+            if os.WIFSIGNALED(status):
+                return "controller-files-exposed"
+            return None if payload == "ok" and os.WEXITSTATUS(status) == 0 else (
+                payload if _TOKEN_OR_REASON.fullmatch(payload) else "namespace-isolation-failed"
+            )
+        except (OSError, ChildProcessError):
+            return "namespace-isolation-unavailable"
+        finally:
+            for descriptor in (release_read, release_write, result_read, result_write):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            if child > 0:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(child, 0)
+                except ChildProcessError:
+                    pass
+
+    def identity(self, path: Path) -> CgroupIdentity | None:
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+            raise CgroupOwnershipError(
+                "cgroup-path-invalid",
+                "configured cgroup path is not a real directory",
+            )
+        return CgroupIdentity(details.st_dev, details.st_ino)
+
+    def create_group(self, parent: Path, name: str) -> CgroupIdentity:
+        os.mkdir(parent / name, mode=0o700)
+        identity = self.identity(parent / name)
+        if identity is None:  # pragma: no cover - kernel mkdir contract
+            raise CgroupV2Error("create-failed", "created cgroup disappeared")
+        return identity
+
+    def _write_control(self, path: Path, value: str) -> None:
+        _write_kernel_file(path, value)
+
+    def attach(self, path: Path, pid: int) -> None:
+        self._write_control(path / "cgroup.procs", f"{pid}\n")
+
+    def members(self, path: Path) -> set[int]:
+        try:
+            lines = (path / "cgroup.procs").read_text(encoding="ascii").splitlines()
+            return {int(line) for line in lines if line}
+        except (OSError, UnicodeError) as exc:
+            raise CgroupV2Error(
+                "membership-unreadable",
+                "cgroup membership file is unreadable",
+            ) from exc
+        except ValueError as exc:
+            raise CgroupV2Error(
+                "membership-invalid",
+                "cgroup membership file contained a non-PID value",
+            ) from exc
+
+    def populated(self, path: Path) -> bool:
+        try:
+            fields = {
+                name: value
+                for name, value in (
+                    line.split(maxsplit=1)
+                    for line in (path / "cgroup.events")
+                    .read_text(encoding="ascii")
+                    .splitlines()
+                )
+            }
+            return fields["populated"] == "1"
+        except (OSError, UnicodeError) as exc:
+            raise CgroupV2Error(
+                "events-unreadable",
+                "cgroup.events is unreadable",
+            ) from exc
+        except (KeyError, ValueError) as exc:
+            raise CgroupV2Error(
+                "events-invalid",
+                "cgroup.events has no valid populated field",
+            ) from exc
+
+    def kill(self, path: Path) -> None:
+        self._write_control(path / "cgroup.kill", "1\n")
+
+    def remove_group(self, path: Path) -> None:
+        os.rmdir(path)
+
+
+class CgroupV2Backend:
+    """Own one collision-safe cgroup v2 leaf for each prepared run."""
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str] | None,
+        *,
+        state_dir: str | os.PathLike[str],
+        system: CgroupV2System | None = None,
+        empty_timeout: float = 5.0,
+    ) -> None:
+        if empty_timeout <= 0:
+            raise ValueError("cgroup empty timeout must be positive")
+        self.state_dir = Path(state_dir).absolute()
+        self.metadata_dir = self.state_dir / "cgroup-v2"
+        self.system = LinuxCgroupV2System() if system is None else system
+        self.empty_timeout = empty_timeout
+        self._configuration_reason: str | None = None
+        if root is None or not os.fspath(root):
+            self.root: Path | None = None
+        else:
+            selected = Path(root).absolute()
+            try:
+                resolved = selected.resolve(strict=False)
+            except OSError:
+                self.root = selected
+                self._configuration_reason = "root-invalid"
+            else:
+                self.root = selected
+                if resolved != selected:
+                    self._configuration_reason = "root-invalid"
+        owner_hash = hashlib.sha256(
+            f"{os.getuid()}:{self.state_dir}".encode()
+        ).hexdigest()[:16]
+        self.owner_name = f"agcoord-u{os.getuid()}-{owner_hash}"
+        self._probe_result: CgroupProbe | None = None
+
+    @property
+    def isolate_workers(self) -> bool:
+        """Whether the real kernel backend needs the launcher namespace step."""
+
+        return isinstance(self.system, LinuxCgroupV2System)
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        state_dir: str | os.PathLike[str],
+    ) -> CgroupV2Backend:
+        return cls(os.environ.get(CGROUP_ROOT_ENV), state_dir=state_dir)
+
+    def _probe(self) -> CgroupProbe:
+        if self._probe_result is not None:
+            return self._probe_result
+        if self.root is None:
+            result = CgroupProbe(False, "delegation-unconfigured", frozenset())
+        elif self._configuration_reason is not None:
+            result = CgroupProbe(False, self._configuration_reason, frozenset())
+        else:
+            try:
+                result = self.system.probe(self.root)
+            except Exception:
+                result = CgroupProbe(False, "probe-failed", frozenset())
+        if result.available and result.reason is not None:
+            result = CgroupProbe(False, "probe-invalid", frozenset())
+        if not result.available and result.reason is None:
+            result = CgroupProbe(False, "probe-invalid", frozenset())
+        self._probe_result = result
+        return result
+
+    def probe(self) -> Mapping[str, object]:
+        result = self._probe()
+        return {
+            "available": result.available,
+            "kinds": ["generic"] if result.available else [],
+            "units": ["admission-unit"] if result.available else [],
+            "operations": list(RESOURCE_OPERATIONS) if result.available else [],
+            "reason": result.reason,
+        }
+
+    def _validate_request(self, request: ResourceRequest) -> None:
+        if request.backend != CGROUP_BACKEND or not request.resources:
+            raise CgroupV2Error("request-invalid", "cgroup request is invalid")
+        for name, binding in request.bindings.items():
+            if (
+                name not in request.resources
+                or binding["kind"] != "generic"
+                or binding["unit"] != "admission-unit"
+            ):
+                raise CgroupV2Error(
+                    "request-unsupported",
+                    "cgroup lifecycle backend supports only generic admission units",
+                )
+
+    def _require_available(self) -> None:
+        result = self._probe()
+        if not result.available:
+            raise CgroupV2Error(
+                str(result.reason),
+                "configured cgroup v2 delegation is unavailable",
+            )
+
+    def _prepare_metadata(self) -> None:
+        self.metadata_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        details = self.metadata_dir.lstat()
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+        ):
+            raise CgroupOwnershipError(
+                "metadata-invalid",
+                "cgroup ownership metadata path is unsafe",
+            )
+        if details.st_mode & 0o077:
+            self.metadata_dir.chmod(0o700)
+
+    def _write_json(self, path: Path, value: Mapping[str, object]) -> None:
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                payload = json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                _write_all(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _read_json(self, path: Path) -> dict[str, object]:
+        details = path.lstat()
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_size > _MAX_METADATA_BYTES
+        ):
+            raise CgroupOwnershipError(
+                "metadata-invalid",
+                "cgroup ownership metadata file is unsafe",
+            )
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise CgroupOwnershipError(
+                "metadata-invalid",
+                "cgroup ownership metadata is unreadable",
+            ) from exc
+        if not isinstance(raw, dict):
+            raise CgroupOwnershipError(
+                "metadata-invalid",
+                "cgroup ownership metadata is not an object",
+            )
+        return raw
+
+    @property
+    def _owner_record_path(self) -> Path:
+        return self.metadata_dir / "owner.json"
+
+    def _manifest_path(self, run_id: str) -> Path:
+        run_hash = hashlib.sha256(run_id.encode()).hexdigest()[:32]
+        return self.metadata_dir / f"run-{run_hash}.json"
+
+    def _owner_record(
+        self,
+        *,
+        root_identity: CgroupIdentity,
+        owner_identity: CgroupIdentity,
+    ) -> dict[str, object]:
+        assert self.root is not None
+        return {
+            "version": 1,
+            "root": str(self.root),
+            "root_device": root_identity.device,
+            "root_inode": root_identity.inode,
+            "owner": self.owner_name,
+            "owner_device": owner_identity.device,
+            "owner_inode": owner_identity.inode,
+        }
+
+    def _validate_owner_record(
+        self,
+        raw: Mapping[str, object],
+    ) -> tuple[Path, CgroupIdentity | None]:
+        if (
+            set(raw) != _OWNER_KEYS
+            or type(raw.get("version")) is not int
+            or raw.get("version") != 1
+        ):
+            raise CgroupOwnershipError("owner-metadata-invalid", "owner record is invalid")
+        if self.root is None or raw.get("root") != str(self.root):
+            raise CgroupOwnershipError("root-changed", "delegated cgroup root changed")
+        if raw.get("owner") != self.owner_name:
+            raise CgroupOwnershipError("owner-changed", "cgroup owner identity changed")
+        identity_fields = (
+            "root_device",
+            "root_inode",
+            "owner_device",
+            "owner_inode",
+        )
+        if any(
+            not isinstance(raw.get(field), int)
+            or isinstance(raw.get(field), bool)
+            or int(raw[field]) < 0
+            for field in identity_fields
+        ):
+            raise CgroupOwnershipError(
+                "owner-metadata-invalid",
+                "owner record identities are invalid",
+            )
+        root_identity = self.system.identity(self.root)
+        expected_root = CgroupIdentity(
+            int(raw["root_device"]),
+            int(raw["root_inode"]),
+        )
+        if root_identity != expected_root:
+            raise CgroupOwnershipError("root-reused", "delegated cgroup root was reused")
+        owner_path = self.root / self.owner_name
+        owner_identity = self.system.identity(owner_path)
+        expected_owner = CgroupIdentity(
+            int(raw["owner_device"]),
+            int(raw["owner_inode"]),
+        )
+        if owner_identity is not None and owner_identity != expected_owner:
+            raise CgroupOwnershipError("owner-reused", "AGCoord cgroup owner path was reused")
+        return owner_path, owner_identity
+
+    def _ensure_owner(self) -> tuple[Path, CgroupIdentity]:
+        assert self.root is not None
+        root_identity = self.system.identity(self.root)
+        if root_identity is None:
+            raise CgroupV2Error("root-missing", "delegated cgroup root disappeared")
+        record_path = self._owner_record_path
+        if record_path.exists():
+            owner_path, owner_identity = self._validate_owner_record(
+                self._read_json(record_path)
+            )
+            if owner_identity is None:
+                if any(self.metadata_dir.glob("run-*.json")):
+                    raise CgroupOwnershipError(
+                        "owner-missing",
+                        "live cgroup manifests lost their owner path",
+                    )
+                owner_identity = self.system.create_group(self.root, self.owner_name)
+                self._write_json(
+                    record_path,
+                    self._owner_record(
+                        root_identity=root_identity,
+                        owner_identity=owner_identity,
+                    ),
+                )
+            return owner_path, owner_identity
+
+        owner_path = self.root / self.owner_name
+        if self.system.identity(owner_path) is not None:
+            raise CgroupOwnershipError(
+                "owner-collision",
+                "cgroup owner path exists without AGCoord ownership metadata",
+            )
+        owner_identity = self.system.create_group(self.root, self.owner_name)
+        try:
+            self._write_json(
+                record_path,
+                self._owner_record(
+                    root_identity=root_identity,
+                    owner_identity=owner_identity,
+                ),
+            )
+        except BaseException:
+            try:
+                self.system.remove_group(owner_path)
+            except OSError:
+                pass
+            raise
+        return owner_path, owner_identity
+
+    def _validate_handle(self, raw: object) -> dict[str, object]:
+        if not isinstance(raw, Mapping) or set(raw) != _HANDLE_KEYS:
+            raise CgroupOwnershipError("handle-invalid", "cgroup handle is invalid")
+        selected = dict(raw)
+        if (
+            type(selected["version"]) is not int
+            or selected["version"] != 1
+            or selected["owner"] != self.owner_name
+            or not isinstance(selected["owner_device"], int)
+            or isinstance(selected["owner_device"], bool)
+            or selected["owner_device"] < 0
+            or not isinstance(selected["owner_inode"], int)
+            or isinstance(selected["owner_inode"], bool)
+            or selected["owner_inode"] < 0
+            or not isinstance(selected["leaf_device"], int)
+            or isinstance(selected["leaf_device"], bool)
+            or selected["leaf_device"] < 0
+            or not isinstance(selected["leaf_inode"], int)
+            or isinstance(selected["leaf_inode"], bool)
+            or selected["leaf_inode"] < 0
+            or not isinstance(selected["leaf"], str)
+            or not _LEAF_NAME.fullmatch(selected["leaf"])
+            or not isinstance(selected["token"], str)
+            or not _TOKEN.fullmatch(selected["token"])
+        ):
+            raise CgroupOwnershipError("handle-invalid", "cgroup handle fields are invalid")
+        return selected
+
+    def _manifest(
+        self,
+        request: ResourceRequest,
+        handle: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {"version": 1, "run_id": request.run_id, "handle": dict(handle)}
+
+    def _read_manifest(
+        self,
+        request: ResourceRequest,
+    ) -> tuple[Path, dict[str, object]]:
+        path = self._manifest_path(request.run_id)
+        try:
+            raw = self._read_json(path)
+        except FileNotFoundError as exc:
+            raise CgroupOwnershipError(
+                "manifest-missing",
+                "cgroup run ownership manifest is missing",
+            ) from exc
+        if (
+            set(raw) != _MANIFEST_KEYS
+            or type(raw.get("version")) is not int
+            or raw.get("version") != 1
+        ):
+            raise CgroupOwnershipError("manifest-invalid", "cgroup run manifest is invalid")
+        if raw.get("run_id") != request.run_id:
+            raise CgroupOwnershipError("manifest-collision", "cgroup run manifest collided")
+        return path, self._validate_handle(raw.get("handle"))
+
+    def _resolve(
+        self,
+        request: ResourceRequest,
+        raw_handle: Mapping[str, object],
+        *,
+        allow_missing: bool,
+    ) -> Path | None:
+        handle = self._validate_handle(raw_handle)
+        _manifest_path, manifest_handle = self._read_manifest(request)
+        if manifest_handle != handle:
+            raise CgroupOwnershipError("handle-mismatch", "cgroup handle does not own manifest")
+        owner_path, owner_identity = self._validate_owner_record(
+            self._read_json(self._owner_record_path)
+        )
+        expected_owner = CgroupIdentity(handle["owner_device"], handle["owner_inode"])
+        if owner_identity is None:
+            if allow_missing:
+                return None
+            raise CgroupOwnershipError("owner-missing", "cgroup owner path disappeared")
+        if owner_identity != expected_owner:
+            raise CgroupOwnershipError("owner-reused", "cgroup owner identity changed")
+        leaf_path = owner_path / str(handle["leaf"])
+        leaf_identity = self.system.identity(leaf_path)
+        if leaf_identity is None:
+            if allow_missing:
+                return None
+            raise CgroupOwnershipError("leaf-missing", "run cgroup leaf disappeared")
+        expected_leaf = CgroupIdentity(handle["leaf_device"], handle["leaf_inode"])
+        if leaf_identity != expected_leaf:
+            raise CgroupOwnershipError("leaf-reused", "run cgroup leaf was reused")
+        return leaf_path
+
+    def prepare(self, request: ResourceRequest) -> Mapping[str, object]:
+        self._validate_request(request)
+        self._require_available()
+        self._prepare_metadata()
+        owner_path, owner_identity = self._ensure_owner()
+        manifest_path = self._manifest_path(request.run_id)
+        if manifest_path.exists():
+            _path, handle = self._read_manifest(request)
+            leaf_path = self._resolve(request, handle, allow_missing=True)
+            if leaf_path is not None:
+                if self.system.populated(leaf_path):
+                    raise CgroupV2Error(
+                        "leaf-populated",
+                        "existing run cgroup is still populated",
+                    )
+                return handle
+            manifest_path.unlink()
+
+        for _attempt in range(16):
+            token = uuid4().hex
+            run_hash = hashlib.sha256(request.run_id.encode()).hexdigest()[:16]
+            leaf_name = f"run-{run_hash}-{token[:12]}"
+            try:
+                leaf_identity = self.system.create_group(owner_path, leaf_name)
+            except FileExistsError:
+                continue
+            handle = {
+                "version": 1,
+                "owner": self.owner_name,
+                "owner_device": owner_identity.device,
+                "owner_inode": owner_identity.inode,
+                "leaf": leaf_name,
+                "leaf_device": leaf_identity.device,
+                "leaf_inode": leaf_identity.inode,
+                "token": token,
+            }
+            try:
+                self._write_json(manifest_path, self._manifest(request, handle))
+            except BaseException:
+                try:
+                    self.system.remove_group(owner_path / leaf_name)
+                except OSError:
+                    pass
+                raise
+            return handle
+        raise CgroupV2Error("leaf-collision", "could not allocate a unique run cgroup")
+
+    def attach(
+        self,
+        request: ResourceRequest,
+        state: Mapping[str, object],
+        worker_pid: int,
+    ) -> None:
+        self._validate_request(request)
+        leaf_path = self._resolve(request, state, allow_missing=False)
+        assert leaf_path is not None
+        self.system.attach(leaf_path, worker_pid)
+        if worker_pid not in self.system.members(leaf_path):
+            raise CgroupV2Error(
+                "attach-unverified",
+                "launcher cgroup membership could not be verified",
+            )
+
+    def usage(
+        self,
+        request: ResourceRequest,
+        state: Mapping[str, object],
+    ) -> Mapping[str, int]:
+        self._validate_request(request)
+        self._resolve(request, state, allow_missing=False)
+        return {}
+
+    def _kill_and_wait(self, leaf_path: Path) -> None:
+        if self.system.populated(leaf_path):
+            self.system.kill(leaf_path)
+        deadline = time.monotonic() + self.empty_timeout
+        while self.system.populated(leaf_path):
+            if time.monotonic() >= deadline:
+                raise CgroupV2Error(
+                    "leaf-populated",
+                    "run cgroup did not become unpopulated after kill",
+                )
+            time.sleep(0.02)
+
+    def finish(
+        self,
+        request: ResourceRequest,
+        state: Mapping[str, object],
+    ) -> Mapping[str, int]:
+        self._validate_request(request)
+        leaf_path = self._resolve(request, state, allow_missing=True)
+        if leaf_path is not None:
+            self._kill_and_wait(leaf_path)
+        return {}
+
+    def cancel(
+        self,
+        request: ResourceRequest,
+        state: Mapping[str, object],
+    ) -> None:
+        self._validate_request(request)
+        leaf_path = self._resolve(request, state, allow_missing=True)
+        if leaf_path is not None:
+            self._kill_and_wait(leaf_path)
+
+    def _cleanup_owner(self) -> None:
+        if any(self.metadata_dir.glob("run-*.json")):
+            return
+        try:
+            raw = self._read_json(self._owner_record_path)
+        except FileNotFoundError:
+            return
+        owner_path, owner_identity = self._validate_owner_record(raw)
+        if owner_identity is None:
+            self._owner_record_path.unlink(missing_ok=True)
+            return
+        if self.system.populated(owner_path):
+            return
+        try:
+            self.system.remove_group(owner_path)
+        except OSError as exc:
+            if exc.errno in {errno.EBUSY, errno.ENOTEMPTY}:
+                return
+            raise
+        self._owner_record_path.unlink(missing_ok=True)
+
+    def cleanup(
+        self,
+        request: ResourceRequest,
+        state: Mapping[str, object],
+    ) -> None:
+        self._validate_request(request)
+        manifest_path, manifest_handle = self._read_manifest(request)
+        handle = self._validate_handle(state)
+        if manifest_handle != handle:
+            raise CgroupOwnershipError("handle-mismatch", "cgroup cleanup handle mismatched")
+        leaf_path = self._resolve(request, handle, allow_missing=True)
+        if leaf_path is not None:
+            if self.system.populated(leaf_path):
+                raise CgroupV2Error("leaf-populated", "cannot remove populated run cgroup")
+            self.system.remove_group(leaf_path)
+        manifest_path.unlink(missing_ok=True)
+        self._cleanup_owner()

@@ -50,6 +50,14 @@ was requested, actually applied, and measured. See the
 [resource contract](docs/coordinator.md#repository-lanes-and-resources) for the strict binding
 shape and current backend availability.
 
+On Linux, the built-in `cgroup-v2` backend can own the complete descendant lifecycle for an
+explicitly delegated, namespace-safe cgroup root. It attaches the blocked launcher before user
+code, kills detached descendants on finish or cancellation, and recovers ownership across broker
+restart. This stage provides generic lifecycle containment; typed CPU, memory, PID, and I/O
+controller values are separate contracts. See
+[delegated cgroup setup](docs/coordinator.md#delegated-cgroup-v2-lifecycle) before enabling a
+required binding.
+
 If a gate starts several worker-owning tools concurrently, admitted subprocesses can use
 the public Python [child CPU lease API](docs/coordinator.md#child-cpu-leases-for-parallel-tools)
 to divide the job's declared CPU budget fairly. Leases support exact or partial grants,
