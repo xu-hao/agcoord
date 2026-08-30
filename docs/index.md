@@ -14,6 +14,8 @@ procedure is in [the contributor workflow](contributing.md).
   TUI.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
   publication, optional adapters, and release posture.
+- [Session handoff format](session_handoff_format.md) — closing changed work with concise
+  status, open work, genuine decisions, and recommended options.
 
 ## Assets
 
