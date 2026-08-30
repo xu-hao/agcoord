@@ -22,6 +22,8 @@ procedures listed in [docs/index.md](docs/index.md).
 - Never upload an AGCoord distribution to PyPI unless the user explicitly requests it.
   Permission to implement, test, commit, push, merge, tag, or create a GitHub release
   does not authorize an upload.
+- End changed work with the four-part [session handoff](docs/session_handoff_format.md);
+  answer read-only questions directly without an empty handoff shell.
 - Follow the [contributor workflow](docs/contributing.md) for commands, bootstrap,
   recovery, and cleanup. The [coordinator guide](docs/coordinator.md) and
   [release guide](docs/releasing.md) define the corresponding component contracts.
