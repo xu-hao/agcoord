@@ -234,6 +234,55 @@ row. Repository wrappers should verify immediately before protected gate work an
 refusal as a failed gate. The verifier remains an internal seam for wrappers, not a second
 submission or user-facing workflow.
 
+### Child CPU leases for parallel tools
+
+A job that declares `--resource cpu=N` owns one finite worker-token budget for its entire
+descendant process tree. Parallel tools must divide that budget instead of each treating `N`
+as its private worker count. An admitted subprocess can acquire a tool-neutral child lease
+through the public Python client without submitting a nested job:
+
+```python
+import os
+import subprocess
+
+from agcoord import CoordinatorClient
+
+client = CoordinatorClient(
+    state_dir=os.environ["AGCOORD_STATE_DIR"],
+    autostart=False,
+)
+with client.acquire_child_cpu_lease(8, minimum=1, timeout=30) as lease:
+    subprocess.run(["my-test-runner", f"--workers={lease.granted}"], check=True)
+```
+
+Omitting `minimum` requests an exact grant: if that many tokens exceed the parent's CPU
+budget, acquisition fails immediately. Supplying `minimum` permits a partial grant between
+that value and `requested`; a minimum above the parent budget also fails immediately. A
+compatible request waits when the tokens are merely busy, and `timeout` cancels that waiting
+request. The context manager releases its grant on normal or exceptional exit.
+
+Waiting is FIFO within the parent run, with one bounded bypass when the oldest request cannot
+fit the temporarily available tokens and a younger request can. This lets mixed large and
+small requests make progress without allowing a stream of small requests to starve the older
+large one. Active grants for a run never total more than its declared parent CPU allocation.
+Child leases partition that allocation only: they do not change machine-level allocations,
+repository barriers, publication order, or the normal job history, and they do not replace an
+OS enforcement backend such as cgroup v2.
+
+The three admission environment values select the parent but do not authenticate it. Lease
+acquisition also verifies the live worker and caller through durable PID start identities and
+requires the caller to be a current descendant of that worker. A copied environment from an
+unrelated process is refused. Parent cancellation cancels both waiting and active leases;
+owner exit or crash reclaims its tokens. Lease rows are durable, so a replacement broker
+preserves a still-live owner after verifying both identities and otherwise cancels the stale
+grant without minting capacity.
+
+`CoordinatorClient.child_cpu_leases(run_id)` exposes current waiting and active leases to the
+owner-only spool's operators. Each record reports the lease and parent IDs, status, requested,
+minimum and granted counts, whether the grant is full, owner PID, timestamps, and waiting
+position. Terminal lease records are omitted unless `include_terminal=True`; none appear as
+child jobs in `list`, `show`, the TUI, or ordinary run history.
+
 ## Atomic landing
 
 The normal landing operation is one durable request containing the forge adapter/request,
@@ -389,4 +438,6 @@ facts represented by the old schema; it never upgrades a legacy label into an ex
 receipt, fuses separate full and merge rows into a land, or invents a gate phase/status that
 the legacy row did not record. Protocol-1 and protocol-2 resource maps migrate as generic
 admission-only contracts with empty applied, peak, and event fields. Familiar legacy names are
-not reinterpreted as typed or enforced resources.
+not reinterpreted as typed or enforced resources. Protocol 3 migrates by adding the durable
+child-CPU-lease catalogue; terminal run history remains unchanged and no lease is invented for
+old work.

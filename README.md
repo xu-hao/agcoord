@@ -50,6 +50,11 @@ was requested, actually applied, and measured. See the
 [resource contract](docs/coordinator.md#repository-lanes-and-resources) for the strict binding
 shape and current backend availability.
 
+If a gate starts several worker-owning tools concurrently, admitted subprocesses can use
+the public Python [child CPU lease API](docs/coordinator.md#child-cpu-leases-for-parallel-tools)
+to divide the job's declared CPU budget fairly. Leases support exact or partial grants,
+waiting, cancellation, crash reclamation, and broker recovery without creating nested jobs.
+
 Run a standalone full validation for an exact clean Git head when publication is not part of
 the request:
 
