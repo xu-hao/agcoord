@@ -27,6 +27,7 @@ def _row(
     kind: str = "check",
     label: str = "unit tests",
     repository_id: str = "repo-alpha",
+    repository: str | None = None,
     head_sha: str | None = None,
     gate_run_id: str | None = None,
     publication: dict[str, object] | None = None,
@@ -50,7 +51,7 @@ def _row(
         "label": label,
         "agent": "agent-7",
         "repository_id": repository_id,
-        "repository": f"/repos/{repository_id}.git",
+        "repository": repository or f"/repos/{repository_id}.git",
         "worktree_id": f"worktree-{sequence}",
         "checkout": f"/worktrees/{repository_id}/{sequence}",
         "branch": f"feature/{sequence}",
@@ -247,6 +248,55 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
             "stale-main",
         ):
             assert fact in merge_detail
+
+
+@pytest.mark.asyncio
+async def test_repository_table_and_filter_show_remote_and_local_names_not_internal_ids():
+    snapshot = _snapshot()
+    snapshot["active"] = [
+        _row(
+            "remote-active",
+            4,
+            "running",
+            repository_id="repo-remote-identity",
+            repository="github.com/example/widgets",
+        ),
+        _row(
+            "local-active",
+            5,
+            "running",
+            repository_id="repo-local-identity",
+            repository="/srv/projects/widgets/.git",
+        ),
+    ]
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        table = _table(app)
+        assert [str(table.get_row_at(index)[2]) for index in range(table.row_count)] == [
+            "widgets",
+            "widgets",
+        ]
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert table.row_count == 1
+        assert str(table.get_row_at(0)[2]) == "widgets"
+        subject = str(app.query_one("#gate-subject", Static).content)
+        assert "/srv/projects/widgets/.git" in subject
+        assert "repo-local-identity" not in subject
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert table.row_count == 1
+        assert str(table.get_row_at(0)[2]) == "widgets"
+        subject = str(app.query_one("#gate-subject", Static).content)
+        assert "github.com/example/widgets" in subject
+        assert "repo-remote-identity" not in subject
 
 
 @pytest.mark.asyncio

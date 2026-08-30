@@ -280,13 +280,18 @@ The expected key map is:
 
 Refresh preserves the selected run and both viewport offsets when that row still exists.
 At 80 columns the compact table is exactly `STATE · KIND · REPO · RUN · LABEL · AGE · DUR`
-and does not require horizontal navigation. `AGE` is time since creation; `DUR` is absent
-before start, live while running, and fixed at finish. Full agent, repository and worktree
-identity, checkout, branch, barrier, resources, blockers, command, exact created/started/
-finished timestamps, head, receipt, publication, phase, gate exit, and failure values remain
-available in persistent selection detail and the detail view. A land remains one selected
-row as it moves from gating to publishing, and `l` reads one combined gate-and-publication
-transcript rather than separate run logs.
+and does not require horizontal navigation. `REPO` shows the compact repository name derived
+from the credential-free normalized remote identity, or from the local Git identity when the
+checkout has no remote. The repository-filter header and persistent selection detail retain
+the complete readable value so equal basenames remain distinguishable. The hashed
+`repository_id` remains the internal lane/filter key and is available with the full repository
+and worktree identities in the detail view. `AGE` is time since creation; `DUR` is absent
+before start, live while running, and fixed at finish. Full agent, checkout, branch, barrier,
+resources, blockers, command, exact created/started/finished timestamps, head, receipt,
+publication, phase, gate exit, and failure values remain available in persistent selection
+detail and the detail view. A land remains one selected row as it moves from gating to
+publishing, and `l` reads one combined gate-and-publication transcript rather than separate
+run logs.
 
 ## Worker scratch and cleanup
 

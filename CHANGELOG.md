@@ -3,6 +3,11 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Show compact human-readable remote or local repository names in the TUI table and full
+  readable identities in its filter header while retaining hashes as internal lane keys.
+
 ## 0.1.0 — 2026-08-30
 
 - Publish the standalone `agcoord` distribution, import package, module entry point, and
