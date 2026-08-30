@@ -3,6 +3,11 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Separate compact TUI columns with visible gutters and mark every clipped value with an
+  ellipsis while retaining the complete value in the detail view.
+
 ## 0.1.0 — 2026-08-30
 
 - Publish the standalone `agcoord` distribution, import package, module entry point, and

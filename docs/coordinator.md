@@ -280,13 +280,15 @@ The expected key map is:
 
 Refresh preserves the selected run and both viewport offsets when that row still exists.
 At 80 columns the compact table is exactly `STATE · KIND · REPO · RUN · LABEL · AGE · DUR`
-and does not require horizontal navigation. `AGE` is time since creation; `DUR` is absent
-before start, live while running, and fixed at finish. Full agent, repository and worktree
-identity, checkout, branch, barrier, resources, blockers, command, exact created/started/
-finished timestamps, head, receipt, publication, phase, gate exit, and failure values remain
-available in persistent selection detail and the detail view. A land remains one selected
-row as it moves from gating to publishing, and `l` reads one combined gate-and-publication
-transcript rather than separate run logs.
+and does not require horizontal navigation. Adjacent columns retain a visible gutter, and a
+value wider than its compact cell ends in a visible ellipsis instead of running into the next
+column or disappearing at a hard edge. `AGE` is time since creation; `DUR` is absent before
+start, live while running, and fixed at finish. Full agent, repository and worktree identity,
+label, checkout, branch, barrier, resources, blockers, command, exact created/started/finished
+timestamps, head, receipt, publication, phase, gate exit, and failure values remain available
+without abbreviation in persistent selection detail and the detail view. A land remains one
+selected row as it moves from gating to publishing, and `l` reads one combined
+gate-and-publication transcript rather than separate run logs.
 
 ## Worker scratch and cleanup
 
