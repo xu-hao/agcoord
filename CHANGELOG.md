@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.1.1 — 2026-08-30
+
 - Replace the cartoon character with a naturalist botanical gourd while retaining
   the stable mascot URL, transparent canvas, and compact README presentation.
 - Separate compact TUI columns with visible gutters and mark every clipped value with an
