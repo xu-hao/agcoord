@@ -290,6 +290,32 @@ async def test_rendered_table_separates_columns_and_marks_truncated_detail_value
 
 
 @pytest.mark.asyncio
+async def test_label_uses_wide_terminal_space_and_returns_to_compact_ellipsis():
+    full_label = "integration release validation"
+    snapshot = _snapshot()
+    snapshot["active"] = [_row("check-wide", 1, "running", label=full_label)]
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(120, 24)) as pilot:
+        await _settled(pilot)
+
+        table = _table(app)
+        wide_row = table.render_line(table.header_height).text
+        assert full_label in wide_row
+        assert table.max_scroll_x == 0
+
+        await pilot.resize_terminal(80, 24)
+        await _settled(pilot)
+
+        compact_row = table.render_line(table.header_height).text
+        assert full_label not in compact_row
+        assert re.search(r"integration… +45s\b", compact_row), compact_row
+        assert table.max_scroll_x == 0
+
+
+@pytest.mark.asyncio
 async def test_repository_table_and_filter_show_remote_and_local_names_not_internal_ids():
     snapshot = _snapshot()
     snapshot["active"] = [

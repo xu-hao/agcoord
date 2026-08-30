@@ -9,6 +9,8 @@ versioning; dates use ISO 8601.
   the stable mascot URL, transparent canvas, and compact README presentation.
 - Separate compact TUI columns with visible gutters and mark every clipped value with an
   ellipsis while retaining the complete value in the detail view.
+- Expand the TUI `LABEL` column into space available beyond 80 terminal columns and restore
+  its compact ellipsis form when the terminal narrows.
 - Show compact human-readable remote or local repository names in the TUI table and full
   readable identities in its filter header while retaining hashes as internal lane keys.
 
