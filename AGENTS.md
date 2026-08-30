@@ -49,6 +49,9 @@ agcoord land <request> --label "gate and publish" --resource cpu=4 -- python -m 
   either reference moves.
 - Do not invoke `agcoord`, a gate wrapper, or publication from inside an admitted AGCoord
   job; nested submissions are rejected to prevent self-deadlock.
+- Do not upload an AGCoord distribution to PyPI unless the user explicitly asks for that
+  upload. Permission to implement, test, commit, push, open or merge a pull request, tag,
+  or create a GitHub release is not permission to upload to PyPI.
 - Remove the merged ticket worktree and branch only after publication succeeds.
 
 Bootstrap exception: before AGCoord is installed in a fresh AGCoord development environment,
