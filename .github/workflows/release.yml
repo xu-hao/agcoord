@@ -10,48 +10,16 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install twine
+      - run: python -m pip install build twine
       - name: Verify tag matches package version
         shell: bash
         run: test "${GITHUB_REF_NAME#v}" = "$(PYTHONPATH=src python -c 'from agcoord import __version__; print(__version__)')"
-      - name: Select successful TestPyPI run for this exact commit
-        id: testpypi
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_HEAD: ${{ github.sha }}
-        run: |
-          gh api --method GET \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/testpypi.yml/runs" \
-            -f head_sha="$RELEASE_HEAD" \
-            -f event=workflow_dispatch \
-            -f per_page=100 \
-            > "$RUNNER_TEMP/testpypi-runs.json"
-          run_id="$(
-            python tools/select_testpypi_run.py \
-              --head-sha "$RELEASE_HEAD" \
-              "$RUNNER_TEMP/testpypi-runs.json"
-          )"
-          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
-          echo "Promoting exact artifacts from TestPyPI run $run_id"
-      - name: Download exact TestPyPI artifacts
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TESTPYPI_RUN_ID: ${{ steps.testpypi.outputs.run-id }}
-        run: |
-          gh run download "$TESTPYPI_RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name testpypi-distributions \
-            --dir dist
+      - run: python -m build
       - run: python -m twine check dist/*
       - run: python -m venv /tmp/agcoord-wheel
       - run: /tmp/agcoord-wheel/bin/pip install dist/*.whl
@@ -66,18 +34,3 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
-
-  publish:
-    needs: verify
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/agcoord/
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: python-package-distributions
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1

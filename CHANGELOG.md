@@ -24,5 +24,5 @@ versioning; dates use ISO 8601.
   so internal repository gate wrappers can verify the correct full or land admission even
   with an explicit state directory, without exposing environment values or credentials in
   public job rows.
-- Promote the exact successful TestPyPI wheel and source archive from the tagged commit to
-  PyPI instead of rebuilding production artifacts after the release-candidate smoke.
+- Build, audit, and clean-install the standalone wheel and source archive before publishing
+  those exact artifacts directly to production PyPI.

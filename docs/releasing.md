@@ -41,18 +41,21 @@ smoke-tested from the built wheel.
 5. In that clean environment, start a temporary explicit state directory, run a check, read
    its log, clear terminal history, and verify that importing the core does not require a
    forge executable or credentials.
-6. Dispatch the TestPyPI workflow for the intended release commit. Install that run's exact
-   version in another clean environment and complete the command/state smoke before tagging;
-   do not dispatch another successful build for the same commit after selecting the artifact
-   authority.
-7. Tag that exact commit and publish through the identity-bound trusted publisher. The tag
-   workflow selects the newest successful TestPyPI dispatch for the exact tag SHA, downloads
-   its retained `testpypi-distributions` artifact, repeats Twine and clean-install checks, and
-   promotes those same wheel/sdist bytes. It fails closed when no matching successful run or
-   retained artifact exists. Do not keep a long-lived upload token in a repository or shell.
+6. Record both artifact hashes, then upload those exact files directly to production PyPI
+   with `python -m twine upload --repository pypi <wheel> <sdist>`. Twine reads the existing
+   `pypi` login from `~/.pypirc`; keep that file owner-only, use a project-scoped API token,
+   and never place the token in a repository, command line, or long-lived shell variable.
+7. Read the production PyPI JSON metadata for the new version. Require exactly the expected
+   wheel and source archive, compare their SHA-256 values with the local records, and install
+   `agcoord==<version>` from `https://pypi.org/simple/` into another clean environment.
+8. Tag the exact source commit as `v<version>` and push only that tag. The tag workflow
+   independently rebuilds and smoke-tests the tagged source without publishing it. Require
+   that workflow to pass, then create the GitHub release and attach the same local wheel and
+   source archive that production PyPI accepted.
 
-The release workflow should fail closed if the TestPyPI authority is absent, artifact versions
-differ, files are dirty, a tag does not match the declared version, or the wheel exposes a
-command/package name other than `agcoord`. Releases never migrate a user's live spool
+The release workflow should fail closed if artifact versions differ, files are dirty, a tag
+does not match the declared version, or the wheel exposes a command/package name other than
+`agcoord`. Publishing remains an explicit maintainer action through Twine; GitHub Actions has
+no package-index credentials or deployment job. Releases never migrate a user's live spool
 implicitly; protocol changes require the explicit `agcoord migrate` runbook in
 [the coordinator guide](coordinator.md#migrations).
