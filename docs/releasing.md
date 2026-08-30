@@ -31,9 +31,9 @@ smoke-tested from the built wheel.
    user-visible changes.
 2. Run the complete test suite, including generic multi-repository scheduling, one-row
    exact-head gate-and-publication behavior, recovery/cancellation boundaries, the optional
-   GitHub adapter, and real terminal UI coverage. A standalone `agc full` may validate a
-   release candidate, but landing repository changes uses `agc land` so the verdict and
-   publication cannot be separated.
+   GitHub adapter, child CPU lease contention and recovery, and real terminal UI coverage. A
+   standalone `agc full` may validate a release candidate, but repository changes must land
+   with `agc land` so the verdict and publication cannot be separated.
 3. Build both artifacts with `python -m build` and validate them with
    `python -m twine check dist/*`.
 4. Create a fresh virtual environment outside the checkout. Install the wheel, with each

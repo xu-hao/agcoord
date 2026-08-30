@@ -9,7 +9,7 @@ module opens no network listener and has no dependency on a product repository.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -46,7 +46,7 @@ from .resources import (
 )
 
 
-PROTOCOL = 3
+PROTOCOL = 4
 TERMINAL_STATUSES = frozenset({
     "passed", "failed", "cancelled", "interrupted",
 })
@@ -61,6 +61,9 @@ CANCEL_GRACE_SECONDS = 5.0
 RUN_ID_ENV = "AGCOORD_RUN_ID"
 RUN_KIND_ENV = "AGCOORD_RUN_KIND"
 STATE_DIR_ENV = "AGCOORD_STATE_DIR"
+CHILD_CPU_RESOURCE = "cpu"
+CHILD_LEASE_POLL_SECONDS = 0.05
+CHILD_LEASE_MAX_BYPASSES = 1
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
 RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
@@ -263,19 +266,24 @@ def _shell_status(returncode: int) -> int:
     return 128 + abs(returncode) if returncode < 0 else returncode
 
 
-def _process_start_token(pid: int) -> str | None:
+def _process_identity(pid: int) -> tuple[int, str] | None:
     """Linux process identity beyond a reusable PID.
 
     The gate already relies on Linux ``flock``.  Field 22 of ``/proc/<pid>/stat`` is the
-    process start tick and lets a restarted broker distinguish its worker from a later
-    process that happened to receive the same PID.
+    process start tick and field 4 is its parent PID. Together they let a restarted broker
+    distinguish its worker tree from later processes that reused one of its PIDs.
     """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         fields_after_name = stat[stat.rfind(")") + 2:].split()
-        return fields_after_name[19]
-    except (OSError, IndexError):
+        return int(fields_after_name[1]), fields_after_name[19]
+    except (OSError, IndexError, ValueError):
         return None
+
+
+def _process_start_token(pid: int) -> str | None:
+    identity = _process_identity(pid)
+    return identity[1] if identity is not None else None
 
 
 def _same_process(pid: int | None, token: str | None) -> bool:
@@ -286,6 +294,33 @@ def _same_process(pid: int | None, token: str | None) -> bool:
     except (OSError, ProcessLookupError):
         return False
     return _process_start_token(pid) == token
+
+
+def _is_descendant_process(
+    pid: int,
+    token: str,
+    *,
+    ancestor_pid: int,
+    ancestor_token: str,
+) -> bool:
+    """Prove one live process belongs to an admitted worker tree without trusting env."""
+    current_pid = pid
+    expected_token = token
+    visited: set[int] = set()
+    while current_pid > 0 and current_pid not in visited:
+        visited.add(current_pid)
+        identity = _process_identity(current_pid)
+        if identity is None or identity[1] != expected_token:
+            return False
+        if current_pid == ancestor_pid:
+            return expected_token == ancestor_token
+        parent_pid = identity[0]
+        parent_identity = _process_identity(parent_pid)
+        if parent_identity is None:
+            return False
+        current_pid = parent_pid
+        expected_token = parent_identity[1]
+    return False
 
 
 def _process_group_exists(process_group: int | None) -> bool:
@@ -492,6 +527,40 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
     }
 
 
+def _create_child_cpu_lease_table(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        CREATE TABLE child_cpu_leases (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            lease_id TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (
+                status IN ('waiting', 'active', 'released', 'cancelled')
+            ),
+            requested INTEGER NOT NULL CHECK (requested > 0),
+            minimum INTEGER NOT NULL CHECK (minimum > 0 AND minimum <= requested),
+            granted INTEGER NOT NULL DEFAULT 0 CHECK (
+                granted >= 0 AND granted <= requested
+            ),
+            owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+            owner_start_token TEXT NOT NULL,
+            bypass_count INTEGER NOT NULL DEFAULT 0 CHECK (bypass_count >= 0),
+            created_at TEXT NOT NULL,
+            acquired_at TEXT,
+            finished_at TEXT
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX child_cpu_leases_run_sequence "
+        "ON child_cpu_leases(run_id, sequence)"
+    )
+    db.execute(
+        "CREATE INDEX child_cpu_leases_status_sequence "
+        "ON child_cpu_leases(status, sequence)"
+    )
+
+
 def migrate_queue(
     *,
     state_dir: str | os.PathLike[str] | None = None,
@@ -551,11 +620,11 @@ def migrate_queue(
             previous = int(stored["value"])
             original_protocol = previous
             changed = False
-            if previous not in {1, 2, PROTOCOL}:
+            if previous not in {1, 2, 3, PROTOCOL}:
                 raise CoordinatorError(
                     f"queue protocol is {previous}; no migration to {PROTOCOL} is defined"
                 )
-            if previous in {1, 2}:
+            if previous in {1, 2, 3}:
                 live = db.execute(
                     "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
                     "ORDER BY sequence"
@@ -693,6 +762,14 @@ def migrate_queue(
                             row["run_id"],
                         ),
                     )
+                db.execute(
+                    "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
+                    ("3",),
+                )
+                previous = 3
+                changed = True
+            if previous == 3:
+                _create_child_cpu_lease_table(db)
                 db.execute(
                     "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
                     (str(PROTOCOL),),
@@ -895,6 +972,7 @@ class CoordinatorBroker:
                     "INSERT INTO coordinator_meta(key, value) VALUES ('protocol', ?)",
                     (str(PROTOCOL),),
                 )
+                _create_child_cpu_lease_table(db)
             elif tables != {"runs", "coordinator_meta"}:
                 raise CoordinatorError(
                     "gate queue database is partially initialized; it needs explicit "
@@ -912,6 +990,14 @@ class CoordinatorBroker:
                     f"gate queue database protocol is {stored['value']}; need {PROTOCOL}; "
                     "after the old broker exits run `agc "
                     f"migrate --state-dir {self.paths.state_dir}`"
+                )
+            lease_table = db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'child_cpu_leases'"
+            ).fetchone()
+            if lease_table is None:
+                raise CoordinatorError(
+                    "gate queue database is missing the child CPU lease table"
                 )
             required = {
                 "kind", "phase", "agent", "repository_id", "repository", "worktree_id",
@@ -1590,6 +1676,350 @@ class CoordinatorBroker:
         self._touch()
         return {"cleared": len(rows)}
 
+    def _admitted_child_run(
+        self,
+        db: sqlite3.Connection,
+        run_id: str,
+        *,
+        owner_pid: int,
+        owner_start_token: str,
+    ) -> sqlite3.Row:
+        row = db.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise CoordinatorError(f"unknown parent run {run_id!r}")
+        if row["status"] != "running" or row["cancel_requested"]:
+            raise CoordinatorError(
+                f"parent run {run_id} is not accepting child CPU leases"
+            )
+        worker_pid = row["worker_pid"]
+        worker_token = row["worker_start_token"]
+        if not _same_process(worker_pid, worker_token):
+            raise CoordinatorError(
+                f"parent run {run_id} has no live worker identity"
+            )
+        if not _is_descendant_process(
+            owner_pid,
+            owner_start_token,
+            ancestor_pid=worker_pid,
+            ancestor_token=worker_token,
+        ):
+            raise CoordinatorError(
+                f"caller is not a live descendant of admitted run {run_id}"
+            )
+        return row
+
+    def request_child_cpu_lease(
+        self,
+        run_id: str,
+        *,
+        requested: int,
+        minimum: int,
+    ) -> dict[str, Any]:
+        """Create one authenticated FIFO request within a running parent's CPU budget."""
+        if not isinstance(run_id, str) or not run_id:
+            raise CoordinatorError("child CPU lease parent run ID must be non-empty")
+        if (
+            not isinstance(requested, int)
+            or isinstance(requested, bool)
+            or requested <= 0
+        ):
+            raise CoordinatorError("child CPU lease request must be a positive integer")
+        if (
+            not isinstance(minimum, int)
+            or isinstance(minimum, bool)
+            or minimum <= 0
+            or minimum > requested
+        ):
+            raise CoordinatorError(
+                "child CPU lease minimum must be positive and no greater than requested"
+            )
+        if _broker_owner(self.paths) is None:
+            raise CoordinatorError(
+                f"no gate broker owns {self.paths.state_dir}"
+            )
+        owner_pid = os.getpid()
+        owner_start_token = _process_start_token(owner_pid)
+        if owner_start_token is None:
+            raise CoordinatorError("cannot identify child CPU lease owner process")
+        lease_id = f"cpu-lease-{uuid4().hex[:12]}"
+        with self._db_lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            parent = self._admitted_child_run(
+                db,
+                run_id,
+                owner_pid=owner_pid,
+                owner_start_token=owner_start_token,
+            )
+            budget = self._row_resources(parent).get(CHILD_CPU_RESOURCE)
+            if budget is None:
+                raise CoordinatorError(
+                    f"parent run {run_id} has no {CHILD_CPU_RESOURCE!r} resource budget"
+                )
+            if minimum > budget:
+                raise CoordinatorError(
+                    f"child CPU lease minimum {minimum} exceeds parent budget {budget}"
+                )
+            db.execute(
+                "INSERT INTO child_cpu_leases ("
+                "lease_id, run_id, status, requested, minimum, owner_pid, "
+                "owner_start_token, created_at"
+                ") VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?)",
+                (
+                    lease_id,
+                    run_id,
+                    requested,
+                    minimum,
+                    owner_pid,
+                    owner_start_token,
+                    _now(),
+                ),
+            )
+            self._maintain_child_cpu_leases(db)
+            row = db.execute(
+                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+        self._touch()
+        return self._public_child_cpu_lease(row, position=self._lease_position(row))
+
+    def child_cpu_lease_status(self, lease_id: str) -> dict[str, Any]:
+        if not isinstance(lease_id, str) or not lease_id:
+            raise CoordinatorError("child CPU lease ID must be non-empty")
+        with self._db_lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._maintain_child_cpu_leases(db)
+            row = db.execute(
+                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            if row is None:
+                raise CoordinatorError(f"unknown child CPU lease {lease_id!r}")
+            position = self._lease_position(row, db=db)
+        self._touch()
+        return self._public_child_cpu_lease(row, position=position)
+
+    def child_cpu_leases(
+        self,
+        run_id: str | None = None,
+        *,
+        include_terminal: bool = False,
+    ) -> list[dict[str, Any]]:
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            raise CoordinatorError("child CPU lease parent run ID must be non-empty")
+        with self._db_lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._maintain_child_cpu_leases(db)
+            if run_id is not None:
+                parent = db.execute(
+                    "SELECT run_id FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if parent is None:
+                    raise CoordinatorError(f"unknown parent run {run_id!r}")
+            conditions: list[str] = []
+            values: list[object] = []
+            if run_id is not None:
+                conditions.append("run_id = ?")
+                values.append(run_id)
+            if not include_terminal:
+                conditions.append("status IN ('waiting', 'active')")
+            where = " WHERE " + " AND ".join(conditions) if conditions else ""
+            rows = db.execute(
+                "SELECT * FROM child_cpu_leases" + where + " ORDER BY sequence",
+                values,
+            ).fetchall()
+            waiting_positions: dict[str, int] = {}
+            public: list[dict[str, Any]] = []
+            for row in rows:
+                position = None
+                if row["status"] == "waiting":
+                    waiting_positions[row["run_id"]] = (
+                        waiting_positions.get(row["run_id"], 0) + 1
+                    )
+                    position = waiting_positions[row["run_id"]]
+                public.append(self._public_child_cpu_lease(row, position=position))
+        self._touch()
+        return public
+
+    def _finish_child_cpu_lease(self, lease_id: str, *, status: str) -> dict[str, Any]:
+        if status not in {"released", "cancelled"}:
+            raise ValueError("child CPU lease terminal status is invalid")
+        if not isinstance(lease_id, str) or not lease_id:
+            raise CoordinatorError("child CPU lease ID must be non-empty")
+        owner_pid = os.getpid()
+        owner_start_token = _process_start_token(owner_pid)
+        if owner_start_token is None:
+            raise CoordinatorError("cannot identify child CPU lease owner process")
+        with self._db_lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            if row is None:
+                raise CoordinatorError(f"unknown child CPU lease {lease_id!r}")
+            if row["owner_pid"] != owner_pid or row["owner_start_token"] != owner_start_token:
+                raise CoordinatorError(
+                    f"caller does not own child CPU lease {lease_id}"
+                )
+            if row["status"] in {"waiting", "active"}:
+                db.execute(
+                    "UPDATE child_cpu_leases SET status = ?, finished_at = ? "
+                    "WHERE lease_id = ?",
+                    (status, _now(), lease_id),
+                )
+                self._maintain_child_cpu_leases(db)
+            row = db.execute(
+                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+        self._touch()
+        return self._public_child_cpu_lease(row, position=None)
+
+    def release_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
+        return self._finish_child_cpu_lease(lease_id, status="released")
+
+    def cancel_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
+        return self._finish_child_cpu_lease(lease_id, status="cancelled")
+
+    def _lease_position(
+        self,
+        row: sqlite3.Row,
+        *,
+        db: sqlite3.Connection | None = None,
+    ) -> int | None:
+        if row["status"] != "waiting":
+            return None
+        if db is None:
+            with self._db_lock, self._connect() as selected:
+                return selected.execute(
+                    "SELECT COUNT(*) FROM child_cpu_leases "
+                    "WHERE run_id = ? AND status = 'waiting' AND sequence <= ?",
+                    (row["run_id"], row["sequence"]),
+                ).fetchone()[0]
+        return db.execute(
+            "SELECT COUNT(*) FROM child_cpu_leases "
+            "WHERE run_id = ? AND status = 'waiting' AND sequence <= ?",
+            (row["run_id"], row["sequence"]),
+        ).fetchone()[0]
+
+    def _public_child_cpu_lease(
+        self,
+        row: sqlite3.Row,
+        *,
+        position: int | None,
+    ) -> dict[str, Any]:
+        granted = row["granted"]
+        return {
+            "lease_id": row["lease_id"],
+            "run_id": row["run_id"],
+            "status": row["status"],
+            "requested": row["requested"],
+            "minimum": row["minimum"],
+            "granted": granted,
+            "full": granted > 0 and granted == row["requested"],
+            "owner_pid": row["owner_pid"],
+            "created_at": row["created_at"],
+            "acquired_at": row["acquired_at"],
+            "finished_at": row["finished_at"],
+            "position": position,
+        }
+
+    def _maintain_child_cpu_leases(self, db: sqlite3.Connection) -> None:
+        """Reclaim dead owners and fairly admit durable requests per parent run."""
+        now = _now()
+        live = db.execute(
+            "SELECT leases.*, runs.status AS run_status, "
+            "runs.cancel_requested AS run_cancel_requested, "
+            "runs.worker_pid AS run_worker_pid, "
+            "runs.worker_start_token AS run_worker_start_token "
+            "FROM child_cpu_leases AS leases JOIN runs USING (run_id) "
+            "WHERE leases.status IN ('waiting', 'active') ORDER BY leases.sequence"
+        ).fetchall()
+        for lease in live:
+            valid = (
+                lease["run_status"] == "running"
+                and not lease["run_cancel_requested"]
+                and _same_process(
+                    lease["run_worker_pid"], lease["run_worker_start_token"]
+                )
+                and _same_process(lease["owner_pid"], lease["owner_start_token"])
+                and _is_descendant_process(
+                    lease["owner_pid"],
+                    lease["owner_start_token"],
+                    ancestor_pid=lease["run_worker_pid"],
+                    ancestor_token=lease["run_worker_start_token"],
+                )
+            )
+            if not valid:
+                db.execute(
+                    "UPDATE child_cpu_leases SET status = 'cancelled', finished_at = ? "
+                    "WHERE lease_id = ? AND status IN ('waiting', 'active')",
+                    (now, lease["lease_id"]),
+                )
+
+        run_ids = [
+            row["run_id"]
+            for row in db.execute(
+                "SELECT DISTINCT run_id FROM child_cpu_leases "
+                "WHERE status IN ('waiting', 'active') ORDER BY run_id"
+            )
+        ]
+        for run_id in run_ids:
+            parent = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if parent is None or parent["status"] != "running" or parent["cancel_requested"]:
+                continue
+            budget = self._row_resources(parent).get(CHILD_CPU_RESOURCE)
+            if budget is None:
+                raise CoordinatorError(
+                    f"parent run {run_id} has live child leases without a CPU budget"
+                )
+            active = db.execute(
+                "SELECT * FROM child_cpu_leases "
+                "WHERE run_id = ? AND status = 'active' ORDER BY sequence",
+                (run_id,),
+            ).fetchall()
+            used = sum(row["granted"] for row in active)
+            if used > budget:
+                raise CoordinatorError(
+                    f"child CPU leases for {run_id} hold {used}, above parent budget {budget}"
+                )
+            available = budget - used
+            waiting = list(db.execute(
+                "SELECT * FROM child_cpu_leases "
+                "WHERE run_id = ? AND status = 'waiting' ORDER BY sequence",
+                (run_id,),
+            ).fetchall())
+            while available > 0 and waiting:
+                oldest = waiting[0]
+                selected = oldest if oldest["minimum"] <= available else None
+                if selected is None:
+                    if oldest["bypass_count"] >= CHILD_LEASE_MAX_BYPASSES:
+                        break
+                    selected = next(
+                        (candidate for candidate in waiting[1:] if candidate["minimum"] <= available),
+                        None,
+                    )
+                    if selected is None:
+                        break
+                    db.execute(
+                        "UPDATE child_cpu_leases SET bypass_count = bypass_count + 1 "
+                        "WHERE lease_id = ?",
+                        (oldest["lease_id"],),
+                    )
+                granted = min(selected["requested"], available)
+                if granted < selected["minimum"]:
+                    raise CoordinatorError("child CPU lease scheduler selected an impossible grant")
+                db.execute(
+                    "UPDATE child_cpu_leases SET status = 'active', granted = ?, "
+                    "acquired_at = ? WHERE lease_id = ? AND status = 'waiting'",
+                    (granted, now, selected["lease_id"]),
+                )
+                available -= granted
+                waiting = [
+                    candidate for candidate in waiting
+                    if candidate["lease_id"] != selected["lease_id"]
+                ]
+
     def verify_admission(
         self,
         run_id: str,
@@ -2084,12 +2514,15 @@ class CoordinatorBroker:
 
     def _pump_once(self) -> None:
         with self._db_lock, self._connect() as db:
+            self._maintain_child_cpu_leases(db)
             active = db.execute(
                 "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
             ).fetchall()
             self._validate_active_set(active)
             for row in active:
                 self._observe_active(db, row)
+
+            self._maintain_child_cpu_leases(db)
 
             # Observation may have completed any number of workers.  Admission reasons
             # from the durable rows again, in the same transaction.
@@ -2921,6 +3354,35 @@ def _validate_command(command: Any) -> list[str]:
     return list(command)
 
 
+@dataclass
+class ChildCpuLease:
+    """One granted share of an admitted run's finite CPU worker-token budget."""
+
+    lease_id: str
+    run_id: str
+    requested: int
+    minimum: int
+    granted: int
+    _client: "CoordinatorClient" = field(repr=False)
+    _released: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def full(self) -> bool:
+        return self.granted == self.requested
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._client.release_child_cpu_lease(self.lease_id)
+        self._released = True
+
+    def __enter__(self) -> "ChildCpuLease":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.release()
+
+
 class CoordinatorClient:
     """Strict synchronous client over the user-only durable spool.
 
@@ -3093,6 +3555,98 @@ class CoordinatorClient:
     def clear(self) -> dict[str, int]:
         self._ensure_broker()
         return self._catalogue().clear()
+
+    def acquire_child_cpu_lease(
+        self,
+        requested: int,
+        *,
+        minimum: int | None = None,
+        timeout: float | None = None,
+        run_id: str | None = None,
+        poll_interval: float = CHILD_LEASE_POLL_SECONDS,
+    ) -> ChildCpuLease:
+        """Wait for an exact or partial CPU-token grant inside the admitted worker tree."""
+        if timeout is not None and (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout < 0
+        ):
+            raise CoordinatorError("child CPU lease timeout must be non-negative or null")
+        if poll_interval <= 0:
+            raise CoordinatorError("child CPU lease poll interval must be positive")
+        marker = os.environ.get(RUN_ID_ENV)
+        selected_run = marker if run_id is None else run_id
+        if not selected_run:
+            raise CoordinatorError(
+                "child CPU leases are available only inside an admitted AGCoord run"
+            )
+        if marker != selected_run:
+            raise CoordinatorError(
+                "child CPU lease parent does not match the admitted run context"
+            )
+        state_marker = os.environ.get(STATE_DIR_ENV)
+        if not state_marker or _absolute(state_marker) != self.paths.state_dir:
+            raise CoordinatorError(
+                "child CPU lease state does not match the admitted run context"
+            )
+        selected_minimum = requested if minimum is None else minimum
+        self._ensure_broker()
+        row = self._catalogue().request_child_cpu_lease(
+            selected_run,
+            requested=requested,
+            minimum=selected_minimum,
+        )
+        lease_id = row["lease_id"]
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while row["status"] == "waiting":
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.cancel_child_cpu_lease(lease_id)
+                    raise CoordinatorError(
+                        f"timed out waiting for child CPU lease {lease_id}"
+                    )
+                time.sleep(poll_interval)
+                row = self._catalogue().child_cpu_lease_status(lease_id)
+        except BaseException:
+            try:
+                current = self._catalogue().child_cpu_lease_status(lease_id)
+                if current["status"] in {"waiting", "active"}:
+                    self._catalogue().cancel_child_cpu_lease(lease_id)
+            except CoordinatorError:
+                pass
+            raise
+        if row["status"] != "active":
+            raise CoordinatorError(
+                f"child CPU lease {lease_id} ended as {row['status']} before grant"
+            )
+        return ChildCpuLease(
+            lease_id=lease_id,
+            run_id=row["run_id"],
+            requested=row["requested"],
+            minimum=row["minimum"],
+            granted=row["granted"],
+            _client=self,
+        )
+
+    def child_cpu_leases(
+        self,
+        run_id: str | None = None,
+        *,
+        include_terminal: bool = False,
+    ) -> list[dict[str, Any]]:
+        self._ensure_broker()
+        return self._catalogue().child_cpu_leases(
+            run_id,
+            include_terminal=include_terminal,
+        )
+
+    def release_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
+        self._ensure_broker()
+        return self._catalogue().release_child_cpu_lease(lease_id)
+
+    def cancel_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
+        self._ensure_broker()
+        return self._catalogue().cancel_child_cpu_lease(lease_id)
 
     def verify_admission(
         self,

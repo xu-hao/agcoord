@@ -47,6 +47,12 @@ agc full \
   -- python -m pytest -q
 ```
 
+When one admitted gate starts multiple worker-owning tools concurrently, each controller
+must acquire a [child CPU lease](coordinator.md#child-cpu-leases-for-parallel-tools) and use
+the granted count. Do not give every tool the gate's complete CPU allocation through one
+gate-wide environment value. Tool-specific translation, such as mapping a lease to a test
+runner's worker option, belongs in that tool's adapter rather than the coordinator core.
+
 Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is a barrier for its repository, not an undeclared
 machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside

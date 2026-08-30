@@ -10,6 +10,10 @@ versioning; dates use ISO 8601.
 - Add typed resource bindings, explicit admission-only/best-effort/required modes, sanitized
   backend capability probes, and durable requested/applied/peak/event receipts. Protocol-1 and
   protocol-2 history migrates without reinterpreting legacy resource names as enforced limits.
+- Add authenticated child CPU leases so concurrent tools inside one admitted run can fairly
+  divide its declared CPU budget with exact or partial grants, cancellation, crash reclamation,
+  and broker recovery without nested jobs or extra history rows. Protocol 3 requires an explicit
+  migration that preserves terminal history while adding the durable lease catalogue.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 

@@ -1,6 +1,7 @@
 """Machine-local coordination for development agents and repository gates."""
 
 from .queue import (
+    ChildCpuLease,
     CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
@@ -9,6 +10,7 @@ from .queue import (
 )
 
 __all__ = [
+    "ChildCpuLease",
     "CoordinatorBroker",
     "CoordinatorClient",
     "CoordinatorError",
