@@ -5,6 +5,9 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
+  require vertical scrolling, without removing the visible gutters between columns.
+
 ## 0.1.1 — 2026-08-30
 
 - Replace the cartoon character with a naturalist botanical gourd while retaining
