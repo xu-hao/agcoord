@@ -282,13 +282,18 @@ Refresh preserves the selected run and both viewport offsets when that row still
 At 80 columns the compact table is exactly `STATE · KIND · REPO · RUN · LABEL · AGE · DUR`
 and does not require horizontal navigation. Adjacent columns retain a visible gutter, and a
 value wider than its compact cell ends in a visible ellipsis instead of running into the next
-column or disappearing at a hard edge. `AGE` is time since creation; `DUR` is absent before
-start, live while running, and fixed at finish. Full agent, repository and worktree identity,
-label, checkout, branch, barrier, resources, blockers, command, exact created/started/finished
-timestamps, head, receipt, publication, phase, gate exit, and failure values remain available
-without abbreviation in persistent selection detail and the detail view. A land remains one
-selected row as it moves from gating to publishing, and `l` reads one combined
-gate-and-publication transcript rather than separate run logs.
+column or disappearing at a hard edge. `REPO` shows the compact repository name derived
+from the credential-free normalized remote identity, or from the local Git identity when the
+checkout has no remote. The repository-filter header and persistent selection detail retain
+the complete readable value so equal basenames remain distinguishable. The hashed
+`repository_id` remains the internal lane/filter key and is available with the full repository
+and worktree identities in the detail view. `AGE` is time since creation; `DUR` is absent
+before start, live while running, and fixed at finish. Full agent, label, checkout, branch,
+barrier, resources, blockers, command, exact created/started/finished timestamps, head,
+receipt, publication, phase, gate exit, and failure values remain available without
+abbreviation in persistent selection detail and the detail view. A land remains one selected
+row as it moves from gating to publishing, and `l` reads one combined gate-and-publication
+transcript rather than separate run logs.
 
 ## Worker scratch and cleanup
 
