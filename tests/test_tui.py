@@ -290,6 +290,38 @@ async def test_rendered_table_separates_columns_and_marks_truncated_detail_value
 
 
 @pytest.mark.asyncio
+async def test_default_width_long_queue_keeps_gutters_without_horizontal_scrollbar():
+    snapshot = _snapshot()
+    snapshot["active"] = []
+    snapshot["queued"] = []
+    snapshot["recent"] = [
+        _row(
+            f"check-scroll-{number:02d}",
+            number,
+            "passed",
+            label=f"completed check {number}",
+        )
+        for number in range(30)
+    ]
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _settled(pilot)
+
+        table = _table(app)
+        rendered_row = table.render_line(table.header_height).text
+        assert table.show_vertical_scrollbar
+        assert re.search(r"\bpassed +check\b", rendered_row), rendered_row
+        assert not table.show_horizontal_scrollbar, (
+            f"size={table.size!r} virtual={table.virtual_size!r} "
+            f"gutter={table.scrollbar_gutter!r} "
+            f"scrollbar_space={table.scrollbars_space!r} "
+            f"max_scroll_x={table.max_scroll_x}"
+        )
+        assert table.max_scroll_x == 0
+
+
+@pytest.mark.asyncio
 async def test_label_uses_wide_terminal_space_and_returns_to_compact_ellipsis():
     full_label = "integration release validation"
     snapshot = _snapshot()

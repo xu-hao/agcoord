@@ -39,6 +39,25 @@ def _label_width(viewport_width: int) -> int:
     return _COMPACT_LABEL_WIDTH + max(0, viewport_width - _COMPACT_TABLE_WIDTH)
 
 
+def _fitted_label_width(table: DataTable, row_count: int) -> int:
+    """Fit LABEL around a required vertical scrollbar at supported widths."""
+    preferred = _label_width(table.size.width)
+    header_height = table.header_height if table.show_header else 0
+    needs_vertical_scrollbar = row_count + header_height > table.size.height
+    if table.size.width < _COMPACT_TABLE_WIDTH or not needs_vertical_scrollbar:
+        return preferred
+
+    columns = table.ordered_columns
+    label_index = 4
+    fixed_render_width = sum(
+        column.width
+        for index, column in enumerate(columns)
+        if index != label_index
+    ) + 2 * table.cell_padding * len(columns)
+    available_width = table.size.width - table.scrollbar_size_vertical
+    return max(1, min(preferred, available_width - fixed_render_width))
+
+
 async def _off_loop(operation: Callable[[], object]) -> object:
     """Run bounded coordinator I/O without owning the event loop's default executor."""
     loop = asyncio.get_running_loop()
@@ -422,7 +441,6 @@ def build_app(
             selected = self._selected_id()
             table = self.query_one("#gates", DataTable)
             viewport = (table.scroll_x, table.scroll_y)
-            table.ordered_columns[4].width = _label_width(table.size.width)
             all_rows = [
                 *snapshot["active"],
                 *snapshot["queued"],
@@ -439,6 +457,7 @@ def build_app(
             if self._agent_filter is not None:
                 ordered = [row for row in ordered if row["agent"] == self._agent_filter]
             self._rows = {row["run_id"]: row for row in ordered}
+            table.ordered_columns[4].width = _fitted_label_width(table, len(ordered))
             table.clear(columns=False)
             now = _moment(snapshot["captured_at"]) or datetime.now(timezone.utc)
             for row in ordered:
