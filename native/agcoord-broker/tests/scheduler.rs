@@ -1,7 +1,7 @@
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BROKER: &str = env!("CARGO_BIN_EXE_agcoord-broker");
+const MIB: u64 = 1024 * 1024;
 
 struct TestDirectory(PathBuf);
 
@@ -204,6 +205,18 @@ fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("condition was not satisfied within {timeout:?}");
+}
+
+fn wait_for_nonempty_file(path: &Path, timeout: Duration) -> Vec<u8> {
+    let mut contents = None;
+    wait_for(timeout, || match fs::read(path) {
+        Ok(value) if !value.is_empty() => {
+            contents = Some(value);
+            true
+        }
+        _ => false,
+    });
+    contents.unwrap()
 }
 
 fn run(arguments: &[&str]) -> Output {
@@ -511,6 +524,30 @@ fn append_command(path: &Path, value: &str) -> Vec<String> {
         value.to_owned(),
         path.to_str().unwrap().to_owned(),
     ]
+}
+
+fn write_project_quota_config(state: &Path, mode: &str) {
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "disk": {
+                    "backend": "project-quota",
+                    "kind": "storage",
+                    "mode": mode,
+                    "unit": "bytes"
+                },
+                "disk_inodes": {
+                    "backend": "project-quota",
+                    "kind": "inodes",
+                    "mode": mode,
+                    "unit": "inodes"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 fn create_legacy_database(state: &Path, checkout: &Path, selected_protocol: u64) {
@@ -1348,6 +1385,1093 @@ fn best_effort_cgroup_binding_runs_unenforced_when_delegation_is_unavailable() {
                 && event["code"] == "not-cgroup-v2")
     );
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn project_quota_fixture_provisions_private_scratch_and_retains_usage() {
+    let temporary = TestDirectory::new("project-quota-fixture");
+    let fixture = temporary.path().join("quota-filesystem");
+    let state = fixture.join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("report.json");
+    for path in [&fixture, &state, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "disk": {
+                    "backend": "project-quota",
+                    "kind": "storage",
+                    "mode": "required",
+                    "unit": "bytes"
+                },
+                "disk_inodes": {
+                    "backend": "project-quota",
+                    "kind": "inodes",
+                    "mode": "required",
+                    "unit": "inodes"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &["--project-quota-fixture", fixture.to_str().unwrap()],
+    );
+    let machine = snapshot(&state).unwrap();
+    assert_eq!(
+        machine["resource_capabilities"]["project-quota"]["available"],
+        true
+    );
+
+    let command = vec![
+        "/usr/bin/python3".to_owned(),
+        "-c".to_owned(),
+        "import ctypes,json,os,pathlib,sys; target=pathlib.Path(os.environ['TMPDIR']); (target/'payload').write_bytes(b'x'*8192); status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in line}; libc=ctypes.CDLL(None,use_errno=True); ctypes.set_errno(0); reacquire=libc.prctl(47,2,21,0,0); pathlib.Path(sys.argv[1]).write_text(json.dumps({'target':str(target),'mode':target.stat().st_mode & 0o777,'caps':[status[name] for name in ('CapEff','CapPrm','CapInh','CapAmb')],'no_new_privs':status['NoNewPrivs'],'reacquire':[reacquire,ctypes.get_errno()]}))".to_owned(),
+        report.to_str().unwrap().to_owned(),
+    ];
+    let submission = Submission {
+        run_id: "project-quota-fixture",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command,
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        )
+        .status
+        .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let target = PathBuf::from(observed["target"].as_str().unwrap());
+    assert_eq!(observed["mode"], 0o700);
+    assert_eq!(
+        observed["caps"],
+        json!([
+            "0000000000000000",
+            "0000000000000000",
+            "0000000000000000",
+            "0000000000000000"
+        ])
+    );
+    assert_eq!(observed["no_new_privs"], "1");
+    assert_eq!(observed["reacquire"], json!([-1, libc::EPERM]));
+    assert_eq!(
+        passed["resource_receipt"]["applied"],
+        json!({"disk": 8 * 1024 * 1024, "disk_inodes": 64})
+    );
+    assert!(passed["resource_receipt"]["peak"]["disk"].as_u64().unwrap() >= 8192);
+    assert!(
+        passed["resource_receipt"]["peak"]["disk_inodes"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    assert!(!target.exists());
+    assert!(
+        fs::read_dir(state.join("project-quota").join("runs"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn project_quota_fixture_refuses_incomplete_misaligned_or_mixed_policies() {
+    let temporary = TestDirectory::new("project-quota-policy-refusals");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let cases = [
+        (
+            "missing-inodes",
+            json!({
+                "disk": {"backend":"project-quota", "kind":"storage", "mode":"required", "unit":"bytes"},
+                "disk_inodes": {"backend":"project-quota", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            }),
+            vec![("disk", 8 * 1024 * 1024)],
+            "quota-policy-incomplete",
+        ),
+        (
+            "misaligned-bytes",
+            json!({
+                "disk": {"backend":"project-quota", "kind":"storage", "mode":"required", "unit":"bytes"},
+                "disk_inodes": {"backend":"project-quota", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            }),
+            vec![("disk", 8 * 1024 * 1024 + 1), ("disk_inodes", 64)],
+            "quota-byte-alignment-invalid",
+        ),
+        (
+            "mixed-modes",
+            json!({
+                "disk": {"backend":"project-quota", "kind":"storage", "mode":"required", "unit":"bytes"},
+                "disk_inodes": {"backend":"project-quota", "kind":"inodes", "mode":"best-effort", "unit":"inodes"}
+            }),
+            vec![("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            "quota-mode-mismatch",
+        ),
+    ];
+    for (name, bindings, requested, expected_code) in cases {
+        let fixture = temporary.path().join(format!("fixture-{name}"));
+        let state = fixture.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("config.json"),
+            serde_json::to_vec(&json!({"bindings": bindings})).unwrap(),
+        )
+        .unwrap();
+        let mut capacities = vec![
+            ("jobs", 1),
+            ("disk", 16 * 1024 * 1024),
+            ("disk_inodes", 128),
+        ];
+        if name == "missing-inodes" {
+            capacities.retain(|(resource, _)| *resource != "disk_inodes");
+        }
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &capacities,
+            &["--project-quota-fixture", fixture.to_str().unwrap()],
+        );
+        let marker = temporary.path().join(format!("must-not-run-{name}"));
+        let submission = Submission {
+            run_id: name,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(&state, &submission, &requested)
+                .status
+                .success()
+        );
+        let failed = wait_status(&state, name, "failed");
+        assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+        assert!(
+            failed["resource_receipt"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["stage"] == "prepare" && event["code"] == expected_code),
+            "{name}: {failed}"
+        );
+        assert!(!marker.exists());
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn unavailable_project_quota_obeys_required_or_best_effort_fallback() {
+    let temporary = TestDirectory::new("project-quota-unavailable");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    for (mode, expected_status, ran) in [
+        ("required", "failed", false),
+        ("best-effort", "passed", true),
+    ] {
+        let fixture = temporary.path().join(format!("missing-{mode}"));
+        let state = temporary.path().join(format!("state-{mode}"));
+        fs::create_dir(&state).unwrap();
+        write_project_quota_config(&state, mode);
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            &["--project-quota-fixture", fixture.to_str().unwrap()],
+        );
+        assert_eq!(
+            snapshot(&state).unwrap()["resource_capabilities"]["project-quota"]["reason"],
+            "quota-root-unavailable"
+        );
+        let marker = temporary.path().join(format!("ran-{mode}"));
+        let submission = Submission {
+            run_id: mode,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(
+                &state,
+                &submission,
+                &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            )
+            .status
+            .success()
+        );
+        let finished = wait_status(&state, mode, expected_status);
+        assert_eq!(marker.exists(), ran);
+        assert_eq!(
+            finished["resource_receipt"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["code"] == "quota-root-unavailable")
+                .count(),
+            2
+        );
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn project_quota_worker_privilege_refusal_always_fails_closed() {
+    let temporary = TestDirectory::new("project-quota-privilege-refusal");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    for mode in ["required", "best-effort"] {
+        let fixture = temporary.path().join(format!("fixture-{mode}"));
+        let state = fixture.join("state");
+        fs::create_dir_all(&state).unwrap();
+        write_project_quota_config(&state, mode);
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            &[
+                "--project-quota-fixture",
+                fixture.to_str().unwrap(),
+                "--worker-fault",
+                "privilege-verification",
+            ],
+        );
+        let marker = temporary.path().join(format!("must-not-run-{mode}"));
+        let submission = Submission {
+            run_id: mode,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(
+                &state,
+                &submission,
+                &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            )
+            .status
+            .success()
+        );
+        let failed = wait_status(&state, mode, "failed");
+        assert_eq!(failed["exit_status"], 125);
+        assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+        assert!(!marker.exists());
+        assert_eq!(
+            failed["resource_receipt"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["code"] == "worker-privilege-drop-unverified")
+                .count(),
+            2
+        );
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn project_quota_fixture_keeps_parallel_allocations_distinct() {
+    let temporary = TestDirectory::new("project-quota-parallel");
+    let fixture = temporary.path().join("fixture");
+    let state = fixture.join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    write_project_quota_config(&state, "required");
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 2), ("disk", 8 * 1024 * 1024), ("disk_inodes", 128)],
+        &["--project-quota-fixture", fixture.to_str().unwrap()],
+    );
+    let script = "import os,pathlib,sys,time; target=pathlib.Path(os.environ['TMPDIR']); (target/'payload').write_bytes(b'x'*4096); pathlib.Path(sys.argv[1]).write_text(str(target)); release=pathlib.Path(sys.argv[2]);\nwhile not release.exists(): time.sleep(.01)";
+    let mut submissions = Vec::new();
+    for (name, repository) in [
+        ("quota-parallel-a", "repo-a"),
+        ("quota-parallel-b", "repo-b"),
+    ] {
+        let report = temporary.path().join(format!("{name}.path"));
+        let release = temporary.path().join(format!("{name}.release"));
+        let submission = Submission {
+            run_id: name,
+            kind: "check",
+            repository,
+            checkout: &checkout,
+            command: vec![
+                "/usr/bin/python3".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                report.to_str().unwrap().to_owned(),
+                release.to_str().unwrap().to_owned(),
+            ],
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(
+                &state,
+                &submission,
+                &[("disk", 4 * 1024 * 1024), ("disk_inodes", 32)],
+            )
+            .status
+            .success()
+        );
+        submissions.push((name, report, release));
+    }
+    let targets: Vec<_> = submissions
+        .iter()
+        .map(|(_, report, _)| {
+            PathBuf::from(
+                String::from_utf8(wait_for_nonempty_file(report, Duration::from_secs(5))).unwrap(),
+            )
+        })
+        .collect();
+    assert_ne!(targets[0], targets[1]);
+    assert!(targets.iter().all(|target| target.is_dir()));
+    for (_, _, release) in &submissions {
+        fs::write(release, "release").unwrap();
+    }
+    for (name, _, _) in &submissions {
+        let passed = wait_status(&state, name, "passed");
+        assert_eq!(
+            passed["resource_receipt"]["applied"],
+            json!({"disk": 4 * 1024 * 1024, "disk_inodes": 32})
+        );
+    }
+    assert!(targets.iter().all(|target| !target.exists()));
+    let registry: Value = serde_json::from_slice(
+        &fs::read(fixture.join(".agcoord-project-quota-fixture.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registry["projects"], json!({}));
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn project_quota_cancellation_retains_terminal_usage_before_cleanup() {
+    let temporary = TestDirectory::new("project-quota-cancel");
+    let fixture = temporary.path().join("fixture");
+    let state = fixture.join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("target.path");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    write_project_quota_config(&state, "required");
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &["--project-quota-fixture", fixture.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "project-quota-cancel",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "import os,pathlib,sys,time; target=pathlib.Path(os.environ['TMPDIR']); (target/'payload').write_bytes(b'x'*8192); pathlib.Path(sys.argv[1]).write_text(str(target));\nwhile True: time.sleep(1)".to_owned(),
+            report.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        )
+        .status
+        .success()
+    );
+    let target = PathBuf::from(
+        String::from_utf8(wait_for_nonempty_file(&report, Duration::from_secs(5))).unwrap(),
+    );
+    assert!(
+        run(&[
+            "cancel",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            submission.run_id,
+        ])
+        .status
+        .success()
+    );
+    let cancelled = wait_status(&state, submission.run_id, "cancelled");
+    assert!(
+        cancelled["resource_receipt"]["peak"]["disk"]
+            .as_u64()
+            .unwrap()
+            >= 8192
+    );
+    assert!(
+        cancelled["resource_receipt"]["peak"]["disk_inodes"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    let codes: BTreeSet<_> = cancelled["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(codes.contains("cancelled"));
+    assert!(codes.contains("finished"));
+    assert!(codes.contains("cleaned"));
+    assert!(!target.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn replacement_recovers_live_project_quota_state_and_cleans_owned_data() {
+    let temporary = TestDirectory::new("project-quota-recovery");
+    let fixture = temporary.path().join("fixture");
+    let state = fixture.join("state");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered.path");
+    let release = temporary.path().join("release");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    write_project_quota_config(&state, "required");
+    let fixture_argument = fixture.to_str().unwrap();
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &[
+            "--project-quota-fixture",
+            fixture_argument,
+            "--crash-after",
+            "worker-release",
+        ],
+    );
+    let submission = Submission {
+        run_id: "project-quota-recovery",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "import os,pathlib,sys,time; target=pathlib.Path(os.environ['TMPDIR']); (target/'survives').write_bytes(b'x'*8192); pathlib.Path(sys.argv[1]).write_text(str(target)); release=pathlib.Path(sys.argv[2]);\nwhile not release.exists(): time.sleep(.01)".to_owned(),
+            entered.to_str().unwrap().to_owned(),
+            release.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        )
+        .status
+        .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    let target = PathBuf::from(
+        String::from_utf8(wait_for_nonempty_file(&entered, Duration::from_secs(5))).unwrap(),
+    );
+    let original_pid = status(&state, submission.run_id)["worker_pid"].clone();
+    let mut replacement = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &["--project-quota-fixture", fixture_argument],
+    );
+    assert_eq!(
+        status(&state, submission.run_id)["worker_pid"],
+        original_pid
+    );
+    fs::write(&release, "release").unwrap();
+    let interrupted = wait_status(&state, submission.run_id, "interrupted");
+    assert_eq!(interrupted["failure_reason"], "worker-result-lost");
+    assert!(
+        interrupted["resource_receipt"]["peak"]["disk"]
+            .as_u64()
+            .unwrap()
+            >= 8192
+    );
+    let codes: BTreeSet<_> = interrupted["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(codes.contains("finished"));
+    assert!(codes.contains("cleaned"));
+    assert!(!target.exists());
+    assert!(replacement.terminate().success());
+}
+
+#[test]
+fn project_quota_identity_and_setup_crashes_reclaim_without_execution() {
+    let temporary = TestDirectory::new("project-quota-pre-release-crashes");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    for crash_point in ["worker-identity-commit", "worker-setup-commit"] {
+        let fixture = temporary.path().join(format!("fixture-{crash_point}"));
+        let state = fixture.join("state");
+        fs::create_dir_all(&state).unwrap();
+        write_project_quota_config(&state, "required");
+        let fixture_argument = fixture.to_str().unwrap();
+        let marker = temporary.path().join(format!("must-not-run-{crash_point}"));
+        let mut crashing = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            &[
+                "--project-quota-fixture",
+                fixture_argument,
+                "--crash-after",
+                crash_point,
+            ],
+        );
+        let submission = Submission {
+            run_id: crash_point,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(
+                &state,
+                &submission,
+                &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            )
+            .status
+            .success()
+        );
+        assert_eq!(crashing.wait().code(), Some(86));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists());
+        let mut replacement = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+            &["--project-quota-fixture", fixture_argument],
+        );
+        let interrupted = wait_status(&state, crash_point, "interrupted");
+        assert_eq!(interrupted["failure_reason"], "worker-result-lost");
+        assert!(!marker.exists());
+        assert!(
+            fs::read_dir(state.join("project-quota").join("runs"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        let registry: Value = serde_json::from_slice(
+            &fs::read(fixture.join(".agcoord-project-quota-fixture.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry["projects"], json!({}));
+        assert!(replacement.terminate().success());
+    }
+}
+
+#[test]
+fn replacement_refuses_a_changed_project_quota_handle_without_mutation() {
+    let temporary = TestDirectory::new("project-quota-handle-mismatch");
+    let fixture = temporary.path().join("fixture");
+    let state = fixture.join("state");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("must-not-run");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    write_project_quota_config(&state, "required");
+    let fixture_argument = fixture.to_str().unwrap();
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &[
+            "--project-quota-fixture",
+            fixture_argument,
+            "--crash-after",
+            "worker-identity-commit",
+        ],
+    );
+    let submission = Submission {
+        run_id: "project-quota-handle-mismatch",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        )
+        .status
+        .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    let database = state.join("queue.sqlite3");
+    let db = Connection::open(&database).unwrap();
+    let original_state: String = db
+        .query_row(
+            "SELECT resource_state_json FROM runs WHERE run_id = ?1",
+            params![submission.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut changed: Value = serde_json::from_str(&original_state).unwrap();
+    changed["project-quota"]["handle"]["token"] = json!("00000000000000000000000000000000");
+    let changed_state = serde_json::to_string(&changed).unwrap();
+    db.execute(
+        "UPDATE runs SET resource_state_json = ?1 WHERE run_id = ?2",
+        params![changed_state, submission.run_id],
+    )
+    .unwrap();
+    drop(db);
+    let manifest = fs::read_dir(state.join("project-quota"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("run-"))
+        })
+        .unwrap();
+    let manifest_before = fs::read(&manifest).unwrap();
+    let registry_path = fixture.join(".agcoord-project-quota-fixture.json");
+    let registry_before = fs::read(&registry_path).unwrap();
+
+    let refused = run(&[
+        "serve",
+        "--state-dir",
+        state_argument(&state),
+        "--capacity",
+        "jobs=1",
+        "--capacity",
+        "disk=8388608",
+        "--capacity",
+        "disk_inodes=64",
+        "--project-quota-fixture",
+        fixture_argument,
+    ]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-row-invalid"
+    );
+    assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+    assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+    let db = Connection::open(&database).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT resource_state_json FROM runs WHERE run_id = ?1",
+            params![submission.run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        changed_state
+    );
+    db.execute(
+        "UPDATE runs SET resource_state_json = ?1 WHERE run_id = ?2",
+        params![original_state, submission.run_id],
+    )
+    .unwrap();
+    drop(db);
+    let mut replacement = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &["--project-quota-fixture", fixture_argument],
+    );
+    wait_status(&state, submission.run_id, "interrupted");
+    assert!(!marker.exists());
+    assert!(!manifest.exists());
+    assert!(replacement.terminate().success());
+}
+
+#[test]
+fn project_quota_cleanup_refuses_a_replaced_tree_without_removing_it() {
+    let temporary = TestDirectory::new("project-quota-tree-reuse");
+    let fixture = temporary.path().join("fixture");
+    let state = fixture.join("state");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered.path");
+    let release = temporary.path().join("release");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    write_project_quota_config(&state, "required");
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        &["--project-quota-fixture", fixture.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "project-quota-tree-reuse",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "import os,pathlib,sys,time; target=pathlib.Path(os.environ['TMPDIR']); (target/'owned').write_text('owned'); pathlib.Path(sys.argv[1]).write_text(str(target)); release=pathlib.Path(sys.argv[2]);\nwhile not release.exists(): time.sleep(.01)".to_owned(),
+            entered.to_str().unwrap().to_owned(),
+            release.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+        )
+        .status
+        .success()
+    );
+    let target = PathBuf::from(
+        String::from_utf8(wait_for_nonempty_file(&entered, Duration::from_secs(5))).unwrap(),
+    );
+    fs::remove_dir_all(&target).unwrap();
+    fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let replacement = target.join("replacement");
+    fs::write(&replacement, "must survive").unwrap();
+    fs::write(&release, "release").unwrap();
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert!(target.is_dir());
+    assert_eq!(fs::read_to_string(&replacement).unwrap(), "must survive");
+    assert!(
+        passed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["code"] == "quota-tree-reused" && event["status"] == "failed")
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn real_ext4_project_quota_enforces_bytes_inodes_and_parallel_identity() {
+    if std::env::var_os("AGCOORD_TEST_PROJECT_QUOTA").as_deref() != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    for command in ["mkfs.ext4", "mount", "umount"] {
+        assert!(
+            Command::new("/usr/bin/env")
+                .args(["sh", "-c", &format!("command -v {command}")])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "{command} is required for the real quota test"
+        );
+    }
+    let temporary = TestDirectory::new("real-project-quota");
+    let image = temporary.path().join("project-quota.ext4");
+    let mountpoint = temporary.path().join("mounted");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&mountpoint).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    File::create(&image)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-O", "quota,project", "-Q", "prjquota"])
+            .arg(&image)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("mount")
+            .args(["-o", "loop,prjquota"])
+            .arg(&image)
+            .arg(&mountpoint)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _mount = MountGuard(mountpoint.clone());
+    let state = mountpoint.join("state");
+    fs::create_dir(&state).unwrap();
+    write_project_quota_config(&state, "required");
+    let mut broker = RunningBroker::start(
+        &state,
+        &[
+            ("jobs", 2),
+            ("disk", 16 * 1024 * 1024),
+            ("disk_inodes", 256),
+        ],
+    );
+    assert_eq!(
+        snapshot(&state).unwrap()["resource_capabilities"]["project-quota"]["available"],
+        true
+    );
+
+    let byte_report = temporary.path().join("byte-report.json");
+    let byte_submission = Submission {
+        run_id: "real-project-quota-bytes",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            r#"import errno,json,os,pathlib,sys
+target=pathlib.Path(os.environ['TMPDIR'])
+fd=os.open(target/'payload', os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+written=0
+limited=False
+try:
+    while True:
+        try: written += os.write(fd, b'x'*4096)
+        except OSError as exc:
+            if exc.errno not in (errno.EDQUOT, errno.ENOSPC): raise
+            limited=True
+            break
+finally: os.close(fd)
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'limited':limited,'target':str(target),'written':written}))"#.to_owned(),
+            byte_report.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &byte_submission,
+            &[("disk", 2 * 1024 * 1024), ("disk_inodes", 128)],
+        )
+        .status
+        .success()
+    );
+    let byte_finished = wait_status(&state, byte_submission.run_id, "passed");
+    let byte_observed: Value = serde_json::from_slice(&fs::read(&byte_report).unwrap()).unwrap();
+    assert_eq!(byte_observed["limited"], true);
+    assert!(byte_observed["written"].as_u64().unwrap() > 0);
+    assert!(byte_observed["written"].as_u64().unwrap() <= 2 * 1024 * 1024);
+    assert!(!Path::new(byte_observed["target"].as_str().unwrap()).exists());
+    assert!(
+        byte_finished["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["code"] == "storage-byte-limit-hit")
+    );
+
+    let inode_report = temporary.path().join("inode-report.json");
+    let inode_submission = Submission {
+        run_id: "real-project-quota-inodes",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            r#"import errno,json,os,pathlib,sys
+target=pathlib.Path(os.environ['TMPDIR'])
+created=0
+limited=False
+while True:
+    try:
+        (target/f'item-{created}').touch(exist_ok=False)
+        created += 1
+    except OSError as exc:
+        if exc.errno not in (errno.EDQUOT, errno.ENOSPC): raise
+        limited=True
+        break
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'created':created,'limited':limited,'target':str(target)}))"#.to_owned(),
+            inode_report.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &inode_submission,
+            &[("disk", 8 * 1024 * 1024), ("disk_inodes", 16)],
+        )
+        .status
+        .success()
+    );
+    let inode_finished = wait_status(&state, inode_submission.run_id, "passed");
+    let inode_observed: Value = serde_json::from_slice(&fs::read(&inode_report).unwrap()).unwrap();
+    assert_eq!(inode_observed["limited"], true);
+    assert!(inode_observed["created"].as_u64().unwrap() > 0);
+    assert!(inode_observed["created"].as_u64().unwrap() < 16);
+    assert!(!Path::new(inode_observed["target"].as_str().unwrap()).exists());
+    assert!(
+        inode_finished["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["code"] == "storage-inode-limit-hit")
+    );
+
+    let parallel_script = "import fcntl,json,os,pathlib,struct,sys,time; target=pathlib.Path(os.environ['TMPDIR']); (target/'payload').write_bytes(b'x'*(1024*1024)); raw=bytearray(28); descriptor=os.open(target,os.O_RDONLY|os.O_DIRECTORY); fcntl.ioctl(descriptor,(2<<30)|(28<<16)|(ord('X')<<8)|31,raw,True); os.close(descriptor); project_id=struct.unpack_from('I',raw,12)[0]; pathlib.Path(sys.argv[1]).write_text(json.dumps({'target':str(target),'project_id':project_id})); release=pathlib.Path(sys.argv[2]);\nwhile not release.exists(): time.sleep(.01)";
+    let mut parallel = Vec::new();
+    for (name, repository) in [("real-quota-a", "repo-a"), ("real-quota-b", "repo-b")] {
+        let report = temporary.path().join(format!("{name}.path"));
+        let release = temporary.path().join(format!("{name}.release"));
+        let submission = Submission {
+            run_id: name,
+            kind: "check",
+            repository,
+            checkout: &checkout,
+            command: vec![
+                "/usr/bin/python3".to_owned(),
+                "-c".to_owned(),
+                parallel_script.to_owned(),
+                report.to_str().unwrap().to_owned(),
+                release.to_str().unwrap().to_owned(),
+            ],
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(
+                &state,
+                &submission,
+                &[("disk", 4 * 1024 * 1024), ("disk_inodes", 64)],
+            )
+            .status
+            .success()
+        );
+        parallel.push((name, report, release));
+    }
+    let observations: Vec<Value> = parallel
+        .iter()
+        .map(|(_, report, _)| {
+            serde_json::from_slice(&wait_for_nonempty_file(report, Duration::from_secs(10)))
+                .unwrap()
+        })
+        .collect();
+    let targets: Vec<_> = observations
+        .iter()
+        .map(|observed| PathBuf::from(observed["target"].as_str().unwrap()))
+        .collect();
+    assert_ne!(targets[0], targets[1]);
+    assert_ne!(observations[0]["project_id"], observations[1]["project_id"]);
+    for (_, _, release) in &parallel {
+        fs::write(release, "release").unwrap();
+    }
+    for (name, _, _) in &parallel {
+        wait_status(&state, name, "passed");
+    }
+    assert!(targets.iter().all(|target| !target.exists()));
+    assert!(broker.terminate().success());
+
+    for crash_point in ["worker-identity-commit", "worker-setup-commit"] {
+        let marker = temporary.path().join(format!("{crash_point}-must-not-run"));
+        let mut crashing = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 1), ("disk", 8 * MIB), ("disk_inodes", 64)],
+            &["--crash-after", crash_point],
+        );
+        let submission = Submission {
+            run_id: crash_point,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(
+                &state,
+                &submission,
+                &[("disk", 8 * MIB), ("disk_inodes", 64)],
+            )
+            .status
+            .success()
+        );
+        assert_eq!(crashing.wait().code(), Some(86));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists());
+        let mut replacement = RunningBroker::start(
+            &state,
+            &[("jobs", 1), ("disk", 8 * MIB), ("disk_inodes", 64)],
+        );
+        let interrupted = wait_status(&state, crash_point, "interrupted");
+        assert_eq!(interrupted["failure_reason"], "worker-result-lost");
+        assert!(!marker.exists());
+        assert!(
+            fs::read_dir(state.join("project-quota").join("runs"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(replacement.terminate().success());
+    }
+
+    let crash_entered = temporary.path().join("crash-entered.path");
+    let crash_release = temporary.path().join("crash-release");
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("disk", 8 * MIB), ("disk_inodes", 64)],
+        &["--crash-after", "worker-release"],
+    );
+    let crash_submission = Submission {
+        run_id: "real-project-quota-recovery",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "import os,pathlib,sys,time; target=pathlib.Path(os.environ['TMPDIR']); (target/'survives').write_bytes(b'x'*8192); pathlib.Path(sys.argv[1]).write_text(str(target)); release=pathlib.Path(sys.argv[2]);\nwhile not release.exists(): time.sleep(.01)".to_owned(),
+            crash_entered.to_str().unwrap().to_owned(),
+            crash_release.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &crash_submission,
+            &[("disk", 8 * MIB), ("disk_inodes", 64)],
+        )
+        .status
+        .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    let crash_target = PathBuf::from(
+        String::from_utf8(wait_for_nonempty_file(
+            &crash_entered,
+            Duration::from_secs(5),
+        ))
+        .unwrap(),
+    );
+    let original_pid = status(&state, crash_submission.run_id)["worker_pid"].clone();
+    let mut replacement = RunningBroker::start(
+        &state,
+        &[("jobs", 1), ("disk", 8 * MIB), ("disk_inodes", 64)],
+    );
+    assert_eq!(
+        status(&state, crash_submission.run_id)["worker_pid"],
+        original_pid
+    );
+    fs::write(&crash_release, "release").unwrap();
+    let interrupted = wait_status(&state, crash_submission.run_id, "interrupted");
+    assert_eq!(interrupted["failure_reason"], "worker-result-lost");
+    assert!(
+        interrupted["resource_receipt"]["peak"]["disk"]
+            .as_u64()
+            .unwrap()
+            >= 8192
+    );
+    assert!(!crash_target.exists());
+    assert!(replacement.terminate().success());
 }
 
 #[test]
@@ -3464,6 +4588,124 @@ fn running_owner_retains_the_configuration_loaded_at_startup() {
             == "passed"
     });
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn migration_refuses_live_and_preserves_terminal_project_quota_identity() {
+    let temporary = TestDirectory::new("project-quota-migration");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut bootstrap = RunningBroker::start(&state, &[("jobs", 1)]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "legacy-full",
+            kind: "full",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: vec!["/usr/bin/true".to_owned()],
+            gate_run_id: None,
+        },
+    );
+    wait_status(&state, "legacy-full", "passed");
+    assert!(bootstrap.terminate().success());
+    let resources = json!({"disk": 8 * MIB, "disk_inodes": 64, "jobs": 1});
+    let contract = json!({
+        "disk": {"backend":"project-quota", "kind":"storage", "mode":"required", "unit":"bytes"},
+        "disk_inodes": {"backend":"project-quota", "kind":"inodes", "mode":"required", "unit":"inodes"},
+        "jobs": {"backend":null, "kind":"generic", "mode":"admission-only", "unit":"admission-unit"}
+    });
+    let receipt = json!({
+        "requested": resources,
+        "applied": {"disk": 8 * MIB, "disk_inodes": 64},
+        "peak": {"disk": 4096, "disk_inodes": 2},
+        "events": [
+            {"at":"2026-08-31T00:00:01Z", "backend":"project-quota", "resource":"disk", "stage":"attach", "status":"applied", "code":"quota-ready"},
+            {"at":"2026-08-31T00:00:01Z", "backend":"project-quota", "resource":"disk_inodes", "stage":"attach", "status":"applied", "code":"quota-ready"}
+        ]
+    });
+    let resource_state = json!({
+        "project-quota": {
+            "handle": {
+                "version": 1,
+                "token": "0123456789abcdef0123456789abcdef",
+                "project_id": 1500000042_u64,
+                "path": "/managed/project-quota/run-identity-0123456789ab",
+                "path_device": 41,
+                "path_inode": 42,
+                "filesystem": "ext4",
+                "mount_device": "8:30",
+                "hard_bytes": 8 * MIB,
+                "hard_inodes": 64
+            },
+            "resources": ["disk", "disk_inodes"],
+            "finished": false,
+            "cancelled": false
+        }
+    });
+    let encoded = (
+        serde_json::to_string(&resources).unwrap(),
+        serde_json::to_string(&contract).unwrap(),
+        serde_json::to_string(&receipt).unwrap(),
+        serde_json::to_string(&resource_state).unwrap(),
+    );
+    let database = state.join("queue.sqlite3");
+    let db = Connection::open(&database).unwrap();
+    db.execute("DELETE FROM coordinator_meta WHERE key != 'protocol'", [])
+        .unwrap();
+    db.execute(
+        "UPDATE coordinator_meta SET value='4' WHERE key='protocol'",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE runs SET status='running', phase='running', finished_at=NULL,
+             exit_status=NULL, resources_json=?1, resource_contract_json=?2,
+             resource_receipt_json=?3, resource_state_json=?4
+         WHERE run_id='legacy-full'",
+        params![encoded.0, encoded.1, encoded.2, encoded.3],
+    )
+    .unwrap();
+    drop(db);
+
+    let refused = run(&["migrate", "--state-dir", state_argument(&state)]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-migration-live-runs"
+    );
+    let db = Connection::open(&database).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT resource_state_json FROM runs WHERE run_id='legacy-full'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        encoded.3
+    );
+    db.execute(
+        "UPDATE runs SET status='interrupted', phase='complete',
+             finished_at='2026-08-31T00:00:02Z', exit_status=125
+         WHERE run_id='legacy-full'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let migrated = json_output(&["migrate", "--state-dir", state_argument(&state)]);
+    assert_eq!(migrated["from_protocol"], 4);
+    assert_eq!(migrated["to_protocol"], 5);
+    let db = Connection::open(&database).unwrap();
+    let preserved: (String, String, String) = db
+        .query_row(
+            "SELECT resource_contract_json, resource_receipt_json, resource_state_json
+             FROM runs WHERE run_id='legacy-full'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(preserved, (encoded.1, encoded.2, encoded.3));
 }
 
 #[test]

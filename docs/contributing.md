@@ -78,6 +78,20 @@ loop-backed ext4 image, run buffered and direct workloads, and unmount only that
 filesystem. The native test covers symmetric and directional bandwidth and IOPS units plus I/O
 weight.
 
+Exercise the native persistent-scratch owner against a real ext4 project-quota filesystem with:
+
+```bash
+AGCOORD_TEST_PROJECT_QUOTA=1 \
+  agc run --label "native real project-quota tests" --resource cpu=1 -- \
+  cargo test -p agcoord-broker --test scheduler \
+  real_ext4_project_quota_enforces_bytes_inodes_and_parallel_identity --offline
+```
+
+Run this opt-in test as init-namespace root on an exclusive disposable host with `mkfs.ext4`,
+`mount`, and `umount` available. It owns a loop-backed image and mount, proves byte and inode
+exhaustion, parallel project identity, cleanup, and replacement-broker crash recovery, and
+unmounts only its test-owned filesystem.
+
 Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is a barrier for its repository, not an undeclared
 machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside

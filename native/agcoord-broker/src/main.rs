@@ -2,6 +2,7 @@ mod broker;
 mod cgroup;
 mod error;
 mod platform;
+mod project_quota;
 mod resources;
 mod store;
 mod worker;
@@ -137,6 +138,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
     let mut crash_after = None;
     let mut worker_fault = None;
     let mut cgroup_fixture = None;
+    let mut project_quota_fixture = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -199,6 +201,16 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                     "--cgroup-fixture",
                 )?));
             }
+            "--project-quota-fixture" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --project-quota-fixture"));
+                }
+                project_quota_fixture = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--project-quota-fixture",
+                )?));
+            }
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
         }
         index += 1;
@@ -213,6 +225,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
         crash_after,
         worker_fault,
         cgroup_fixture,
+        project_quota_fixture,
     })
 }
 
