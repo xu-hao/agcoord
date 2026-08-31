@@ -5,6 +5,9 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Replace repository and agent filter cycling in the TUI with searchable picker menus that
+  provide explicit all-values choices and preserve the current filter when dismissed.
+
 ## 0.2.0 — 2026-08-30
 
 - Rename the installed console command from `agcoord` to `agc` while retaining `agcoord` as
