@@ -10,6 +10,8 @@ import re
 import subprocess
 import sys
 
+from packaging.requirements import Requirement
+
 
 PUBLIC_COMMANDS = {
     "run",
@@ -52,6 +54,21 @@ def test_distribution_import_and_console_identity_are_exact():
     assert "xdist" in (distribution.metadata.get_all("Provides-Extra") or [])
     assert not Path(sys.executable).with_name("agcoord").exists()
     assert importlib.metadata.version("agcoord")
+
+
+def test_distribution_requires_supported_textual_8_release_line():
+    requirements = [
+        Requirement(value)
+        for value in importlib.metadata.distribution("agcoord").requires or []
+    ]
+    textual = [requirement for requirement in requirements if requirement.name == "textual"]
+
+    assert len(textual) == 1
+    assert textual[0].marker is None
+    assert {
+        (specifier.operator, specifier.version)
+        for specifier in textual[0].specifier
+    } == {(">=", "8.2"), ("<", "9")}
 
 
 def test_module_entrypoint_exposes_the_complete_public_command_set():

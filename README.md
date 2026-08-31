@@ -19,6 +19,10 @@ Install the published package in a tool environment:
 python -m pip install agcoord
 ```
 
+The base package installs the supported Textual 8 release line (`textual>=8.2,<9`) for the
+terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
+after its real-TUI behavior is validated.
+
 ### Upgrading from 0.1.x
 
 Version 0.2.0 removes the `agcoord` console executable. Replace downstream shell commands,
