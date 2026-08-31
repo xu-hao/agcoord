@@ -20,9 +20,11 @@ clean environment with no project checkout on `PYTHONPATH`.
 Queue ownership, durable state, scheduling, process supervision, and the forge-neutral
 atomic-landing protocol belong to the core distribution. Forge credentials and SDKs do not.
 GitHub is an optional adapter and `gh` is not required to import or use the core coordinator.
-The TUI may use an install extra if its third-party runtime is not kept in the base package;
-whichever extra names the package declares are part of the published interface and must be
-smoke-tested from the built wheel.
+Textual is a base dependency because the installed `agc tui` command is part of the core
+interface. The supported framework line is `textual>=8.2,<9`; older releases have no
+compatibility promise, and a new Textual major requires explicit real-TUI validation before the
+upper bound moves. Whichever install extras the package declares are also part of the published
+interface and must be smoke-tested from the built wheel.
 
 ## Release checklist
 

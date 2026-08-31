@@ -9,6 +9,8 @@ versioning; dates use ISO 8601.
   provide explicit all-values choices and preserve the current filter when dismissed.
 - Show each run's branch in a dedicated TUI table column, prioritizing branch and then label
   width on larger terminals while retaining the no-horizontal-scrollbar 80-column layout.
+- Require the supported Textual 8 release line (`textual>=8.2,<9`) instead of maintaining
+  compatibility with Textual 1 through 7 or accepting an unvalidated future major.
 
 ## 0.2.0 — 2026-08-30
 
