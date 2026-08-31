@@ -237,6 +237,18 @@ def test_parser_and_submission_validation_use_agc_command_name(fake_client):
         cli.run(parser.parse_args(["run"]), out=StringIO())
 
 
+@pytest.mark.parametrize("command", ["run", "full", "land"])
+def test_submission_help_describes_the_stable_unnamed_agent_default(
+    command: str,
+    capsys,
+):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main([command, "--help"])
+
+    assert stopped.value.code == 0
+    assert "AGCOORD_AGENT or unnamed" in capsys.readouterr().out
+
+
 def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_path: Path):
     state_dir = tmp_path / "state"
     listed = StringIO()

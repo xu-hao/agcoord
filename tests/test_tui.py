@@ -605,6 +605,42 @@ async def test_repository_and_agent_filters_use_searchable_cancelable_picker_men
 
 
 @pytest.mark.asyncio
+async def test_agent_picker_omits_legacy_pid_fallbacks_and_keeps_unnamed():
+    snapshot = _snapshot()
+    rows = []
+    for index, agent in enumerate(
+        ("pid:4101", "pid:4102", "unnamed", "agent-special"),
+        start=1,
+    ):
+        row = _row(f"check-agent-{index}", index, "running")
+        row["agent"] = agent
+        rows.append(row)
+    snapshot["active"] = rows
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        await pilot.press("a")
+        await pilot.pause()
+
+        options = app.screen.query_one("#filter-options", OptionList)
+        prompts = [
+            str(options.get_option_at_index(index).prompt)
+            for index in range(options.option_count)
+        ]
+        assert prompts == ["All agents", "agent-special", "unnamed"]
+
+        for key in "unnamed":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _table(app).row_count == 1
+        assert "unnamed" in _screen_text(app)
+
+
+@pytest.mark.asyncio
 async def test_history_toggle_is_non_destructive_cached_and_discoverable():
     client = FakeClient()
     app = build_app(lambda: client, refresh_interval=60)
@@ -636,7 +672,7 @@ async def test_history_toggle_is_non_destructive_cached_and_discoverable():
 
 
 @pytest.mark.asyncio
-async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists():
+async def test_refresh_preserves_selected_job_and_viewport_without_scroll_snapback():
     snapshot = _snapshot()
     snapshot["active"] = []
     snapshot["queued"] = []
@@ -677,6 +713,17 @@ async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists(
         await pilot.pause()
         before = (table.scroll_x, table.scroll_y)
         assert before[0] > 0 and before[1] > 0
+        vertical_offsets: list[tuple[float, float]] = []
+        app.watch(
+            table,
+            "scroll_y",
+            lambda old, new: vertical_offsets.append((old, new)),
+            init=False,
+        )
+
+        await pilot.press("r")
+        await _settled(pilot)
+        assert vertical_offsets == []
 
         changed = deepcopy(snapshot)
         changed["active"] = [_row("check-new", 100, "running", repository_id="repo-new")]
@@ -688,6 +735,7 @@ async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists(
 
         assert ids()[table.cursor_row] == target
         assert (table.scroll_x, table.scroll_y) == before
+        assert all(new > 0 for _old, new in vertical_offsets), vertical_offsets
 
 
 @pytest.mark.asyncio
