@@ -4,7 +4,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::ExitStatus;
 
 pub struct OwnerLock {
     file: File,
@@ -167,24 +166,54 @@ pub fn prepare_private_directory(path: &Path) -> Result<()> {
     })
 }
 
-fn process_identity(pid: u32) -> Option<(String, String)> {
+fn process_identity(pid: u32) -> Option<(String, u32, String)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let closing = stat.rfind(')')?;
     let fields: Vec<_> = stat.get(closing + 2..)?.split_whitespace().collect();
-    Some((fields.first()?.to_string(), fields.get(19)?.to_string()))
+    Some((
+        fields.first()?.to_string(),
+        fields.get(2)?.parse().ok()?,
+        fields.get(19)?.to_string(),
+    ))
 }
 
 pub fn process_start_token(pid: u32) -> Option<String> {
-    process_identity(pid).map(|(_state, token)| token)
+    process_identity(pid).map(|(_state, _process_group, token)| token)
 }
 
-pub fn same_process(pid: Option<u32>, token: Option<&str>) -> bool {
+pub fn same_worker_process(pid: Option<u32>, token: Option<&str>) -> bool {
     match (pid, token) {
-        (Some(pid), Some(token)) => process_identity(pid).is_some_and(|(state, observed)| {
-            !matches!(state.as_str(), "Z" | "X") && observed == token
-        }),
+        (Some(pid), Some(token)) => {
+            process_identity(pid).is_some_and(|(state, process_group, observed)| {
+                !matches!(state.as_str(), "Z" | "X") && process_group == pid && observed == token
+            })
+        }
         _ => false,
     }
+}
+
+pub fn worker_identity_conflicts(pid: Option<u32>, token: Option<&str>) -> bool {
+    match (pid, token) {
+        (Some(pid), Some(token)) => {
+            process_identity(pid).is_some_and(|(_state, process_group, observed)| {
+                process_group != pid || observed != token
+            })
+        }
+        _ => false,
+    }
+}
+
+pub fn process_group_exists(process_group: u32) -> bool {
+    let Ok(process_group) = i32::try_from(process_group) else {
+        return false;
+    };
+    // SAFETY: signal zero performs only an existence/permission probe for this numeric
+    // process group and cannot deliver a signal.
+    let result = unsafe { libc::kill(-process_group, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 pub fn signal_process_group(pid: u32, signal: i32) -> Result<()> {
@@ -208,16 +237,6 @@ pub fn signal_process_group(pid: u32, signal: i32) -> Result<()> {
         "broker-worker-signal-failed",
         format!("cannot signal worker process group: {error}"),
     ))
-}
-
-pub fn shell_exit_status(status: ExitStatus) -> i64 {
-    use std::os::unix::process::ExitStatusExt;
-
-    status
-        .code()
-        .map(i64::from)
-        .or_else(|| status.signal().map(|signal| i64::from(128 + signal)))
-        .unwrap_or(255)
 }
 
 pub fn sync_file(path: &Path) -> Result<()> {

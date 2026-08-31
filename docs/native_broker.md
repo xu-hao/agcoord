@@ -180,6 +180,32 @@ authoritative and is drained to a durable result. The identity-verified land-pha
 and cancellation transaction both take the same immediate SQLite write lock, so exactly one
 wins their race.
 
+### Implemented worker boundary
+
+The native owner now forks its launcher path directly without an internal command-line mode.
+Two `O_CLOEXEC` pipes and a kernel-random 256-bit token bind the launcher hello, its PID and
+process-group identity, the setup result, and two distinct releases. The broker commits the
+PID/start token and clears the durable environment before the first release. EOF, a short or
+substituted channel, a stale token, launcher death, or broker death before final release exits
+the child with status 125 and cannot execute the submitted command.
+
+Between the releases, the child resets inherited broker signal handlers, clears effective,
+permitted, inheritable, and ambient capabilities, sets `no_new_privs`, and verifies those values
+from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the two
+private channels, reports the token-bound setup result, waits for final release, closes those
+channels, verifies the final descriptor set, and calls `execve`. Submitted `_AGCOORD_*`
+variables are removed; the broker supplies only the public admission context itself. Debug
+builds can inject bounded launcher, token, channel, privilege, descriptor, setup, and release
+failures; release builds do not accept those controls.
+
+Cancellation targets the verified process group and keeps the row and allocation live until
+every descendant is gone, escalating from `SIGTERM` to `SIGKILL`. Recovery adopts only a live
+leader whose PID, start token, and process group all match. A conflicting live PID is classified
+as lost without receiving any signal; a vanished verified leader may leave its original group
+to be drained. Concrete namespace, cgroup, tmpfs, and quota setup remains in the ordered backend
+tickets: at this boundary native resource contracts are still generic admission-only contracts,
+and no kernel backend claims applied enforcement.
+
 ### Client-authored operations
 
 Clients continue to use short SQLite transactions rather than mutating live processes:
@@ -269,7 +295,7 @@ The scheduler/state implementation freezes these refusal families:
 | Submission and admission | `broker-submission-invalid`, `broker-run-exists`, `broker-run-unknown`, `broker-run-terminal`, `broker-resource-unavailable`, `broker-active-state-invalid` |
 | Gate and land authority | `broker-gate-required`, `broker-gate-mismatch`, `stale-gate-verdict`, `broker-land-phase-invalid`, `broker-land-identity-mismatch`, `broker-land-cancelled`, `broker-publication-authoritative` |
 | Migration | `broker-migration-live-runs`, `broker-migration-row-invalid`, `broker-migration-state-changed`, `broker-migration-backup-failed`, `broker-migration-backup-invalid` |
-| Worker ownership | `broker-worker-start-failed`, `broker-worker-identity-invalid`, `broker-worker-identity-mismatch`, `broker-worker-observation-failed`, `broker-worker-signal-failed` |
+| Worker ownership | `broker-worker-start-failed`, `broker-worker-handshake-failed`, `broker-worker-identity-invalid`, `broker-worker-identity-mismatch`, `broker-worker-observation-failed`, `broker-worker-signal-failed`, `worker-privilege-drop-failed`, `worker-privilege-drop-unverified`, `worker-descriptor-leak` |
 
 Later resource backends may add backend-specific refusal or receipt-event codes without changing
 the meaning of these codes.
