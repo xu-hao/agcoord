@@ -1,6 +1,7 @@
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -41,6 +42,14 @@ struct RunningBroker {
 
 impl RunningBroker {
     fn start(state_dir: &Path, capacities: &[(&str, u64)]) -> Self {
+        Self::start_with_options(state_dir, capacities, &[])
+    }
+
+    fn start_with_worker_fault(state_dir: &Path, capacities: &[(&str, u64)], fault: &str) -> Self {
+        Self::start_with_options(state_dir, capacities, &["--worker-fault", fault])
+    }
+
+    fn start_with_options(state_dir: &Path, capacities: &[(&str, u64)], options: &[&str]) -> Self {
         let mut command = Command::new(BROKER);
         command
             .arg("serve")
@@ -51,6 +60,7 @@ impl RunningBroker {
         for (name, units) in capacities {
             command.arg("--capacity").arg(format!("{name}={units}"));
         }
+        command.args(options);
         let mut child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -245,6 +255,69 @@ fn process_state(pid: u64) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+struct ProcessGuard {
+    pid: u32,
+    token: String,
+    armed: bool,
+}
+
+impl ProcessGuard {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            token: process_start_token(u64::from(pid)),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && fs::read_to_string(format!("/proc/{}/stat", self.pid))
+                .ok()
+                .and_then(|stat| {
+                    let closing = stat.rfind(')')?;
+                    stat[closing + 2..]
+                        .split_whitespace()
+                        .nth(19)
+                        .map(ToOwned::to_owned)
+                })
+                .as_deref()
+                == Some(&self.token)
+        {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &self.pid.to_string()])
+                .status();
+        }
+    }
+}
+
+struct ChildGuard(Child);
+
+impl ChildGuard {
+    fn is_running(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
 fn advance_land_phase(state_dir: &Path, run_id: &str, row: &Value, phase: &str) -> Output {
     let worker_pid = row["worker_pid"].as_u64().unwrap();
     let token = process_start_token(worker_pid);
@@ -298,6 +371,14 @@ struct Submission<'a> {
 }
 
 fn submit(state_dir: &Path, submission: &Submission<'_>) -> Output {
+    submit_with_environment(state_dir, submission, &[])
+}
+
+fn submit_with_environment(
+    state_dir: &Path,
+    submission: &Submission<'_>,
+    environment: &[(&str, &str)],
+) -> Output {
     let mut arguments = vec![
         "submit".to_owned(),
         "--state-dir".to_owned(),
@@ -325,6 +406,9 @@ fn submit(state_dir: &Path, submission: &Submission<'_>) -> Output {
     ];
     if let Some(gate_run_id) = submission.gate_run_id {
         arguments.extend(["--gate-run-id".to_owned(), gate_run_id.to_owned()]);
+    }
+    for (name, value) in environment {
+        arguments.extend(["--env".to_owned(), format!("{name}={value}")]);
     }
     arguments.push("--".to_owned());
     arguments.extend(submission.command.clone());
@@ -1049,11 +1133,15 @@ fn identity_commit_contention_never_orphans_a_started_worker() {
     let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
     locker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let _fifo_reader = OpenOptions::new().read(true).open(&fifo).unwrap();
-    wait_for(Duration::from_secs(5), || marker.exists());
     thread::sleep(Duration::from_millis(150));
+    assert!(
+        !marker.exists(),
+        "worker ran before its durable identity commit completed"
+    );
     locker.execute_batch("ROLLBACK").unwrap();
 
     let completed = wait_status(&state, "identity-contention", "passed");
+    assert!(marker.exists());
     assert!(completed["worker_pid"].is_number());
     assert!(broker.terminate().success());
 }
@@ -1344,9 +1432,7 @@ fn worker_identity_and_terminal_commit_crashes_recover_durably() {
     let state = temporary.path().join("worker-state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
-    let entered = temporary.path().join("entered");
-    let release = temporary.path().join("release");
-    let starts = temporary.path().join("starts");
+    let marker = temporary.path().join("must-not-run-before-release");
     let mut crashing = start_crashing_broker(&state, "worker-identity-commit");
     submit_ok(
         &state,
@@ -1355,20 +1441,22 @@ fn worker_identity_and_terminal_commit_crashes_recover_durably() {
             kind: "check",
             repository: "repo-a",
             checkout: &checkout,
-            command: blocking_command(&entered, &release, Some(&starts)),
+            command: touch_command(&marker),
             gate_run_id: None,
         },
     );
     assert_eq!(crashing.wait().unwrap().code(), Some(86));
-    wait_for(Duration::from_secs(5), || entered.exists());
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        !marker.exists(),
+        "the admitted command ran before the broker released its launcher"
+    );
     let original_pid = status(&state, "identity-crash")["worker_pid"].clone();
     let mut replacement = RunningBroker::start(&state, &[("jobs", 1)]);
     assert_eq!(status(&state, "identity-crash")["worker_pid"], original_pid);
-    assert_eq!(fs::read_to_string(&starts).unwrap().lines().count(), 1);
-    fs::write(&release, "release").unwrap();
     let recovered = wait_status(&state, "identity-crash", "interrupted");
     assert_eq!(recovered["failure_reason"], "worker-result-lost");
-    assert_eq!(fs::read_to_string(&starts).unwrap().lines().count(), 1);
+    assert!(!marker.exists());
     assert!(replacement.terminate().success());
 
     let terminal_state = temporary.path().join("terminal-state");
@@ -1414,6 +1502,316 @@ fn worker_identity_and_terminal_commit_crashes_recover_durably() {
     let mut cleanup_replacement = RunningBroker::start(&cleanup_state, &[("jobs", 1)]);
     assert_eq!(status(&cleanup_state, "cleanup-crash")["status"], "passed");
     assert!(cleanup_replacement.terminate().success());
+}
+
+#[test]
+fn setup_and_final_release_crashes_preserve_exactly_once_execution() {
+    let temporary = TestDirectory::new("crash-worker-release");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+
+    let setup_state = temporary.path().join("setup-state");
+    let setup_marker = temporary.path().join("setup-must-not-run");
+    let mut setup_crash = start_crashing_broker(&setup_state, "worker-setup-commit");
+    submit_ok(
+        &setup_state,
+        &Submission {
+            run_id: "setup-crash",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&setup_marker),
+            gate_run_id: None,
+        },
+    );
+    assert_eq!(setup_crash.wait().unwrap().code(), Some(86));
+    thread::sleep(Duration::from_millis(250));
+    assert!(!setup_marker.exists());
+    let mut setup_replacement = RunningBroker::start(&setup_state, &[("jobs", 1)]);
+    wait_status(&setup_state, "setup-crash", "interrupted");
+    assert!(!setup_marker.exists());
+    assert!(setup_replacement.terminate().success());
+
+    let release_state = temporary.path().join("release-state");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let starts = temporary.path().join("starts");
+    let mut release_crash = start_crashing_broker(&release_state, "worker-release");
+    submit_ok(
+        &release_state,
+        &Submission {
+            run_id: "release-crash",
+            kind: "check",
+            repository: "repo-b",
+            checkout: &checkout,
+            command: blocking_command(&entered, &release, Some(&starts)),
+            gate_run_id: None,
+        },
+    );
+    assert_eq!(release_crash.wait().unwrap().code(), Some(86));
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let original_pid = status(&release_state, "release-crash")["worker_pid"].clone();
+    let mut release_replacement = RunningBroker::start(&release_state, &[("jobs", 1)]);
+    assert_eq!(
+        status(&release_state, "release-crash")["worker_pid"],
+        original_pid
+    );
+    assert_eq!(fs::read_to_string(&starts).unwrap().lines().count(), 1);
+    fs::write(&release, "release").unwrap();
+    wait_status(&release_state, "release-crash", "interrupted");
+    assert_eq!(fs::read_to_string(&starts).unwrap().lines().count(), 1);
+    assert!(release_replacement.terminate().success());
+}
+
+#[test]
+fn admitted_command_enters_with_no_privilege_or_inherited_broker_descriptors() {
+    let temporary = TestDirectory::new("worker-privilege");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let report = temporary.path().join("privilege.json");
+    let script = r#"
+import fcntl
+import json
+import os
+import pathlib
+import sys
+import time
+
+opened = []
+for descriptor in range(3, 256):
+    try:
+        fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    except OSError:
+        continue
+    opened.append(descriptor)
+status = {}
+for line in pathlib.Path('/proc/self/status').read_text(encoding='ascii').splitlines():
+    name, separator, value = line.partition(':')
+    if separator and name in {'CapEff', 'CapPrm', 'CapInh', 'CapAmb', 'NoNewPrivs'}:
+        status[name] = value.strip()
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps({
+        'status': status,
+        'open_fds': opened,
+        'internal': sorted(name for name in os.environ if name.startswith('_AGCOORD_')),
+        'safe': os.environ.get('SAFE_VISIBLE'),
+    }),
+    encoding='ascii',
+)
+while not pathlib.Path(sys.argv[2]).exists():
+    time.sleep(0.01)
+"#;
+    let release = temporary.path().join("release");
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let submission = Submission {
+        run_id: "worker-privilege",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            report.to_str().unwrap().to_owned(),
+            release.to_str().unwrap().to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    let submitted = submit_with_environment(
+        &state,
+        &submission,
+        &[
+            ("_AGCOORD_FORGED", "must-not-escape"),
+            ("SAFE_VISIBLE", "kept"),
+        ],
+    );
+    assert!(submitted.status.success());
+    wait_for(Duration::from_secs(5), || report.exists());
+    let database = Connection::open(state.join("queue.sqlite3")).unwrap();
+    let durable_environment: String = database
+        .query_row(
+            "SELECT environment_json FROM runs WHERE run_id = 'worker-privilege'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(durable_environment, "{}");
+    drop(database);
+    let report: Value = serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(report["open_fds"], json!([]));
+    assert_eq!(report["internal"], json!([]));
+    assert_eq!(report["safe"], "kept");
+    assert_eq!(report["status"]["CapEff"], "0000000000000000");
+    assert_eq!(report["status"]["CapPrm"], "0000000000000000");
+    assert_eq!(report["status"]["CapInh"], "0000000000000000");
+    assert_eq!(report["status"]["CapAmb"], "0000000000000000");
+    assert_eq!(report["status"]["NoNewPrivs"], "1");
+    fs::write(&release, "release").unwrap();
+    wait_status(&state, "worker-privilege", "passed");
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn forged_replayed_or_broken_worker_handshakes_fail_closed() {
+    let temporary = TestDirectory::new("worker-handshake-faults");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    for fault in [
+        "launcher-death",
+        "hello-token",
+        "replayed-token",
+        "substituted-channel",
+        "setup-token",
+        "privilege-verification",
+        "retained-descriptor",
+        "final-token",
+    ] {
+        let state = temporary.path().join(format!("state-{fault}"));
+        let marker = temporary.path().join(format!("ran-{fault}"));
+        let mut broker = RunningBroker::start_with_worker_fault(&state, &[("jobs", 1)], fault);
+        submit_ok(
+            &state,
+            &Submission {
+                run_id: "faulted-worker",
+                kind: "check",
+                repository: "repo-a",
+                checkout: &checkout,
+                command: touch_command(&marker),
+                gate_run_id: None,
+            },
+        );
+        let failed = wait_status(&state, "faulted-worker", "failed");
+        assert_eq!(failed["exit_status"], 125, "fault {fault}");
+        assert!(!marker.exists(), "fault {fault} released user code");
+        assert!(
+            broker.terminate().success(),
+            "fault {fault} killed the broker"
+        );
+    }
+}
+
+#[test]
+fn cancellation_drains_the_complete_owned_process_group_before_terminal_state() {
+    let temporary = TestDirectory::new("worker-tree-cancel");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let child_pid = temporary.path().join("child.pid");
+    let entered = temporary.path().join("entered");
+    let script = r#"
+/bin/sh -c 'trap "" TERM; i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' agcoord-descendant &
+printf '%s\n' "$!" >"$1"
+touch "$2"
+i=0
+while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+"#;
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "worker-tree-cancel",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                "agcoord-tree".to_owned(),
+                child_pid.to_str().unwrap().to_owned(),
+                entered.to_str().unwrap().to_owned(),
+            ],
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let descendant: u32 = fs::read_to_string(&child_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut guard = ProcessGuard::new(descendant);
+    let cancellation = run(&[
+        "cancel",
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "worker-tree-cancel",
+    ]);
+    assert!(cancellation.status.success());
+    wait_status(&state, "worker-tree-cancel", "cancelled");
+    wait_for(Duration::from_secs(5), || {
+        process_state(u64::from(descendant)).is_none_or(|state| state == "Z")
+    });
+    guard.disarm();
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn stale_worker_identity_never_signals_an_unrelated_reused_process_group() {
+    let temporary = TestDirectory::new("worker-pid-reuse");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let marker = temporary.path().join("must-not-run");
+    let mut bootstrap = RunningBroker::start(&state, &[("jobs", 1)]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "capacity-blocker",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&entered, &release, None),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "stale-worker",
+            kind: "check",
+            repository: "repo-b",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        },
+    );
+    assert_eq!(status(&state, "stale-worker")["status"], "queued");
+    assert!(bootstrap.terminate().success());
+
+    let mut unrelated_command = Command::new("/bin/sleep");
+    unrelated_command.arg("30").process_group(0);
+    let mut unrelated = ChildGuard(unrelated_command.spawn().unwrap());
+    let stale_token = process_start_token(u64::from(unrelated.id()))
+        .parse::<u64>()
+        .unwrap()
+        .saturating_add(1)
+        .to_string();
+    let database = state.join("queue.sqlite3");
+    let db = Connection::open(&database).unwrap();
+    db.execute(
+        "UPDATE runs SET status = 'running', phase = 'running',
+         started_at = '2026-08-31T00:00:00Z', worker_pid = ?1,
+         worker_start_token = ?2 WHERE run_id = 'stale-worker'",
+        params![i64::from(unrelated.id()), stale_token],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut replacement = RunningBroker::start(&state, &[("jobs", 1)]);
+    let recovered = wait_status(&state, "stale-worker", "interrupted");
+    assert_eq!(recovered["failure_reason"], "worker-result-lost");
+    assert!(
+        unrelated.is_running(),
+        "the broker signalled a process group whose start token did not match"
+    );
+    assert!(!marker.exists());
+    assert!(replacement.terminate().success());
 }
 
 #[test]

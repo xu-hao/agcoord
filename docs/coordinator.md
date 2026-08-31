@@ -828,6 +828,12 @@ receive process-group cancellation and become terminal only after every descenda
 Publishing land jobs refuse cancellation as described above. Unknown IDs and terminal jobs
 produce named errors rather than silently changing another row.
 
+The native owner authenticates a worker with its PID, Linux start token, and requirement that
+the PID lead its recorded process group. Replacement recovery adopts only that exact live
+identity. If the PID has been reused, its token changed, or it belongs to another group, the run
+is interrupted without signaling that process. Only a group already tied to the vanished
+verified leader is eligible for recovery drain.
+
 `agc clear` is intentionally narrow. It refuses while any job is queued or running. Once
 the coordinator is inactive, it removes terminal rows and their run logs but preserves the
 spool, ownership protocol, broker diagnostics, and migration records. There is no `--all`

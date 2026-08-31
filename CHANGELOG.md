@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Replace the native broker's direct command spawn with an authenticated in-process launcher:
+  user code remains blocked through durable PID/start-token/process-group ownership, verified
+  capability and descriptor cleanup, and a token-bound final release. Cancellation now drains
+  the complete owned process group, while recovery refuses conflicting or reused identities
+  without signaling unrelated processes.
 - Add the protocol-5 Rust scheduler and durable SQLite owner with repository barriers and fair
   lanes, capacity admission, cancellation and atomic land authority, WAL contention handling,
   graceful shutdown, identity-safe crash adoption, stable corruption refusals, and verified

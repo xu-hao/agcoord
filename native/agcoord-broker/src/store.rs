@@ -1,6 +1,6 @@
 use crate::error::{AppError, Result};
 use crate::platform::{
-    OwnerLock, live_owner_metadata, prepare_private_directory, same_process, sync_file,
+    OwnerLock, live_owner_metadata, prepare_private_directory, same_worker_process, sync_file,
 };
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, params};
 use serde_json::{Map, Value, json};
@@ -1329,7 +1329,7 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
     }
     if run.worker_pid != Some(request.worker_pid)
         || run.worker_start_token.as_deref() != Some(&request.worker_start_token)
-        || !same_process(Some(request.worker_pid), Some(&request.worker_start_token))
+        || !same_worker_process(Some(request.worker_pid), Some(&request.worker_start_token))
         || run.checkout != request.checkout
         || run.head_sha.as_deref() != Some(&request.head_sha)
     {
