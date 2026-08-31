@@ -233,11 +233,7 @@ def _screen_text(app) -> str:
 
 
 def _widget_text(widget: Static) -> str:
-    if hasattr(widget, "content"):
-        return str(widget.content)
-    # Textual 1 wraps the same rendered value instead of exposing `content`.
-    visual = widget.render()
-    return str(visual._renderable)
+    return str(widget.content)
 
 
 @pytest.mark.asyncio
