@@ -817,8 +817,16 @@ The expected key map is:
 | `l` | read the selected job log |
 | `c` | request cancellation; a publishing land explains why it cannot be cancelled |
 | `h` | hide or restore terminal history without deleting it or rereading the spool |
+| `p` | open the searchable repository picker |
+| `a` | open the searchable agent picker |
 | `?` | show context-sensitive help |
 | `q` | quit the view; jobs continue |
+
+Each filter picker starts in a focused search field. Typing narrows the complete snapshot's
+choices, `Tab` moves into the scrollable result menu, and `Enter` applies the highlighted
+choice. `All repositories` or `All agents` clears that filter directly; `Esc` closes the picker
+without changing the current filter. Repository choices show their complete readable remote or
+local identity rather than the internal hashed lane key.
 
 Refresh preserves the selected run and both viewport offsets when that row still exists.
 At 80 columns the compact table is exactly `STATE · KIND · REPO · RUN · LABEL · AGE · DUR`
