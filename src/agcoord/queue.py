@@ -32,9 +32,9 @@ from uuid import uuid4
 from .cgroup import (
     CGROUP_BACKEND,
     CGROUP_ISOLATE_ENV,
-    CGROUP_ROOT_ENV,
     CgroupV2Backend,
 )
+from .config import BrokerConfig, BrokerConfigError, load_broker_config
 from .resources import (
     ResourceBackend,
     ResourceBackendError,
@@ -42,7 +42,7 @@ from .resources import (
     ResourceObservation,
     ResourceRequest,
     capability_issue,
-    default_resource_bindings,
+    configured_resource_bindings,
     initial_resource_receipt,
     probe_resource_backends,
     resource_contract,
@@ -405,30 +405,21 @@ def parse_resource_claims(values: Iterable[str]) -> dict[str, int]:
     return _positive_mapping(raw, subject="resource", include_job=False)
 
 
-def default_capacities() -> dict[str, int]:
-    """Return validated machine capacities from one stable environment setting."""
-    configured = os.environ.get("AGCOORD_CAPACITIES")
-    if configured is None:
+def configured_capacities(section: Mapping[str, Any] | None) -> dict[str, int]:
+    """Return validated machine capacities from one configuration file section."""
+    if section is None:
         return {"jobs": DEFAULT_JOB_CAPACITY}
-    if not configured.strip():
-        raise CoordinatorError("AGCOORD_CAPACITIES is empty")
-    try:
-        if configured.lstrip().startswith("{"):
-            raw = json.loads(configured)
-        else:
-            raw = {}
-            for item in configured.split(","):
-                name, separator, units = item.partition("=")
-                if not separator:
-                    raise ValueError(f"missing '=' in {item!r}")
-                raw[name.strip()] = int(units)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise CoordinatorError(
-            "AGCOORD_CAPACITIES must be JSON or comma-separated name=units entries"
-        ) from exc
-    capacities = _positive_mapping(raw, subject="capacity", include_job=False)
+    capacities = _positive_mapping(section, subject="capacity", include_job=False)
     capacities.setdefault("jobs", DEFAULT_JOB_CAPACITY)
     return dict(sorted(capacities.items()))
+
+
+def broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
+    """Read one state directory's configuration as a coordinator-level failure."""
+    try:
+        return load_broker_config(state_dir)
+    except BrokerConfigError as exc:
+        raise CoordinatorError(str(exc)) from exc
 
 
 def _validate_resources(
@@ -816,16 +807,19 @@ class CoordinatorBroker:
         self.paths = queue_paths(state_dir=state_dir)
         self.idle_timeout = idle_timeout
         self.recent_limit = recent_limit
-        self.capacities = _positive_mapping(
-            default_capacities() if capacities is None else capacities,
-            subject="capacity",
-            include_job=False,
+        # One read of the state directory's configuration file serves capacity, bindings,
+        # and the delegated cgroup root, so a broker cannot mix two file revisions.
+        configuration = broker_config(self.paths.state_dir)
+        self.capacities = (
+            configured_capacities(configuration.capacities)
+            if capacities is None
+            else _positive_mapping(capacities, subject="capacity", include_job=False)
         )
         if "jobs" not in self.capacities:
             raise ValueError("capacities must include a positive 'jobs' capacity")
         try:
             self.resource_bindings = validate_resource_bindings(
-                default_resource_bindings()
+                configured_resource_bindings(configuration.bindings)
                 if resource_bindings is None
                 else resource_bindings
             )
@@ -839,8 +833,9 @@ class CoordinatorBroker:
                 CGROUP_BACKEND in referenced_backends
                 and CGROUP_BACKEND not in self.resource_backends
             ):
-                self.resource_backends[CGROUP_BACKEND] = CgroupV2Backend.from_environment(
-                    state_dir=self.paths.state_dir
+                self.resource_backends[CGROUP_BACKEND] = CgroupV2Backend.from_config(
+                    configuration.cgroup_root,
+                    state_dir=self.paths.state_dir,
                 )
             self.resource_capabilities = probe_resource_backends(
                 self.resource_backends,
@@ -3220,7 +3215,6 @@ class CoordinatorBroker:
         environment[RUN_ID_ENV] = run_id
         environment[RUN_KIND_ENV] = row["kind"]
         environment[STATE_DIR_ENV] = str(self.paths.state_dir)
-        environment.pop(CGROUP_ROOT_ENV, None)
         environment.pop(CGROUP_ISOLATE_ENV, None)
         environment.pop(TMPFS_SETUP_ENV, None)
         worker_tmp = self._worker_tmp_path(run_id)
@@ -3984,9 +3978,7 @@ class CoordinatorClient:
         # Prepare and protocol-check the private spool before a detached process is born.
         # This also closes the interval in which its redirected log could inherit loose
         # permissions from a pre-existing operator-selected directory.
-        catalogue = self._catalogue()
-        capacities = default_capacities()
-        bindings = catalogue.resource_bindings
+        self._catalogue()
         try:
             log = self.paths.daemon_log.open("ab", buffering=0)
         except OSError as exc:
@@ -4001,10 +3993,6 @@ class CoordinatorClient:
             "serve",
             "--state-dir",
             str(self.paths.state_dir),
-            "--capacities-json",
-            json.dumps(capacities, separators=(",", ":")),
-            "--resource-bindings-json",
-            json.dumps(bindings, separators=(",", ":")),
         ]
         try:
             subprocess.Popen(
@@ -4098,11 +4086,6 @@ def _build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
     serve.add_argument("--state-dir", required=True)
     serve.add_argument("--idle-seconds", type=float, default=DEFAULT_IDLE_SECONDS)
-    serve.add_argument(
-        "--capacities-json",
-        default=json.dumps(default_capacities(), separators=(",", ":")),
-    )
-    serve.add_argument("--resource-bindings-json", default="{}")
     submit = commands.add_parser("submit", help=argparse.SUPPRESS)
     submit.add_argument("--state-dir")
     submit.add_argument("--checkout", required=True)
@@ -4129,15 +4112,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command_name == "serve":
         try:
-            capacities = json.loads(args.capacities_json)
-            bindings = json.loads(args.resource_bindings_json)
             broker = CoordinatorBroker(
                 args.state_dir,
                 idle_timeout=args.idle_seconds,
-                capacities=capacities,
-                resource_bindings=bindings,
             )
-        except (json.JSONDecodeError, CoordinatorError) as exc:
+        except CoordinatorError as exc:
             print(f"AGCoord: invalid broker configuration: {exc}", file=sys.stderr)
             return 2
 

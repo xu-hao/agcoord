@@ -367,7 +367,6 @@ Path(os.environ["CGROUP_REPORT"]).write_text(
     json.dumps({
         "command": os.getpid(),
         "child": child.pid,
-        "configured_root": os.environ.get("AGCOORD_CGROUP_ROOT"),
         "isolation_flag": os.environ.get("_AGCOORD_CGROUP_ISOLATE"),
     }),
     encoding="utf-8",
@@ -384,7 +383,6 @@ child.wait()
             environment={
                 **caller_environment(),
                 CGROUP_ISOLATE_ENV: "caller-forged",
-                "AGCOORD_CGROUP_ROOT": str(root),
                 "CGROUP_ATTACHED": str(marker),
                 "CGROUP_REPORT": str(report),
                 "CGROUP_RELEASE": str(release),
@@ -392,7 +390,6 @@ child.wait()
         )
         wait_for(report.exists, "the cgroup-attached command never reported")
         pids = json.loads(report.read_text(encoding="utf-8"))
-        assert pids["configured_root"] is None
         assert pids["isolation_flag"] is None
 
         def inherited() -> bool:

@@ -55,10 +55,26 @@ the entire machine:
   between its preflight, gate, and atomic publication. Retained legacy `merge` rows remain
   identifiable in migrated history but are not the normal public landing workflow.
 
-Capacity defaults to `jobs=2`. Set `AGCOORD_CAPACITIES` before the broker starts using either
-JSON (`{"jobs":4,"cpu":8,"browser":1}`) or comma-separated pairs
-(`jobs=4,cpu=8,browser=1`). The state-directory settings do not configure capacity, and a
-live owner keeps the capacity map with which it acquired the spool.
+One JSON file, `config.json` in the state directory, configures the broker that owns that
+directory. It holds at most `capacities`, `bindings`, and `cgroup_root`; invalid JSON, a
+top-level value that is not an object, an unknown key, a section that is not an object, or an
+empty `cgroup_root` is refused when the broker loads its configuration. An absent file is the
+default configuration, and capacity then defaults to `jobs=2`.
+
+```json
+{
+  "capacities": {"jobs": 4, "cpu": 8, "browser": 1},
+  "bindings": {
+    "cpu": {"kind": "cpu", "unit": "logical-cpu", "mode": "required", "backend": "cgroup-v2"}
+  },
+  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service"
+}
+```
+
+No environment variable configures capacity, bindings, or the delegated cgroup root;
+`AGCOORD_STATE_DIR` selects which state directory, and therefore which configuration file, a
+client and broker share. A live owner keeps the configuration with which it acquired the
+spool, so editing the file changes the next broker rather than the running one.
 
 Every job implicitly requests `jobs=1`. Jobs add resources with repeatable
 `--resource NAME=UNITS` options. Names are generic machine capabilities such as `cpu`,
@@ -71,35 +87,37 @@ labels or commands.
 Capacity and enforcement are separate contracts. An unbound name is always a generic
 `admission-unit`, even when it is spelled `cpu`, `memory`, or `disk`: AGCoord schedules it but
 does not claim to have constrained or measured the process. Bind selected capacity names before
-the broker starts with the JSON-only `AGCOORD_RESOURCE_BINDINGS` setting:
+the broker starts with the `bindings` section of `config.json`:
 
-```bash
-export AGCOORD_RESOURCE_BINDINGS='{
-  "cpu": {
-    "kind": "cpu",
-    "unit": "logical-cpu",
-    "mode": "required",
-    "backend": "cgroup-v2"
-  },
-  "memory": {
-    "kind": "memory",
-    "unit": "bytes",
-    "mode": "required",
-    "backend": "cgroup-v2"
-  },
-  "memory_pressure": {
-    "kind": "memory-high",
-    "unit": "bytes",
-    "mode": "required",
-    "backend": "cgroup-v2"
-  },
-  "swap": {
-    "kind": "swap",
-    "unit": "bytes",
-    "mode": "required",
-    "backend": "cgroup-v2"
+```json
+{
+  "bindings": {
+    "cpu": {
+      "kind": "cpu",
+      "unit": "logical-cpu",
+      "mode": "required",
+      "backend": "cgroup-v2"
+    },
+    "memory": {
+      "kind": "memory",
+      "unit": "bytes",
+      "mode": "required",
+      "backend": "cgroup-v2"
+    },
+    "memory_pressure": {
+      "kind": "memory-high",
+      "unit": "bytes",
+      "mode": "required",
+      "backend": "cgroup-v2"
+    },
+    "swap": {
+      "kind": "swap",
+      "unit": "bytes",
+      "mode": "required",
+      "backend": "cgroup-v2"
+    }
   }
-}'
+}
 ```
 
 A binding contains exactly `kind`, `unit`, `mode`, and `backend`. The supported typed pairs are
@@ -110,7 +128,7 @@ admission-only resource. `admission-only` requires a null backend, `best-effort`
 backend or unit is unavailable but records that it was not applied, and `required` fails the
 row with exit status 125 and `failure_reason=resource-enforcement-failed` before releasing the
 blocked worker launcher. A binding does not create capacity; its name must still be present in
-`AGCOORD_CAPACITIES` before a job can request it.
+the `capacities` section before a job can request it.
 
 Backends expose a sanitized capability probe and the idempotent lifecycle `prepare`, `attach`,
 `usage`, `finish`, `cancel`, and `cleanup`. Attach happens before user code can start; usage,
@@ -125,23 +143,28 @@ The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the match
 are delegated, aggregate CPU bandwidth, task counts, memory, and swap. Configure one exclusive
 delegated root and explicitly bind the capacity names before the broker starts:
 
-```bash
-export AGCOORD_CAPACITIES='jobs=2,cpu=4,pids=128'
-export AGCOORD_RESOURCE_BINDINGS='{
-  "cpu": {
-    "kind": "cpu",
-    "unit": "logical-cpu",
-    "mode": "required",
-    "backend": "cgroup-v2"
+```json
+{
+  "capacities": {"jobs": 2, "cpu": 4, "pids": 128},
+  "bindings": {
+    "cpu": {
+      "kind": "cpu",
+      "unit": "logical-cpu",
+      "mode": "required",
+      "backend": "cgroup-v2"
+    },
+    "pids": {
+      "kind": "processes",
+      "unit": "processes",
+      "mode": "required",
+      "backend": "cgroup-v2"
+    }
   },
-  "pids": {
-    "kind": "processes",
-    "unit": "processes",
-    "mode": "required",
-    "backend": "cgroup-v2"
-  }
-}'
-export AGCOORD_CGROUP_ROOT=/sys/fs/cgroup/user.slice/example.slice/agcoord.service
+  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service"
+}
+```
+
+```bash
 agc run --resource cpu=2 --resource pids=64 -- python -m pytest -q
 ```
 
