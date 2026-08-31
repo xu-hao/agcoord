@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Bring the Rust broker's cgroup v2 backend to enforcement and receipt parity: verify delegated
+  namespace rooting, own collision-safe leaves, apply and measure CPU, process, memory, pressure,
+  swap, tmpfs, bandwidth, IOPS, and I/O-weight controls, retain terminal and recovery evidence,
+  support required refusal or best-effort tmpfs disk fallback, and reject malformed durable
+  resource contracts, receipts, state, or recovery handles without rewriting them.
 - Replace the native broker's direct command spawn with an authenticated in-process launcher:
   user code remains blocked through durable PID/start-token/process-group ownership, verified
   capability and descriptor cleanup, and a token-bound final release. Cancellation now drains
