@@ -58,7 +58,8 @@ explicitly delegated, namespace-safe cgroup root. It attaches the blocked launch
 code, kills detached descendants on finish or cancellation, and recovers ownership across broker
 restart. Typed `cpu/logical-cpu` and `processes/processes` bindings add aggregate `cpu.max` and
 `pids.max` limits plus peak and violation reporting; they do not imply CPU affinity. Memory and
-I/O controller values remain separate contracts. See
+swap envelopes, bounded temporary storage, and verified per-device block-I/O limits remain
+separate opt-in contracts. See
 [delegated cgroup setup](docs/coordinator.md#delegated-cgroup-v2-lifecycle) before enabling a
 required binding.
 

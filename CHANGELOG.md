@@ -36,13 +36,17 @@ versioning; dates use ISO 8601.
 - Provision optional persistent scratch trees on explicitly project-quota-enabled ext4 or XFS
   filesystems, with atomic byte/inode limits, collision-safe project identities, terminal usage,
   capability-stripped workers, crash recovery, and required or best-effort fallback semantics.
+- Enforce typed symmetric or directional per-device bandwidth and IOPS ceilings plus optional
+  I/O weights for safely resolved scratch devices, with verified controller values, durable
+  device identity, interval-rate peaks, terminal sampling, and fail-closed storage-stack checks.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 - Configure every broker from one `config.json` in its state directory, holding `capacities`,
-  `bindings`, and `cgroup_root`. **Breaking:** `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`,
-  and `AGCOORD_CGROUP_ROOT`, and the comma-separated `name=units` capacity syntax, are removed
-  with no deprecation period; move those values into the file. `AGCOORD_STATE_DIR` is unchanged
-  and now selects which configuration file a client and broker share.
+  `bindings`, `cgroup_root`, and optional `cgroup_io` paths. **Breaking:**
+  `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`, and `AGCOORD_CGROUP_ROOT`, and the
+  comma-separated `name=units` capacity syntax, are removed with no deprecation period; move
+  those values into the file. `AGCOORD_STATE_DIR` is unchanged and now selects which
+  configuration file a client and broker share.
 
 ## 0.1.1 — 2026-08-30
 
