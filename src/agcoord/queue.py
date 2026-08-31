@@ -67,6 +67,7 @@ STATUSES = LIVE_STATUSES | TERMINAL_STATUSES
 DEFAULT_RECENT_LIMIT = 50
 DEFAULT_IDLE_SECONDS = 60.0
 DEFAULT_JOB_CAPACITY = 2
+DEFAULT_DATABASE_TIMEOUT = 10.0
 MAX_LOG_BYTES = 64 * 1024
 MAX_OWNER_METADATA_BYTES = 1024 * 1024
 CANCEL_GRACE_SECONDS = 5.0
@@ -97,6 +98,17 @@ class _OwnerMetadataError(CoordinatorError):
 
 class _ResourceEnforcementError(CoordinatorError):
     """A required backend contract failed before the blocked launcher was released."""
+
+
+def _transient_database_error(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF in {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_LOCKED", 6),
+    }:
+        return True
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def _agent_identity(agent: object) -> str:
@@ -565,6 +577,15 @@ def _create_child_cpu_lease_table(db: sqlite3.Connection) -> None:
     )
 
 
+def _enable_wal(db: sqlite3.Connection) -> None:
+    selected = db.execute("PRAGMA journal_mode = WAL").fetchone()
+    mode = None if selected is None else str(selected[0]).lower()
+    if mode != "wal":
+        raise CoordinatorError(
+            f"gate queue database refused WAL journal mode (reported {mode!r})"
+        )
+
+
 def migrate_queue(
     *,
     state_dir: str | os.PathLike[str] | None = None,
@@ -594,6 +615,12 @@ def migrate_queue(
         raise CoordinatorError(
             f"no gate queue database exists at {paths.database}"
         )
+    configuration = broker_config(paths.state_dir)
+    database_timeout = (
+        DEFAULT_DATABASE_TIMEOUT
+        if configuration.database_timeout is None
+        else configuration.database_timeout
+    )
 
     descriptor = os.open(paths.owner_lock, os.O_RDWR | os.O_CREAT, 0o600)
     os.fchmod(descriptor, 0o600)
@@ -606,7 +633,7 @@ def migrate_queue(
                 "run and the old broker finish first"
             ) from exc
 
-        with sqlite3.connect(paths.database, timeout=10) as db:
+        with sqlite3.connect(paths.database, timeout=database_timeout) as db:
             db.row_factory = sqlite3.Row
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -779,6 +806,8 @@ def migrate_queue(
                     (str(PROTOCOL),),
                 )
                 changed = True
+            db.commit()
+            _enable_wal(db)
         paths.database.chmod(0o600)
         return {
             "changed": changed,
@@ -820,6 +849,11 @@ class CoordinatorBroker:
         # One read of the state directory's configuration file serves capacity, bindings,
         # and the delegated cgroup root, so a broker cannot mix two file revisions.
         configuration = broker_config(self.paths.state_dir)
+        self.database_timeout = (
+            DEFAULT_DATABASE_TIMEOUT
+            if configuration.database_timeout is None
+            else configuration.database_timeout
+        )
         self.capacities = (
             configured_capacities(configuration.capacities)
             if capacities is None
@@ -918,7 +952,10 @@ class CoordinatorBroker:
                 directory.chmod(0o700)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.paths.database, timeout=10)
+        connection = sqlite3.connect(
+            self.paths.database,
+            timeout=self.database_timeout,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
@@ -1044,6 +1081,8 @@ class CoordinatorBroker:
                     "gate queue database is missing current protocol columns: "
                     + ", ".join(missing)
                 )
+            db.commit()
+            _enable_wal(db)
         try:
             self.paths.database.chmod(0o600)
         except OSError as exc:
@@ -1109,14 +1148,24 @@ class CoordinatorBroker:
                 f"capacities={self.capacities}; resource backends="
                 f"{sorted(self.resource_capabilities)}"
             )
+        failure: BaseException | None = None
         try:
             self._pump()
+        except BaseException as exc:
+            failure = exc
+            self._append_daemon_log(
+                f"broker failure: {type(exc).__name__}: {exc}; "
+                "live workers left for replacement supervision"
+            )
+            raise
         finally:
             try:
-                # Retain ownership until an explicit shutdown has stopped and reaped each
-                # active process group. Otherwise a replacement can observe this broker's
-                # unreaped child as live forever and cannot safely resume the queue.
-                self._cancel_active_for_shutdown()
+                if failure is None:
+                    # An explicit close is a cancellation request and retains ownership
+                    # until every safe worker is reaped. An unexpected broker failure must
+                    # release ownership without rewriting or signalling live rows, so a
+                    # replacement can adopt their durable process identities.
+                    self._cancel_active_for_shutdown()
             finally:
                 with self._lifecycle_lock:
                     self._closed = True
@@ -1210,12 +1259,22 @@ class CoordinatorBroker:
         # from losing its broker without turning every 100 ms log poll into a write.
         if self._last_request - self._last_activity_write < 0.5:
             return
-        with self._db_lock, self._connect() as db:
-            db.execute(
-                "INSERT INTO coordinator_meta(key, value) VALUES ('last_activity', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(time.time()),),
+        try:
+            with self._db_lock, self._connect() as db:
+                db.execute(
+                    "INSERT INTO coordinator_meta(key, value) VALUES ('last_activity', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(time.time()),),
+                )
+        except sqlite3.OperationalError as exc:
+            if not _transient_database_error(exc):
+                raise
+            # The public operation already committed before its activity heartbeat. Never
+            # turn an accepted submission or successful read into an apparent failure.
+            self._append_daemon_log(
+                f"activity heartbeat database contention; deferred: {exc}"
             )
+            return
         self._last_activity_write = self._last_request
 
     # --------------------------------------------------------------- public operations
@@ -2529,6 +2588,15 @@ class CoordinatorBroker:
         while not self._stop.wait(0.1):
             try:
                 self._pump_once()
+            except sqlite3.OperationalError as exc:
+                if _transient_database_error(exc):
+                    self._append_daemon_log(
+                        f"pump database contention; retrying: {exc}"
+                    )
+                else:
+                    self._append_daemon_log(
+                        f"pump error: {type(exc).__name__}: {exc}"
+                    )
             except Exception as exc:  # keep one bad row from silently killing admission
                 self._append_daemon_log(f"pump error: {type(exc).__name__}: {exc}")
             if self._should_idle_exit():
@@ -3590,8 +3658,6 @@ class CoordinatorBroker:
             self._finish_and_cleanup_resources(db, row)
             if not self._remove_worker_tmp(run_id):
                 return
-            self._children.pop(run_id, None)
-            self._group_drain_started.pop(run_id, None)
             refreshed = db.execute(
                 "SELECT * FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -3613,6 +3679,11 @@ class CoordinatorBroker:
                 (status, _now(), exit_status, failure_reason, run_id),
             )
             self._prune(db)
+            # Keep the owned Popen until the terminal row update succeeds. A transient
+            # writer lock can roll this transaction back; retaining the child preserves
+            # its already-observed return code for the next pump attempt.
+            self._children.pop(run_id, None)
+            self._group_drain_started.pop(run_id, None)
             return
 
         # A broker can be SIGKILLed while its process group remains. The replacement does
@@ -3706,13 +3777,23 @@ class CoordinatorBroker:
     def _should_idle_exit(self) -> bool:
         if self.idle_timeout is None:
             return False
-        with self._db_lock, self._connect() as db:
-            activity = db.execute(
-                "SELECT value FROM coordinator_meta WHERE key = 'last_activity'"
-            ).fetchone()
-            live = db.execute(
-                "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')"
-            ).fetchone()[0]
+        try:
+            with self._db_lock, self._connect() as db:
+                activity = db.execute(
+                    "SELECT value FROM coordinator_meta WHERE key = 'last_activity'"
+                ).fetchone()
+                live = db.execute(
+                    "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')"
+                ).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if not _transient_database_error(exc):
+                raise
+            # A health check that cannot read the live-row count cannot prove idleness.
+            # Treat contention as "not idle" and let the next pump iteration retry.
+            self._append_daemon_log(
+                f"idle check database contention; retrying: {exc}"
+            )
+            return False
         if live:
             return False
         last_activity = float(activity["value"]) if activity is not None else 0.0
