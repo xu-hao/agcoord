@@ -636,7 +636,7 @@ async def test_history_toggle_is_non_destructive_cached_and_discoverable():
 
 
 @pytest.mark.asyncio
-async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists():
+async def test_refresh_preserves_selected_job_and_viewport_without_scroll_snapback():
     snapshot = _snapshot()
     snapshot["active"] = []
     snapshot["queued"] = []
@@ -677,6 +677,17 @@ async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists(
         await pilot.pause()
         before = (table.scroll_x, table.scroll_y)
         assert before[0] > 0 and before[1] > 0
+        vertical_offsets: list[tuple[float, float]] = []
+        app.watch(
+            table,
+            "scroll_y",
+            lambda old, new: vertical_offsets.append((old, new)),
+            init=False,
+        )
+
+        await pilot.press("r")
+        await _settled(pilot)
+        assert vertical_offsets == []
 
         changed = deepcopy(snapshot)
         changed["active"] = [_row("check-new", 100, "running", repository_id="repo-new")]
@@ -688,6 +699,7 @@ async def test_refresh_preserves_selected_job_and_viewport_when_it_still_exists(
 
         assert ids()[table.cursor_row] == target
         assert (table.scroll_x, table.scroll_y) == before
+        assert all(new > 0 for _old, new in vertical_offsets), vertical_offsets
 
 
 @pytest.mark.asyncio
