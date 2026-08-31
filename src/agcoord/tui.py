@@ -33,24 +33,31 @@ _MISSING = (
 )
 
 _COMPACT_TABLE_WIDTH = 80
-_COMPACT_LABEL_WIDTH = 12
+_COMPACT_BRANCH_WIDTH = 10
+_COMPACT_LABEL_WIDTH = 11
+_WIDE_BRANCH_WIDTH = 27
 
 
-def _label_width(viewport_width: int) -> int:
-    """Give LABEL all width beyond the compact 80-column table."""
-    return _COMPACT_LABEL_WIDTH + max(0, viewport_width - _COMPACT_TABLE_WIDTH)
+def _flexible_widths(viewport_width: int) -> tuple[int, int]:
+    """Grow BRANCH to a useful cap, then give LABEL the remaining width."""
+    extra = max(0, viewport_width - _COMPACT_TABLE_WIDTH)
+    branch_extra = min(extra, _WIDE_BRANCH_WIDTH - _COMPACT_BRANCH_WIDTH)
+    return (
+        _COMPACT_BRANCH_WIDTH + branch_extra,
+        _COMPACT_LABEL_WIDTH + extra - branch_extra,
+    )
 
 
 def _fitted_label_width(table: DataTable, row_count: int) -> int:
     """Fit LABEL around a required vertical scrollbar at supported widths."""
-    preferred = _label_width(table.size.width)
+    _, preferred = _flexible_widths(table.size.width)
     header_height = table.header_height if table.show_header else 0
     needs_vertical_scrollbar = row_count + header_height > table.size.height
     if table.size.width < _COMPACT_TABLE_WIDTH or not needs_vertical_scrollbar:
         return preferred
 
     columns = table.ordered_columns
-    label_index = 4
+    label_index = 5
     fixed_render_width = sum(
         column.width
         for index, column in enumerate(columns)
@@ -462,14 +469,16 @@ def build_app(
             table = self.query_one("#gates", RunTable)
             table.resize_callback = self._render_resized_table
             table.cell_padding = 1
+            branch_width, label_width = _flexible_widths(table.size.width)
             for label, width in (
-                ("STATE", 10),
+                ("STATE", 9),
                 ("KIND", 5),
-                ("REPO", 11),
-                ("RUN", 15),
-                ("LABEL", _label_width(table.size.width)),
-                ("AGE", 6),
-                ("DUR", 6),
+                ("REPO", 9),
+                ("RUN", 9),
+                ("BRANCH", branch_width),
+                ("LABEL", label_width),
+                ("AGE", 5),
+                ("DUR", 5),
             ):
                 table.add_column(label, width=width)
             self.action_refresh()
@@ -557,7 +566,9 @@ def build_app(
             if self._agent_filter is not None:
                 ordered = [row for row in ordered if row["agent"] == self._agent_filter]
             self._rows = {row["run_id"]: row for row in ordered}
-            table.ordered_columns[4].width = _fitted_label_width(table, len(ordered))
+            branch_width, _ = _flexible_widths(table.size.width)
+            table.ordered_columns[4].width = branch_width
+            table.ordered_columns[5].width = _fitted_label_width(table, len(ordered))
             table.clear(columns=False)
             now = _moment(snapshot["captured_at"]) or datetime.now(timezone.utc)
             for row in ordered:
@@ -566,6 +577,7 @@ def build_app(
                     _compact_cell(row["kind"]),
                     _compact_cell(_repository_label(row["repository"])),
                     _compact_cell(row["run_id"]),
+                    _compact_cell(row["branch"]),
                     _compact_cell(row["label"]),
                     _compact_cell(_age(row, now)),
                     _compact_cell(_duration(row, now)),
