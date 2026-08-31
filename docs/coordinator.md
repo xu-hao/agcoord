@@ -828,7 +828,8 @@ choice. `All repositories` or `All agents` clears that filter directly; `Esc` cl
 without changing the current filter. Repository choices show their complete readable remote or
 local identity rather than the internal hashed lane key.
 
-Refresh preserves the selected run and both viewport offsets when that row still exists.
+Refresh reconciles keyed rows in place, preserving the selected run and both viewport offsets
+when that row still exists without first painting a reset-to-top frame.
 At 80 columns the compact table is exactly
 `STATE · KIND · REPO · RUN · BRANCH · LABEL · AGE · DUR` and does not require horizontal
 navigation, including when a long queue also needs its vertical scrollbar. Adjacent columns

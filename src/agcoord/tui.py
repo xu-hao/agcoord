@@ -569,10 +569,15 @@ def build_app(
             branch_width, _ = _flexible_widths(table.size.width)
             table.ordered_columns[4].width = branch_width
             table.ordered_columns[5].width = _fitted_label_width(table, len(ordered))
-            table.clear(columns=False)
+            # Fixed-width mutation is immediate, while DataTable normally updates its
+            # virtual width on a later dimension pass. Clearing previously forced that
+            # pass as a side effect; keep the scroll range accurate explicitly now.
+            table.virtual_size = table.virtual_size.with_width(
+                sum(column.get_render_width(table) for column in table.ordered_columns)
+            )
             now = _moment(snapshot["captured_at"]) or datetime.now(timezone.utc)
-            for row in ordered:
-                table.add_row(
+            rendered = {
+                row["run_id"]: (
                     _compact_cell(row["status"]),
                     _compact_cell(row["kind"]),
                     _compact_cell(_repository_label(row["repository"])),
@@ -581,19 +586,51 @@ def build_app(
                     _compact_cell(row["label"]),
                     _compact_cell(_age(row, now)),
                     _compact_cell(_duration(row, now)),
-                    key=row["run_id"],
+                )
+                for row in ordered
+            }
+            existing = [str(row.key.value) for row in table.ordered_rows]
+            existing_set = set(existing)
+            desired = [row["run_id"] for row in ordered]
+            desired_set = set(desired)
+
+            # Reconcile keyed rows instead of clearing the table. DataTable.clear()
+            # immediately publishes scroll_y=0 and only permits restoration after a
+            # later layout, which makes every periodic refresh visibly snap to the top.
+            # Add first so replacing rows does not temporarily shrink the scroll range.
+            for run_id in desired:
+                if run_id not in existing_set:
+                    table.add_row(*rendered[run_id], key=run_id)
+            for run_id in existing:
+                if run_id not in desired_set:
+                    table.remove_row(run_id)
+
+            columns = table.ordered_columns
+            for run_id in desired:
+                current = table.get_row(run_id)
+                for column, old, new in zip(columns, current, rendered[run_id]):
+                    if old != new:
+                        table.update_cell(run_id, column.key, new)
+
+            current_order = [str(row.key.value) for row in table.ordered_rows]
+            if current_order != desired:
+                positions = {run_id: index for index, run_id in enumerate(desired)}
+                table.sort(
+                    columns[3].key,
+                    key=lambda value: positions[str(value)],
                 )
             if selected in self._rows:
                 table.move_cursor(
-                    row=[row["run_id"] for row in ordered].index(selected),
+                    row=desired.index(selected),
                     scroll=False,
                 )
             elif ordered:
                 table.move_cursor(row=0, scroll=False)
 
-            # DataTable.clear() resets both scroll axes before its new dimensions are
-            # available. Restore after layout so Textual can clamp only when the refreshed
-            # content genuinely became smaller.
+            # A structural change can make DataTable's cursor watcher scroll the
+            # retained selection into view after dimensions settle. Reassert the
+            # user's viewport after that watcher; unlike the former clear/rebuild
+            # path, reconciliation never exposes a reset-to-zero frame first.
             table.call_after_refresh(
                 table.scroll_to,
                 x=viewport[0],
