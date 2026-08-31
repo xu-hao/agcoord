@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Keep the TUI's vertical viewport stable throughout periodic refreshes instead of briefly
+  snapping to the top while rows are rebuilt and then restoring the previous position.
 - Replace repository and agent filter cycling in the TUI with searchable picker menus that
   provide explicit all-values choices and preserve the current filter when dismissed.
 - Show each run's branch in a dedicated TUI table column, prioritizing branch and then label
