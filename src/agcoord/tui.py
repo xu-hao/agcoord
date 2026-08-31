@@ -21,7 +21,8 @@ try:
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.events import Resize
     from textual.screen import ModalScreen
-    from textual.widgets import Button, DataTable, Footer, Label, Static
+    from textual.widgets import Button, DataTable, Footer, Input, Label, OptionList, Static
+    from textual.widgets.option_list import Option
 except ImportError:  # pragma: no cover - the package declares Textual; CLI guard is tested
     App = None
 
@@ -294,6 +295,91 @@ def build_app(
         def action_cancel(self) -> None:
             self.dismiss(False)
 
+    class FilterPicker(ModalScreen[tuple[bool, str | None]]):
+        BINDINGS = [Binding("escape", "cancel", "keep current filter")]
+
+        def __init__(
+            self,
+            title: str,
+            all_label: str,
+            choices: list[tuple[str, str]],
+            current: str | None,
+        ) -> None:
+            super().__init__()
+            self.title_text = title
+            self.all_label = all_label
+            self.choices = choices
+            self.current = current
+            self._visible_choices: list[tuple[str | None, str]] = []
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="filter-picker"):
+                yield Label(self.title_text, markup=False, id="filter-title")
+                yield Input(
+                    placeholder="Type to narrow choices",
+                    id="filter-query",
+                )
+                yield OptionList(id="filter-options")
+                yield Static(
+                    "Type to narrow · Tab choices · Enter apply · Esc keep current",
+                    markup=False,
+                    id="filter-keys",
+                    classes="status",
+                )
+
+        def on_mount(self) -> None:
+            self._render_options("")
+            self.query_one("#filter-query", Input).focus()
+
+        def _render_options(self, query: str) -> None:
+            needle = query.strip().casefold()
+            matches = [
+                (value, label)
+                for value, label in self.choices
+                if not needle or needle in label.casefold()
+            ]
+            self._visible_choices = [(None, self.all_label), *matches]
+            options = self.query_one("#filter-options", OptionList)
+            options.clear_options()
+            options.add_options(
+                Option(
+                    Text(label, no_wrap=True, overflow="ellipsis"),
+                    id=f"filter-choice-{index}",
+                )
+                for index, (_value, label) in enumerate(self._visible_choices)
+            )
+            if needle:
+                options.highlighted = 1 if matches else None
+                return
+            options.highlighted = next(
+                (
+                    index
+                    for index, (value, _label) in enumerate(self._visible_choices)
+                    if value == self.current
+                ),
+                0,
+            )
+
+        def _accept(self, index: int | None) -> None:
+            if index is None or not 0 <= index < len(self._visible_choices):
+                return
+            self.dismiss((True, self._visible_choices[index][0]))
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            self._render_options(event.value)
+
+        def on_input_submitted(self, _event: Input.Submitted) -> None:
+            options = self.query_one("#filter-options", OptionList)
+            self._accept(options.highlighted)
+
+        def on_option_list_option_selected(
+            self, event: OptionList.OptionSelected
+        ) -> None:
+            self._accept(event.option_index)
+
+        def action_cancel(self) -> None:
+            self.dismiss((False, None))
+
     class RunTable(DataTable):
         # Keep Enter owned by DataTable.RowSelected while making its actual meaning visible
         # in the one-line Footer. An App-level Enter binding would double-fire selection.
@@ -312,6 +398,15 @@ def build_app(
         CSS = frame.CSS + """
         #gates { height: 1fr; }
         #gate-detail { height: 9; min-height: 9; max-height: 9; }
+        #filter-picker { width: 76%; max-width: 96; height: 80%; max-height: 32;
+                         padding: 0 1; background: #ffffff; color: #111111;
+                         border: double #111111; }
+        #filter-title { height: auto; padding: 0 1; background: #ddddda;
+                        color: #111111; text-style: bold; }
+        #filter-query { margin: 1 1 0 1; }
+        #filter-options { height: 1fr; margin: 0 1; background: #ffffff;
+                          color: #111111; }
+        #filter-keys { height: 1; }
         """
         ENABLE_COMMAND_PALETTE = False
         BINDINGS = [
@@ -529,28 +624,64 @@ def build_app(
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
 
-        def _cycle_filter(self, field: str, current: str | None) -> str | None:
+        def _filter_rows(self) -> list[dict]:
             if self._snapshot is None:
-                return None
-            rows = [
+                return []
+            return [
                 *self._snapshot["active"],
                 *self._snapshot["queued"],
                 *self._snapshot["recent"],
             ]
-            choices: list[str | None] = [None, *sorted({str(row[field]) for row in rows})]
-            if current not in choices:
-                return None
-            return choices[(choices.index(current) + 1) % len(choices)]
 
         def action_repository(self) -> None:
-            self._repository_filter = self._cycle_filter(
-                "repository_id", self._repository_filter
+            repositories: dict[str, str] = {}
+            for row in self._filter_rows():
+                repositories.setdefault(
+                    str(row["repository_id"]), str(row["repository"])
+                )
+            choices = sorted(
+                repositories.items(),
+                key=lambda choice: (choice[1].casefold(), choice[0]),
             )
+            self.push_screen(
+                FilterPicker(
+                    "Repository filter",
+                    "All repositories",
+                    choices,
+                    self._repository_filter,
+                ),
+                self._repository_picked,
+            )
+
+        def _repository_picked(self, result: tuple[bool, str | None]) -> None:
+            accepted, repository = result
+            if not accepted:
+                return
+            self._repository_filter = repository
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
 
         def action_agent(self) -> None:
-            self._agent_filter = self._cycle_filter("agent", self._agent_filter)
+            agents = sorted(
+                {str(row["agent"]) for row in self._filter_rows()},
+                key=str.casefold,
+            )
+            choices = [(agent, agent) for agent in agents]
+            self.push_screen(
+                FilterPicker(
+                    "Agent filter",
+                    "All agents",
+                    choices,
+                    self._agent_filter,
+                ),
+                self._agent_picked,
+            )
+
+        def _agent_picked(self, result: tuple[bool, str | None]) -> None:
+            accepted, agent = result
+            if not accepted:
+                return
+            self._agent_filter = agent
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
 
