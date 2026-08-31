@@ -40,7 +40,7 @@ diff -u "$expected" "$actual"
 
 while IFS=$'\t' read -r name version license; do
     case "$license" in
-        MIT|MIT\ OR\ Apache-2.0|MIT/Apache-2.0|Public-Domain) ;;
+        MIT|MIT\ OR\ Apache-2.0|MIT/Apache-2.0|Public-Domain|Unlicense\ OR\ MIT|\(MIT\ OR\ Apache-2.0\)\ AND\ Unicode-3.0) ;;
         *)
             printf 'unapproved native dependency license: %s %s (%s)\n' "$name" "$version" "$license" >&2
             exit 1

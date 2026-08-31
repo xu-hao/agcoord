@@ -1444,15 +1444,35 @@ class CoordinatorBroker:
         ]
         with self._db_lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            cutoff_row = db.execute(
+                "SELECT value FROM coordinator_meta "
+                "WHERE key = 'invalid_gate_through_sequence'"
+            ).fetchone()
+            try:
+                invalid_gate_through = (
+                    0 if cutoff_row is None else int(cutoff_row["value"])
+                )
+            except (TypeError, ValueError) as exc:
+                raise CoordinatorError(
+                    "rollback gate cutoff metadata is invalid"
+                ) from exc
+            if invalid_gate_through < 0:
+                raise CoordinatorError("rollback gate cutoff metadata is invalid")
             if gate_run_id is None:
                 receipt = db.execute(
                     """
                     SELECT * FROM runs
                     WHERE kind = 'full' AND status = 'passed'
                       AND repository_id = ? AND branch = ? AND head_sha = ?
+                      AND sequence > ?
                     ORDER BY sequence DESC LIMIT 1
                     """,
-                    (identity.repository_id, selected_branch, selected_head),
+                    (
+                        identity.repository_id,
+                        selected_branch,
+                        selected_head,
+                        invalid_gate_through,
+                    ),
                 ).fetchone()
                 if receipt is None:
                     raise CoordinatorError(
@@ -1467,6 +1487,11 @@ class CoordinatorBroker:
                 if receipt is None:
                     raise CoordinatorError(
                         f"unknown full-gate receipt {gate_run_id!r}"
+                    )
+                if receipt["sequence"] <= invalid_gate_through:
+                    raise CoordinatorError(
+                        f"gate receipt {gate_run_id} is stale after rollback; "
+                        "run a new full gate"
                     )
                 mismatches: list[str] = []
                 if receipt["kind"] != "full" or receipt["status"] != "passed":
