@@ -20,6 +20,8 @@ from uuid import uuid4
 from .resources import (
     RESOURCE_OPERATIONS,
     ResourceContractError,
+    ResourceMeasurement,
+    ResourceObservation,
     ResourceRequest,
 )
 
@@ -66,6 +68,14 @@ _MS_NODEV = 4
 _MS_NOEXEC = 8
 _MS_REC = 16384
 _MS_PRIVATE = 1 << 18
+CPU_PERIOD_USEC = 100_000
+_COMPUTE_BINDINGS = {
+    ("cpu", "logical-cpu"): "cpu",
+    ("processes", "processes"): "pids",
+}
+_LIFECYCLE_BINDING = ("generic", "admission-unit")
+_CONTROLLER_FILE = re.compile(r"^(?:cpu|pids)\.[a-z][a-z0-9_.-]{0,31}$")
+_METRIC_KEY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 
 
 class CgroupV2Error(ResourceContractError):
@@ -121,6 +131,14 @@ class CgroupV2System(Protocol):
     def kill(self, path: Path) -> None: ...
 
     def remove_group(self, path: Path) -> None: ...
+
+    def monotonic_ns(self) -> int: ...
+
+    def enable_controllers(self, path: Path, controllers: set[str]) -> None: ...
+
+    def write_file(self, path: Path, name: str, value: str) -> None: ...
+
+    def read_file(self, path: Path, name: str) -> str: ...
 
 
 def _decode_mount_path(value: str) -> str:
@@ -545,6 +563,90 @@ class LinuxCgroupV2System:
     def remove_group(self, path: Path) -> None:
         os.rmdir(path)
 
+    def monotonic_ns(self) -> int:
+        return time.monotonic_ns()
+
+    def _controller_names(self, path: Path, name: str) -> set[str]:
+        try:
+            values = (path / name).read_text(encoding="ascii").split()
+        except (OSError, UnicodeError) as exc:
+            raise CgroupV2Error(
+                "controller-state-unreadable",
+                "cgroup controller state is unreadable",
+            ) from exc
+        if any(not _CONTROLLER.fullmatch(value) for value in values):
+            raise CgroupV2Error(
+                "controller-state-invalid",
+                "cgroup controller state is invalid",
+            )
+        return set(values)
+
+    def enable_controllers(self, path: Path, controllers: set[str]) -> None:
+        if not controllers:
+            return
+        if any(not _CONTROLLER.fullmatch(name) for name in controllers):
+            raise CgroupV2Error(
+                "controller-invalid",
+                "requested cgroup controller name is invalid",
+            )
+        available = self._controller_names(path, "cgroup.controllers")
+        if not controllers <= available:
+            raise CgroupV2Error(
+                "controller-unavailable",
+                "a requested cgroup controller is unavailable",
+            )
+        enabled = self._controller_names(path, "cgroup.subtree_control")
+        missing = controllers - enabled
+        if missing:
+            try:
+                self._write_control(
+                    path / "cgroup.subtree_control",
+                    " ".join(f"+{name}" for name in sorted(missing)) + "\n",
+                )
+            except OSError as exc:
+                raise CgroupV2Error(
+                    "controller-enable-failed",
+                    "requested cgroup controllers could not be enabled",
+                ) from exc
+        if not controllers <= self._controller_names(path, "cgroup.subtree_control"):
+            raise CgroupV2Error(
+                "controller-enable-unverified",
+                "requested cgroup controllers were not enabled",
+            )
+
+    def write_file(self, path: Path, name: str, value: str) -> None:
+        if not _CONTROLLER_FILE.fullmatch(name):
+            raise CgroupV2Error(
+                "controller-file-invalid",
+                "requested cgroup controller file is invalid",
+            )
+        try:
+            self._write_control(path / name, f"{value.rstrip()}\n")
+        except OSError as exc:
+            raise CgroupV2Error(
+                "controller-write-failed",
+                "cgroup controller value could not be written",
+            ) from exc
+
+    def read_file(self, path: Path, name: str) -> str:
+        if not _CONTROLLER_FILE.fullmatch(name):
+            raise CgroupV2Error(
+                "controller-file-invalid",
+                "requested cgroup controller file is invalid",
+            )
+        try:
+            return (path / name).read_text(encoding="ascii")
+        except FileNotFoundError as exc:
+            raise CgroupV2Error(
+                "controller-file-missing",
+                "cgroup controller file is unavailable",
+            ) from exc
+        except (OSError, UnicodeError) as exc:
+            raise CgroupV2Error(
+                "controller-read-failed",
+                "cgroup controller value could not be read",
+            ) from exc
+
 
 class CgroupV2Backend:
     """Own one collision-safe cgroup v2 leaf for each prepared run."""
@@ -582,6 +684,8 @@ class CgroupV2Backend:
         ).hexdigest()[:16]
         self.owner_name = f"agcoord-u{os.getuid()}-{owner_hash}"
         self._probe_result: CgroupProbe | None = None
+        self._cpu_samples: dict[str, tuple[int, int, int]] = {}
+        self._pids_peaks: dict[str, int] = {}
 
     @property
     def isolate_workers(self) -> bool:
@@ -618,27 +722,108 @@ class CgroupV2Backend:
 
     def probe(self) -> Mapping[str, object]:
         result = self._probe()
+        kinds = {"generic"}
+        units = {"admission-unit"}
+        if "cpu" in result.controllers:
+            kinds.add("cpu")
+            units.add("logical-cpu")
+        if "pids" in result.controllers:
+            kinds.add("processes")
+            units.add("processes")
         return {
             "available": result.available,
-            "kinds": ["generic"] if result.available else [],
-            "units": ["admission-unit"] if result.available else [],
+            "kinds": sorted(kinds) if result.available else [],
+            "units": sorted(units) if result.available else [],
             "operations": list(RESOURCE_OPERATIONS) if result.available else [],
             "reason": result.reason,
         }
 
     def _validate_request(self, request: ResourceRequest) -> None:
-        if request.backend != CGROUP_BACKEND or not request.resources:
+        if (
+            request.backend != CGROUP_BACKEND
+            or not request.resources
+            or set(request.bindings) != set(request.resources)
+        ):
             raise CgroupV2Error("request-invalid", "cgroup request is invalid")
         for name, binding in request.bindings.items():
-            if (
-                name not in request.resources
-                or binding["kind"] != "generic"
-                or binding["unit"] != "admission-unit"
-            ):
+            pair = (binding["kind"], binding["unit"])
+            if pair != _LIFECYCLE_BINDING and pair not in _COMPUTE_BINDINGS:
                 raise CgroupV2Error(
                     "request-unsupported",
-                    "cgroup lifecycle backend supports only generic admission units",
+                    "cgroup backend does not support the requested typed unit",
                 )
+
+    def _controller_resources(self, request: ResourceRequest) -> dict[str, str]:
+        selected: dict[str, str] = {}
+        for name, binding in request.bindings.items():
+            controller = _COMPUTE_BINDINGS.get((binding["kind"], binding["unit"]))
+            if controller is None:
+                continue
+            if controller in selected:
+                raise CgroupV2Error(
+                    "controller-ambiguous",
+                    "one run cannot bind two names to the same cgroup controller",
+                )
+            selected[controller] = name
+        return selected
+
+    def _controller_settings(self, request: ResourceRequest) -> dict[str, str]:
+        resources = self._controller_resources(request)
+        selected: dict[str, str] = {}
+        if cpu_name := resources.get("cpu"):
+            quota = request.resources[cpu_name] * CPU_PERIOD_USEC
+            selected["cpu.max"] = f"{quota} {CPU_PERIOD_USEC}"
+        if pids_name := resources.get("pids"):
+            selected["pids.max"] = str(request.resources[pids_name])
+        return selected
+
+    def _enable_controllers(
+        self,
+        request: ResourceRequest,
+        owner_path: Path,
+    ) -> None:
+        controllers = set(self._controller_resources(request))
+        if not controllers:
+            return
+        result = self._probe()
+        if not controllers <= result.controllers:
+            raise CgroupV2Error(
+                "controller-unavailable",
+                "a requested cgroup controller is unavailable",
+            )
+        assert self.root is not None
+        self.system.enable_controllers(self.root, controllers)
+        self.system.enable_controllers(owner_path, controllers)
+
+    def _configure_controller_values(
+        self,
+        request: ResourceRequest,
+        leaf_path: Path,
+    ) -> None:
+        for name, expected in self._controller_settings(request).items():
+            self.system.write_file(leaf_path, name, expected)
+            observed = " ".join(self.system.read_file(leaf_path, name).split())
+            if observed != expected:
+                raise CgroupV2Error(
+                    "controller-value-unverified",
+                    "cgroup controller value could not be verified",
+                )
+
+    def _start_cpu_sample(self, request: ResourceRequest, leaf_path: Path) -> None:
+        resources = self._controller_resources(request)
+        if "cpu" not in resources:
+            return
+        stats = self._flat_values(self.system.read_file(leaf_path, "cpu.stat"))
+        if "usage_usec" not in stats:
+            raise CgroupV2Error(
+                "cpu-stat-invalid",
+                "cpu.stat does not contain aggregate usage",
+            )
+        self._cpu_samples[request.run_id] = (
+            self.system.monotonic_ns(),
+            stats["usage_usec"],
+            0,
+        )
 
     def _require_available(self) -> None:
         result = self._probe()
@@ -931,6 +1116,11 @@ class CgroupV2Backend:
         self._require_available()
         self._prepare_metadata()
         owner_path, owner_identity = self._ensure_owner()
+        try:
+            self._enable_controllers(request, owner_path)
+        except BaseException:
+            self._cleanup_owner()
+            raise
         manifest_path = self._manifest_path(request.run_id)
         if manifest_path.exists():
             _path, handle = self._read_manifest(request)
@@ -941,6 +1131,16 @@ class CgroupV2Backend:
                         "leaf-populated",
                         "existing run cgroup is still populated",
                     )
+                try:
+                    self._configure_controller_values(request, leaf_path)
+                    self._start_cpu_sample(request, leaf_path)
+                except BaseException:
+                    self._cpu_samples.pop(request.run_id, None)
+                    self._pids_peaks.pop(request.run_id, None)
+                    self.system.remove_group(leaf_path)
+                    manifest_path.unlink(missing_ok=True)
+                    self._cleanup_owner()
+                    raise
                 return handle
             manifest_path.unlink()
 
@@ -963,12 +1163,17 @@ class CgroupV2Backend:
                 "token": token,
             }
             try:
+                self._configure_controller_values(request, owner_path / leaf_name)
+                self._start_cpu_sample(request, owner_path / leaf_name)
                 self._write_json(manifest_path, self._manifest(request, handle))
             except BaseException:
+                self._cpu_samples.pop(request.run_id, None)
+                self._pids_peaks.pop(request.run_id, None)
                 try:
                     self.system.remove_group(owner_path / leaf_name)
                 except OSError:
                     pass
+                self._cleanup_owner()
                 raise
             return handle
         raise CgroupV2Error("leaf-collision", "could not allocate a unique run cgroup")
@@ -989,14 +1194,112 @@ class CgroupV2Backend:
                 "launcher cgroup membership could not be verified",
             )
 
+    @staticmethod
+    def _flat_values(raw: str) -> dict[str, int]:
+        selected: dict[str, int] = {}
+        try:
+            for line in raw.splitlines():
+                name, value = line.split()
+                if (
+                    not _METRIC_KEY.fullmatch(name)
+                    or name in selected
+                    or not value.isascii()
+                    or not value.isdecimal()
+                ):
+                    raise ValueError
+                selected[name] = int(value)
+        except ValueError as exc:
+            raise CgroupV2Error(
+                "controller-metrics-invalid",
+                "cgroup controller metrics are invalid",
+            ) from exc
+        return selected
+
+    @staticmethod
+    def _single_value(raw: str, *, code: str) -> int:
+        value = raw.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise CgroupV2Error(code, "cgroup controller metric is invalid")
+        return int(value)
+
+    def _measurement(
+        self,
+        request: ResourceRequest,
+        leaf_path: Path,
+    ) -> ResourceMeasurement:
+        resources = self._controller_resources(request)
+        peak: dict[str, int] = {}
+        observations: list[ResourceObservation] = []
+
+        if cpu_name := resources.get("cpu"):
+            stats = self._flat_values(self.system.read_file(leaf_path, "cpu.stat"))
+            if "usage_usec" not in stats:
+                raise CgroupV2Error(
+                    "cpu-stat-invalid",
+                    "cpu.stat does not contain aggregate usage",
+                )
+            now_ns = self.system.monotonic_ns()
+            sample = self._cpu_samples.get(request.run_id)
+            measured_peak = 0
+            if sample is not None:
+                previous_ns, previous_usage, measured_peak = sample
+                if now_ns < previous_ns or stats["usage_usec"] < previous_usage:
+                    raise CgroupV2Error(
+                        "cpu-stat-invalid",
+                        "aggregate CPU sampling moved backwards",
+                    )
+                elapsed_usec = (now_ns - previous_ns) // 1_000
+                if elapsed_usec > 0:
+                    used_usec = stats["usage_usec"] - previous_usage
+                    concurrency = (used_usec + elapsed_usec - 1) // elapsed_usec
+                    measured_peak = max(measured_peak, concurrency)
+            self._cpu_samples[request.run_id] = (
+                now_ns,
+                stats["usage_usec"],
+                measured_peak,
+            )
+            peak[cpu_name] = measured_peak
+            if stats.get("nr_throttled", 0) > 0 or stats.get("throttled_usec", 0) > 0:
+                observations.append(ResourceObservation(cpu_name, "cpu-throttled"))
+
+        if pids_name := resources.get("pids"):
+            current = self._single_value(
+                self.system.read_file(leaf_path, "pids.current"),
+                code="pids-current-invalid",
+            )
+            try:
+                reported_peak = self._single_value(
+                    self.system.read_file(leaf_path, "pids.peak"),
+                    code="pids-peak-invalid",
+                )
+            except CgroupV2Error as exc:
+                if exc.code != "controller-file-missing":
+                    raise
+                reported_peak = current
+            measured_peak = max(
+                current,
+                reported_peak,
+                self._pids_peaks.get(request.run_id, 0),
+            )
+            self._pids_peaks[request.run_id] = measured_peak
+            peak[pids_name] = measured_peak
+            events = self._flat_values(self.system.read_file(leaf_path, "pids.events"))
+            if events.get("max", 0) > 0:
+                observations.append(ResourceObservation(pids_name, "pids-limit-hit"))
+
+        return ResourceMeasurement(peak, tuple(observations))
+
     def usage(
         self,
         request: ResourceRequest,
         state: Mapping[str, object],
-    ) -> Mapping[str, int]:
+    ) -> Mapping[str, int] | ResourceMeasurement:
         self._validate_request(request)
-        self._resolve(request, state, allow_missing=False)
-        return {}
+        leaf_path = self._resolve(request, state, allow_missing=False)
+        assert leaf_path is not None
+        if not self._controller_resources(request):
+            return {}
+        return self._measurement(request, leaf_path)
 
     def _kill_and_wait(self, leaf_path: Path) -> None:
         if self.system.populated(leaf_path):
@@ -1014,11 +1317,13 @@ class CgroupV2Backend:
         self,
         request: ResourceRequest,
         state: Mapping[str, object],
-    ) -> Mapping[str, int]:
+    ) -> Mapping[str, int] | ResourceMeasurement:
         self._validate_request(request)
         leaf_path = self._resolve(request, state, allow_missing=True)
         if leaf_path is not None:
             self._kill_and_wait(leaf_path)
+            if self._controller_resources(request):
+                return self._measurement(request, leaf_path)
         return {}
 
     def cancel(
@@ -1067,5 +1372,7 @@ class CgroupV2Backend:
             if self.system.populated(leaf_path):
                 raise CgroupV2Error("leaf-populated", "cannot remove populated run cgroup")
             self.system.remove_group(leaf_path)
+        self._cpu_samples.pop(request.run_id, None)
+        self._pids_peaks.pop(request.run_id, None)
         manifest_path.unlink(missing_ok=True)
         self._cleanup_owner()

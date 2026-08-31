@@ -37,6 +37,7 @@ from .cgroup import (
 from .resources import (
     ResourceBackend,
     ResourceContractError,
+    ResourceObservation,
     ResourceRequest,
     capability_issue,
     default_resource_bindings,
@@ -48,6 +49,7 @@ from .resources import (
     validate_resource_bindings,
     validate_resource_capabilities,
     validate_resource_contract,
+    validate_resource_measurement,
     validate_resource_receipt,
 )
 
@@ -2898,17 +2900,8 @@ class CoordinatorBroker:
         value: object,
         *,
         expected: set[str],
-    ) -> dict[str, int]:
-        if not isinstance(value, Mapping):
-            raise ResourceContractError("resource usage must be a resource mapping")
-        measured: dict[str, int] = {}
-        for name, units in value.items():
-            if name not in expected:
-                raise ResourceContractError("resource usage names an unexpected resource")
-            if not isinstance(units, int) or isinstance(units, bool) or units < 0:
-                raise ResourceContractError("resource usage must be non-negative integers")
-            measured[name] = units
-        return measured
+    ) -> tuple[dict[str, int], tuple[ResourceObservation, ...]]:
+        return validate_resource_measurement(value, expected=expected)
 
     def _capture_resource_usage(
         self,
@@ -2938,7 +2931,10 @@ class CoordinatorBroker:
                     if final
                     else backend.usage(request, record["handle"])
                 )
-                measured = self._resource_measurement(raw, expected=set(names))
+                measured, observations = self._resource_measurement(
+                    raw,
+                    expected=set(names),
+                )
             except Exception as exc:
                 already_recorded = any(
                     event["backend"] == backend_name
@@ -2966,6 +2962,23 @@ class CoordinatorBroker:
                     if units > peak.get(name, -1):
                         peak[name] = units
                         changed = True
+                for observation in observations:
+                    if any(
+                        event["backend"] == backend_name
+                        and event["resource"] == observation.resource
+                        and event["code"] == observation.code
+                        for event in receipt["events"]
+                    ):
+                        continue
+                    self._append_resource_event(
+                        receipt,
+                        backend=backend_name,
+                        resource=observation.resource,
+                        stage=stage,
+                        status="recorded",
+                        code=observation.code,
+                    )
+                    changed = True
                 if final:
                     for name in names:
                         self._append_resource_event(

@@ -22,6 +22,7 @@ from agcoord.queue import (
     migrate_queue,
     state_dir_for,
 )
+from agcoord.resources import ResourceMeasurement, ResourceObservation
 
 from conftest import RunningCoordinator, caller_environment, wait_for
 
@@ -652,6 +653,25 @@ class RecordingResourceBackend:
         self.calls.append(("cleanup", (request, dict(state))))
 
 
+class ObservingResourceBackend(RecordingResourceBackend):
+    def _measurement(self, request) -> ResourceMeasurement:
+        return ResourceMeasurement(
+            {name: 1 for name in request.resources},
+            tuple(
+                ResourceObservation(name, "cpu-throttled")
+                for name in request.resources
+            ),
+        )
+
+    def usage(self, request, state: dict[str, object]) -> ResourceMeasurement:
+        self.calls.append(("usage", (request, dict(state))))
+        return self._measurement(request)
+
+    def finish(self, request, state: dict[str, object]) -> ResourceMeasurement:
+        self.calls.append(("finish", (request, dict(state))))
+        return self._measurement(request)
+
+
 def test_unbound_resource_names_keep_admission_only_meaning(tmp_path: Path):
     running = RunningCoordinator(
         tmp_path / "state",
@@ -764,6 +784,49 @@ def test_backend_lifecycle_applies_and_measures_a_typed_resource(tmp_path: Path)
         assert stages.index("attach") < stages.index("finish")
         assert stages.index("finish") < stages.index("cleanup")
     finally:
+        running.stop()
+
+
+def test_backend_observations_are_sanitized_and_recorded_once(tmp_path: Path):
+    backend = ObservingResourceBackend()
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 1, "cpu": 1},
+        resource_bindings=RESOURCE_BINDING,
+        resource_backends={"test": backend},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    try:
+        run_id = _submit(
+            client,
+            _blocking_command(entered, release, "observed resource"),
+            repository,
+            resources={"cpu": 1},
+        )
+        wait_for(entered.exists, "the observed resource worker did not start")
+
+        def observation_recorded() -> bool:
+            return any(
+                event["code"] == "cpu-throttled"
+                for event in client.status(run_id)["resource_receipt"]["events"]
+            )
+
+        wait_for(observation_recorded, "the backend observation was not recorded")
+        release.touch()
+        row = _row(client, run_id, "passed")
+        observations = [
+            event
+            for event in row["resource_receipt"]["events"]
+            if event["code"] == "cpu-throttled"
+        ]
+        assert len(observations) == 1
+        assert observations[0]["status"] == "recorded"
+        assert row["resource_receipt"]["peak"] == {"cpu": 1}
+    finally:
+        release.touch()
         running.stop()
 
 

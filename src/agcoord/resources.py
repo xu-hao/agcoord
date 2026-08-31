@@ -59,6 +59,22 @@ class ResourceContractError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ResourceObservation:
+    """One sanitized backend fact to record in the durable resource events."""
+
+    resource: str
+    code: str
+
+
+@dataclass(frozen=True)
+class ResourceMeasurement:
+    """Peak values plus stable, non-sensitive observations from one sample."""
+
+    peak: Mapping[str, int]
+    observations: tuple[ResourceObservation, ...] = ()
+
+
+@dataclass(frozen=True)
 class ResourceRequest:
     """One backend's immutable subset of an admitted run's resource contract."""
 
@@ -113,13 +129,13 @@ class ResourceBackend(Protocol):
         self,
         request: ResourceRequest,
         state: Mapping[str, object],
-    ) -> Mapping[str, int]: ...
+    ) -> Mapping[str, int] | ResourceMeasurement: ...
 
     def finish(
         self,
         request: ResourceRequest,
         state: Mapping[str, object],
-    ) -> Mapping[str, int]: ...
+    ) -> Mapping[str, int] | ResourceMeasurement: ...
 
     def cancel(
         self,
@@ -262,6 +278,48 @@ def initial_resource_receipt(resources: Mapping[str, int]) -> dict[str, object]:
         "peak": {},
         "events": [],
     }
+
+
+def validate_resource_measurement(
+    value: object,
+    *,
+    expected: set[str],
+) -> tuple[dict[str, int], tuple[ResourceObservation, ...]]:
+    """Normalize one backend sample without admitting unexpected public names."""
+
+    if isinstance(value, ResourceMeasurement):
+        raw_peak = value.peak
+        raw_observations = value.observations
+    else:
+        raw_peak = value
+        raw_observations = ()
+    peak = _resource_mapping(
+        raw_peak,
+        subject="resource usage",
+        allow_zero=True,
+    )
+    if not set(peak).issubset(expected):
+        raise ResourceContractError("resource usage names an unexpected resource")
+    if not isinstance(raw_observations, tuple):
+        raise ResourceContractError("resource observations must be a tuple")
+    observations: list[ResourceObservation] = []
+    for observation in raw_observations:
+        if not isinstance(observation, ResourceObservation):
+            raise ResourceContractError("resource observation is invalid")
+        if (
+            not isinstance(observation.resource, str)
+            or observation.resource not in expected
+        ):
+            raise ResourceContractError(
+                "resource observation names an unexpected resource"
+            )
+        if not isinstance(observation.code, str) or not _CODE.fullmatch(
+            observation.code
+        ):
+            raise ResourceContractError("resource observation code is invalid")
+        if observation not in observations:
+            observations.append(observation)
+    return peak, tuple(observations)
 
 
 def validate_resource_receipt(
