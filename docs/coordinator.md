@@ -56,10 +56,11 @@ the entire machine:
   identifiable in migrated history but are not the normal public landing workflow.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
-directory. It holds at most `capacities`, `bindings`, and `cgroup_root`; invalid JSON, a
-top-level value that is not an object, an unknown key, a section that is not an object, or an
-empty `cgroup_root` is refused when the broker loads its configuration. An absent file is the
-default configuration, and capacity then defaults to `jobs=2`.
+directory. It holds at most `capacities`, `bindings`, `cgroup_root`, and `cgroup_io`; invalid
+JSON, a top-level value that is not an object, an unknown key, a section that is not an object,
+or an empty `cgroup_root` is refused when the broker loads its configuration. When present,
+`cgroup_io` contains exactly one nonempty `paths` list of unique absolute strings. An absent
+file is the default configuration, and capacity then defaults to `jobs=2`.
 
 ```json
 {
@@ -71,10 +72,10 @@ default configuration, and capacity then defaults to `jobs=2`.
 }
 ```
 
-No environment variable configures capacity, bindings, or the delegated cgroup root;
-`AGCOORD_STATE_DIR` selects which state directory, and therefore which configuration file, a
-client and broker share. A live owner keeps the configuration with which it acquired the
-spool, so editing the file changes the next broker rather than the running one.
+No environment variable configures capacity, bindings, the delegated cgroup root, or block-I/O
+paths; `AGCOORD_STATE_DIR` selects which state directory, and therefore which configuration
+file, a client and broker share. A live owner keeps the configuration with which it acquired
+the spool, so editing the file changes the next broker rather than the running one.
 
 Every job implicitly requests `jobs=1`. Jobs add resources with repeatable
 `--resource NAME=UNITS` options. Names are generic machine capabilities such as `cpu`,
@@ -122,13 +123,16 @@ the broker starts with the `bindings` section of `config.json`:
 
 A binding contains exactly `kind`, `unit`, `mode`, and `backend`. The supported typed pairs are
 `cpu/logical-cpu`; `memory`, `memory-high`, `swap`, `tmpfs`, or `storage` with `bytes`;
-`io-bandwidth/bytes-per-second`; `io-operations/operations-per-second`; `inodes/inodes`; and
-`processes/processes`. `generic/admission-unit` remains available for an explicitly typed
-admission-only resource. `admission-only` requires a null backend, `best-effort` runs when its
-backend or unit is unavailable but records that it was not applied, and `required` fails the
-row with exit status 125 and `failure_reason=resource-enforcement-failed` before releasing the
-blocked worker launcher. A binding does not create capacity; its name must still be present in
-the `capacities` section before a job can request it.
+`io-bandwidth` with `bytes-per-second`, `read-bytes-per-second`, or
+`write-bytes-per-second`; `io-operations` with `operations-per-second`,
+`read-operations-per-second`, or `write-operations-per-second`; `io-weight/weight`;
+`inodes/inodes`; and `processes/processes`. `generic/admission-unit` remains available for an
+explicitly typed admission-only resource. `admission-only` requires a null backend,
+`best-effort` runs when its backend or unit is unavailable but records that it was not applied,
+and `required` fails the row with exit status 125 and
+`failure_reason=resource-enforcement-failed` before releasing the blocked worker launcher. A
+binding does not create capacity; its name must still be present in the `capacities` section
+before a job can request it.
 
 Backends expose a sanitized capability probe and the idempotent lifecycle `prepare`, `attach`,
 `usage`, `finish`, `cancel`, and `cleanup`. Attach happens before user code can start; usage,
@@ -140,8 +144,9 @@ remain separate implementations; a configured backend is never silently treated 
 ### Delegated cgroup v2 lifecycle
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
-are delegated, aggregate CPU bandwidth, task counts, memory, and swap. Configure one exclusive
-delegated root and explicitly bind the capacity names before the broker starts:
+are delegated, aggregate CPU bandwidth, task counts, memory, swap, and explicitly mapped block
+I/O. Configure one exclusive delegated root and explicitly bind the capacity names before the
+broker starts:
 
 ```json
 {
@@ -412,14 +417,93 @@ options](https://www.man7.org/linux/man-pages/man5/ext4.5.html), and [XFS projec
 semantics](https://www.man7.org/linux/man-pages/man8/xfs_quota.8.html) define the underlying
 enforcement.
 
+### Per-device block I/O
+
+The `cgroup-v2` backend can enforce bandwidth and operation-rate ceilings for explicitly
+configured scratch devices. The paths identify devices; AGCoord does not create those paths,
+redirect `TMPDIR`, or limit filesystem capacity. Bind directional names, and configure one or
+more scratch paths in the same broker file:
+
+```json
+{
+  "capacities": {
+    "jobs": 2,
+    "read_bps": 268435456,
+    "write_bps": 134217728,
+    "read_iops": 4000,
+    "write_iops": 2000
+  },
+  "bindings": {
+    "read_bps": {
+      "kind": "io-bandwidth", "unit": "read-bytes-per-second",
+      "mode": "required", "backend": "cgroup-v2"
+    },
+    "write_bps": {
+      "kind": "io-bandwidth", "unit": "write-bytes-per-second",
+      "mode": "required", "backend": "cgroup-v2"
+    },
+    "read_iops": {
+      "kind": "io-operations", "unit": "read-operations-per-second",
+      "mode": "required", "backend": "cgroup-v2"
+    },
+    "write_iops": {
+      "kind": "io-operations", "unit": "write-operations-per-second",
+      "mode": "required", "backend": "cgroup-v2"
+    }
+  },
+  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service",
+  "cgroup_io": {"paths": ["/srv/agcoord-scratch"]}
+}
+```
+
+```bash
+agc run --resource read_bps=134217728 --resource write_bps=67108864 \
+  --resource read_iops=2000 --resource write_iops=1000 -- python -m pytest -q
+```
+
+The generic `bytes-per-second` and `operations-per-second` units apply the same requested value
+to both directions. They cannot be combined with a directional binding that would claim the
+same `rbps`, `wbps`, `riops`, or `wiops` control in one run. An optional `io-weight/weight`
+binding writes a per-device proportional weight from 1 through 10000; kernel or scheduler
+support is still verified, and the requested weight consumes its ordinary named admission
+capacity like every other resource.
+
+Before creating the run leaf, AGCoord resolves every configured path to a distinct device and
+records the sorted major:minor and filesystem identities in private ownership metadata. It
+accepts only real, writable mount trees on directly identifiable whole block devices using
+ext2, ext4, F2FS, or XFS. It refuses symlinks, bind/subdirectory mounts, overlay and network
+filesystems, Btrfs, partitions, device mapper, MD, and other stacked devices. Linux itself
+rejects partition numbers for per-block-cgroup settings, so AGCoord never substitutes a parent
+disk and pretends that it is the requested target. The mapping is resolved again before launcher
+attachment and during recovery; any identity change fails closed.
+
+AGCoord writes and reads back every requested `io.max` or `io.weight` value before releasing
+user code. The policy applies to all I/O issued by the complete run cgroup to each recorded
+device, including other paths on that device; it does not constrain checkout or scratch I/O on
+an unlisted device. The requested number is applied independently to every selected device; it
+is not divided into one aggregate multi-device ceiling. Multiple configured paths that resolve
+to one device are deduplicated and receive one policy.
+
+Receipts retain the exact named limits in `applied`. The backend samples the recorded devices'
+monotonic `io.stat` byte and operation counters and reports the greatest interval rate under
+each binding in `peak`; a symmetric binding uses the greater directional rate. A terminal sample
+is taken after the worker tree is gone but before the leaf is removed for normal completion and
+cancellation. A weight has no absolute usage peak. The raw device identity stays in the private
+handle so public output does not disclose host topology. Temporary bursts remain possible under
+the kernel's `io.max` contract, and buffered writeback is supported only for the filesystems
+listed above. Block-I/O controls do not limit bytes or inodes stored; use the separate project
+quota or tmpfs contracts when capacity is the requirement. See the kernel's
+[`io.max`, `io.weight`, `io.stat`, and writeback contract`](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#io)
+for the underlying behavior.
+
 Normal finish and cancellation use `cgroup.kill`, wait for `cgroup.events` to report
 `populated 0`, and remove only the identity recorded for that run. A replacement broker adopts a
 still-live durable handle without creating a second leaf. Missing partial state is cleaned
 idempotently, while a changed device/inode, mismatched token, unrecorded collision, or populated
 stale leaf is refused and never removed as if it were owned.
 
-The cgroup backend does not yet translate I/O units. Optional tmpfs and project-quota trees are
-scratch resource controls rather than credential, network, or general security sandboxes.
+Optional tmpfs and project-quota trees plus block-I/O policies are resource controls rather than
+credential, network, or general security sandboxes.
 
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an

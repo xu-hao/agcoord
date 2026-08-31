@@ -25,8 +25,21 @@ RESOURCE_UNITS_BY_KIND = {
     "swap": frozenset({"bytes"}),
     "tmpfs": frozenset({"bytes"}),
     "storage": frozenset({"bytes"}),
-    "io-bandwidth": frozenset({"bytes-per-second"}),
-    "io-operations": frozenset({"operations-per-second"}),
+    "io-bandwidth": frozenset(
+        {
+            "bytes-per-second",
+            "read-bytes-per-second",
+            "write-bytes-per-second",
+        }
+    ),
+    "io-operations": frozenset(
+        {
+            "operations-per-second",
+            "read-operations-per-second",
+            "write-operations-per-second",
+        }
+    ),
+    "io-weight": frozenset({"weight"}),
     "inodes": frozenset({"inodes"}),
     "processes": frozenset({"processes"}),
 }
