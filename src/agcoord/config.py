@@ -1,6 +1,6 @@
 """The one JSON file that configures a state directory's broker.
 
-Capacity, resource bindings, the delegated cgroup root, and block-I/O paths are operator
+Capacity, resource bindings, host-backed enforcement, and database lock waiting are operator
 contracts for one state directory, so they live beside that directory's spool rather than in
 ambient process environment.  This module owns only file location, JSON shape, and section
 types; capacity semantics stay in :mod:`agcoord.queue`, binding semantics in
@@ -12,12 +12,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import math
 import os
 from typing import Any, Mapping
 
 
 CONFIG_FILENAME = "config.json"
-_CONFIG_KEYS = frozenset({"capacities", "bindings", "cgroup_root", "cgroup_io"})
+MAX_DATABASE_TIMEOUT = 2_147_483.647
+_CONFIG_KEYS = frozenset(
+    {"capacities", "bindings", "cgroup_root", "cgroup_io", "database_timeout"}
+)
 
 
 class BrokerConfigError(RuntimeError):
@@ -32,6 +36,7 @@ class BrokerConfig:
     bindings: Mapping[str, Any] | None
     cgroup_root: str | None
     cgroup_io: Mapping[str, Any] | None
+    database_timeout: float | None
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -50,6 +55,7 @@ def load_broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
             bindings=None,
             cgroup_root=None,
             cgroup_io=None,
+            database_timeout=None,
         )
     except OSError as exc:
         raise BrokerConfigError(f"cannot read broker configuration {path}: {exc}") from exc
@@ -76,6 +82,7 @@ def parse_broker_config(
     capacities = _section(document, "capacities", source=source)
     bindings = _section(document, "bindings", source=source)
     cgroup_io = _cgroup_io_section(document, source=source)
+    database_timeout = _database_timeout(document, source=source)
     cgroup_root = document.get("cgroup_root")
     if cgroup_root is not None and (
         not isinstance(cgroup_root, str) or not cgroup_root.strip()
@@ -88,6 +95,7 @@ def parse_broker_config(
         bindings=bindings,
         cgroup_root=cgroup_root,
         cgroup_io=cgroup_io,
+        database_timeout=database_timeout,
     )
 
 
@@ -144,3 +152,31 @@ def _cgroup_io_section(
         identities.add(identity)
         selected.append(raw_path)
     return {"paths": selected}
+
+
+def _database_timeout(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> float | None:
+    value = document.get("database_timeout")
+    if value is None:
+        return None
+    selected: float | None = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            selected = float(value)
+        except OverflowError:
+            pass
+    if (
+        selected is None
+        or not math.isfinite(selected)
+        or selected <= 0
+        or selected > MAX_DATABASE_TIMEOUT
+    ):
+        raise BrokerConfigError(
+            f"broker configuration {source} database_timeout must be "
+            f"a positive finite number of seconds no greater than "
+            f"{MAX_DATABASE_TIMEOUT}"
+        )
+    return selected

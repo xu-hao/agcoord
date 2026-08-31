@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -363,6 +364,165 @@ def test_absent_configuration_file_defaults_to_two_job_slots(tmp_path: Path):
         running.stop()
 
 
+def test_fresh_database_uses_wal_and_the_configured_lock_timeout(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    repository = _repository(tmp_path / "repository")
+    write_broker_config(
+        state_dir,
+        capacities={"jobs": 1},
+        database_timeout=0.05,
+    )
+    broker = CoordinatorBroker(state_dir, idle_timeout=None)
+    locker = sqlite3.connect(broker.paths.database)
+    try:
+        assert locker.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        locker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            broker.submit(
+                _python("print('must not run')"),
+                checkout=str(repository),
+                resources={"jobs": 1},
+                caller_pid=os.getpid(),
+                environment=caller_environment(),
+            )
+        assert time.monotonic() - started < 1
+    finally:
+        locker.rollback()
+        locker.close()
+        broker.close()
+
+
+def test_wal_writer_contention_does_not_stop_or_cancel_the_live_broker(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    write_broker_config(
+        state_dir,
+        capacities={"jobs": 1},
+        database_timeout=0.05,
+    )
+    running = RunningCoordinator(
+        state_dir,
+        capacities=None,
+        idle_timeout=60,
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    locker: sqlite3.Connection | None = None
+    try:
+        run_id = _submit(
+            client,
+            _blocking_command(entered, release, "locked full"),
+            repository,
+            kind="full",
+        )
+        wait_for(entered.exists, "the lock-test full gate never started")
+
+        locker = sqlite3.connect(running.broker.paths.database)
+        locker.execute("BEGIN EXCLUSIVE")
+        locker.execute(
+            "UPDATE coordinator_meta SET value = value WHERE key = 'protocol'"
+        )
+        release.touch()
+        wait_for(
+            lambda: "database is locked"
+            in running.broker.paths.daemon_log.read_text(encoding="utf-8"),
+            "the broker never encountered the held writer lock",
+        )
+
+        assert running.thread.is_alive()
+        assert running.errors == []
+        locked = client.status(run_id)
+        assert locked["status"] == "running"
+        assert locked["cancel_requested"] is False
+
+        locker.rollback()
+        locker.close()
+        locker = None
+        finished = _row(client, run_id, "passed")
+        assert finished["cancel_requested"] is False
+    finally:
+        if locker is not None:
+            locker.rollback()
+            locker.close()
+        release.touch()
+        running.stop()
+
+
+def test_idle_health_check_retries_a_transient_legacy_journal_lock(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    write_broker_config(
+        state_dir,
+        capacities={"jobs": 1},
+        database_timeout=0.05,
+    )
+    running = RunningCoordinator(
+        state_dir,
+        capacities=None,
+        idle_timeout=60,
+    )
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    locker: sqlite3.Connection | None = None
+    try:
+        with sqlite3.connect(running.broker.paths.database) as setup:
+            assert setup.execute("PRAGMA journal_mode = DELETE").fetchone()[0] == "delete"
+
+        running.thread.start()
+        wait_for(
+            lambda: running.broker.ready.is_set() or running.errors,
+            "the legacy-journal broker never acquired ownership",
+        )
+        assert running.errors == []
+        run_id = running.broker.submit(
+            _blocking_command(entered, release, "legacy lock full"),
+            checkout=str(repository),
+            kind="full",
+            resources={"jobs": 1},
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+        )
+        wait_for(entered.exists, "the legacy-lock full gate never started")
+
+        locker = sqlite3.connect(running.broker.paths.database)
+        locker.execute("BEGIN EXCLUSIVE")
+        locker.execute(
+            "UPDATE coordinator_meta SET value = value WHERE key = 'protocol'"
+        )
+        wait_for(
+            lambda: (
+                "idle check database contention"
+                in running.broker.paths.daemon_log.read_text(encoding="utf-8")
+            ),
+            "the idle health check never observed the held database lock",
+        )
+        assert running.thread.is_alive()
+        assert running.errors == []
+
+        locker.rollback()
+        locker.close()
+        locker = None
+        client = CoordinatorClient(state_dir=state_dir, autostart=False)
+        preserved = client.status(run_id)
+        assert preserved["status"] == "running"
+        assert preserved["cancel_requested"] is False
+
+        release.touch()
+        assert _row(client, run_id, "passed")["cancel_requested"] is False
+    finally:
+        if locker is not None:
+            locker.rollback()
+            locker.close()
+        release.touch()
+        running.stop()
+
+
 def test_capacity_environment_variable_no_longer_configures_a_broker(
     monkeypatch,
     tmp_path: Path,
@@ -384,6 +544,11 @@ def test_capacity_environment_variable_no_longer_configures_a_broker(
         '{"capacities": {"jobs": 2}, "unknown": 1}',
         '{"capacities": []}',
         '{"cgroup_root": ""}',
+        '{"database_timeout": 0}',
+        '{"database_timeout": -1}',
+        '{"database_timeout": true}',
+        '{"database_timeout": "10"}',
+        '{"database_timeout": 2147483.648}',
     ],
 )
 def test_malformed_configuration_file_is_rejected_when_the_broker_loads(
@@ -548,6 +713,8 @@ def test_legacy_history_requires_explicit_migration_without_inventing_enforcemen
         "from_protocol": legacy_protocol,
         "to_protocol": PROTOCOL,
     }
+    with sqlite3.connect(database) as db:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     running = RunningCoordinator(state_dir, capacities={"jobs": 1})
     client = running.start()
     try:
@@ -1682,6 +1849,94 @@ broker.serve_forever()
         assert not scratch_root.exists()
     finally:
         gate_release.touch()
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=5)
+        if replacement is not None:
+            replacement.stop()
+        elif worker_pid is not None:
+            try:
+                os.killpg(worker_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_replacement_broker_preserves_a_full_worker_after_the_owner_crashes(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    crash = tmp_path / "crash"
+    owner = subprocess.Popen(
+        _python(
+            """
+import sys
+from pathlib import Path
+
+from agcoord.queue import CoordinatorBroker
+
+class CrashingBroker(CoordinatorBroker):
+    def _should_idle_exit(self):
+        if Path(sys.argv[2]).exists():
+            raise RuntimeError("injected broker failure")
+        return False
+
+broker = CrashingBroker(
+    state_dir=sys.argv[1],
+    capacities={"jobs": 1},
+    idle_timeout=None,
+)
+broker.serve_forever()
+""",
+            state_dir,
+            crash,
+        ),
+        env=caller_environment(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    replacement: RunningCoordinator | None = None
+    worker_pid: int | None = None
+
+    try:
+        snapshot = wait_for(
+            lambda: client.snapshot(),
+            "the original full broker never acquired ownership",
+        )
+        assert snapshot["broker_pid"] == owner.pid
+        run_id = _submit(
+            client,
+            _blocking_command(entered, release, "recovered full"),
+            repository,
+            kind="full",
+            label="recoverable full",
+        )
+        wait_for(entered.exists, "the recoverable full gate never started")
+        live = client.status(run_id)
+        worker_pid = live["worker_pid"]
+        assert isinstance(worker_pid, int)
+
+        crash.touch()
+        assert owner.wait(timeout=5) != 0
+
+        replacement = RunningCoordinator(state_dir, capacities={"jobs": 1})
+        recovered_client = replacement.start()
+        recovered = recovered_client.status(run_id)
+        assert recovered["status"] == "running"
+        assert recovered["worker_pid"] == worker_pid
+        assert recovered["cancel_requested"] is False
+        assert recovered_client.snapshot()["allocations"] == {"jobs": 1}
+
+        release.touch()
+        finished = _row(recovered_client, run_id, "interrupted")
+        assert finished["exit_status"] is None
+        assert finished["worker_pid"] == worker_pid
+        assert "recovered full" in recovered_client.log(run_id)["text"]
+    finally:
+        release.touch()
         if owner.poll() is None:
             owner.terminate()
             owner.wait(timeout=5)

@@ -63,13 +63,14 @@ class RunningCoordinator:
         capacities: dict[str, int] | None = None,
         resource_bindings: dict[str, dict[str, object]] | None = None,
         resource_backends: dict[str, object] | None = None,
+        idle_timeout: float | None = None,
     ) -> None:
         self.broker = CoordinatorBroker(
             state_dir=state_dir,
             capacities=capacities,
             resource_bindings=resource_bindings,
             resource_backends=resource_backends,
-            idle_timeout=None,
+            idle_timeout=idle_timeout,
         )
         self.errors: list[BaseException] = []
         self.thread = threading.Thread(
