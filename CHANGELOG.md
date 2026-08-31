@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.2.2 — 2026-08-31
+
 - Preserve every identity-verified live worker when a broker exits unexpectedly, allowing a
   replacement owner to adopt it instead of recording an unrequested cancellation; explicit
   broker shutdown remains a graceful cancellation boundary.
