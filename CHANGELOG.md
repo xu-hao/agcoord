@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.2.1 — 2026-08-31
+
 - Use one stable `unnamed` identity when neither `--agent` nor `AGCOORD_AGENT` is set, retain
   the exact caller PID separately, and omit legacy per-PID fallbacks from the TUI agent picker.
 - Keep the TUI's vertical viewport stable throughout periodic refreshes instead of briefly
