@@ -925,3 +925,11 @@ admission-only contracts with empty applied, peak, and event fields. Familiar le
 not reinterpreted as typed or enforced resources. Protocol 3 migrates by adding the durable
 child-CPU-lease catalogue; terminal run history remains unchanged and no lease is invented for
 old work.
+
+During the protocol-5 native-owner rollout, its separate migration first produces and verifies
+a normalized protocol-4 rollback backup. An explicit rollback restores that baseline, replays
+terminal native history, and writes `invalid_gate_through_sequence`. Protocol-4 merge submission
+then ignores all full-gate receipts through that sequence, including an explicitly named one;
+run a new exact-head full gate before any legacy merge workflow. The installed `agc` continues
+to own protocol-4 migration until native client selection is enabled, so installing or building
+the native artifact alone never performs this transition.

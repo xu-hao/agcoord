@@ -153,6 +153,33 @@ The protocol-4 Python broker remains the current owner until the explicit migrat
 integration tickets land. Merely building or placing the native artifact does not change a live
 broker or state directory.
 
+### Implemented scheduler and state boundary
+
+The native executable now implements the protocol-5 owner lock, SQLite spool initialization,
+submission validation, admission, repository barriers, queue-order-preserving round-robin
+selection, generic capacity accounting, cancellation, land-phase authority, history reads,
+worker observation, and explicit migration and rollback. This is the implementation boundary
+for scheduler conformance; it does not activate the native broker for the Python CLI yet.
+
+`serve` validates the complete schema and every stored run before changing activity metadata,
+puts new and migrated databases in WAL mode, and uses `database_timeout` from the state
+directory's strict `config.json`. Busy or locked pump transactions are retried. Other structural
+errors stop the owner with a stable JSON refusal; one executable that cannot be spawned fails
+only its owning row.
+
+Admission commits before worker creation and worker identity commits separately. A replacement
+therefore classifies a committed admission with no live worker as `interrupted`, adopts an exact
+live PID/start-token identity without running the command twice, and preserves an already
+terminal commit. Debug builds expose bounded crash-injection points for these commits and their
+cleanup; release builds reject the injection option.
+
+On `SIGINT` or `SIGTERM`, the owner stops admitting work, leaves queued rows durable for the next
+owner, requests cancellation of active checks, full gates, and pre-publication lands, and drains
+them. A running legacy merge or a land whose `publishing` transition committed remains
+authoritative and is drained to a durable result. The identity-verified land-phase transaction
+and cancellation transaction both take the same immediate SQLite write lock, so exactly one
+wins their race.
+
 ### Client-authored operations
 
 Clients continue to use short SQLite transactions rather than mutating live processes:
@@ -232,6 +259,21 @@ Native-only startup and protocol refusals use a stable kebab-case code plus a hu
 Messages may include an operator-selected path but never credentials, raw kernel exceptions,
 environment values, or publication secrets. Clients branch only on codes and protocol numbers.
 
+The scheduler/state implementation freezes these refusal families:
+
+| Family | Stable codes |
+| --- | --- |
+| Command and configuration | `broker-command-invalid`, `broker-config-invalid` |
+| State and ownership | `broker-state-invalid`, `broker-state-missing`, `broker-already-owned`, `broker-not-running`, `broker-owner-lock-unavailable`, `broker-owner-metadata-invalid` |
+| Protocol and storage | `broker-protocol-mismatch`, `broker-protocol-unsupported`, `broker-schema-invalid`, `broker-row-invalid`, `broker-wal-unavailable`, `broker-database-busy`, `broker-database-error` |
+| Submission and admission | `broker-submission-invalid`, `broker-run-exists`, `broker-run-unknown`, `broker-run-terminal`, `broker-resource-unavailable`, `broker-active-state-invalid` |
+| Gate and land authority | `broker-gate-required`, `broker-gate-mismatch`, `stale-gate-verdict`, `broker-land-phase-invalid`, `broker-land-identity-mismatch`, `broker-land-cancelled`, `broker-publication-authoritative` |
+| Migration | `broker-migration-live-runs`, `broker-migration-row-invalid`, `broker-migration-state-changed`, `broker-migration-backup-failed`, `broker-migration-backup-invalid` |
+| Worker ownership | `broker-worker-start-failed`, `broker-worker-identity-invalid`, `broker-worker-identity-mismatch`, `broker-worker-observation-failed`, `broker-worker-signal-failed` |
+
+Later resource backends may add backend-specific refusal or receipt-event codes without changing
+the meaning of these codes.
+
 ## Native worker contract
 
 The serving process forks or clones its worker path inside the same executable. There is no
@@ -275,6 +317,20 @@ Protocol 1 through 3 first use their already-defined migrations to protocol 4. R
 separate explicit idle operation that restores the verified protocol-4 backup; neither client
 nor broker performs an implicit down-migration. A moved binary, changed build digest, target
 branch move, or incompatible client invalidates previous startup or landing evidence.
+
+The native migration command checkpoints WAL, creates and fsyncs a mode-`0600` backup, verifies
+its owner, protocol, SQLite integrity, schema, rows, and lack of live work, and only then commits
+the protocol-5 owner fingerprint and the first sequence eligible to authorize native
+publication. Protocol-1 through protocol-3 input is transactionally normalized to protocol 4
+first, without inventing resource enforcement or child leases, and the normalized protocol-4
+database is the rollback baseline.
+
+Rollback also requires an idle owner lock. In one transaction it restores that verified
+protocol-4 baseline and replays terminal protocol-5 rows and leases, preserving history while
+discarding no authoritative result. It records `invalid_gate_through_sequence` at the greatest
+sequence observed before rollback. A protocol-4 client excludes every receipt at or below that
+cutoff, whether selected automatically or named explicitly, so publication requires a new full
+gate after rollback.
 
 During rollout, Python clients may understand both owner records but start only the native
 binary for protocol 5. The old Python `serve` entry point refuses protocol 5. The native broker
