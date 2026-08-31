@@ -453,6 +453,11 @@ options](https://www.man7.org/linux/man-pages/man5/ext4.5.html), and [XFS projec
 semantics](https://www.man7.org/linux/man-pages/man8/xfs_quota.8.html) define the underlying
 enforcement.
 
+The Python and Rust broker owners enforce this same contract and use compatible durable handles,
+receipts, and protocol-5 recovery rules. The native owner performs the filesystem attribute and
+quota operations through kernel interfaces in the static broker; it does not invoke `chattr`,
+`setquota`, `xfs_quota`, or another host-side quota helper.
+
 ### Per-device block I/O
 
 The `cgroup-v2` backend can enforce bandwidth and operation-rate ceilings for explicitly
