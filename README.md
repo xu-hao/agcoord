@@ -29,9 +29,12 @@ agc tui
 
 State defaults to `${XDG_STATE_HOME:-~/.local/state}/agcoord`. Set
 `AGCOORD_STATE_DIR` or pass `--state-dir` to use a deliberate alternate spool.
-Machine capacity defaults to two concurrent job slots. Configure named resources before the
-broker starts with either `AGCOORD_CAPACITIES='jobs=4,cpu=8,browser=1'` or an equivalent JSON
-object.
+Machine capacity defaults to two concurrent job slots. One JSON file, `config.json` in the
+state directory, configures the broker that owns it:
+
+```json
+{"capacities": {"jobs": 4, "cpu": 8, "browser": 1}}
+```
 
 ## Run work
 
@@ -43,10 +46,10 @@ agc run --label "unit tests" --resource cpu=2 -- python -m pytest -q
 
 Every job implicitly holds one `jobs` slot. Repeatable `--resource` options add only named,
 configured resources; unknown or impossible requests fail instead of waiting forever.
-Those names are admission accounting by default. Optional JSON
-`AGCOORD_RESOURCE_BINDINGS` entries give selected names explicit units and
-`admission-only`, `best-effort`, or `required` backend semantics; every run then reports what
-was requested, actually applied, and measured. See the
+Those names are admission accounting by default. Optional `bindings` entries in the same
+`config.json` give selected names explicit units and `admission-only`, `best-effort`, or
+`required` backend semantics; every run then reports what was requested, actually applied, and
+measured. See the
 [resource contract](docs/coordinator.md#repository-lanes-and-resources) for the strict binding
 shape and current backend availability.
 

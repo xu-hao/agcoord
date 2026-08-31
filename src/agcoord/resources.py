@@ -239,19 +239,13 @@ def validate_resource_bindings(
     return dict(sorted(selected.items()))
 
 
-def default_resource_bindings() -> dict[str, dict[str, object]]:
-    configured = os.environ.get("AGCOORD_RESOURCE_BINDINGS")
-    if configured is None:
+def configured_resource_bindings(
+    section: Mapping[str, Mapping[str, object]] | None,
+) -> dict[str, dict[str, object]]:
+    """Validate the bindings section of one state directory's configuration file."""
+    if section is None:
         return {}
-    if not configured.strip():
-        raise ResourceContractError("AGCOORD_RESOURCE_BINDINGS is empty")
-    try:
-        raw = json.loads(configured)
-    except json.JSONDecodeError as exc:
-        raise ResourceContractError(
-            "AGCOORD_RESOURCE_BINDINGS must be one JSON object"
-        ) from exc
-    return validate_resource_bindings(raw)
+    return validate_resource_bindings(section)
 
 
 def resource_contract(
