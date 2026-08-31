@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.2.1 — 2026-08-31
+
 - Replace repository and agent filter cycling in the TUI with searchable picker menus that
   provide explicit all-values choices and preserve the current filter when dismissed.
 - Show each run's branch in a dedicated TUI table column, prioritizing branch and then label
