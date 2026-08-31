@@ -254,10 +254,27 @@ def resource_contract(
 ) -> dict[str, dict[str, object]]:
     requested = _resource_mapping(resources, subject="requested", allow_zero=False)
     configured = validate_resource_bindings(bindings)
-    return {
+    selected = {
         name: dict(configured.get(name, ADMISSION_BINDING))
         for name in requested
     }
+    _validate_scratch_providers(selected)
+    return selected
+
+
+def _validate_scratch_providers(
+    contract: Mapping[str, Mapping[str, object]],
+) -> None:
+    kinds = {
+        str(binding["kind"])
+        for binding in contract.values()
+        if binding["mode"] != "admission-only"
+        and binding["kind"] in {"storage", "tmpfs"}
+    }
+    if kinds == {"storage", "tmpfs"}:
+        raise ResourceContractError(
+            "one run cannot combine persistent-storage and tmpfs scratch providers"
+        )
 
 
 def validate_resource_contract(
@@ -270,6 +287,7 @@ def validate_resource_contract(
         raise ResourceContractError(
             "resource contract names do not match the requested resource names"
         )
+    _validate_scratch_providers(contract)
     return contract
 
 
