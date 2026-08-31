@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.2.0 — 2026-08-30
+
 - Rename the installed console command from `agcoord` to `agc` while retaining `agcoord` as
   the PyPI project, import package, module entry point, state namespace, and protocol identity.
 - Add typed resource bindings, explicit admission-only/best-effort/required modes, sanitized

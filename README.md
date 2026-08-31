@@ -19,6 +19,21 @@ Install the published package in a tool environment:
 python -m pip install agcoord
 ```
 
+### Upgrading from 0.1.x
+
+Version 0.2.0 removes the `agcoord` console executable. Replace downstream shell commands,
+service units, and automation with `agc`; the PyPI project, Python import, stable state-directory
+name, and `python -m agcoord` entry point remain `agcoord`.
+
+Before upgrading, let every 0.1.x job finish, wait for its on-demand broker to relinquish the
+idle spool, and back up the state directory when its history matters. Move capacity, resource
+binding, and cgroup-root values from `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`, and
+`AGCOORD_CGROUP_ROOT` into that state directory's single `config.json`; those three environment
+variables and the old comma-separated capacity syntax are no longer accepted. After installing
+0.2.0, run `agc migrate` once for the idle default spool (or
+`agc --state-dir /path/to/state migrate`), then use `agc list` to start the new broker. Migration
+preserves historical meaning and never reinterprets legacy resource names as enforced limits.
+
 There is no separate service-install step. The first command starts the detached broker on
 demand; later shells and repositories join the same user-scoped coordinator:
 
