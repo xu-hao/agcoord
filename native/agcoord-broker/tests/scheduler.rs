@@ -1735,7 +1735,10 @@ if first == 0:
     os.setsid()
     detached = os.fork()
     if detached == 0:
-        Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')
+        target = Path(sys.argv[1])
+        pending = target.with_name(target.name + '.pending')
+        pending.write_text(str(os.getpid()), encoding='ascii')
+        pending.replace(target)
         while True:
             time.sleep(1)
     time.sleep(0.5)
