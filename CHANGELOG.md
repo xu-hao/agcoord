@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add the protocol-5 Rust scheduler and durable SQLite owner with repository barriers and fair
+  lanes, capacity admission, cancellation and atomic land authority, WAL contention handling,
+  graceful shutdown, identity-safe crash adoption, stable corruption refusals, and verified
+  protocol-1-through-4 migration. Native rollback restores its protocol-4 baseline, preserves
+  terminal native history, and prevents reuse of every pre-rollback gate receipt.
 - Add a pinned Rust workspace and reproducible static x86_64 Linux broker artifact with bundled
   SQLite, exact protocol/build identity, checksums, provenance, dependency inventory, and
   automated ELF and clean-copy reproducibility audits.
