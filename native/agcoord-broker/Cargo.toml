@@ -1,0 +1,20 @@
+[package]
+name = "agcoord-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single-executable native scheduler and enforcement owner for AGCoord"
+build = "build.rs"
+publish = false
+
+[dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+
+[[bin]]
+name = "agcoord-broker"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

@@ -3,6 +3,7 @@
 /.ruff_cache/
 /build/
 /dist/
+/target/
 *.egg-info/
 __pycache__/
 *.py[cod]
