@@ -103,7 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--label", default=name, help="short queue label")
         command.add_argument("--checkout", default=".", help="command working tree")
         command.add_argument("--repository", help="explicit stable repository identity")
-        command.add_argument("--agent", help="agent identity (default: AGCOORD_AGENT or PID)")
+        command.add_argument(
+            "--agent",
+            help="agent identity (default: AGCOORD_AGENT or unnamed)",
+        )
         command.add_argument(
             "--resource",
             action="append",
@@ -126,7 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
     land.add_argument("--label", default="land", help="short queue label")
     land.add_argument("--checkout", default=".", help="ticket worktree")
     land.add_argument("--repository", help="explicit stable repository identity")
-    land.add_argument("--agent", help="agent identity")
+    land.add_argument(
+        "--agent",
+        help="agent identity (default: AGCOORD_AGENT or unnamed)",
+    )
     land.add_argument("--resource", action="append", default=[], metavar="NAME=UNITS")
     land.add_argument("worker_command", nargs="+")
     return parser

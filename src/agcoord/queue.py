@@ -73,6 +73,8 @@ CANCEL_GRACE_SECONDS = 5.0
 RUN_ID_ENV = "AGCOORD_RUN_ID"
 RUN_KIND_ENV = "AGCOORD_RUN_KIND"
 STATE_DIR_ENV = "AGCOORD_STATE_DIR"
+AGENT_ENV = "AGCOORD_AGENT"
+DEFAULT_AGENT = "unnamed"
 CHILD_CPU_RESOURCE = "cpu"
 CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
@@ -95,6 +97,13 @@ class _OwnerMetadataError(CoordinatorError):
 
 class _ResourceEnforcementError(CoordinatorError):
     """A required backend contract failed before the blocked launcher was released."""
+
+
+def _agent_identity(agent: object) -> str:
+    selected = agent or os.environ.get(AGENT_ENV) or DEFAULT_AGENT
+    if not isinstance(selected, str) or not selected.strip():
+        raise CoordinatorError("agent must be a non-empty string")
+    return selected.strip()
 
 
 def _resource_failure_code(exc: Exception, fallback: str) -> str:
@@ -1253,9 +1262,7 @@ class CoordinatorBroker:
             or selected_pid <= 0
         ):
             raise CoordinatorError("caller_pid must be a positive integer")
-        selected_agent = agent or os.environ.get("AGCOORD_AGENT") or f"pid:{selected_pid}"
-        if not isinstance(selected_agent, str) or not selected_agent.strip():
-            raise CoordinatorError("agent must be a non-empty string")
+        selected_agent = _agent_identity(agent)
         owner = _broker_owner(self.paths)
         capacities = owner["capacities"] if owner is not None else self.capacities
         selected_resources = _validate_resources(resources, capacities)
@@ -1281,7 +1288,7 @@ class CoordinatorBroker:
                     run_id,
                     kind,
                     label.strip(),
-                    selected_agent.strip(),
+                    selected_agent,
                     identity.repository_id,
                     identity.repository,
                     identity.worktree_id,
@@ -1336,9 +1343,7 @@ class CoordinatorBroker:
             or selected_pid <= 0
         ):
             raise CoordinatorError("caller_pid must be a positive integer")
-        selected_agent = agent or os.environ.get("AGCOORD_AGENT") or f"pid:{selected_pid}"
-        if not isinstance(selected_agent, str) or not selected_agent.strip():
-            raise CoordinatorError("agent must be a non-empty string")
+        selected_agent = _agent_identity(agent)
         owner = _broker_owner(self.paths)
         capacities = owner["capacities"] if owner is not None else self.capacities
         selected_resources = _validate_resources(resources, capacities)
@@ -1433,7 +1438,7 @@ class CoordinatorBroker:
                 (
                     run_id,
                     f"merge GitHub PR #{request}",
-                    selected_agent.strip(),
+                    selected_agent,
                     identity.repository_id,
                     identity.repository,
                     identity.worktree_id,
@@ -1499,9 +1504,7 @@ class CoordinatorBroker:
             or selected_pid <= 0
         ):
             raise CoordinatorError("caller_pid must be a positive integer")
-        selected_agent = agent or os.environ.get("AGCOORD_AGENT") or f"pid:{selected_pid}"
-        if not isinstance(selected_agent, str) or not selected_agent.strip():
-            raise CoordinatorError("agent must be a non-empty string")
+        selected_agent = _agent_identity(agent)
         owner = _broker_owner(self.paths)
         capacities = owner["capacities"] if owner is not None else self.capacities
         selected_resources = _validate_resources(resources, capacities)
@@ -1527,7 +1530,7 @@ class CoordinatorBroker:
                 (
                     run_id,
                     label.strip(),
-                    selected_agent.strip(),
+                    selected_agent,
                     identity.repository_id,
                     identity.repository,
                     identity.worktree_id,

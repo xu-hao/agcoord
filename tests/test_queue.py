@@ -626,6 +626,55 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
     assert row["checkout"] == str(repository.resolve())
 
 
+def test_unnamed_agent_is_stable_while_explicit_identity_and_caller_pid_are_kept(
+    coordinator,
+    tmp_path: Path,
+    monkeypatch,
+):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    monkeypatch.delenv("AGCOORD_AGENT", raising=False)
+
+    first_id = client.submit(
+        _python("print('first unnamed')"),
+        checkout=str(repository),
+        caller_pid=4101,
+        environment=caller_environment(),
+    )
+    second_id = client.submit(
+        _python("print('second unnamed')"),
+        checkout=str(repository),
+        caller_pid=4102,
+        environment=caller_environment(),
+    )
+    monkeypatch.setenv("AGCOORD_AGENT", "environment-agent")
+    environment_id = client.submit(
+        _python("print('environment identity')"),
+        checkout=str(repository),
+        caller_pid=4103,
+        environment=caller_environment(),
+    )
+    explicit_id = client.submit(
+        _python("print('explicit identity')"),
+        checkout=str(repository),
+        agent="explicit-agent",
+        caller_pid=4104,
+        environment=caller_environment(),
+    )
+
+    rows = [
+        _row(client, run_id, "passed")
+        for run_id in (first_id, second_id, environment_id, explicit_id)
+    ]
+    assert [row["agent"] for row in rows] == [
+        "unnamed",
+        "unnamed",
+        "environment-agent",
+        "explicit-agent",
+    ]
+    assert [row["caller_pid"] for row in rows] == [4101, 4102, 4103, 4104]
+
+
 RESOURCE_BINDING = {
     "cpu": {
         "kind": "cpu",

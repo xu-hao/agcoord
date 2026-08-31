@@ -605,6 +605,42 @@ async def test_repository_and_agent_filters_use_searchable_cancelable_picker_men
 
 
 @pytest.mark.asyncio
+async def test_agent_picker_omits_legacy_pid_fallbacks_and_keeps_unnamed():
+    snapshot = _snapshot()
+    rows = []
+    for index, agent in enumerate(
+        ("pid:4101", "pid:4102", "unnamed", "agent-special"),
+        start=1,
+    ):
+        row = _row(f"check-agent-{index}", index, "running")
+        row["agent"] = agent
+        rows.append(row)
+    snapshot["active"] = rows
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        await pilot.press("a")
+        await pilot.pause()
+
+        options = app.screen.query_one("#filter-options", OptionList)
+        prompts = [
+            str(options.get_option_at_index(index).prompt)
+            for index in range(options.option_count)
+        ]
+        assert prompts == ["All agents", "agent-special", "unnamed"]
+
+        for key in "unnamed":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _table(app).row_count == 1
+        assert "unnamed" in _screen_text(app)
+
+
+@pytest.mark.asyncio
 async def test_history_toggle_is_non_destructive_cached_and_discoverable():
     client = FakeClient()
     app = build_app(lambda: client, refresh_interval=60)
