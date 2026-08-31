@@ -68,6 +68,7 @@ _MS_NODEV = 4
 _MS_NOEXEC = 8
 _MS_REC = 16384
 _MS_PRIVATE = 1 << 18
+_MNT_DETACH = 2
 CPU_PERIOD_USEC = 100_000
 _CONTROL_BINDINGS = {
     ("cpu", "logical-cpu"): "cpu",
@@ -75,12 +76,26 @@ _CONTROL_BINDINGS = {
     ("memory", "bytes"): "memory.max",
     ("memory-high", "bytes"): "memory.high",
     ("swap", "bytes"): "memory.swap.max",
+    ("tmpfs", "bytes"): "tmpfs.size",
+    ("inodes", "inodes"): "tmpfs.nr_inodes",
 }
 _LIFECYCLE_BINDING = ("generic", "admission-unit")
 _CONTROLLER_FILE = re.compile(
     r"^(?:cpu|pids|memory(?:\.swap)?)\.[a-z][a-z0-9_.-]{0,31}$"
 )
 _METRIC_KEY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_TMPFS_REPORT_KEYS = frozenset(
+    {
+        "version",
+        "token",
+        "peak_bytes",
+        "peak_inodes",
+        "terminal_bytes",
+        "terminal_inodes",
+        "byte_limit_hit",
+        "inode_limit_hit",
+    }
+)
 
 
 class CgroupV2Error(ResourceBackendError):
@@ -115,6 +130,15 @@ class CgroupProbe:
 class CgroupMount:
     path: Path
     options: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TmpfsPolicy:
+    size_name: str
+    inode_name: str
+    memory_name: str
+    size: int
+    inodes: int
 
 
 class CgroupV2System(Protocol):
@@ -203,6 +227,35 @@ def _cgroup2_mounts(mountinfo: Path) -> list[CgroupMount]:
     return mounts
 
 
+def _filesystem_mounts(
+    mountinfo: Path,
+) -> list[tuple[Path, str, frozenset[str]]]:
+    try:
+        lines = mountinfo.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise CgroupIsolationError(
+            "mountinfo-unreadable",
+            "mount information is unavailable",
+        ) from exc
+    mounts: list[tuple[Path, str, frozenset[str]]] = []
+    for line in lines:
+        try:
+            left, right = line.split(" - ", 1)
+            fields = left.split()
+            right_fields = right.split()
+            mounted = Path(_decode_mount_path(fields[4]))
+            filesystem = right_fields[0]
+            options = frozenset(
+                fields[5].split(",") + right_fields[2].split(",")
+            )
+            if not mounted.is_absolute() or not filesystem:
+                continue
+        except (IndexError, ValueError):
+            continue
+        mounts.append((mounted, filesystem, options))
+    return mounts
+
+
 def _covering_mounts(mounts: list[CgroupMount]) -> list[CgroupMount]:
     """Select mounts whose replacement hides every visible cgroup2 mount."""
 
@@ -230,8 +283,10 @@ def _call_libc(name: str, *arguments: object) -> None:
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.c_ulong,
-            ctypes.c_void_p,
+            ctypes.c_char_p,
         ]
+    elif name == "umount2":
+        function.argtypes = [ctypes.c_char_p, ctypes.c_int]
     if function(*arguments) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
@@ -315,6 +370,130 @@ def isolate_current_cgroup(
             "namespace-verification-failed",
             "worker cgroup namespace is not rooted at the run cgroup",
         )
+
+
+def mount_current_tmpfs(
+    target: str | os.PathLike[str],
+    *,
+    size: int,
+    inodes: int,
+    mountinfo: Path = Path("/proc/self/mountinfo"),
+) -> os.statvfs_result:
+    """Mount and verify one private, bounded tmpfs in the current mount namespace."""
+
+    selected = Path(target)
+    if (
+        not selected.is_absolute()
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or not isinstance(inodes, int)
+        or isinstance(inodes, bool)
+        or inodes <= 0
+    ):
+        raise CgroupIsolationError(
+            "tmpfs-setup-invalid",
+            "tmpfs setup values are invalid",
+        )
+    try:
+        details = selected.lstat()
+        resolved = selected.resolve(strict=True)
+    except OSError as exc:
+        raise CgroupIsolationError(
+            "tmpfs-target-invalid",
+            "tmpfs target is unavailable",
+        ) from exc
+    if (
+        resolved != selected
+        or stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise CgroupIsolationError(
+            "tmpfs-target-invalid",
+            "tmpfs target is not a private owned directory",
+        )
+    options = (
+        f"size={size},nr_inodes={inodes},mode=700,uid={os.getuid()},gid={os.getgid()}"
+    ).encode("ascii")
+    mounted = False
+    try:
+        _call_libc(
+            "mount",
+            b"agcoord-tmpfs",
+            os.fsencode(selected),
+            b"tmpfs",
+            _MS_NOSUID | _MS_NODEV | _MS_NOEXEC,
+            options,
+        )
+        mounted = True
+        matching = [
+            mount
+            for mount in _filesystem_mounts(mountinfo)
+            if mount[0] == selected
+        ]
+        if len(matching) != 1 or matching[0][1] != "tmpfs" or not {
+            "nodev",
+            "noexec",
+            "nosuid",
+        } <= matching[0][2]:
+            raise CgroupIsolationError(
+                "tmpfs-mount-unverified",
+                "tmpfs mount options could not be verified",
+            )
+        mounted_details = selected.stat()
+        if (
+            not stat.S_ISDIR(mounted_details.st_mode)
+            or mounted_details.st_uid != os.getuid()
+            or mounted_details.st_gid != os.getgid()
+            or stat.S_IMODE(mounted_details.st_mode) != 0o700
+        ):
+            raise CgroupIsolationError(
+                "tmpfs-mount-unverified",
+                "tmpfs root ownership could not be verified",
+            )
+        usage = os.statvfs(selected)
+        if usage.f_blocks * usage.f_frsize > size:
+            raise CgroupIsolationError(
+                "tmpfs-size-unverified",
+                "tmpfs byte capacity exceeds its requested limit",
+            )
+        if usage.f_files > inodes:
+            raise CgroupIsolationError(
+                "tmpfs-inodes-unverified",
+                "tmpfs inode capacity exceeds its requested limit",
+            )
+        return usage
+    except CgroupIsolationError:
+        if mounted:
+            try:
+                _call_libc("umount2", os.fsencode(selected), _MNT_DETACH)
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        if mounted:
+            try:
+                _call_libc("umount2", os.fsencode(selected), _MNT_DETACH)
+            except OSError:
+                pass
+        raise CgroupIsolationError(
+            "tmpfs-mount-unavailable",
+            "private tmpfs mounting is unavailable",
+        ) from exc
+
+
+def unmount_current_tmpfs(target: str | os.PathLike[str]) -> None:
+    """Detach a setup that will not be released to user code."""
+
+    try:
+        _call_libc("umount2", os.fsencode(target), _MNT_DETACH)
+    except OSError as exc:
+        raise CgroupIsolationError(
+            "tmpfs-unmount-failed",
+            "private tmpfs setup could not be rolled back",
+        ) from exc
 
 
 class LinuxCgroupV2System:
@@ -759,8 +938,8 @@ class CgroupV2Backend:
             kinds.add("processes")
             units.add("processes")
         if "memory" in result.controllers:
-            kinds.update({"memory", "memory-high", "swap"})
-            units.add("bytes")
+            kinds.update({"inodes", "memory", "memory-high", "swap", "tmpfs"})
+            units.update({"bytes", "inodes"})
         return {
             "available": result.available,
             "kinds": sorted(kinds) if result.available else [],
@@ -800,6 +979,7 @@ class CgroupV2Backend:
 
     def _controller_settings(self, request: ResourceRequest) -> dict[str, str]:
         resources = self._controller_resources(request)
+        self._tmpfs_policy(request, resources=resources)
         selected: dict[str, str] = {}
         if cpu_name := resources.get("cpu"):
             quota = request.resources[cpu_name] * CPU_PERIOD_USEC
@@ -832,14 +1012,69 @@ class CgroupV2Backend:
             selected["memory.oom.group"] = "1" if hard_name else "0"
         return selected
 
+    def _tmpfs_policy(
+        self,
+        request: ResourceRequest,
+        *,
+        resources: Mapping[str, str] | None = None,
+    ) -> TmpfsPolicy | None:
+        selected = (
+            self._controller_resources(request)
+            if resources is None
+            else dict(resources)
+        )
+        size_name = selected.get("tmpfs.size")
+        inode_name = selected.get("tmpfs.nr_inodes")
+        if size_name is None and inode_name is None:
+            return None
+        if size_name is None or inode_name is None:
+            raise CgroupV2Error(
+                "tmpfs-policy-incomplete",
+                "tmpfs byte and inode controls must be requested together",
+            )
+        memory_name = selected.get("memory.max")
+        if memory_name is None or request.bindings[memory_name]["mode"] != "required":
+            raise CgroupV2Error(
+                "tmpfs-memory-required",
+                "bounded tmpfs requires a required hard memory envelope",
+            )
+        requested_size = request.resources[size_name]
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        size = requested_size - (requested_size % page_size)
+        if size == 0:
+            raise CgroupV2Error(
+                "tmpfs-size-impossible",
+                "tmpfs byte capacity is smaller than one memory page",
+            )
+        if size > request.resources[memory_name]:
+            raise CgroupV2Error(
+                "tmpfs-memory-impossible",
+                "tmpfs capacity cannot exceed the hard memory envelope",
+            )
+        return TmpfsPolicy(
+            size_name=size_name,
+            inode_name=inode_name,
+            memory_name=memory_name,
+            size=size,
+            inodes=request.resources[inode_name],
+        )
+
     def _enable_controllers(
         self,
         request: ResourceRequest,
         owner_path: Path,
     ) -> None:
+        controller_by_control = {
+            "cpu": "cpu",
+            "pids": "pids",
+            "memory.high": "memory",
+            "memory.max": "memory",
+            "memory.swap.max": "memory",
+        }
         controllers = {
-            control.split(".", maxsplit=1)[0]
+            controller_by_control[control]
             for control in self._controller_resources(request)
+            if control in controller_by_control
         }
         if not controllers:
             return
@@ -1004,6 +1239,10 @@ class CgroupV2Backend:
     def _manifest_path(self, run_id: str) -> Path:
         run_hash = hashlib.sha256(run_id.encode()).hexdigest()[:32]
         return self.metadata_dir / f"run-{run_hash}.json"
+
+    def _tmpfs_report_path(self, run_id: str) -> Path:
+        run_hash = hashlib.sha256(run_id.encode()).hexdigest()[:32]
+        return self.metadata_dir / f"tmpfs-{run_hash}.json"
 
     def _owner_record(
         self,
@@ -1296,6 +1535,50 @@ class CgroupV2Backend:
                 "launcher cgroup membership could not be verified",
             )
 
+    def tmpfs_setup(
+        self,
+        request: ResourceRequest,
+        state: Mapping[str, object],
+        target: str | os.PathLike[str],
+    ) -> Mapping[str, object] | None:
+        """Return one validated private launcher setup for a bounded tmpfs."""
+
+        self._validate_request(request)
+        policy = self._tmpfs_policy(request)
+        if policy is None:
+            return None
+        self._resolve(request, state, allow_missing=False)
+        selected = Path(target)
+        try:
+            details = selected.lstat()
+            resolved = selected.resolve(strict=True)
+        except OSError as exc:
+            raise CgroupV2Error(
+                "tmpfs-target-invalid",
+                "tmpfs target is unavailable",
+            ) from exc
+        if (
+            not selected.is_absolute()
+            or resolved != selected
+            or stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise CgroupV2Error(
+                "tmpfs-target-invalid",
+                "tmpfs target is not a private owned directory",
+            )
+        handle = self._validate_handle(state)
+        return {
+            "version": 1,
+            "target": str(selected),
+            "size": policy.size,
+            "inodes": policy.inodes,
+            "report": str(self._tmpfs_report_path(request.run_id)),
+            "token": handle["token"],
+        }
+
     @staticmethod
     def _flat_values(raw: str) -> dict[str, int]:
         selected: dict[str, int] = {}
@@ -1517,6 +1800,59 @@ class CgroupV2Backend:
             if events.get("max", 0) > 0 or events.get("fail", 0) > 0:
                 observations.append(ResourceObservation(swap_name, "swap-limit-hit"))
 
+        policy = self._tmpfs_policy(request, resources=resources)
+        if policy is not None:
+            try:
+                report = self._read_json(self._tmpfs_report_path(request.run_id))
+            except FileNotFoundError:
+                report = None
+            if report is not None:
+                _manifest_path, handle = self._read_manifest(request)
+                numeric = (
+                    "peak_bytes",
+                    "peak_inodes",
+                    "terminal_bytes",
+                    "terminal_inodes",
+                )
+                if (
+                    set(report) != _TMPFS_REPORT_KEYS
+                    or type(report.get("version")) is not int
+                    or report.get("version") != 1
+                    or report.get("token") != handle["token"]
+                    or any(
+                        not isinstance(report.get(name), int)
+                        or isinstance(report.get(name), bool)
+                        or int(report[name]) < 0
+                        for name in numeric
+                    )
+                    or not isinstance(report.get("byte_limit_hit"), bool)
+                    or not isinstance(report.get("inode_limit_hit"), bool)
+                    or int(report["terminal_bytes"]) > int(report["peak_bytes"])
+                    or int(report["terminal_inodes"]) > int(report["peak_inodes"])
+                    or int(report["peak_bytes"]) > policy.size
+                    or int(report["peak_inodes"]) > policy.inodes
+                ):
+                    raise CgroupV2Error(
+                        "tmpfs-report-invalid",
+                        "tmpfs usage report is invalid",
+                    )
+                peak[policy.size_name] = int(report["peak_bytes"])
+                peak[policy.inode_name] = int(report["peak_inodes"])
+                if report["byte_limit_hit"]:
+                    observations.append(
+                        ResourceObservation(
+                            policy.size_name,
+                            "tmpfs-byte-limit-hit",
+                        )
+                    )
+                if report["inode_limit_hit"]:
+                    observations.append(
+                        ResourceObservation(
+                            policy.inode_name,
+                            "tmpfs-inode-limit-hit",
+                        )
+                    )
+
         return ResourceMeasurement(peak, tuple(observations))
 
     def usage(
@@ -1606,5 +1942,6 @@ class CgroupV2Backend:
         self._pids_peaks.pop(request.run_id, None)
         self._memory_peaks.pop(request.run_id, None)
         self._swap_peaks.pop(request.run_id, None)
+        self._tmpfs_report_path(request.run_id).unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
         self._cleanup_owner()

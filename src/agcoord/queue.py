@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import sqlite3
@@ -53,6 +54,7 @@ from .resources import (
     validate_resource_measurement,
     validate_resource_receipt,
 )
+from .worker import TMPFS_SETUP_ENV
 
 
 PROTOCOL = 4
@@ -78,31 +80,8 @@ RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
 })
 _RESOURCE_NAME = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
-_WORKER_LAUNCHER = (
-    "import os, sys\n"
-    "release_fd = int(sys.argv[1])\n"
-    f"isolate_cgroup = os.environ.pop({CGROUP_ISOLATE_ENV!r}, None) == '1'\n"
-    "try:\n"
-    "    admitted = os.read(release_fd, 1)\n"
-    "finally:\n"
-    "    os.close(release_fd)\n"
-    "if admitted != b'1':\n"
-    "    raise SystemExit(125)\n"
-    "if isolate_cgroup:\n"
-    "    try:\n"
-    "        from agcoord.cgroup import isolate_current_cgroup\n"
-    "        isolate_current_cgroup()\n"
-    "    except Exception as exc:\n"
-    "        print(f'AGCoord: could not isolate worker cgroup: {exc}', "
-    "file=sys.stderr, flush=True)\n"
-    "        raise SystemExit(125)\n"
-    "try:\n"
-    "    os.execvpe(sys.argv[2], sys.argv[2:], os.environ)\n"
-    "except OSError as exc:\n"
-    "    print(f'AGCoord: could not exec worker: {exc}', "
-    "file=sys.stderr, flush=True)\n"
-    "    raise SystemExit(127)\n"
-)
+_SETUP_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_WORKER_LAUNCHER = "from agcoord.worker import launcher_main; launcher_main()\n"
 
 
 class CoordinatorError(RuntimeError):
@@ -2883,6 +2862,11 @@ class CoordinatorBroker:
                     failed_best_effort.add(backend_name)
             else:
                 for name, units in request.resources.items():
+                    if (
+                        backend_name == CGROUP_BACKEND
+                        and contract[name]["kind"] in {"inodes", "tmpfs"}
+                    ):
+                        continue
                     applied[name] = units
                     self._append_resource_event(
                         receipt,
@@ -3066,6 +3050,160 @@ class CoordinatorBroker:
         if changed:
             self._save_resource_records(db, row, receipt, state)
 
+    def _tmpfs_resource_names(self, row: sqlite3.Row) -> list[str]:
+        contract = self._row_resource_contract(row)
+        return [
+            name
+            for name, binding in contract.items()
+            if binding["backend"] == CGROUP_BACKEND
+            and binding["kind"] in {"inodes", "tmpfs"}
+        ]
+
+    def _record_tmpfs_setup(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        code: str,
+        setup: Mapping[str, object] | None,
+    ) -> bool:
+        names = self._tmpfs_resource_names(row)
+        if not names:
+            return False
+        receipt = self._row_resource_receipt(row)
+        state = self._row_resource_state(row)
+        contract = self._row_resource_contract(row)
+        requested = self._row_resources(row)
+        applied = receipt["applied"]
+        if not isinstance(applied, dict):
+            raise CoordinatorError("resource receipt application record is not mutable")
+        required_failure = False
+        if code == "ok":
+            if setup is None:
+                raise CoordinatorError("successful tmpfs setup has no private setup record")
+            values = {
+                "tmpfs": setup["size"],
+                "inodes": setup["inodes"],
+            }
+            for name in names:
+                value = values[str(contract[name]["kind"])]
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
+                    or value > requested[name]
+                ):
+                    raise CoordinatorError("tmpfs setup applied an invalid capacity")
+                applied[name] = value
+                self._append_resource_event(
+                    receipt,
+                    backend=CGROUP_BACKEND,
+                    resource=name,
+                    stage="attach",
+                    status="applied",
+                    code="tmpfs-mounted",
+                )
+        else:
+            if not _SETUP_CODE.fullmatch(code):
+                code = "tmpfs-setup-failed"
+            namespace_failure = code.startswith("namespace-") or code in {
+                "controller-files-exposed",
+                "tmpfs-namespace-required",
+            }
+            for name in names:
+                mode = str(contract[name]["mode"])
+                self._append_resource_event(
+                    receipt,
+                    backend=CGROUP_BACKEND,
+                    resource=name,
+                    stage="attach",
+                    status="failed" if mode == "required" else "unapplied",
+                    code=code,
+                )
+                required_failure = required_failure or mode == "required"
+            if namespace_failure:
+                required_failure = required_failure or any(
+                    binding["backend"] == CGROUP_BACKEND
+                    and binding["mode"] == "required"
+                    for binding in contract.values()
+                )
+            record = state.get(CGROUP_BACKEND)
+            if isinstance(record, dict):
+                record["resources"] = [
+                    name
+                    for name in record["resources"]
+                    if name not in names
+                ]
+        self._save_resource_records(db, row, receipt, state)
+        return required_failure
+
+    def _prepare_tmpfs_setup(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        target: Path,
+    ) -> dict[str, object] | None:
+        names = self._tmpfs_resource_names(row)
+        if not names:
+            return None
+        state = self._row_resource_state(row)
+        record = state.get(CGROUP_BACKEND)
+        backend = self.resource_backends.get(CGROUP_BACKEND)
+        try:
+            if record is None or not isinstance(backend, CgroupV2Backend):
+                raise ResourceContractError("tmpfs cgroup state is unavailable")
+            request = self._resource_request(
+                row,
+                CGROUP_BACKEND,
+                record["resources"],
+            )
+            raw = backend.tmpfs_setup(request, record["handle"], target)
+            if not isinstance(raw, Mapping):
+                raise ResourceContractError("tmpfs setup is unavailable")
+            setup = dict(raw)
+            if (
+                set(setup)
+                != {"version", "target", "size", "inodes", "report", "token"}
+                or type(setup["version"]) is not int
+                or setup["version"] != 1
+                or setup["target"] != str(target)
+                or not isinstance(setup["report"], str)
+                or not Path(setup["report"]).is_absolute()
+                or not isinstance(setup["token"], str)
+                or not re.fullmatch(r"[0-9a-f]{32}", setup["token"])
+                or not isinstance(setup["size"], int)
+                or isinstance(setup["size"], bool)
+                or setup["size"] <= 0
+                or not isinstance(setup["inodes"], int)
+                or isinstance(setup["inodes"], bool)
+                or setup["inodes"] <= 0
+            ):
+                raise ResourceContractError("tmpfs setup is invalid")
+        except Exception as exc:
+            code = _resource_failure_code(exc, "tmpfs-setup-failed")
+            if self._record_tmpfs_setup(db, row, code=code, setup=None):
+                raise _ResourceEnforcementError(
+                    "a required tmpfs could not be prepared"
+                ) from exc
+            return None
+        return setup
+
+    @staticmethod
+    def _read_worker_setup(descriptor: int, *, timeout: float = 5.0) -> str:
+        readable, _writable, _exceptional = select.select(
+            [descriptor],
+            [],
+            [],
+            timeout,
+        )
+        if not readable:
+            return "tmpfs-setup-timeout"
+        try:
+            payload = os.read(descriptor, 128).decode("ascii")
+        except (OSError, UnicodeError):
+            return "tmpfs-setup-failed"
+        return payload if _SETUP_CODE.fullmatch(payload) else "tmpfs-setup-invalid"
+
     def _start_worker(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
         run_id = row["run_id"]
         command = json.loads(row["command_json"])
@@ -3084,9 +3222,12 @@ class CoordinatorBroker:
         environment[STATE_DIR_ENV] = str(self.paths.state_dir)
         environment.pop(CGROUP_ROOT_ENV, None)
         environment.pop(CGROUP_ISOLATE_ENV, None)
+        environment.pop(TMPFS_SETUP_ENV, None)
         worker_tmp = self._worker_tmp_path(run_id)
         release_read = -1
         release_write = -1
+        setup_read = -1
+        setup_write = -1
         process: subprocess.Popen[bytes] | None = None
         released = False
         try:
@@ -3129,9 +3270,24 @@ class CoordinatorBroker:
                 ]
             worker_tmp.mkdir(mode=0o700)
             worker_tmp.chmod(0o700)
+            prepared_row = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            tmpfs_setup = self._prepare_tmpfs_setup(
+                db,
+                prepared_row,
+                worker_tmp,
+            )
+            if tmpfs_setup is not None:
+                environment[TMPFS_SETUP_ENV] = json.dumps(
+                    tmpfs_setup,
+                    separators=(",", ":"),
+                )
             for variable in ("TMPDIR", "TMP", "TEMP"):
                 environment[variable] = str(worker_tmp)
             release_read, release_write = os.pipe()
+            if tmpfs_setup is not None:
+                setup_read, setup_write = os.pipe()
             with log_path.open("ab", buffering=0) as output:
                 log_path.chmod(0o600)
                 process = subprocess.Popen(
@@ -3140,6 +3296,7 @@ class CoordinatorBroker:
                         "-c",
                         _WORKER_LAUNCHER,
                         str(release_read),
+                        str(setup_write),
                         *worker_command,
                     ],
                     cwd=row["checkout"],
@@ -3148,10 +3305,17 @@ class CoordinatorBroker:
                     stderr=subprocess.STDOUT,
                     env=environment,
                     start_new_session=True,
-                    pass_fds=(release_read,),
+                    pass_fds=(
+                        (release_read,)
+                        if setup_write < 0
+                        else (release_read, setup_write)
+                    ),
                 )
             os.close(release_read)
             release_read = -1
+            if setup_write >= 0:
+                os.close(setup_write)
+                setup_write = -1
             token = _process_start_token(process.pid)
             if token is None:
                 raise CoordinatorError(
@@ -3172,6 +3336,25 @@ class CoordinatorBroker:
             db.commit()
             self._children[run_id] = process
             os.write(release_write, b"1")
+            if tmpfs_setup is not None:
+                setup_code = self._read_worker_setup(setup_read)
+                os.close(setup_read)
+                setup_read = -1
+                setup_row = db.execute(
+                    "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                required_failure = self._record_tmpfs_setup(
+                    db,
+                    setup_row,
+                    code=setup_code,
+                    setup=tmpfs_setup,
+                )
+                db.commit()
+                os.write(release_write, b"0" if required_failure else b"1")
+                if required_failure:
+                    raise _ResourceEnforcementError(
+                        "a required tmpfs could not be mounted"
+                    )
             released = True
         except Exception as exc:
             self._children.pop(run_id, None)
@@ -3237,6 +3420,10 @@ class CoordinatorBroker:
                 os.close(release_read)
             if release_write >= 0:
                 os.close(release_write)
+            if setup_read >= 0:
+                os.close(setup_read)
+            if setup_write >= 0:
+                os.close(setup_write)
 
     def _failure_reason_for(
         self,

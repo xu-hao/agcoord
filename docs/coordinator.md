@@ -116,8 +116,8 @@ Backends expose a sanitized capability probe and the idempotent lifecycle `prepa
 `usage`, `finish`, `cancel`, and `cleanup`. Attach happens before user code can start; usage,
 finish, cancellation, and cleanup remain owned by the broker. The core currently defines this
 backend-neutral seam and a Linux cgroup v2 lifecycle backend. Controller values, provisioned
-filesystems, process-specific adapters, and containers remain separate implementations; a
-configured backend is never silently treated as successful.
+persistent filesystems, process-specific adapters, and containers remain separate
+implementations; a configured backend is never silently treated as successful.
 
 ### Delegated cgroup v2 lifecycle
 
@@ -235,14 +235,76 @@ operator wants reclaim pressure, but every safety-critical run should also reque
 binding. Swap capacity should not exceed the swap the host can lose without harming those
 uncontrolled services.
 
+### Bounded tmpfs scratch
+
+The `cgroup-v2` backend can replace a run's ordinary private temporary directory with a bounded
+tmpfs. Bind one `tmpfs/bytes` name and one `inodes/inodes` name to that backend, and bind a
+required `memory/bytes` name in the same run:
+
+```bash
+export AGCOORD_CAPACITIES='jobs=2,memory=2147483648,tmpfs=1073741824,tmpfs_inodes=131072'
+export AGCOORD_RESOURCE_BINDINGS='{
+  "memory": {
+    "kind": "memory", "unit": "bytes", "mode": "required", "backend": "cgroup-v2"
+  },
+  "tmpfs": {
+    "kind": "tmpfs", "unit": "bytes", "mode": "required", "backend": "cgroup-v2"
+  },
+  "tmpfs_inodes": {
+    "kind": "inodes", "unit": "inodes", "mode": "required", "backend": "cgroup-v2"
+  }
+}'
+agc run --resource memory=1073741824 --resource tmpfs=536870912 \
+  --resource tmpfs_inodes=65536 -- python -m pytest -q
+```
+
+The byte and inode requests are an atomic tmpfs policy: omitting either is refused. The hard
+memory binding must be `required` and at least as large as the page-rounded-down tmpfs capacity.
+All three names reserve their independently configured admission capacities, while actual tmpfs
+pages are charged by the kernel inside the same run cgroup's `memory.max`; tmpfs therefore cannot
+act as hidden memory. Because a hard-memory run defaults `memory.swap.max` to zero unless it also
+requests swap, its tmpfs pages cannot spill into undeclared host swap. Leave memory headroom for
+the interpreter, subprocesses, and non-tmpfs allocations instead of setting both limits equal.
+
+After the launcher is attached to its cgroup but before user code can execute, it enters the
+verified private user/cgroup/mount namespace and mounts `tmpfs` at the already-owned run temp
+directory with explicit `size`, `nr_inodes`, `mode=700`, `uid`, and `gid`, plus
+`nosuid,nodev,noexec`. It verifies the mount type, options, ownership, and effective ceilings,
+reports success to the broker, and waits for a second release. Only then does AGCoord durably mark
+the tmpfs resources applied and let the command start. `TMPDIR`, `TMP`, and `TEMP` all name that
+mount; the private setup record and ownership token are removed from the command environment.
+The `noexec` policy means tools must execute generated programs through an interpreter or place
+executables outside temporary scratch.
+
+The launcher supervises the direct command and samples `statvfs` while the mount exists. Receipts
+retain peak allocated bytes and user-created inodes (above the mount's initial root inode), plus
+deduplicated `tmpfs-byte-limit-hit` or `tmpfs-inode-limit-hit` events. The configured inode limit
+is the kernel filesystem ceiling and includes tmpfs's own root inode. A token-bound report in the
+private backend metadata lets a replacement broker retain the last sample without exposing file
+names or contents.
+
+A required namespace or mount failure stops before user code with exit status 125 and
+`failure_reason=resource-enforcement-failed`. If both tmpfs bindings are `best-effort`, the same
+failure is recorded as unapplied and the command continues in the ordinary owned directory; the
+hard memory control remains applied. With no tmpfs bindings, AGCoord preserves that existing
+directory behavior without claiming RAM backing or a byte/inode ceiling.
+
+Every run gets a distinct mount namespace and target. The mount remains alive while any process
+in that worker tree retains the namespace, then the kernel tears it down when the tree is gone;
+only afterward does the broker remove the owned underlying directory and token-bound report.
+Normal completion, cancellation, and replacement-broker recovery use the same ordering. Tmpfs is
+temporary virtual memory rather than a general filesystem sandbox; the kernel's
+[tmpfs contract](https://www.kernel.org/doc/html/latest/filesystems/tmpfs.html) defines its size,
+inode, and swap behavior.
+
 Normal finish and cancellation use `cgroup.kill`, wait for `cgroup.events` to report
 `populated 0`, and remove only the identity recorded for that run. A replacement broker adopts a
 still-live durable handle without creating a second leaf. Missing partial state is cleaned
 idempotently, while a changed device/inode, mismatched token, unrecorded collision, or populated
 stale leaf is refused and never removed as if it were owned.
 
-This backend does not yet translate I/O units, and cgroups remain resource controls rather than
-a filesystem, credential, network, or general security sandbox.
+This backend does not yet translate persistent-storage or I/O units, and its optional private
+tmpfs is scratch rather than a credential, network, or general security sandbox.
 
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an

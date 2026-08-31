@@ -30,6 +30,9 @@ versioning; dates use ISO 8601.
 - Enforce hard memory, pressure, and swap byte budgets with cgroup v2; default hard-memory runs
   to zero swap, terminate local OOMs as one process group, preserve final memory/swap peaks and
   pressure or limit evidence, and expose `memory-oom` without overriding cancellation.
+- Provision optional per-run tmpfs scratch with byte and inode ceilings, safe private mount
+  options, memory-cgroup accounting, a pre-exec setup handshake, best-effort directory fallback,
+  durable usage/limit evidence, and namespace-owned teardown across completion or cancellation.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 
