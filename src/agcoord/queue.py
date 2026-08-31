@@ -36,6 +36,7 @@ from .cgroup import (
 )
 from .resources import (
     ResourceBackend,
+    ResourceBackendError,
     ResourceContractError,
     ResourceObservation,
     ResourceRequest,
@@ -114,6 +115,12 @@ class _OwnerMetadataError(CoordinatorError):
 
 class _ResourceEnforcementError(CoordinatorError):
     """A required backend contract failed before the blocked launcher was released."""
+
+
+def _resource_failure_code(exc: Exception, fallback: str) -> str:
+    """Use only validated backend codes and never arbitrary exception text."""
+
+    return exc.code if isinstance(exc, ResourceBackendError) else fallback
 
 
 @dataclass(frozen=True)
@@ -2724,6 +2731,7 @@ class CoordinatorBroker:
                     raise ResourceContractError("backend unavailable")
                 backend.cleanup(request, record["handle"])
             except Exception as exc:
+                failure_code = _resource_failure_code(exc, "cleanup-failed")
                 self._append_daemon_log(
                     f"resource cleanup failed for {row['run_id']} via "
                     f"{backend_name}: {type(exc).__name__}"
@@ -2735,7 +2743,7 @@ class CoordinatorBroker:
                         resource=name,
                         stage="cleanup",
                         status="failed",
-                        code="cleanup-failed",
+                        code=failure_code,
                     )
             else:
                 for name in names:
@@ -2800,6 +2808,7 @@ class CoordinatorBroker:
                 selected = validate_backend_state({backend_name: candidate})
                 state[backend_name] = selected[backend_name]
             except Exception as exc:
+                failure_code = _resource_failure_code(exc, "prepare-failed")
                 self._append_daemon_log(
                     f"resource prepare failed for {row['run_id']} via "
                     f"{backend_name}: {type(exc).__name__}"
@@ -2812,7 +2821,7 @@ class CoordinatorBroker:
                         resource=name,
                         stage="prepare",
                         status="failed" if mode == "required" else "unapplied",
-                        code="prepare-failed",
+                        code=failure_code,
                     )
                     required_failure = required_failure or mode == "required"
             else:
@@ -2854,6 +2863,7 @@ class CoordinatorBroker:
                     raise ResourceContractError("backend unavailable")
                 backend.attach(request, record["handle"], worker_pid)
             except Exception as exc:
+                failure_code = _resource_failure_code(exc, "attach-failed")
                 self._append_daemon_log(
                     f"resource attach failed for {row['run_id']} via "
                     f"{backend_name}: {type(exc).__name__}"
@@ -2866,7 +2876,7 @@ class CoordinatorBroker:
                         resource=name,
                         stage="attach",
                         status="failed" if mode == "required" else "unapplied",
-                        code="attach-failed",
+                        code=failure_code,
                     )
                     required_failure = required_failure or mode == "required"
                 if not any(contract[name]["mode"] == "required" for name in names):
@@ -2936,10 +2946,11 @@ class CoordinatorBroker:
                     expected=set(names),
                 )
             except Exception as exc:
+                failure_code = _resource_failure_code(exc, f"{stage}-failed")
                 already_recorded = any(
                     event["backend"] == backend_name
                     and event["stage"] == stage
-                    and event["code"] == f"{stage}-failed"
+                    and event["code"] == failure_code
                     for event in receipt["events"]
                 )
                 if not already_recorded:
@@ -2954,7 +2965,7 @@ class CoordinatorBroker:
                             resource=name,
                             stage=stage,
                             status="failed",
-                            code=f"{stage}-failed",
+                            code=failure_code,
                         )
                     changed = True
             else:
@@ -3026,6 +3037,7 @@ class CoordinatorBroker:
                     raise ResourceContractError("backend unavailable")
                 backend.cancel(request, record["handle"])
             except Exception as exc:
+                failure_code = _resource_failure_code(exc, "cancel-failed")
                 self._append_daemon_log(
                     f"resource cancel failed for {row['run_id']} via "
                     f"{backend_name}: {type(exc).__name__}"
@@ -3037,7 +3049,7 @@ class CoordinatorBroker:
                         resource=name,
                         stage="cancel",
                         status="failed",
-                        code="cancel-failed",
+                        code=failure_code,
                     )
             else:
                 for name in names:
@@ -3233,7 +3245,12 @@ class CoordinatorBroker:
         status: str,
         exit_status: int | None,
     ) -> str | None:
-        if status != "failed" or row["kind"] not in {"merge", "land"}:
+        if status != "failed":
+            return None
+        receipt = self._row_resource_receipt(row)
+        if any(event["code"] == "memory-oom" for event in receipt["events"]):
+            return "memory-oom"
+        if row["kind"] not in {"merge", "land"}:
             return None
         from .merge import FAILURE_REASONS
 
@@ -3264,14 +3281,17 @@ class CoordinatorBroker:
                 return
             self._children.pop(run_id, None)
             self._group_drain_started.pop(run_id, None)
+            refreshed = db.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
             exit_status = _shell_status(returncode)
-            if row["cancel_requested"]:
+            if refreshed["cancel_requested"]:
                 status = "cancelled"
                 exit_status = 130
             else:
                 status = "passed" if exit_status == 0 else "failed"
             failure_reason = self._failure_reason_for(
-                row,
+                refreshed,
                 status=status,
                 exit_status=exit_status,
             )

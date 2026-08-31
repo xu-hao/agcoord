@@ -84,14 +84,26 @@ export AGCOORD_RESOURCE_BINDINGS='{
   "memory": {
     "kind": "memory",
     "unit": "bytes",
-    "mode": "best-effort",
+    "mode": "required",
+    "backend": "cgroup-v2"
+  },
+  "memory_pressure": {
+    "kind": "memory-high",
+    "unit": "bytes",
+    "mode": "required",
+    "backend": "cgroup-v2"
+  },
+  "swap": {
+    "kind": "swap",
+    "unit": "bytes",
+    "mode": "required",
     "backend": "cgroup-v2"
   }
 }'
 ```
 
 A binding contains exactly `kind`, `unit`, `mode`, and `backend`. The supported typed pairs are
-`cpu/logical-cpu`; `memory`, `tmpfs`, or `storage` with `bytes`;
+`cpu/logical-cpu`; `memory`, `memory-high`, `swap`, `tmpfs`, or `storage` with `bytes`;
 `io-bandwidth/bytes-per-second`; `io-operations/operations-per-second`; `inodes/inodes`; and
 `processes/processes`. `generic/admission-unit` remains available for an explicitly typed
 admission-only resource. `admission-only` requires a null backend, `best-effort` runs when its
@@ -110,8 +122,8 @@ configured backend is never silently treated as successful.
 ### Delegated cgroup v2 lifecycle
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
-are delegated, aggregate CPU bandwidth and task counts. Configure one exclusive delegated root
-and explicitly bind the capacity names before the broker starts:
+are delegated, aggregate CPU bandwidth, task counts, memory, and swap. Configure one exclusive
+delegated root and explicitly bind the capacity names before the broker starts:
 
 ```bash
 export AGCOORD_CAPACITIES='jobs=2,cpu=4,pids=128'
@@ -190,14 +202,47 @@ comes from `pids.peak` when the host provides it, otherwise from broker samples 
 event. Normal completion and cancellation capture final CPU and PID measurements after the leaf
 is unpopulated but before it is removed.
 
+`memory/bytes=N` writes the hard `memory.max=N` envelope for the complete run subtree and sets
+`memory.oom.group=1`, so a local hard-limit OOM terminates the run as one workload instead of
+leaving a partial process tree. With no explicit `swap/bytes` binding on that run,
+`memory.swap.max` defaults to `0`; a RAM budget therefore cannot silently consume unbounded host
+swap. With no `memory-high/bytes` binding, `memory.high` keeps its disabled `max` default.
+
+`memory-high/bytes=N` writes the reclaim and throttle boundary `memory.high=N`; if no hard memory
+binding is present, `memory.max` and `memory.swap.max` retain `max` and
+`memory.oom.group` remains `0`. A high value above an explicitly requested hard value is refused
+as `memory-limit-impossible`. Crossing the high boundary records `memory-high-throttled`, and
+nonzero per-cgroup PSI stall totals record `memory-pressure`; neither is reported as an OOM.
+
+`swap/bytes=N` writes `memory.swap.max=N`. A positive explicit swap budget is refused as
+`swap-disabled` when `/proc/meminfo` reports no host swap. Missing controller files, an
+undelegated memory controller, malformed counters, and an unmeasurable pressure interface also
+fail a required binding before user code begins. The backend reports the greatest observed
+`memory.current`/`memory.peak` value under each selected memory name and the greatest observed
+`memory.swap.current`/`memory.swap.peak` value under the swap name. It converts final
+`memory.events`, `memory.swap.events`, and pressure counters into deduplicated
+`memory-max-hit`, `memory-oom`, `swap-limit-hit`, and pressure events before removing the leaf.
+
+A group OOM normally makes the command observable as status `failed`, exit status `137`
+(SIGKILL), and `failure_reason=memory-oom`. An explicit user or broker cancellation retains its
+own `cancelled` status and is never relabeled as OOM, even if final memory evidence is present.
+
+Configure the schedulable hard-memory capacity below the effective ancestor `memory.max`, after
+reserving operator-chosen headroom for the broker, operating system, page cache outside admitted
+leaves, and unrelated sibling services. Do not derive it blindly from host `MemTotal`, especially
+inside a container or user slice. High-boundary capacity may deliberately overcommit when the
+operator wants reclaim pressure, but every safety-critical run should also request a hard-memory
+binding. Swap capacity should not exceed the swap the host can lose without harming those
+uncontrolled services.
+
 Normal finish and cancellation use `cgroup.kill`, wait for `cgroup.events` to report
 `populated 0`, and remove only the identity recorded for that run. A replacement broker adopts a
 still-live durable handle without creating a second leaf. Missing partial state is cleaned
 idempotently, while a changed device/inode, mismatched token, unrecorded collision, or populated
 stale leaf is refused and never removed as if it were owned.
 
-This backend does not yet translate memory or I/O units, and cgroups remain resource controls
-rather than a filesystem, credential, network, or general security sandbox.
+This backend does not yet translate I/O units, and cgroups remain resource controls rather than
+a filesystem, credential, network, or general security sandbox.
 
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an

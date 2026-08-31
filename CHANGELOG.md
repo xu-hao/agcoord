@@ -27,6 +27,9 @@ versioning; dates use ISO 8601.
   typed process allocations as subtree-wide `pids.max` task limits. Preserve CPU weight and
   affinity as separate policies, measure conservative CPU and PID peaks, and retain deduplicated
   throttle or PID-exhaustion events through normal completion and cancellation.
+- Enforce hard memory, pressure, and swap byte budgets with cgroup v2; default hard-memory runs
+  to zero swap, terminate local OOMs as one process group, preserve final memory/swap peaks and
+  pressure or limit evidence, and expose `memory-oom` without overriding cancellation.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 

@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from .resources import (
     RESOURCE_OPERATIONS,
-    ResourceContractError,
+    ResourceBackendError,
     ResourceMeasurement,
     ResourceObservation,
     ResourceRequest,
@@ -69,21 +69,25 @@ _MS_NOEXEC = 8
 _MS_REC = 16384
 _MS_PRIVATE = 1 << 18
 CPU_PERIOD_USEC = 100_000
-_COMPUTE_BINDINGS = {
+_CONTROL_BINDINGS = {
     ("cpu", "logical-cpu"): "cpu",
     ("processes", "processes"): "pids",
+    ("memory", "bytes"): "memory.max",
+    ("memory-high", "bytes"): "memory.high",
+    ("swap", "bytes"): "memory.swap.max",
 }
 _LIFECYCLE_BINDING = ("generic", "admission-unit")
-_CONTROLLER_FILE = re.compile(r"^(?:cpu|pids)\.[a-z][a-z0-9_.-]{0,31}$")
+_CONTROLLER_FILE = re.compile(
+    r"^(?:cpu|pids|memory(?:\.swap)?)\.[a-z][a-z0-9_.-]{0,31}$"
+)
 _METRIC_KEY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 
 
-class CgroupV2Error(ResourceContractError):
+class CgroupV2Error(ResourceBackendError):
     """A stable cgroup refusal whose host details remain broker-private."""
 
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
+        super().__init__(code, message)
 
 
 class CgroupOwnershipError(CgroupV2Error):
@@ -139,6 +143,8 @@ class CgroupV2System(Protocol):
     def write_file(self, path: Path, name: str, value: str) -> None: ...
 
     def read_file(self, path: Path, name: str) -> str: ...
+
+    def swap_total_bytes(self) -> int: ...
 
 
 def _decode_mount_path(value: str) -> str:
@@ -647,6 +653,26 @@ class LinuxCgroupV2System:
                 "cgroup controller value could not be read",
             ) from exc
 
+    def swap_total_bytes(self) -> int:
+        try:
+            lines = Path("/proc/meminfo").read_text(encoding="ascii").splitlines()
+            matches = [line.split() for line in lines if line.startswith("SwapTotal:")]
+            if (
+                len(matches) != 1
+                or len(matches[0]) != 3
+                or matches[0][0] != "SwapTotal:"
+                or not matches[0][1].isascii()
+                or not matches[0][1].isdecimal()
+                or matches[0][2] != "kB"
+            ):
+                raise ValueError
+            return int(matches[0][1]) * 1024
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise CgroupV2Error(
+                "swap-state-unavailable",
+                "host swap availability could not be determined",
+            ) from exc
+
 
 class CgroupV2Backend:
     """Own one collision-safe cgroup v2 leaf for each prepared run."""
@@ -686,6 +712,8 @@ class CgroupV2Backend:
         self._probe_result: CgroupProbe | None = None
         self._cpu_samples: dict[str, tuple[int, int, int]] = {}
         self._pids_peaks: dict[str, int] = {}
+        self._memory_peaks: dict[str, int] = {}
+        self._swap_peaks: dict[str, int] = {}
 
     @property
     def isolate_workers(self) -> bool:
@@ -730,6 +758,9 @@ class CgroupV2Backend:
         if "pids" in result.controllers:
             kinds.add("processes")
             units.add("processes")
+        if "memory" in result.controllers:
+            kinds.update({"memory", "memory-high", "swap"})
+            units.add("bytes")
         return {
             "available": result.available,
             "kinds": sorted(kinds) if result.available else [],
@@ -747,7 +778,7 @@ class CgroupV2Backend:
             raise CgroupV2Error("request-invalid", "cgroup request is invalid")
         for name, binding in request.bindings.items():
             pair = (binding["kind"], binding["unit"])
-            if pair != _LIFECYCLE_BINDING and pair not in _COMPUTE_BINDINGS:
+            if pair != _LIFECYCLE_BINDING and pair not in _CONTROL_BINDINGS:
                 raise CgroupV2Error(
                     "request-unsupported",
                     "cgroup backend does not support the requested typed unit",
@@ -756,15 +787,15 @@ class CgroupV2Backend:
     def _controller_resources(self, request: ResourceRequest) -> dict[str, str]:
         selected: dict[str, str] = {}
         for name, binding in request.bindings.items():
-            controller = _COMPUTE_BINDINGS.get((binding["kind"], binding["unit"]))
-            if controller is None:
+            control = _CONTROL_BINDINGS.get((binding["kind"], binding["unit"]))
+            if control is None:
                 continue
-            if controller in selected:
+            if control in selected:
                 raise CgroupV2Error(
                     "controller-ambiguous",
-                    "one run cannot bind two names to the same cgroup controller",
+                    "one run cannot bind two names to the same cgroup control",
                 )
-            selected[controller] = name
+            selected[control] = name
         return selected
 
     def _controller_settings(self, request: ResourceRequest) -> dict[str, str]:
@@ -775,6 +806,30 @@ class CgroupV2Backend:
             selected["cpu.max"] = f"{quota} {CPU_PERIOD_USEC}"
         if pids_name := resources.get("pids"):
             selected["pids.max"] = str(request.resources[pids_name])
+        hard_name = resources.get("memory.max")
+        high_name = resources.get("memory.high")
+        swap_name = resources.get("memory.swap.max")
+        if hard_name or high_name or swap_name:
+            hard = request.resources[hard_name] if hard_name else None
+            high = request.resources[high_name] if high_name else None
+            if hard is not None and high is not None and high > hard:
+                raise CgroupV2Error(
+                    "memory-limit-impossible",
+                    "memory.high cannot exceed memory.max",
+                )
+            if swap_name and self.system.swap_total_bytes() == 0:
+                raise CgroupV2Error(
+                    "swap-disabled",
+                    "a positive swap budget requires host swap",
+                )
+            selected["memory.high"] = "max" if high is None else str(high)
+            selected["memory.max"] = "max" if hard is None else str(hard)
+            selected["memory.swap.max"] = (
+                str(request.resources[swap_name])
+                if swap_name
+                else ("0" if hard_name else "max")
+            )
+            selected["memory.oom.group"] = "1" if hard_name else "0"
         return selected
 
     def _enable_controllers(
@@ -782,7 +837,10 @@ class CgroupV2Backend:
         request: ResourceRequest,
         owner_path: Path,
     ) -> None:
-        controllers = set(self._controller_resources(request))
+        controllers = {
+            control.split(".", maxsplit=1)[0]
+            for control in self._controller_resources(request)
+        }
         if not controllers:
             return
         result = self._probe()
@@ -824,6 +882,44 @@ class CgroupV2Backend:
             stats["usage_usec"],
             0,
         )
+
+    def _start_memory_sample(self, request: ResourceRequest, leaf_path: Path) -> None:
+        resources = self._controller_resources(request)
+        memory_names = [
+            resources[control]
+            for control in ("memory.max", "memory.high")
+            if control in resources
+        ]
+        if memory_names:
+            current = self._single_value(
+                self.system.read_file(leaf_path, "memory.current"),
+                code="memory-current-invalid",
+            )
+            peak = self._optional_peak(
+                leaf_path,
+                "memory.peak",
+                current=current,
+                code="memory-peak-invalid",
+            )
+            self._flat_values(self.system.read_file(leaf_path, "memory.events"))
+            if "memory.high" in resources:
+                self._pressure_totals(
+                    self.system.read_file(leaf_path, "memory.pressure")
+                )
+            self._memory_peaks[request.run_id] = max(current, peak)
+        if "memory.swap.max" in resources:
+            current = self._single_value(
+                self.system.read_file(leaf_path, "memory.swap.current"),
+                code="swap-current-invalid",
+            )
+            peak = self._optional_peak(
+                leaf_path,
+                "memory.swap.peak",
+                current=current,
+                code="swap-peak-invalid",
+            )
+            self._flat_values(self.system.read_file(leaf_path, "memory.swap.events"))
+            self._swap_peaks[request.run_id] = max(current, peak)
 
     def _require_available(self) -> None:
         result = self._probe()
@@ -1134,9 +1230,12 @@ class CgroupV2Backend:
                 try:
                     self._configure_controller_values(request, leaf_path)
                     self._start_cpu_sample(request, leaf_path)
+                    self._start_memory_sample(request, leaf_path)
                 except BaseException:
                     self._cpu_samples.pop(request.run_id, None)
                     self._pids_peaks.pop(request.run_id, None)
+                    self._memory_peaks.pop(request.run_id, None)
+                    self._swap_peaks.pop(request.run_id, None)
                     self.system.remove_group(leaf_path)
                     manifest_path.unlink(missing_ok=True)
                     self._cleanup_owner()
@@ -1165,10 +1264,13 @@ class CgroupV2Backend:
             try:
                 self._configure_controller_values(request, owner_path / leaf_name)
                 self._start_cpu_sample(request, owner_path / leaf_name)
+                self._start_memory_sample(request, owner_path / leaf_name)
                 self._write_json(manifest_path, self._manifest(request, handle))
             except BaseException:
                 self._cpu_samples.pop(request.run_id, None)
                 self._pids_peaks.pop(request.run_id, None)
+                self._memory_peaks.pop(request.run_id, None)
+                self._swap_peaks.pop(request.run_id, None)
                 try:
                     self.system.remove_group(owner_path / leaf_name)
                 except OSError:
@@ -1221,6 +1323,62 @@ class CgroupV2Backend:
         if not value.isascii() or not value.isdecimal():
             raise CgroupV2Error(code, "cgroup controller metric is invalid")
         return int(value)
+
+    def _optional_peak(
+        self,
+        leaf_path: Path,
+        name: str,
+        *,
+        current: int,
+        code: str,
+    ) -> int:
+        try:
+            return self._single_value(
+                self.system.read_file(leaf_path, name),
+                code=code,
+            )
+        except CgroupV2Error as exc:
+            if exc.code != "controller-file-missing":
+                raise
+            return current
+
+    @staticmethod
+    def _pressure_totals(raw: str) -> dict[str, int]:
+        selected: dict[str, int] = {}
+        decimal = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+        try:
+            for line in raw.splitlines():
+                fields = line.split()
+                if not fields or fields[0] not in {"some", "full"}:
+                    raise ValueError
+                category = fields[0]
+                if category in selected:
+                    raise ValueError
+                values: dict[str, str] = {}
+                for field in fields[1:]:
+                    key, separator, value = field.partition("=")
+                    if (
+                        not separator
+                        or key not in {"avg10", "avg60", "avg300", "total"}
+                        or key in values
+                        or not value.isascii()
+                        or not decimal.fullmatch(value)
+                    ):
+                        raise ValueError
+                    values[key] = value
+                if set(values) != {"avg10", "avg60", "avg300", "total"}:
+                    raise ValueError
+                if not values["total"].isdecimal():
+                    raise ValueError
+                selected[category] = int(values["total"])
+            if set(selected) != {"some", "full"}:
+                raise ValueError
+        except ValueError as exc:
+            raise CgroupV2Error(
+                "memory-pressure-invalid",
+                "cgroup memory pressure metrics are invalid",
+            ) from exc
+        return selected
 
     def _measurement(
         self,
@@ -1286,6 +1444,78 @@ class CgroupV2Backend:
             events = self._flat_values(self.system.read_file(leaf_path, "pids.events"))
             if events.get("max", 0) > 0:
                 observations.append(ResourceObservation(pids_name, "pids-limit-hit"))
+
+        hard_name = resources.get("memory.max")
+        high_name = resources.get("memory.high")
+        if hard_name or high_name:
+            current = self._single_value(
+                self.system.read_file(leaf_path, "memory.current"),
+                code="memory-current-invalid",
+            )
+            reported_peak = self._optional_peak(
+                leaf_path,
+                "memory.peak",
+                current=current,
+                code="memory-peak-invalid",
+            )
+            measured_peak = max(
+                current,
+                reported_peak,
+                self._memory_peaks.get(request.run_id, 0),
+            )
+            self._memory_peaks[request.run_id] = measured_peak
+            for name in (hard_name, high_name):
+                if name is not None:
+                    peak[name] = measured_peak
+            events = self._flat_values(
+                self.system.read_file(leaf_path, "memory.events")
+            )
+            if hard_name is not None:
+                if events.get("max", 0) > 0:
+                    observations.append(
+                        ResourceObservation(hard_name, "memory-max-hit")
+                    )
+                if (
+                    events.get("oom_kill", 0) > 0
+                    or events.get("oom_group_kill", 0) > 0
+                ):
+                    observations.append(ResourceObservation(hard_name, "memory-oom"))
+            if high_name is not None:
+                if events.get("high", 0) > 0:
+                    observations.append(
+                        ResourceObservation(high_name, "memory-high-throttled")
+                    )
+                pressure = self._pressure_totals(
+                    self.system.read_file(leaf_path, "memory.pressure")
+                )
+                if any(value > 0 for value in pressure.values()):
+                    observations.append(
+                        ResourceObservation(high_name, "memory-pressure")
+                    )
+
+        if swap_name := resources.get("memory.swap.max"):
+            current = self._single_value(
+                self.system.read_file(leaf_path, "memory.swap.current"),
+                code="swap-current-invalid",
+            )
+            reported_peak = self._optional_peak(
+                leaf_path,
+                "memory.swap.peak",
+                current=current,
+                code="swap-peak-invalid",
+            )
+            measured_peak = max(
+                current,
+                reported_peak,
+                self._swap_peaks.get(request.run_id, 0),
+            )
+            self._swap_peaks[request.run_id] = measured_peak
+            peak[swap_name] = measured_peak
+            events = self._flat_values(
+                self.system.read_file(leaf_path, "memory.swap.events")
+            )
+            if events.get("max", 0) > 0 or events.get("fail", 0) > 0:
+                observations.append(ResourceObservation(swap_name, "swap-limit-hit"))
 
         return ResourceMeasurement(peak, tuple(observations))
 
@@ -1374,5 +1604,7 @@ class CgroupV2Backend:
             self.system.remove_group(leaf_path)
         self._cpu_samples.pop(request.run_id, None)
         self._pids_peaks.pop(request.run_id, None)
+        self._memory_peaks.pop(request.run_id, None)
+        self._swap_peaks.pop(request.run_id, None)
         manifest_path.unlink(missing_ok=True)
         self._cleanup_owner()
