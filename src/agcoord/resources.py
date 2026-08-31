@@ -21,6 +21,8 @@ RESOURCE_UNITS_BY_KIND = {
     "generic": frozenset({"admission-unit"}),
     "cpu": frozenset({"logical-cpu"}),
     "memory": frozenset({"bytes"}),
+    "memory-high": frozenset({"bytes"}),
+    "swap": frozenset({"bytes"}),
     "tmpfs": frozenset({"bytes"}),
     "storage": frozenset({"bytes"}),
     "io-bandwidth": frozenset({"bytes-per-second"}),
@@ -56,6 +58,16 @@ ADMISSION_BINDING: dict[str, object] = {
 
 class ResourceContractError(RuntimeError):
     """A malformed public resource contract or backend response."""
+
+
+class ResourceBackendError(ResourceContractError):
+    """A backend refusal with a sanitized code safe for durable public receipts."""
+
+    def __init__(self, code: str, message: str) -> None:
+        if not isinstance(code, str) or not _CODE.fullmatch(code):
+            raise ValueError("resource backend error code is invalid")
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
