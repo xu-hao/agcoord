@@ -11,14 +11,18 @@ procedures listed in [docs/index.md](docs/index.md).
 - Verify behavior at public boundaries. Start bug fixes with a failing behavioral test;
   accompany runtime changes with focused tests, affected canonical documentation, and a
   `CHANGELOG.md` entry when the change is user-facing.
+- A documentation-only change needs no tests or AGCoord gate. It qualifies only when every
+  changed path is `README.md`, `CHANGELOG.md`, `AGENTS.md`, or Markdown below `docs/`.
+  Verify the exact pull-request file list and diff, then merge it through the forge; the
+  issue, worktree, branch, pull-request, and no-direct-target-push rules still apply.
 - Tests own and stop every broker, worker, repository, and temporary state they create.
   Never inspect or clean another agent's state.
 - Keep the core coordinator forge-neutral. Forge-specific metadata and publication
   behavior belong in optional adapters.
-- After bootstrap, route checks and publication through the local coordinator, declare
-  every scarce resource, and never submit coordinated work from an admitted job. Gate
-  and publish through one `agc land` request; never bypass or separate its verdict
-  from publication.
+- For every other change after bootstrap, route checks and publication through the local
+  coordinator, declare every scarce resource, and never submit coordinated work from an
+  admitted job. Gate and publish through one `agc land` request; never bypass or separate
+  its verdict from publication.
 - Never upload an AGCoord distribution to PyPI unless the user explicitly requests it.
   Permission to implement, test, commit, push, merge, tag, or create a GitHub release
   does not authorize an upload.
