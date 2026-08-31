@@ -1,6 +1,8 @@
 mod broker;
+mod cgroup;
 mod error;
 mod platform;
+mod resources;
 mod store;
 mod worker;
 
@@ -134,6 +136,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
     let mut idle_timeout = Duration::from_secs(60);
     let mut crash_after = None;
     let mut worker_fault = None;
+    let mut cgroup_fixture = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -186,6 +189,16 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                         .ok_or_else(|| AppError::usage("unknown worker fault"))?,
                 );
             }
+            "--cgroup-fixture" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --cgroup-fixture"));
+                }
+                cgroup_fixture = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--cgroup-fixture",
+                )?));
+            }
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
         }
         index += 1;
@@ -199,6 +212,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
         idle_timeout,
         crash_after,
         worker_fault,
+        cgroup_fixture,
     })
 }
 

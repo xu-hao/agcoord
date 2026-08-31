@@ -1,12 +1,17 @@
+use crate::cgroup::{
+    self, TmpfsBaseline, TmpfsSetup, isolate_current_cgroup, mount_current_tmpfs,
+    unmount_current_tmpfs,
+};
 use crate::error::{AppError, Result};
 use crate::platform::{process_start_token, same_worker_process, signal_process_group};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
@@ -38,6 +43,8 @@ pub enum WorkerFault {
     PrivilegeVerification,
     RetainedDescriptor,
     FinalToken,
+    TmpfsMountUnavailable,
+    NamespaceIsolationUnavailable,
 }
 
 impl WorkerFault {
@@ -51,6 +58,8 @@ impl WorkerFault {
             "privilege-verification" => Some(Self::PrivilegeVerification),
             "retained-descriptor" => Some(Self::RetainedDescriptor),
             "final-token" => Some(Self::FinalToken),
+            "tmpfs-mount-unavailable" => Some(Self::TmpfsMountUnavailable),
+            "namespace-isolation-unavailable" => Some(Self::NamespaceIsolationUnavailable),
             _ => None,
         }
     }
@@ -63,6 +72,20 @@ enum SetupCode {
     PrivilegeDropFailed = 1,
     PrivilegeDropUnverified = 2,
     DescriptorLeak = 3,
+    NamespaceDelegationUnavailable = 4,
+    NamespaceIsolationUnavailable = 5,
+    NamespaceMappingFailed = 6,
+    NamespaceMountFailed = 7,
+    NamespaceVerificationFailed = 8,
+    ControllerFilesExposed = 9,
+    TmpfsNamespaceRequired = 10,
+    TmpfsTargetInvalid = 11,
+    TmpfsMountUnavailable = 12,
+    TmpfsMountUnverified = 13,
+    TmpfsSizeUnverified = 14,
+    TmpfsInodesUnverified = 15,
+    TmpfsSetupFailed = 16,
+    TmpfsReportFailed = 17,
 }
 
 impl SetupCode {
@@ -72,6 +95,20 @@ impl SetupCode {
             1 => Some(Self::PrivilegeDropFailed),
             2 => Some(Self::PrivilegeDropUnverified),
             3 => Some(Self::DescriptorLeak),
+            4 => Some(Self::NamespaceDelegationUnavailable),
+            5 => Some(Self::NamespaceIsolationUnavailable),
+            6 => Some(Self::NamespaceMappingFailed),
+            7 => Some(Self::NamespaceMountFailed),
+            8 => Some(Self::NamespaceVerificationFailed),
+            9 => Some(Self::ControllerFilesExposed),
+            10 => Some(Self::TmpfsNamespaceRequired),
+            11 => Some(Self::TmpfsTargetInvalid),
+            12 => Some(Self::TmpfsMountUnavailable),
+            13 => Some(Self::TmpfsMountUnverified),
+            14 => Some(Self::TmpfsSizeUnverified),
+            15 => Some(Self::TmpfsInodesUnverified),
+            16 => Some(Self::TmpfsSetupFailed),
+            17 => Some(Self::TmpfsReportFailed),
             _ => None,
         }
     }
@@ -91,8 +128,69 @@ impl SetupCode {
                 "worker-descriptor-leak",
                 "native worker retained an internal descriptor before exec",
             )),
+            code => Some(AppError::new(
+                code.stable_code().unwrap(),
+                "native worker resource setup could not be verified",
+            )),
         }
     }
+
+    fn stable_code(self) -> Option<&'static str> {
+        match self {
+            Self::Ok => None,
+            Self::PrivilegeDropFailed => Some("worker-privilege-drop-failed"),
+            Self::PrivilegeDropUnverified => Some("worker-privilege-drop-unverified"),
+            Self::DescriptorLeak => Some("worker-descriptor-leak"),
+            Self::NamespaceDelegationUnavailable => Some("namespace-delegation-unavailable"),
+            Self::NamespaceIsolationUnavailable => Some("namespace-isolation-unavailable"),
+            Self::NamespaceMappingFailed => Some("namespace-mapping-failed"),
+            Self::NamespaceMountFailed => Some("namespace-mount-failed"),
+            Self::NamespaceVerificationFailed => Some("namespace-verification-failed"),
+            Self::ControllerFilesExposed => Some("controller-files-exposed"),
+            Self::TmpfsNamespaceRequired => Some("tmpfs-namespace-required"),
+            Self::TmpfsTargetInvalid => Some("tmpfs-target-invalid"),
+            Self::TmpfsMountUnavailable => Some("tmpfs-mount-unavailable"),
+            Self::TmpfsMountUnverified => Some("tmpfs-mount-unverified"),
+            Self::TmpfsSizeUnverified => Some("tmpfs-size-unverified"),
+            Self::TmpfsInodesUnverified => Some("tmpfs-inodes-unverified"),
+            Self::TmpfsSetupFailed => Some("tmpfs-setup-failed"),
+            Self::TmpfsReportFailed => Some("tmpfs-report-failed"),
+        }
+    }
+
+    fn from_resource_error(code: &str) -> Self {
+        match code {
+            "namespace-delegation-unavailable" => Self::NamespaceDelegationUnavailable,
+            "namespace-isolation-unavailable" => Self::NamespaceIsolationUnavailable,
+            "namespace-mapping-failed" => Self::NamespaceMappingFailed,
+            "namespace-mount-failed" => Self::NamespaceMountFailed,
+            "namespace-verification-failed" => Self::NamespaceVerificationFailed,
+            "controller-files-exposed" => Self::ControllerFilesExposed,
+            "tmpfs-namespace-required" => Self::TmpfsNamespaceRequired,
+            "tmpfs-target-invalid" => Self::TmpfsTargetInvalid,
+            "tmpfs-mount-unavailable" => Self::TmpfsMountUnavailable,
+            "tmpfs-mount-unverified" => Self::TmpfsMountUnverified,
+            "tmpfs-size-unverified" => Self::TmpfsSizeUnverified,
+            "tmpfs-inodes-unverified" => Self::TmpfsInodesUnverified,
+            _ => Self::TmpfsSetupFailed,
+        }
+    }
+
+    fn resource_failure(self) -> Option<&'static str> {
+        match self {
+            Self::Ok
+            | Self::PrivilegeDropFailed
+            | Self::PrivilegeDropUnverified
+            | Self::DescriptorLeak => None,
+            code => code.stable_code(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkerSetup {
+    pub isolate_cgroup: bool,
+    pub tmpfs: Option<TmpfsSetup>,
 }
 
 #[repr(C)]
@@ -118,6 +216,7 @@ struct ExecPlan {
     checkout: CString,
     log_fd: RawFd,
     fault: Option<WorkerFault>,
+    setup: WorkerSetup,
 }
 
 impl ExecPlan {
@@ -127,6 +226,7 @@ impl ExecPlan {
         checkout: &Path,
         log: &File,
         fault: Option<WorkerFault>,
+        setup: WorkerSetup,
     ) -> Result<Self> {
         let executable = resolve_executable(&command[0], environment, checkout)?;
         let arguments = command
@@ -171,6 +271,7 @@ impl ExecPlan {
             checkout,
             log_fd: log.as_raw_fd(),
             fault,
+            setup,
         })
     }
 }
@@ -537,6 +638,196 @@ fn drop_privileges() -> SetupCode {
     }
 }
 
+fn write_tmpfs_report(
+    setup: &TmpfsSetup,
+    peak_bytes: u64,
+    peak_inodes: u64,
+    terminal_bytes: u64,
+    terminal_inodes: u64,
+    byte_limit_hit: bool,
+    inode_limit_hit: bool,
+) -> io::Result<()> {
+    let file_name = setup
+        .report
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "report has no name"))?;
+    let temporary =
+        setup
+            .report
+            .with_file_name(format!(".{}.{}.tmp", file_name.to_string_lossy(), unsafe {
+                libc::getpid()
+            }));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        let payload = serde_json::to_vec(&json!({
+            "version": 1,
+            "token": setup.token,
+            "peak_bytes": peak_bytes,
+            "peak_inodes": peak_inodes,
+            "terminal_bytes": terminal_bytes,
+            "terminal_inodes": terminal_inodes,
+            "byte_limit_hit": byte_limit_hit,
+            "inode_limit_hit": inode_limit_hit,
+        }))?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &setup.report)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+fn emulated_tmpfs_usage(path: &Path) -> io::Result<(u64, u64)> {
+    let mut bytes = 0_u64;
+    let mut inodes = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let details = fs::symlink_metadata(entry.path())?;
+        inodes = inodes
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("inode count overflow"))?;
+        if details.is_dir() {
+            let (nested_bytes, nested_inodes) = emulated_tmpfs_usage(&entry.path())?;
+            bytes = bytes
+                .checked_add(nested_bytes)
+                .ok_or_else(|| io::Error::other("byte count overflow"))?;
+            inodes = inodes
+                .checked_add(nested_inodes)
+                .ok_or_else(|| io::Error::other("inode count overflow"))?;
+        } else if details.is_file() {
+            bytes = bytes
+                .checked_add(details.len())
+                .ok_or_else(|| io::Error::other("byte count overflow"))?;
+        }
+    }
+    Ok((bytes, inodes))
+}
+
+fn tmpfs_sample(setup: &TmpfsSetup, baseline: TmpfsBaseline) -> io::Result<(u64, u64, bool, bool)> {
+    if setup.emulate {
+        let (bytes, inodes) = emulated_tmpfs_usage(&setup.target)?;
+        return Ok((bytes, inodes, bytes >= setup.size, inodes >= setup.inodes));
+    }
+    let usage = cgroup::tmpfs_stat(setup).map_err(|error| io::Error::other(error.code))?;
+    let used_bytes = usage
+        .blocks
+        .saturating_sub(usage.blocks_free)
+        .saturating_mul(usage.fragment_size);
+    let baseline_inodes = baseline.files.saturating_sub(baseline.files_free);
+    let used_inodes = usage
+        .files
+        .saturating_sub(usage.files_free)
+        .saturating_sub(baseline_inodes);
+    Ok((
+        used_bytes,
+        used_inodes,
+        usage.blocks_free == 0,
+        usage.files_free == 0,
+    ))
+}
+
+fn cleanup_emulated_tmpfs(setup: &TmpfsSetup) {
+    if !setup.emulate {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&setup.target) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if fs::symlink_metadata(&path).is_ok_and(|details| details.is_dir()) {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn exec_plan(plan: &ExecPlan) -> ! {
+    close_all_except(&[]);
+    if !descriptors_are_exactly(&[]) {
+        unsafe { libc::_exit(125) }
+    }
+    // SAFETY: checkout, argv, envp and executable are immutable NUL-terminated buffers
+    // built before fork. execve replaces only this child and never returns on success.
+    unsafe {
+        if libc::chdir(plan.checkout.as_ptr()) != 0 {
+            libc::_exit(127);
+        }
+        libc::execve(
+            plan.executable.as_ptr(),
+            plan.argument_pointers.as_ptr(),
+            plan.environment_pointers.as_ptr(),
+        );
+        libc::_exit(127);
+    }
+}
+
+fn supervise_tmpfs(plan: &ExecPlan, setup: &TmpfsSetup, baseline: TmpfsBaseline) -> ! {
+    // SAFETY: the launcher is single-threaded and the child immediately execs or exits.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        unsafe { libc::_exit(125) }
+    }
+    if child == 0 {
+        exec_plan(plan);
+    }
+    let mut peak_bytes = 0;
+    let mut peak_inodes = 0;
+    let mut byte_limit_hit = false;
+    let mut inode_limit_hit = false;
+    let status = loop {
+        let mut status = 0;
+        // SAFETY: child is the supervisor's exact fork child and status is writable.
+        let observed = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        let finished = observed == child;
+        if observed < 0 {
+            unsafe { libc::_exit(125) }
+        }
+        if let Ok((bytes, inodes, bytes_full, inodes_full)) = tmpfs_sample(setup, baseline) {
+            peak_bytes = peak_bytes.max(bytes);
+            peak_inodes = peak_inodes.max(inodes);
+            byte_limit_hit |= bytes_full;
+            inode_limit_hit |= inodes_full;
+            let _ = write_tmpfs_report(
+                setup,
+                peak_bytes,
+                peak_inodes,
+                bytes,
+                inodes,
+                byte_limit_hit,
+                inode_limit_hit,
+            );
+        }
+        if finished {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    cleanup_emulated_tmpfs(setup);
+    if unmount_current_tmpfs(setup).is_err() {
+        unsafe { libc::_exit(125) }
+    }
+    if libc::WIFEXITED(status) {
+        unsafe { libc::_exit(libc::WEXITSTATUS(status)) }
+    }
+    if libc::WIFSIGNALED(status) {
+        let signal = libc::WTERMSIG(status);
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+            libc::_exit(128 + signal);
+        }
+    }
+    unsafe { libc::_exit(125) }
+}
+
 fn reset_worker_signals() {
     // SAFETY: restoring default scalar signal dispositions in the single-threaded fork
     // child prevents the broker's flag handlers from swallowing cancellation.
@@ -605,7 +896,40 @@ fn child_main(
         unsafe { libc::_exit(125) }
     }
 
-    let mut code = drop_privileges();
+    let mut tmpfs_baseline = None;
+    let mut code = SetupCode::Ok;
+    if plan.fault == Some(WorkerFault::NamespaceIsolationUnavailable) {
+        code = SetupCode::NamespaceIsolationUnavailable;
+    } else if plan.setup.isolate_cgroup
+        && let Err(error) = isolate_current_cgroup()
+    {
+        code = SetupCode::from_resource_error(&error.code);
+    }
+    if code == SetupCode::Ok
+        && let Some(setup) = &plan.setup.tmpfs
+    {
+        if !setup.emulate && !plan.setup.isolate_cgroup {
+            code = SetupCode::TmpfsNamespaceRequired;
+        } else if plan.fault == Some(WorkerFault::TmpfsMountUnavailable) {
+            code = SetupCode::TmpfsMountUnavailable;
+        } else {
+            match mount_current_tmpfs(setup) {
+                Ok(baseline) => {
+                    if write_tmpfs_report(setup, 0, 0, 0, 0, false, false).is_err() {
+                        let _ = unmount_current_tmpfs(setup);
+                        code = SetupCode::TmpfsReportFailed;
+                    } else {
+                        tmpfs_baseline = Some(baseline);
+                    }
+                }
+                Err(error) => code = SetupCode::from_resource_error(&error.code),
+            }
+        }
+    }
+    let privilege_code = drop_privileges();
+    if privilege_code != SetupCode::Ok {
+        code = privilege_code;
+    }
     if plan.fault == Some(WorkerFault::PrivilegeVerification) {
         code = SetupCode::PrivilegeDropUnverified;
     }
@@ -615,7 +939,7 @@ fn child_main(
             libc::open(null.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC);
         }
     }
-    if code == SetupCode::Ok && !descriptors_are_exactly(&[control_read, setup_write]) {
+    if !descriptors_are_exactly(&[control_read, setup_write]) {
         code = SetupCode::DescriptorLeak;
     }
     let setup_token = if plan.fault == Some(WorkerFault::SetupToken) {
@@ -623,7 +947,10 @@ fn child_main(
     } else {
         token
     };
-    if !write_all_fd(setup_write, &setup_message(&setup_token, code)) || code != SetupCode::Ok {
+    if !write_all_fd(setup_write, &setup_message(&setup_token, code)) {
+        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
+            let _ = unmount_current_tmpfs(setup);
+        }
         unsafe { libc::_exit(125) }
     }
     let mut final_release = [0_u8; CONTROL_BYTES];
@@ -632,25 +959,23 @@ fn child_main(
         || final_release[4] != FINAL_RELEASE
         || final_release[5..] != token[..]
     {
-        unsafe { libc::_exit(125) }
-    }
-    close_all_except(&[]);
-    if !descriptors_are_exactly(&[]) {
-        unsafe { libc::_exit(125) }
-    }
-    // SAFETY: checkout, argv, envp and executable are immutable NUL-terminated buffers
-    // built before fork. execve replaces only this child and never returns on success.
-    unsafe {
-        if libc::chdir(plan.checkout.as_ptr()) != 0 {
-            libc::_exit(127);
+        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
+            let _ = unmount_current_tmpfs(setup);
         }
-        libc::execve(
-            plan.executable.as_ptr(),
-            plan.argument_pointers.as_ptr(),
-            plan.environment_pointers.as_ptr(),
-        );
-        libc::_exit(127);
+        unsafe { libc::_exit(125) }
     }
+    if code != SetupCode::Ok {
+        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
+            let _ = unmount_current_tmpfs(setup);
+        }
+        exec_plan(plan);
+    }
+    if let (Some(setup), Some(baseline)) = (&plan.setup.tmpfs, tmpfs_baseline)
+        && !setup.emulate
+    {
+        supervise_tmpfs(plan, setup, baseline);
+    }
+    exec_plan(plan);
 }
 
 fn wait_status(status: libc::c_int) -> i64 {
@@ -710,8 +1035,9 @@ impl PendingWorker {
         checkout: &Path,
         log: &File,
         fault: Option<WorkerFault>,
+        setup: WorkerSetup,
     ) -> Result<Self> {
-        let plan = ExecPlan::new(command, environment, checkout, log, fault)?;
+        let plan = ExecPlan::new(command, environment, checkout, log, fault, setup)?;
         let token = random_token()?;
         let (control_read, control_write) = create_pipe().map_err(|_| {
             AppError::new(
@@ -818,7 +1144,7 @@ impl PendingWorker {
         &self.start_token
     }
 
-    pub fn verify_setup(&mut self) -> Result<()> {
+    pub fn verify_setup(&mut self) -> Result<Option<&'static str>> {
         if self.fault == Some(WorkerFault::SubstitutedChannel) {
             if let Ok((substitute_read, substitute_write)) = create_pipe() {
                 let mut substitute = unsafe { File::from_raw_fd(substitute_write) };
@@ -867,11 +1193,15 @@ impl PendingWorker {
                 "native worker returned an unknown setup result",
             )
         })?;
+        if let Some(resource_failure) = code.resource_failure() {
+            self.setup_verified = true;
+            return Ok(Some(resource_failure));
+        }
         if let Some(error) = code.error() {
             return Err(error);
         }
         self.setup_verified = true;
-        Ok(())
+        Ok(None)
     }
 
     pub fn release(mut self) -> Result<NativeWorker> {

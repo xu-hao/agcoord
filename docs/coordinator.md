@@ -162,7 +162,9 @@ remain separate implementations; a configured backend is never silently treated 
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
 are delegated, aggregate CPU bandwidth, task counts, memory, swap, and explicitly mapped block
-I/O. The future single-executable implementation follows the separate
+I/O. Both broker implementations expose the same binding and receipt contract; the Rust owner
+performs its probe, leaf lifecycle, controller operations, namespace setup, tmpfs supervision,
+measurement, recovery, and cancellation inside the single executable described by the
 [native broker architecture and security contract](native_broker.md). Configure one exclusive
 delegated root and explicitly bind the capacity names before the broker starts:
 
@@ -229,9 +231,10 @@ backend probe succeeds. Attaching `userns` permission to a general-purpose Pytho
 including one copied into a root-owned virtual environment, is not a narrow workaround: the
 broker account could invoke that interpreter directly with arbitrary code under the same
 permission. The Python broker therefore has no supported AppArmor exception for this host
-policy. Keep the cgroup backend disabled on such a host unless the administrator deliberately
-accepts a broader account-level user-namespace opt-in; a future native enforcement boundary is
-required for a broker-specific exception.
+policy. The Rust executable provides the narrow broker-specific target, but it does not bypass
+AppArmor by itself: use the native backend only after the documented host package and broker
+profile are installed and verified. Otherwise keep the cgroup backend disabled unless the
+administrator deliberately accepts a broader account-level user-namespace opt-in.
 
 For each run, AGCoord creates an owner-specific, collision-safe leaf and records device/inode
 identities plus a random ownership token in the private spool. The existing launcher stays
@@ -353,11 +356,13 @@ is the kernel filesystem ceiling and includes tmpfs's own root inode. A token-bo
 private backend metadata lets a replacement broker retain the last sample without exposing file
 names or contents.
 
-A required namespace or mount failure stops before user code with exit status 125 and
-`failure_reason=resource-enforcement-failed`. If both tmpfs bindings are `best-effort`, the same
-failure is recorded as unapplied and the command continues in the ordinary owned directory; the
-hard memory control remains applied. With no tmpfs bindings, AGCoord preserves that existing
-directory behavior without claiming RAM backing or a byte/inode ceiling.
+A namespace-rooting failure always stops before user code with exit status 125 and
+`failure_reason=resource-enforcement-failed`; the launcher is never released with parent controls
+visible. A required tmpfs mount failure has the same outcome. If both tmpfs bindings are
+`best-effort`, a mount-specific failure is recorded as unapplied and the command continues in the
+ordinary owned directory; the verified namespace and hard memory control remain applied. With no
+tmpfs bindings, AGCoord preserves that existing directory behavior without claiming RAM backing
+or a byte/inode ceiling.
 
 Every run gets a distinct mount namespace and target. The mount remains alive while any process
 in that worker tree retains the namespace, then the kernel tears it down when the tree is gone;
