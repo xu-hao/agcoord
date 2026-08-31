@@ -7,8 +7,10 @@ use crate::store::{
     Paths, RunRecord, allocations, blocked_by, connect, initialize_native, load_run, load_runs,
     map_database_error, now,
 };
-use crate::worker::{NativeWorker, PendingWorker, WorkerFault};
+use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
+use crate::{cgroup, resources};
 use rusqlite::{Connection, params};
+use serde_json::{Map, Value, json};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
@@ -29,6 +31,7 @@ pub struct ServeOptions {
     pub idle_timeout: Duration,
     pub crash_after: Option<String>,
     pub worker_fault: Option<WorkerFault>,
+    pub cgroup_fixture: Option<PathBuf>,
 }
 
 pub struct Broker {
@@ -37,6 +40,8 @@ pub struct Broker {
     idle_timeout: Duration,
     crash_after: Option<String>,
     worker_fault: Option<WorkerFault>,
+    resource_capabilities: Value,
+    cgroup_backend: Option<cgroup::CgroupBackend>,
     _owner: OwnerLock,
     children: HashMap<String, NativeWorker>,
     cancellation_started: HashMap<String, Instant>,
@@ -60,12 +65,82 @@ impl Broker {
         let paths = Paths::new(&options.state_dir);
         paths.prepare()?;
         let paths = paths.configured()?;
+        let resource_configuration = resources::load_configuration(&options.state_dir)?;
+        let mut capability_map = Map::new();
+        let referenced_backends: BTreeSet<String> = resource_configuration
+            .bindings
+            .values()
+            .filter_map(|binding| binding.backend.clone())
+            .collect();
+        if options.cgroup_fixture.is_some()
+            && !referenced_backends.contains(resources::CGROUP_BACKEND)
+        {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                "cgroup fixture requires at least one cgroup-v2 binding",
+            ));
+        }
+        let mut cgroup_backend = if referenced_backends.contains(resources::CGROUP_BACKEND) {
+            Some(
+                cgroup::CgroupBackend::new(
+                    &resource_configuration,
+                    &options.state_dir,
+                    options.cgroup_fixture.as_deref(),
+                )
+                .map_err(|error| {
+                    AppError::new(
+                        "broker-config-invalid",
+                        format!("cannot initialize cgroup-v2 backend: {}", error.code),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        for backend in &referenced_backends {
+            let capability = if backend == resources::CGROUP_BACKEND {
+                cgroup_backend.as_mut().unwrap().capability()
+            } else {
+                resources::Capability::unavailable("backend-unavailable")
+            };
+            capability_map.insert(backend.clone(), capability.to_value());
+        }
+        let resource_capabilities = Value::Object(capability_map);
         let mut owner = OwnerLock::acquire(&options.state_dir)?;
         if options.crash_after.as_deref() == Some("owner-lock") {
             std::process::exit(86);
         }
         let connection = initialize_native(&paths, &options.capacities)?;
-        load_runs(&connection)?;
+        let runs = load_runs(&connection)?;
+        if cgroup_backend.is_none()
+            && runs
+                .iter()
+                .any(|run| run.resource_state.contains_key(resources::CGROUP_BACKEND))
+        {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "stored cgroup recovery state has no configured native backend",
+            ));
+        }
+        if let Some(backend) = &cgroup_backend {
+            for run in &runs {
+                let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
+                    continue;
+                };
+                let request = Self::cgroup_request(run, &record.resources)?;
+                backend
+                    .validate_recovery(&request, &record.handle)
+                    .map_err(|error| {
+                        AppError::new(
+                            "broker-row-invalid",
+                            format!(
+                                "run {} has invalid cgroup recovery state: {}",
+                                run.run_id, error.code
+                            ),
+                        )
+                    })?;
+            }
+        }
         let started_at = now(&connection)?;
         drop(connection);
         let capacities_json = serde_json::to_string(&options.capacities).map_err(|error| {
@@ -74,12 +149,28 @@ impl Broker {
                 format!("cannot encode capacities: {error}"),
             )
         })?;
+        let bindings_json =
+            serde_json::to_string(&resources::bindings_value(&resource_configuration.bindings))
+                .map_err(|error| {
+                    AppError::new(
+                        "broker-config-invalid",
+                        format!("cannot encode resource bindings: {error}"),
+                    )
+                })?;
+        let capabilities_json = serde_json::to_string(&resource_capabilities).map_err(|error| {
+            AppError::new(
+                "broker-config-invalid",
+                format!("cannot encode resource capabilities: {error}"),
+            )
+        })?;
         owner.publish(&format!(
-            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={{}}\nresource_capabilities={{}}\nstarted_at={}\n",
+            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\nstarted_at={}\n",
             std::process::id(),
             env!("CARGO_PKG_VERSION"),
             env!("AGCOORD_BUILD_ID"),
             capacities_json,
+            bindings_json,
+            capabilities_json,
             started_at,
         ))?;
         let stopped = Arc::new(AtomicBool::new(false));
@@ -101,6 +192,8 @@ impl Broker {
             idle_timeout: options.idle_timeout,
             crash_after: options.crash_after,
             worker_fault: options.worker_fault,
+            resource_capabilities,
+            cgroup_backend,
             _owner: owner,
             children: HashMap::new(),
             cancellation_started: HashMap::new(),
@@ -241,10 +334,21 @@ impl Broker {
     }
 
     fn observe(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
-        if let Some(child) = self.children.get_mut(&run.run_id) {
+        let cgroup_managed = run.resource_state.contains_key(resources::CGROUP_BACKEND);
+        if cgroup_managed {
+            let refreshed = load_run(connection, &run.run_id)?;
+            self.capture_resource_usage(connection, &refreshed)?;
+        }
+        if self.children.contains_key(&run.run_id) {
             if run.cancel_requested {
-                Self::signal_cancel(&mut self.cancellation_started, run)?;
+                if cgroup_managed {
+                    let refreshed = load_run(connection, &run.run_id)?;
+                    let _ = self.cancel_resources(connection, &refreshed)?;
+                } else {
+                    Self::signal_cancel(&mut self.cancellation_started, run)?;
+                }
             }
+            let child = self.children.get_mut(&run.run_id).unwrap();
             let Some(exit) = child.try_wait().map_err(|error| {
                 AppError::new(
                     "broker-worker-observation-failed",
@@ -255,17 +359,23 @@ impl Broker {
                 return Ok(());
             };
             let exit_status = exit;
-            if !self.drain_finished_process_group(run)? {
+            if cgroup_managed {
+                let refreshed = load_run(connection, &run.run_id)?;
+                self.finish_and_cleanup_resources(connection, &refreshed)?;
+            } else if !self.drain_finished_process_group(run)? {
                 return Ok(());
             }
+            let run = load_run(connection, &run.run_id)?;
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
                 ("cancelled", 130, None)
             } else if exit_status == 0 {
                 ("passed", 0, None)
+            } else if Self::has_resource_observation(&run, "memory-oom") {
+                ("failed", exit_status, Some("memory-oom"))
             } else {
                 ("failed", exit_status, None)
             };
-            self.finish_run(connection, run, status, selected_exit, failure_reason)?;
+            self.finish_run(connection, &run, status, selected_exit, failure_reason)?;
             self.crash("terminal-commit");
             self.children.remove(&run.run_id);
             self.cancellation_started.remove(&run.run_id);
@@ -276,21 +386,30 @@ impl Broker {
 
         if same_worker_process(run.worker_pid, run.worker_start_token.as_deref()) {
             if run.cancel_requested {
-                Self::signal_cancel(&mut self.cancellation_started, run)?;
+                if cgroup_managed {
+                    let refreshed = load_run(connection, &run.run_id)?;
+                    let _ = self.cancel_resources(connection, &refreshed)?;
+                } else {
+                    Self::signal_cancel(&mut self.cancellation_started, run)?;
+                }
             }
             return Ok(());
         }
-        if !worker_identity_conflicts(run.worker_pid, run.worker_start_token.as_deref())
+        if cgroup_managed {
+            let refreshed = load_run(connection, &run.run_id)?;
+            self.finish_and_cleanup_resources(connection, &refreshed)?;
+        } else if !worker_identity_conflicts(run.worker_pid, run.worker_start_token.as_deref())
             && !self.drain_finished_process_group(run)?
         {
             return Ok(());
         }
+        let run = load_run(connection, &run.run_id)?;
         let (status, exit_status, failure_reason) = if run.cancel_requested {
             ("cancelled", 130, None)
         } else {
             ("interrupted", 125, Some("worker-result-lost"))
         };
-        self.finish_run(connection, run, status, exit_status, failure_reason)?;
+        self.finish_run(connection, &run, status, exit_status, failure_reason)?;
         self.cancellation_started.remove(&run.run_id);
         self.group_drain_started.remove(&run.run_id);
         Ok(())
@@ -390,6 +509,873 @@ impl Broker {
             .map_err(map_database_error)
     }
 
+    fn run_bindings(run: &RunRecord) -> Result<BTreeMap<String, resources::Binding>> {
+        let bindings = resources::parse_bindings(Some(&run.resource_contract)).map_err(|_| {
+            AppError::new(
+                "broker-row-invalid",
+                format!("run {} has an invalid stored resource contract", run.run_id),
+            )
+        })?;
+        if bindings.keys().collect::<BTreeSet<_>>() != run.resources.keys().collect::<BTreeSet<_>>()
+        {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!(
+                    "run {} resource contract does not match its request",
+                    run.run_id
+                ),
+            ));
+        }
+        Ok(bindings)
+    }
+
+    fn cgroup_request(run: &RunRecord, names: &[String]) -> Result<cgroup::CgroupRequest> {
+        let bindings = Self::run_bindings(run)?;
+        let selected_resources = names
+            .iter()
+            .map(|name| {
+                run.resources
+                    .get(name)
+                    .copied()
+                    .map(|units| (name.clone(), units))
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "broker-row-invalid",
+                            format!("run {} has inconsistent resource state", run.run_id),
+                        )
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let request = cgroup::CgroupRequest::new(&run.run_id, &selected_resources, &bindings);
+        if request.names() != names {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} has inconsistent cgroup state", run.run_id),
+            ));
+        }
+        Ok(request)
+    }
+
+    fn prepare_worker_setup(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+    ) -> Result<(WorkerSetup, bool)> {
+        let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
+            return Ok((WorkerSetup::default(), true));
+        };
+        let request = Self::cgroup_request(run, &record.resources)?;
+        let backend = self.cgroup_backend.as_ref().ok_or_else(|| {
+            AppError::new("broker-config-invalid", "cgroup-v2 backend is unavailable")
+        })?;
+        let isolate_cgroup = !backend.fixture();
+        match backend.tmpfs_setup(&request, &record.handle) {
+            Ok(tmpfs) => Ok((
+                WorkerSetup {
+                    isolate_cgroup,
+                    tmpfs,
+                },
+                true,
+            )),
+            Err(error) => {
+                let bindings = Self::run_bindings(run)?;
+                let affected: Vec<_> = record
+                    .resources
+                    .iter()
+                    .filter(|name| matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes"))
+                    .cloned()
+                    .collect();
+                if affected.is_empty() {
+                    return Err(AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} failed unrelated worker setup", run.run_id),
+                    ));
+                }
+                let mut receipt = run.resource_receipt.clone();
+                let required_failure = affected.iter().any(|name| bindings[name].required());
+                for name in affected {
+                    Self::append_resource_event(
+                        connection,
+                        &mut receipt,
+                        resources::CGROUP_BACKEND,
+                        &name,
+                        "attach",
+                        if bindings[&name].required() {
+                            "failed"
+                        } else {
+                            "unapplied"
+                        },
+                        &error.code,
+                    )?;
+                }
+                Self::save_resource_records(connection, run, &receipt, &run.resource_state)?;
+                Ok((
+                    WorkerSetup {
+                        isolate_cgroup,
+                        tmpfs: None,
+                    },
+                    !required_failure,
+                ))
+            }
+        }
+    }
+
+    fn record_worker_setup(
+        connection: &Connection,
+        run: &RunRecord,
+        setup: &WorkerSetup,
+    ) -> Result<()> {
+        if setup.tmpfs.is_none() {
+            return Ok(());
+        }
+        let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} lost its cgroup resource state", run.run_id),
+            ));
+        };
+        let bindings = Self::run_bindings(run)?;
+        let applied_names: Vec<_> = record
+            .resources
+            .iter()
+            .filter(|name| matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes"))
+            .cloned()
+            .collect();
+        let mut receipt = run.resource_receipt.clone();
+        let applied = receipt
+            .get_mut("applied")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!("run {} has an invalid resource receipt", run.run_id),
+                )
+            })?;
+        let tmpfs = setup.tmpfs.as_ref().unwrap();
+        for name in &applied_names {
+            let units = match bindings[name].kind.as_str() {
+                "tmpfs" => tmpfs.size,
+                "inodes" => tmpfs.inodes,
+                _ => unreachable!(),
+            };
+            if units == 0 || units > run.resources[name] {
+                return Err(AppError::new(
+                    "broker-row-invalid",
+                    format!("run {} received an invalid tmpfs setup", run.run_id),
+                ));
+            }
+            applied.insert(name.clone(), json!(units));
+        }
+        for name in applied_names {
+            Self::append_resource_event(
+                connection,
+                &mut receipt,
+                resources::CGROUP_BACKEND,
+                &name,
+                "attach",
+                "applied",
+                "tmpfs-mounted",
+            )?;
+        }
+        Self::save_resource_records(connection, run, &receipt, &run.resource_state)
+    }
+
+    fn record_worker_setup_failure(
+        connection: &Connection,
+        run: &RunRecord,
+        code: &str,
+    ) -> Result<bool> {
+        if !resources::code_valid(code) {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} returned an invalid setup refusal", run.run_id),
+            ));
+        }
+        let record = run
+            .resource_state
+            .get(resources::CGROUP_BACKEND)
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!("run {} lost its cgroup resource state", run.run_id),
+                )
+            })?;
+        let bindings = Self::run_bindings(run)?;
+        let namespace_failure = code.starts_with("namespace-")
+            || matches!(
+                code,
+                "controller-files-exposed" | "tmpfs-namespace-required"
+            );
+        let affected: Vec<_> = record
+            .resources
+            .iter()
+            .filter(|name| {
+                namespace_failure || matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes")
+            })
+            .cloned()
+            .collect();
+        if affected.is_empty() {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} returned an unrelated setup refusal", run.run_id),
+            ));
+        }
+        let mut receipt = run.resource_receipt.clone();
+        let required_failure =
+            namespace_failure || affected.iter().any(|name| bindings[name].required());
+        if namespace_failure {
+            let applied = receipt
+                .get_mut("applied")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} has an invalid resource receipt", run.run_id),
+                    )
+                })?;
+            for name in &affected {
+                applied.remove(name);
+            }
+        }
+        for name in affected {
+            Self::append_resource_event(
+                connection,
+                &mut receipt,
+                resources::CGROUP_BACKEND,
+                &name,
+                "attach",
+                if bindings[&name].required() {
+                    "failed"
+                } else {
+                    "unapplied"
+                },
+                code,
+            )?;
+        }
+        Self::save_resource_records(connection, run, &receipt, &run.resource_state)?;
+        Ok(required_failure)
+    }
+
+    fn append_resource_event(
+        connection: &Connection,
+        receipt: &mut Value,
+        backend: &str,
+        resource: &str,
+        stage: &str,
+        status: &str,
+        code: &str,
+    ) -> Result<()> {
+        let events = receipt
+            .get_mut("events")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                AppError::new("broker-row-invalid", "resource receipt events are invalid")
+            })?;
+        events.push(json!({
+            "at": now(connection)?,
+            "backend": backend,
+            "resource": resource,
+            "stage": stage,
+            "status": status,
+            "code": code,
+        }));
+        Ok(())
+    }
+
+    fn resource_event_exists(
+        receipt: &Value,
+        backend: &str,
+        resource: Option<&str>,
+        stage: Option<&str>,
+        code: &str,
+    ) -> bool {
+        receipt
+            .get("events")
+            .and_then(Value::as_array)
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    event.get("backend").and_then(Value::as_str) == Some(backend)
+                        && resource.is_none_or(|name| {
+                            event.get("resource").and_then(Value::as_str) == Some(name)
+                        })
+                        && stage.is_none_or(|name| {
+                            event.get("stage").and_then(Value::as_str) == Some(name)
+                        })
+                        && event.get("code").and_then(Value::as_str) == Some(code)
+                })
+            })
+    }
+
+    fn has_resource_observation(run: &RunRecord, code: &str) -> bool {
+        run.resource_receipt
+            .get("events")
+            .and_then(Value::as_array)
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event.get("code").and_then(Value::as_str) == Some(code))
+            })
+    }
+
+    fn merge_measurement(
+        connection: &Connection,
+        run: &RunRecord,
+        receipt: &mut Value,
+        backend: &str,
+        stage: &str,
+        measurement: cgroup::Measurement,
+    ) -> Result<bool> {
+        if measurement
+            .peak
+            .keys()
+            .any(|name| !run.resources.contains_key(name))
+            || measurement.observations.iter().any(|observation| {
+                !run.resources.contains_key(&observation.resource)
+                    || !resources::code_valid(&observation.code)
+            })
+        {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} received invalid resource measurements", run.run_id),
+            ));
+        }
+        let applied_names = receipt
+            .get("applied")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!("run {} has an invalid resource receipt", run.run_id),
+                )
+            })?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let measurement = cgroup::Measurement {
+            peak: measurement
+                .peak
+                .into_iter()
+                .filter(|(name, _units)| applied_names.contains(name))
+                .collect(),
+            observations: measurement
+                .observations
+                .into_iter()
+                .filter(|observation| applied_names.contains(&observation.resource))
+                .collect(),
+        };
+        let mut changed = false;
+        {
+            let peak = receipt
+                .get_mut("peak")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} has an invalid resource receipt", run.run_id),
+                    )
+                })?;
+            for (name, units) in measurement.peak {
+                let previous = peak.get(&name).and_then(Value::as_u64);
+                if previous.is_none_or(|previous| units > previous) {
+                    peak.insert(name, json!(units));
+                    changed = true;
+                }
+            }
+        }
+        for observation in measurement.observations {
+            if Self::resource_event_exists(
+                receipt,
+                backend,
+                Some(&observation.resource),
+                None,
+                &observation.code,
+            ) {
+                continue;
+            }
+            Self::append_resource_event(
+                connection,
+                receipt,
+                backend,
+                &observation.resource,
+                stage,
+                "recorded",
+                &observation.code,
+            )?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn save_resource_records(
+        connection: &Connection,
+        run: &RunRecord,
+        receipt: &Value,
+        state: &BTreeMap<String, resources::BackendState>,
+    ) -> Result<()> {
+        if !resources::receipt_valid(receipt, &run.resources) {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} produced an invalid resource receipt", run.run_id),
+            ));
+        }
+        connection
+            .execute(
+                "UPDATE runs SET resource_receipt_json = ?1, resource_state_json = ?2
+                 WHERE run_id = ?3",
+                params![
+                    serde_json::to_string(receipt).unwrap(),
+                    serde_json::to_string(&resources::backend_state_value(state)).unwrap(),
+                    run.run_id,
+                ],
+            )
+            .map_err(map_database_error)?;
+        Ok(())
+    }
+
+    fn cleanup_resource_records(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+        receipt: &mut Value,
+        state: &mut BTreeMap<String, resources::BackendState>,
+    ) -> Result<()> {
+        let backends: Vec<_> = state.keys().cloned().collect();
+        for backend_name in backends {
+            let record = state.get(&backend_name).unwrap().clone();
+            let result = if backend_name == resources::CGROUP_BACKEND {
+                let request = Self::cgroup_request(run, &record.resources)?;
+                self.cgroup_backend
+                    .as_mut()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| backend.cleanup(&request, &record.handle))
+            } else {
+                Err(cgroup::CgroupError {
+                    code: "backend-unavailable".to_owned(),
+                })
+            };
+            let (status, code) = match result {
+                Ok(()) => ("recorded", "cleaned"),
+                Err(ref error) => ("failed", error.code.as_str()),
+            };
+            for name in &record.resources {
+                Self::append_resource_event(
+                    connection,
+                    receipt,
+                    &backend_name,
+                    name,
+                    "cleanup",
+                    status,
+                    code,
+                )?;
+            }
+            state.remove(&backend_name);
+        }
+        Ok(())
+    }
+
+    fn prepare_resources(&mut self, connection: &Connection, run: &RunRecord) -> Result<bool> {
+        let mut receipt = run.resource_receipt.clone();
+        let mut state = run.resource_state.clone();
+        if !state.is_empty() {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} already has prepared resource state", run.run_id),
+            ));
+        }
+        let bindings = Self::run_bindings(run)?;
+        let capabilities = self.resource_capabilities.as_object().ok_or_else(|| {
+            AppError::new("broker-config-invalid", "resource capabilities invalid")
+        })?;
+        let mut eligible: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut required_failure = false;
+        for name in run.resources.keys() {
+            let binding = bindings.get(name).unwrap();
+            if !binding.enforced() {
+                continue;
+            }
+            let backend = binding.backend.as_deref().unwrap();
+            let Some(issue) = resources::capability_issue(binding, capabilities.get(backend))
+            else {
+                eligible
+                    .entry(backend.to_owned())
+                    .or_default()
+                    .push(name.clone());
+                continue;
+            };
+            let status = if binding.required() {
+                required_failure = true;
+                "failed"
+            } else {
+                "unapplied"
+            };
+            Self::append_resource_event(
+                connection,
+                &mut receipt,
+                backend,
+                name,
+                "probe",
+                status,
+                &issue,
+            )?;
+        }
+
+        if !required_failure {
+            for (backend_name, names) in eligible {
+                let result = if backend_name == resources::CGROUP_BACKEND {
+                    let request = Self::cgroup_request(run, &names)?;
+                    self.cgroup_backend
+                        .as_mut()
+                        .ok_or_else(|| cgroup::CgroupError {
+                            code: "backend-unavailable".to_owned(),
+                        })
+                        .and_then(|backend| backend.prepare(&request))
+                } else {
+                    Err(cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                };
+                match result {
+                    Ok(handle) => {
+                        state.insert(
+                            backend_name.clone(),
+                            resources::BackendState {
+                                handle,
+                                resources: names.clone(),
+                                finished: false,
+                                cancelled: false,
+                            },
+                        );
+                        for name in &names {
+                            Self::append_resource_event(
+                                connection,
+                                &mut receipt,
+                                &backend_name,
+                                name,
+                                "prepare",
+                                "recorded",
+                                "prepared",
+                            )?;
+                        }
+                    }
+                    Err(error) => {
+                        let code = if resources::code_valid(&error.code) {
+                            error.code
+                        } else {
+                            "prepare-failed".to_owned()
+                        };
+                        for name in &names {
+                            let binding = bindings.get(name).unwrap();
+                            let status = if binding.required() {
+                                required_failure = true;
+                                "failed"
+                            } else {
+                                "unapplied"
+                            };
+                            Self::append_resource_event(
+                                connection,
+                                &mut receipt,
+                                &backend_name,
+                                name,
+                                "prepare",
+                                status,
+                                &code,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        if required_failure {
+            self.cleanup_resource_records(connection, run, &mut receipt, &mut state)?;
+            Self::save_resource_records(connection, run, &receipt, &state)?;
+            return Ok(false);
+        }
+        Self::save_resource_records(connection, run, &receipt, &state)?;
+        Ok(true)
+    }
+
+    fn cancel_resources(&mut self, connection: &Connection, run: &RunRecord) -> Result<bool> {
+        let mut receipt = run.resource_receipt.clone();
+        let mut state = run.resource_state.clone();
+        let mut changed = false;
+        for backend_name in state.keys().cloned().collect::<Vec<_>>() {
+            let record = state.get(&backend_name).unwrap().clone();
+            if record.cancelled {
+                continue;
+            }
+            let result = if backend_name == resources::CGROUP_BACKEND {
+                let request = Self::cgroup_request(run, &record.resources)?;
+                self.cgroup_backend
+                    .as_mut()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| backend.cancel(&request, &record.handle))
+            } else {
+                Err(cgroup::CgroupError {
+                    code: "backend-unavailable".to_owned(),
+                })
+            };
+            let (status, code) = match result {
+                Ok(()) => ("recorded", "cancelled"),
+                Err(ref error) => ("failed", error.code.as_str()),
+            };
+            for name in &record.resources {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    &backend_name,
+                    name,
+                    "cancel",
+                    status,
+                    code,
+                )?;
+            }
+            state.get_mut(&backend_name).unwrap().cancelled = true;
+            changed = true;
+        }
+        if changed {
+            Self::save_resource_records(connection, run, &receipt, &state)?;
+        }
+        Ok(!state.is_empty())
+    }
+
+    fn capture_resource_usage(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
+        let mut receipt = run.resource_receipt.clone();
+        let state = run.resource_state.clone();
+        let mut changed = false;
+        for (backend_name, record) in &state {
+            if record.finished {
+                continue;
+            }
+            let result = if backend_name == resources::CGROUP_BACKEND {
+                let request = Self::cgroup_request(run, &record.resources)?;
+                self.cgroup_backend
+                    .as_mut()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| backend.usage(&request, &record.handle))
+            } else {
+                Err(cgroup::CgroupError {
+                    code: "backend-unavailable".to_owned(),
+                })
+            };
+            match result {
+                Ok(measurement) => {
+                    changed |= Self::merge_measurement(
+                        connection,
+                        run,
+                        &mut receipt,
+                        backend_name,
+                        "usage",
+                        measurement,
+                    )?;
+                }
+                Err(error) => {
+                    let code = if resources::code_valid(&error.code) {
+                        error.code
+                    } else {
+                        "usage-failed".to_owned()
+                    };
+                    if Self::resource_event_exists(
+                        &receipt,
+                        backend_name,
+                        None,
+                        Some("usage"),
+                        &code,
+                    ) {
+                        continue;
+                    }
+                    for name in &record.resources {
+                        Self::append_resource_event(
+                            connection,
+                            &mut receipt,
+                            backend_name,
+                            name,
+                            "usage",
+                            "failed",
+                            &code,
+                        )?;
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            Self::save_resource_records(connection, run, &receipt, &state)?;
+        }
+        Ok(())
+    }
+
+    fn attach_resources(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+        worker_pid: u32,
+    ) -> Result<bool> {
+        let mut receipt = run.resource_receipt.clone();
+        let mut state = run.resource_state.clone();
+        let bindings = Self::run_bindings(run)?;
+        let mut required_failure = false;
+        let mut failed = BTreeSet::new();
+        for backend_name in state.keys().cloned().collect::<Vec<_>>() {
+            let record = state.get(&backend_name).unwrap().clone();
+            let result = if backend_name == resources::CGROUP_BACKEND {
+                let request = Self::cgroup_request(run, &record.resources)?;
+                self.cgroup_backend
+                    .as_mut()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| backend.attach(&request, &record.handle, worker_pid))
+            } else {
+                Err(cgroup::CgroupError {
+                    code: "backend-unavailable".to_owned(),
+                })
+            };
+            match result {
+                Ok(()) => {
+                    let applied_names: Vec<_> = record
+                        .resources
+                        .iter()
+                        .filter(|name| !matches!(bindings[*name].kind.as_str(), "inodes" | "tmpfs"))
+                        .cloned()
+                        .collect();
+                    {
+                        let applied = receipt
+                            .get_mut("applied")
+                            .and_then(Value::as_object_mut)
+                            .ok_or_else(|| {
+                                AppError::new(
+                                    "broker-row-invalid",
+                                    format!("run {} has an invalid resource receipt", run.run_id),
+                                )
+                            })?;
+                        for name in &applied_names {
+                            applied.insert(name.clone(), json!(run.resources[name]));
+                        }
+                    }
+                    for name in &applied_names {
+                        Self::append_resource_event(
+                            connection,
+                            &mut receipt,
+                            &backend_name,
+                            name,
+                            "attach",
+                            "applied",
+                            "applied",
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    let code = if resources::code_valid(&error.code) {
+                        error.code
+                    } else {
+                        "attach-failed".to_owned()
+                    };
+                    for name in &record.resources {
+                        let binding = bindings.get(name).unwrap();
+                        let status = if binding.required() {
+                            required_failure = true;
+                            "failed"
+                        } else {
+                            "unapplied"
+                        };
+                        Self::append_resource_event(
+                            connection,
+                            &mut receipt,
+                            &backend_name,
+                            name,
+                            "attach",
+                            status,
+                            &code,
+                        )?;
+                    }
+                    failed.insert(backend_name);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            // Attachment can fail after the kernel accepted the PID. Kill through the
+            // owned leaf before discarding any private handle.
+            let temporary = RunRecord {
+                resource_receipt: receipt.clone(),
+                resource_state: state.clone(),
+                ..run.clone()
+            };
+            let _ = self.cancel_resources(connection, &temporary)?;
+            let refreshed = load_run(connection, &run.run_id)?;
+            receipt = refreshed.resource_receipt;
+            state = refreshed.resource_state;
+            self.cleanup_resource_records(connection, run, &mut receipt, &mut state)?;
+        }
+        Self::save_resource_records(connection, run, &receipt, &state)?;
+        Ok(!required_failure)
+    }
+
+    fn finish_and_cleanup_resources(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+    ) -> Result<()> {
+        let mut receipt = run.resource_receipt.clone();
+        let mut state = run.resource_state.clone();
+        for backend_name in state.keys().cloned().collect::<Vec<_>>() {
+            let record = state.get(&backend_name).unwrap().clone();
+            if record.finished {
+                continue;
+            }
+            let result = if backend_name == resources::CGROUP_BACKEND {
+                let request = Self::cgroup_request(run, &record.resources)?;
+                self.cgroup_backend
+                    .as_mut()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| backend.finish(&request, &record.handle))
+            } else {
+                Err(cgroup::CgroupError {
+                    code: "backend-unavailable".to_owned(),
+                })
+            };
+            let (status, code, measurement) = match result {
+                Ok(measurement) => ("recorded", "finished".to_owned(), Some(measurement)),
+                Err(error) => ("failed", error.code, None),
+            };
+            if let Some(measurement) = measurement {
+                let _ = Self::merge_measurement(
+                    connection,
+                    run,
+                    &mut receipt,
+                    &backend_name,
+                    "finish",
+                    measurement,
+                )?;
+            }
+            for name in &record.resources {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    &backend_name,
+                    name,
+                    "finish",
+                    status,
+                    &code,
+                )?;
+            }
+            state.get_mut(&backend_name).unwrap().finished = true;
+        }
+        Self::save_resource_records(connection, run, &receipt, &state)?;
+        let refreshed = load_run(connection, &run.run_id)?;
+        receipt = refreshed.resource_receipt.clone();
+        state = refreshed.resource_state.clone();
+        self.cleanup_resource_records(connection, &refreshed, &mut receipt, &mut state)?;
+        Self::save_resource_records(connection, &refreshed, &receipt, &state)
+    }
+
     fn start_worker(&mut self, queued: &RunRecord) -> Result<()> {
         let connection = connect(&self.paths)?;
         connection
@@ -424,6 +1410,32 @@ impl Broker {
             self.finish_run(&connection, &current, "cancelled", 130, None)?;
             return Ok(());
         }
+        if !self.prepare_resources(&connection, &current)? {
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_run(
+                &connection,
+                &refreshed,
+                "failed",
+                125,
+                Some("resource-enforcement-failed"),
+            )?;
+            return Ok(());
+        }
+        let current = load_run(&connection, &current.run_id)?;
+        let (worker_setup, setup_ready) = self.prepare_worker_setup(&connection, &current)?;
+        if !setup_ready {
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_and_cleanup_resources(&connection, &refreshed)?;
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_run(
+                &connection,
+                &refreshed,
+                "failed",
+                125,
+                Some("resource-enforcement-failed"),
+            )?;
+            return Ok(());
+        }
         let log_path = self.paths.logs.join(format!("{}.log", current.run_id));
         let output = OpenOptions::new()
             .create(true)
@@ -447,12 +1459,19 @@ impl Broker {
             "AGCOORD_STATE_DIR".to_owned(),
             self.paths.state_dir.to_string_lossy().into_owned(),
         );
+        if let Some(tmpfs) = &worker_setup.tmpfs {
+            let target = tmpfs.target.to_string_lossy().into_owned();
+            environment.insert("TMPDIR".to_owned(), target.clone());
+            environment.insert("TMP".to_owned(), target.clone());
+            environment.insert("TEMP".to_owned(), target);
+        }
         let mut pending = match PendingWorker::spawn(
             &current.command,
             &environment,
             &current.checkout,
             &output,
             self.worker_fault,
+            worker_setup.clone(),
         ) {
             Ok(worker) => worker,
             Err(error) => {
@@ -463,9 +1482,14 @@ impl Broker {
                 } else {
                     error.code
                 };
+                let refreshed = load_run(&connection, &current.run_id)?;
+                if !refreshed.resource_state.is_empty() {
+                    self.finish_and_cleanup_resources(&connection, &refreshed)?;
+                }
+                let refreshed = load_run(&connection, &current.run_id)?;
                 self.finish_run(
                     &connection,
-                    &current,
+                    &refreshed,
                     "failed",
                     exit_status,
                     Some(failure_reason),
@@ -514,22 +1538,71 @@ impl Broker {
             return Err(error);
         }
         self.crash("worker-identity-commit");
-        if let Err(error) = pending.verify_setup() {
+        let attached = load_run(&connection, &current.run_id)?;
+        if !self.attach_resources(&connection, &attached, pid)? {
             drop(pending);
             let refreshed = load_run(&connection, &current.run_id)?;
-            self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+            self.finish_run(
+                &connection,
+                &refreshed,
+                "failed",
+                125,
+                Some("resource-enforcement-failed"),
+            )?;
             return Ok(());
+        }
+        let setup_failure = match pending.verify_setup() {
+            Ok(code) => code,
+            Err(error) => {
+                let refreshed = load_run(&connection, &current.run_id)?;
+                let _ = self.cancel_resources(&connection, &refreshed)?;
+                drop(pending);
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_and_cleanup_resources(&connection, &refreshed)?;
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+                return Ok(());
+            }
+        };
+        let refreshed = load_run(&connection, &current.run_id)?;
+        if let Some(code) = setup_failure {
+            if Self::record_worker_setup_failure(&connection, &refreshed, code)? {
+                let refreshed = load_run(&connection, &current.run_id)?;
+                let _ = self.cancel_resources(&connection, &refreshed)?;
+                drop(pending);
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_and_cleanup_resources(&connection, &refreshed)?;
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_run(
+                    &connection,
+                    &refreshed,
+                    "failed",
+                    125,
+                    Some("resource-enforcement-failed"),
+                )?;
+                return Ok(());
+            }
+        } else {
+            Self::record_worker_setup(&connection, &refreshed, &worker_setup)?;
         }
         self.crash("worker-setup-commit");
         let refreshed = load_run(&connection, &current.run_id)?;
         if refreshed.cancel_requested {
+            let _ = self.cancel_resources(&connection, &refreshed)?;
             drop(pending);
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_and_cleanup_resources(&connection, &refreshed)?;
+            let refreshed = load_run(&connection, &current.run_id)?;
             self.finish_run(&connection, &refreshed, "cancelled", 130, None)?;
             return Ok(());
         }
         let child = match pending.release() {
             Ok(child) => child,
             Err(error) => {
+                let refreshed = load_run(&connection, &current.run_id)?;
+                let _ = self.cancel_resources(&connection, &refreshed)?;
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_and_cleanup_resources(&connection, &refreshed)?;
                 let refreshed = load_run(&connection, &current.run_id)?;
                 self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
                 return Ok(());

@@ -202,9 +202,18 @@ Cancellation targets the verified process group and keeps the row and allocation
 every descendant is gone, escalating from `SIGTERM` to `SIGKILL`. Recovery adopts only a live
 leader whose PID, start token, and process group all match. A conflicting live PID is classified
 as lost without receiving any signal; a vanished verified leader may leave its original group
-to be drained. Concrete namespace, cgroup, tmpfs, and quota setup remains in the ordered backend
-tickets: at this boundary native resource contracts are still generic admission-only contracts,
-and no kernel backend claims applied enforcement.
+to be drained. For cgroup-backed runs, cancellation instead uses the identity-verified owned leaf
+and `cgroup.kill`, waits for that leaf to become empty, retains its final measurements, and then
+removes only the recorded leaf and owner metadata.
+
+The native `cgroup-v2` backend now implements the delegated-root probe, collision-safe owner and
+run leaves, controller enablement and readback, attachment, namespace rooting, recovery,
+cancellation, and cleanup. It enforces CPU, process, memory, memory-pressure, swap, tmpfs,
+bandwidth, IOPS, and I/O-weight bindings, and retains conservative peaks and deduplicated events
+in the same receipt shape as the Python owner. Required setup failures stop before user code;
+best-effort tmpfs mount failures can receive an explicit second release onto the owned disk
+directory only after capability and descriptor cleanup still verifies. Project quota remains an
+independent backend and implementation ticket rather than part of cgroup parity.
 
 ### Client-authored operations
 

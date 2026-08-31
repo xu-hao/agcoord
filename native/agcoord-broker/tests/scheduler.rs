@@ -1,6 +1,8 @@
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -33,6 +35,14 @@ impl TestDirectory {
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct MountGuard(PathBuf);
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.0).status();
     }
 }
 
@@ -218,6 +228,22 @@ fn state_argument(state_dir: &Path) -> &str {
     state_dir.to_str().unwrap()
 }
 
+fn real_cgroup_root() -> Option<PathBuf> {
+    std::env::var_os("AGCOORD_TEST_CGROUP_ROOT")
+        .map(fs::canonicalize)
+        .transpose()
+        .unwrap()
+}
+
+fn assert_no_cgroup_owner(root: &Path) {
+    assert!(
+        !fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("agcoord-u"))
+    );
+}
+
 fn snapshot(state_dir: &Path) -> Option<Value> {
     let result = run(&["snapshot", "--state-dir", state_argument(state_dir)]);
     result
@@ -348,17 +374,16 @@ fn advance_land_phase(state_dir: &Path, run_id: &str, row: &Value, phase: &str) 
 }
 
 fn wait_status(state_dir: &Path, run_id: &str, expected: &str) -> Value {
-    let mut selected = None;
-    wait_for(Duration::from_secs(10), || {
-        let row = status(state_dir, run_id);
-        if row["status"] == expected {
-            selected = Some(row);
-            true
-        } else {
-            false
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = Value::Null;
+    while Instant::now() < deadline {
+        observed = status(state_dir, run_id);
+        if observed["status"] == expected {
+            return observed;
         }
-    });
-    selected.unwrap()
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("run {run_id} did not reach {expected}; last status: {observed}");
 }
 
 struct Submission<'a> {
@@ -377,6 +402,23 @@ fn submit(state_dir: &Path, submission: &Submission<'_>) -> Output {
 fn submit_with_environment(
     state_dir: &Path,
     submission: &Submission<'_>,
+    environment: &[(&str, &str)],
+) -> Output {
+    submit_with_resources_and_environment(state_dir, submission, &[], environment)
+}
+
+fn submit_with_resources(
+    state_dir: &Path,
+    submission: &Submission<'_>,
+    resources: &[(&str, u64)],
+) -> Output {
+    submit_with_resources_and_environment(state_dir, submission, resources, &[])
+}
+
+fn submit_with_resources_and_environment(
+    state_dir: &Path,
+    submission: &Submission<'_>,
+    resources: &[(&str, u64)],
     environment: &[(&str, &str)],
 ) -> Output {
     let mut arguments = vec![
@@ -404,6 +446,9 @@ fn submit_with_environment(
         "--resource".to_owned(),
         "jobs=1".to_owned(),
     ];
+    for (name, units) in resources {
+        arguments.extend(["--resource".to_owned(), format!("{name}={units}")]);
+    }
     if let Some(gate_run_id) = submission.gate_run_id {
         arguments.extend(["--gate-run-id".to_owned(), gate_run_id.to_owned()]);
     }
@@ -1184,6 +1229,2196 @@ fn native_owner_refuses_invalid_sections_in_the_shared_broker_config() {
 }
 
 #[test]
+fn required_cgroup_binding_refuses_before_user_code_when_delegation_is_unavailable() {
+    let temporary = TestDirectory::new("required-cgroup-unavailable");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("not-a-cgroup");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("must-not-run");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cpu": {
+                    "backend": "cgroup-v2",
+                    "kind": "cpu",
+                    "mode": "required",
+                    "unit": "logical-cpu"
+                }
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1), ("cpu", 1)]);
+
+    let machine = snapshot(&state).unwrap();
+    assert_eq!(
+        machine["resource_bindings"]["cpu"],
+        json!({
+            "backend": "cgroup-v2",
+            "kind": "cpu",
+            "mode": "required",
+            "unit": "logical-cpu",
+        })
+    );
+    assert_eq!(
+        machine["resource_capabilities"]["cgroup-v2"]["reason"],
+        "not-cgroup-v2"
+    );
+
+    let submission = Submission {
+        run_id: "required-cgroup-unavailable",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&marker),
+        gate_run_id: None,
+    };
+    let submitted = submit_with_resources(&state, &submission, &[("cpu", 1)]);
+    assert!(submitted.status.success());
+    let failed = wait_status(&state, submission.run_id, "failed");
+    assert_eq!(failed["exit_status"], 125);
+    assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+    assert_eq!(failed["resource_receipt"]["applied"], json!({}));
+    assert!(
+        failed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["resource"] == "cpu"
+                && event["stage"] == "probe"
+                && event["status"] == "failed"
+                && event["code"] == "not-cgroup-v2")
+    );
+    assert!(!marker.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn best_effort_cgroup_binding_runs_unenforced_when_delegation_is_unavailable() {
+    let temporary = TestDirectory::new("best-effort-cgroup-unavailable");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("not-a-cgroup");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("ran-unenforced");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cpu": {"backend":"cgroup-v2", "kind":"cpu", "mode":"best-effort", "unit":"logical-cpu"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1), ("cpu", 1)]);
+    let submission = Submission {
+        run_id: "best-effort-cgroup-unavailable",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cpu", 1)])
+            .status
+            .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert!(marker.exists());
+    assert_eq!(passed["resource_receipt"]["applied"], json!({}));
+    assert!(
+        passed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["resource"] == "cpu"
+                && event["stage"] == "probe"
+                && event["status"] == "unapplied"
+                && event["code"] == "not-cgroup-v2")
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_fixture_refuses_impossible_and_ambiguous_resource_contracts_stably() {
+    let temporary = TestDirectory::new("cgroup-refusal-codes");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let cases = vec![
+        (
+            "memory-order",
+            json!({
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "soft": {"backend":"cgroup-v2", "kind":"memory-high", "mode":"required", "unit":"bytes"}
+            }),
+            vec![("ram", 4096), ("soft", 8192)],
+            "memory-limit-impossible",
+        ),
+        (
+            "tmpfs-incomplete",
+            json!({
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"}
+            }),
+            vec![("ram", 16 * 1024 * 1024), ("scratch", 4 * 1024 * 1024)],
+            "tmpfs-policy-incomplete",
+        ),
+        (
+            "tmpfs-subpage",
+            json!({
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            }),
+            vec![("ram", 16 * 1024 * 1024), ("scratch", 1), ("inodes", 8)],
+            "tmpfs-size-impossible",
+        ),
+        (
+            "tmpfs-memory",
+            json!({
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            }),
+            vec![
+                ("ram", 4 * 1024 * 1024),
+                ("scratch", 8 * 1024 * 1024),
+                ("inodes", 8),
+            ],
+            "tmpfs-memory-impossible",
+        ),
+        (
+            "io-unconfigured",
+            json!({
+                "bandwidth": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"bytes-per-second"}
+            }),
+            vec![("bandwidth", 1_000_000)],
+            "io-path-unconfigured",
+        ),
+        (
+            "controller-ambiguous",
+            json!({
+                "ram_a": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "ram_b": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"}
+            }),
+            vec![("ram_a", 4096), ("ram_b", 4096)],
+            "controller-ambiguous",
+        ),
+    ];
+    for (name, bindings, requested, expected) in cases {
+        let state = temporary.path().join(format!("state-{name}"));
+        let root = temporary.path().join(format!("root-{name}"));
+        let marker = temporary.path().join(format!("must-not-run-{name}"));
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            state.join("config.json"),
+            serde_json::to_vec(&json!({"bindings": bindings, "cgroup_root": &root})).unwrap(),
+        )
+        .unwrap();
+        let mut capacities = vec![("jobs", 1)];
+        capacities.extend(requested.iter().copied());
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &capacities,
+            &["--cgroup-fixture", root.to_str().unwrap()],
+        );
+        let submission = Submission {
+            run_id: name,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(&state, &submission, &requested)
+                .status
+                .success()
+        );
+        let failed = wait_status(&state, name, "failed");
+        assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+        assert!(
+            failed["resource_receipt"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["code"] == expected),
+            "missing {expected} for {name}"
+        );
+        assert!(!marker.exists());
+        assert!(
+            !fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_type().unwrap().is_dir())
+        );
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn cgroup_fixture_refuses_unreadable_initial_metrics_before_user_code() {
+    let temporary = TestDirectory::new("cgroup-initial-metric-refusals");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+
+    let cases = [
+        (
+            "cpu-stat",
+            json!({
+                "cpu": {"backend":"cgroup-v2", "kind":"cpu", "mode":"required", "unit":"logical-cpu"}
+            }),
+            vec![("cpu", 1)],
+            None,
+            json!({"cpu.stat": "broken\n"}),
+            "cpu-stat-invalid",
+        ),
+        (
+            "memory-pressure",
+            json!({
+                "ram-soft": {"backend":"cgroup-v2", "kind":"memory-high", "mode":"required", "unit":"bytes"}
+            }),
+            vec![("ram-soft", 64 * 1024 * 1024)],
+            None,
+            json!({"memory.pressure": "broken\n"}),
+            "memory-pressure-invalid",
+        ),
+        (
+            "io-stat",
+            json!({
+                "read-rate": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"read-bytes-per-second"}
+            }),
+            vec![("read-rate", 1024 * 1024)],
+            Some("scratch"),
+            json!({"io.stat": "broken\n"}),
+            "io-stat-invalid",
+        ),
+        (
+            "missing-memory-current",
+            json!({
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"}
+            }),
+            vec![("ram", 64 * 1024 * 1024)],
+            None,
+            json!({"memory.current": null}),
+            "controller-file-missing",
+        ),
+    ];
+
+    for (name, bindings, requested, io_directory, faults, code) in cases {
+        let state = temporary.path().join(format!("state-{name}"));
+        let root = temporary.path().join(format!("delegated-{name}"));
+        let marker = temporary.path().join(format!("must-not-run-{name}"));
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&root).unwrap();
+        let io_path = io_directory.map(|directory| {
+            let path = temporary.path().join(format!("{directory}-{name}"));
+            fs::create_dir(&path).unwrap();
+            path
+        });
+        let mut configuration = json!({"bindings": bindings, "cgroup_root": root});
+        if let Some(io_path) = &io_path {
+            configuration["cgroup_io"] = json!({"paths": [io_path]});
+        }
+        fs::write(
+            state.join("config.json"),
+            serde_json::to_vec(&configuration).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join(".agcoord-fixture-leaf-faults.json"),
+            serde_json::to_vec(&faults).unwrap(),
+        )
+        .unwrap();
+        let mut capacities = vec![("jobs", 1)];
+        capacities.extend(requested.iter().copied());
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &capacities,
+            &["--cgroup-fixture", root.to_str().unwrap()],
+        );
+        let submission = Submission {
+            run_id: name,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(&state, &submission, &requested)
+                .status
+                .success()
+        );
+        let failed = wait_status(&state, submission.run_id, "failed");
+        assert_eq!(failed["exit_status"], 125);
+        assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+        assert!(
+            failed["resource_receipt"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["stage"] == "prepare"
+                    && event["status"] == "failed"
+                    && event["code"] == code),
+            "{name}: {failed}"
+        );
+        assert!(!marker.exists());
+        assert!(
+            !fs::read_dir(&root)
+                .unwrap()
+                .any(|entry| entry.unwrap().path().is_dir())
+        );
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn typed_cgroup_fixture_applies_controls_before_release_and_cleans_owned_leaf() {
+    let temporary = TestDirectory::new("typed-cgroup-fixture");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cpu": {
+                    "backend": "cgroup-v2",
+                    "kind": "cpu",
+                    "mode": "required",
+                    "unit": "logical-cpu"
+                },
+                "pids": {
+                    "backend": "cgroup-v2",
+                    "kind": "processes",
+                    "mode": "required",
+                    "unit": "processes"
+                }
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_argument = root.to_str().unwrap();
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cpu", 2), ("pids", 8)],
+        &["--cgroup-fixture", root_argument],
+    );
+    let machine = snapshot(&state).unwrap();
+    assert_eq!(
+        machine["resource_capabilities"]["cgroup-v2"]["available"],
+        true
+    );
+
+    let submission = Submission {
+        run_id: "typed-cgroup-fixture",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    let submitted = submit_with_resources(&state, &submission, &[("cpu", 2), ("pids", 8)]);
+    assert!(submitted.status.success());
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let running = status(&state, submission.run_id);
+    assert_eq!(
+        running["resource_receipt"]["applied"],
+        json!({"cpu": 2, "pids": 8})
+    );
+    let worker_pid = running["worker_pid"].as_u64().unwrap();
+    let owner = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("agcoord-u")
+        })
+        .unwrap();
+    let leaf = fs::read_dir(&owner)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("run-")
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(leaf.join("cpu.max")).unwrap(),
+        "200000 100000\n"
+    );
+    assert_eq!(fs::read_to_string(leaf.join("pids.max")).unwrap(), "8\n");
+    assert!(
+        fs::read_to_string(leaf.join("cgroup.procs"))
+            .unwrap()
+            .lines()
+            .any(|line| line == worker_pid.to_string())
+    );
+
+    fs::write(&release, "release").unwrap();
+    let passed = wait_status(&state, submission.run_id, "passed");
+    let codes: BTreeSet<_> = passed["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(
+        ["prepared", "applied", "cleaned"]
+            .into_iter()
+            .all(|code| codes.contains(code))
+    );
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_fixture_cancellation_kills_descendants_and_cleans_the_exact_leaf() {
+    let temporary = TestDirectory::new("cgroup-tree-cancel");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let child_pid = temporary.path().join("child.pid");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"required", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let script = r#"
+import os
+from pathlib import Path
+import sys
+import time
+
+first = os.fork()
+if first == 0:
+    os.setsid()
+    detached = os.fork()
+    if detached == 0:
+        Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')
+        while True:
+            time.sleep(1)
+    time.sleep(0.5)
+    os._exit(0)
+while True:
+    time.sleep(1)
+"#;
+    let submission = Submission {
+        run_id: "cgroup-tree-cancel",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            child_pid.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    wait_for(Duration::from_secs(5), || child_pid.exists());
+    let descendant: u32 = fs::read_to_string(&child_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut guard = ProcessGuard::new(descendant);
+    assert!(
+        run(&[
+            "cancel",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            submission.run_id,
+        ])
+        .status
+        .success()
+    );
+    let cancelled = wait_status(&state, submission.run_id, "cancelled");
+    wait_for(Duration::from_secs(5), || {
+        process_state(u64::from(descendant)).is_none_or(|status| status == "Z")
+    });
+    guard.disarm();
+    let codes: BTreeSet<_> = cancelled["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(
+        ["cancelled", "cleaned"]
+            .into_iter()
+            .all(|code| codes.contains(code))
+    );
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn replacement_recovers_a_live_cgroup_worker_and_cleans_its_durable_leaf() {
+    let temporary = TestDirectory::new("cgroup-crash-recovery");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"required", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_argument = root.to_str().unwrap();
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &[
+            "--cgroup-fixture",
+            root_argument,
+            "--crash-after",
+            "worker-release",
+        ],
+    );
+    let submission = Submission {
+        run_id: "cgroup-crash-recovery",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let original_pid = status(&state, submission.run_id)["worker_pid"].clone();
+    let mut replacement = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &["--cgroup-fixture", root_argument],
+    );
+    assert_eq!(
+        status(&state, submission.run_id)["worker_pid"],
+        original_pid
+    );
+    fs::write(&release, "release").unwrap();
+    let interrupted = wait_status(&state, submission.run_id, "interrupted");
+    assert_eq!(interrupted["failure_reason"], "worker-result-lost");
+    let codes: BTreeSet<_> = interrupted["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(
+        ["finished", "cleaned"]
+            .into_iter()
+            .all(|code| codes.contains(code))
+    );
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    assert!(replacement.terminate().success());
+}
+
+#[test]
+fn replacement_refuses_a_cgroup_handle_that_no_longer_matches_its_manifest() {
+    let temporary = TestDirectory::new("cgroup-corrupt-recovery-handle");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("must-not-run");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"required", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_argument = root.to_str().unwrap();
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &[
+            "--cgroup-fixture",
+            root_argument,
+            "--crash-after",
+            "worker-identity-commit",
+        ],
+    );
+    let submission = Submission {
+        run_id: "cgroup-corrupt-recovery-handle",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    let database = state.join("queue.sqlite3");
+    let db = Connection::open(&database).unwrap();
+    let original: String = db
+        .query_row(
+            "SELECT resource_state_json FROM runs WHERE run_id = 'cgroup-corrupt-recovery-handle'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut corrupted: Value = serde_json::from_str(&original).unwrap();
+    corrupted["cgroup-v2"]["handle"]["token"] = "00000000000000000000000000000000".into();
+    let corrupted = serde_json::to_string(&corrupted).unwrap();
+    db.execute(
+        "UPDATE runs SET resource_state_json = ?1 WHERE run_id = 'cgroup-corrupt-recovery-handle'",
+        params![corrupted],
+    )
+    .unwrap();
+    drop(db);
+
+    let refused = run(&[
+        "serve",
+        "--state-dir",
+        state_argument(&state),
+        "--capacity",
+        "jobs=1",
+        "--capacity",
+        "cgroup_slot=1",
+        "--cgroup-fixture",
+        root_argument,
+        "--idle-timeout",
+        "0.05",
+    ]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-row-invalid"
+    );
+    let db = Connection::open(&database).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT resource_state_json FROM runs WHERE run_id = 'cgroup-corrupt-recovery-handle'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        corrupted
+    );
+    let mut non_ascii_leaf: Value = serde_json::from_str(&original).unwrap();
+    non_ascii_leaf["cgroup-v2"]["handle"]["leaf"] = "run-aaaaaaaaaaaaaaaéaaaaaaaaaaaa".into();
+    let non_ascii_leaf = serde_json::to_string(&non_ascii_leaf).unwrap();
+    db.execute(
+        "UPDATE runs SET resource_state_json = ?1 WHERE run_id = 'cgroup-corrupt-recovery-handle'",
+        params![non_ascii_leaf],
+    )
+    .unwrap();
+    drop(db);
+
+    let refused = run(&[
+        "serve",
+        "--state-dir",
+        state_argument(&state),
+        "--capacity",
+        "jobs=1",
+        "--capacity",
+        "cgroup_slot=1",
+        "--cgroup-fixture",
+        root_argument,
+        "--idle-timeout",
+        "0.05",
+    ]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-row-invalid"
+    );
+    let db = Connection::open(&database).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT resource_state_json FROM runs WHERE run_id = 'cgroup-corrupt-recovery-handle'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        non_ascii_leaf
+    );
+    db.execute(
+        "UPDATE runs SET resource_state_json = ?1 WHERE run_id = 'cgroup-corrupt-recovery-handle'",
+        params![original],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut replacement = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &["--cgroup-fixture", root_argument],
+    );
+    wait_status(&state, submission.run_id, "interrupted");
+    assert!(!marker.exists());
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    assert!(replacement.terminate().success());
+}
+
+#[test]
+fn real_cgroup_delegation_hides_parent_controls_from_the_worker() {
+    let Some(root) = real_cgroup_root() else {
+        return;
+    };
+    let temporary = TestDirectory::new("real-cgroup-namespace");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("namespace.json");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"required", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1), ("cgroup_slot", 1)]);
+    assert_eq!(
+        snapshot(&state).unwrap()["resource_capabilities"]["cgroup-v2"]["available"],
+        true
+    );
+    let script = r#"
+import errno
+import json
+import os
+from pathlib import Path
+import sys
+
+mounts = []
+for line in Path('/proc/self/mountinfo').read_text(encoding='ascii').splitlines():
+    left, separator, right = line.partition(' - ')
+    if separator and right.split()[0] == 'cgroup2':
+        mounts.append(Path(left.split()[4]))
+if not mounts:
+    raise AssertionError('isolated worker has no cgroup2 mount')
+protected = []
+visible_parents = []
+for mount in mounts:
+    visible_parents.extend(path.name for path in mount.iterdir() if path.name.startswith('agcoord-u'))
+    try:
+        descriptor = os.open(mount / 'cgroup.kill', os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            os.write(descriptor, b'1\n')
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        if exc.errno not in {errno.EACCES, errno.EPERM, errno.EROFS}:
+            raise
+        protected.append(str(mount))
+    else:
+        raise AssertionError('worker could rewrite its cgroup namespace root')
+Path(sys.argv[1]).write_text(json.dumps({
+    'cgroup': Path('/proc/self/cgroup').read_text(encoding='ascii'),
+    'mounts': [str(path) for path in mounts],
+    'protected': protected,
+    'visible_parents': visible_parents,
+}), encoding='ascii')
+"#;
+    let submission = Submission {
+        run_id: "real-cgroup-namespace",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            report.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert_eq!(
+        passed["resource_receipt"]["applied"],
+        json!({"cgroup_slot": 1})
+    );
+    let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(observed["cgroup"], "0::/\n");
+    assert_eq!(observed["visible_parents"], json!([]));
+    assert_eq!(
+        observed["protected"].as_array().unwrap().len(),
+        observed["mounts"].as_array().unwrap().len()
+    );
+    assert_no_cgroup_owner(&root);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn real_cgroup_cpu_and_pid_limits_cover_the_complete_process_tree() {
+    let Some(root) = real_cgroup_root() else {
+        return;
+    };
+    let temporary = TestDirectory::new("real-cgroup-compute");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("compute.json");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cpu": {"backend":"cgroup-v2", "kind":"cpu", "mode":"required", "unit":"logical-cpu"},
+                "pids": {"backend":"cgroup-v2", "kind":"processes", "mode":"required", "unit":"processes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1), ("cpu", 1), ("pids", 8)]);
+    let script = r#"
+import errno
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+busy = '''
+import time
+end = time.monotonic() + 1.0
+value = 1
+while time.monotonic() < end:
+    value = (value * 48271) % 2147483647
+'''
+before = os.times()
+started = time.monotonic()
+workers = [subprocess.Popen([sys.executable, '-c', busy]) for _ in range(4)]
+for worker in workers:
+    worker.wait()
+wall = time.monotonic() - started
+after = os.times()
+child_cpu = after.children_user + after.children_system - before.children_user - before.children_system
+sleepers = []
+exhausted = False
+for _attempt in range(32):
+    try:
+        sleepers.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']))
+    except OSError as exc:
+        if exc.errno != errno.EAGAIN:
+            raise
+        exhausted = True
+        break
+try:
+    Path(sys.argv[1]).write_text(json.dumps({
+        'affinity': len(os.sched_getaffinity(0)),
+        'child_cpu': child_cpu,
+        'exhausted': exhausted,
+        'sleepers': len(sleepers),
+        'wall': wall,
+    }), encoding='ascii')
+finally:
+    for sleeper in sleepers:
+        sleeper.terminate()
+    for sleeper in sleepers:
+        sleeper.wait()
+"#;
+    let submission = Submission {
+        run_id: "real-cgroup-compute",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            report.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cpu", 1), ("pids", 8)])
+            .status
+            .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert!(
+        observed["child_cpu"].as_f64().unwrap() <= observed["wall"].as_f64().unwrap() * 1.5 + 0.1
+    );
+    assert_eq!(observed["exhausted"], true);
+    assert!(observed["sleepers"].as_u64().unwrap() <= 7);
+    let codes: BTreeSet<_> = passed["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(codes.contains("pids-limit-hit"));
+    if observed["affinity"].as_u64().unwrap() > 1 {
+        assert!(codes.contains("cpu-throttled"));
+    }
+    assert!((1..=8).contains(&passed["resource_receipt"]["peak"]["pids"].as_u64().unwrap()));
+    assert_no_cgroup_owner(&root);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn real_cgroup_memory_pressure_oom_and_swap_contracts_are_local() {
+    let Some(root) = real_cgroup_root() else {
+        return;
+    };
+    const MIB: u64 = 1024 * 1024;
+    let temporary = TestDirectory::new("real-cgroup-memory");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let swap_report = temporary.path().join("swap-limit");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "pressure": {"backend":"cgroup-v2", "kind":"memory-high", "mode":"required", "unit":"bytes"},
+                "swap": {"backend":"cgroup-v2", "kind":"swap", "mode":"required", "unit":"bytes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(
+        &state,
+        &[
+            ("jobs", 1),
+            ("ram", 128 * MIB),
+            ("pressure", 32 * MIB),
+            ("swap", 16 * MIB),
+        ],
+    );
+    let oom = Submission {
+        run_id: "real-cgroup-oom",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "blocks = []\nwhile True:\n block = bytearray(4 * 1024 * 1024)\n for offset in range(0, len(block), 4096): block[offset] = 1\n blocks.append(block)".to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &oom, &[("ram", 64 * MIB)])
+            .status
+            .success()
+    );
+    let failed = wait_status(&state, oom.run_id, "failed");
+    assert_eq!(failed["failure_reason"], "memory-oom");
+    assert!(
+        failed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["code"] == "memory-oom")
+    );
+
+    let pressure = Submission {
+        run_id: "real-cgroup-pressure",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "payload = bytearray(48 * 1024 * 1024)\nfor offset in range(0, len(payload), 4096): payload[offset] = 1".to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &pressure,
+            &[("pressure", 32 * MIB), ("ram", 128 * MIB)],
+        )
+        .status
+        .success()
+    );
+    let pressured = wait_status(&state, pressure.run_id, "passed");
+    let pressure_codes: BTreeSet<_> = pressured["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(
+        ["memory-high-throttled", "memory-pressure"]
+            .into_iter()
+            .all(|code| pressure_codes.contains(code))
+    );
+    assert!(!pressure_codes.contains("memory-oom"));
+
+    let swap = Submission {
+        run_id: "real-cgroup-swap",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "from pathlib import Path\nimport sys\nfor line in Path('/proc/self/mountinfo').read_text(encoding='ascii').splitlines():\n left, separator, right = line.partition(' - ')\n if separator and right.split()[0] == 'cgroup2':\n  Path(sys.argv[1]).write_text((Path(left.split()[4]) / 'memory.swap.max').read_text(encoding='ascii').strip(), encoding='ascii')\n  break\nelse:\n raise AssertionError('missing cgroup2 mount')".to_owned(),
+            swap_report.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &swap, &[("swap", 16 * MIB)])
+            .status
+            .success()
+    );
+    let swap_total = fs::read_to_string("/proc/meminfo")
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with("SwapTotal:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    if swap_total == 0 {
+        let refused = wait_status(&state, swap.run_id, "failed");
+        assert_eq!(refused["failure_reason"], "resource-enforcement-failed");
+        assert!(
+            refused["resource_receipt"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["code"] == "swap-disabled")
+        );
+        assert!(!swap_report.exists());
+    } else {
+        let passed = wait_status(&state, swap.run_id, "passed");
+        assert_eq!(passed["resource_receipt"]["applied"]["swap"], 16 * MIB);
+        assert_eq!(
+            fs::read_to_string(&swap_report).unwrap(),
+            (16 * MIB).to_string()
+        );
+    }
+    assert_no_cgroup_owner(&root);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_fixture_reports_conservative_compute_and_memory_peaks_and_events() {
+    let temporary = TestDirectory::new("cgroup-compute-memory-receipt");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cpu": {"backend":"cgroup-v2", "kind":"cpu", "mode":"required", "unit":"logical-cpu"},
+                "pids": {"backend":"cgroup-v2", "kind":"processes", "mode":"required", "unit":"processes"},
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "ram_soft": {"backend":"cgroup-v2", "kind":"memory-high", "mode":"required", "unit":"bytes"},
+                "swap": {"backend":"cgroup-v2", "kind":"swap", "mode":"required", "unit":"bytes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[
+            ("jobs", 1),
+            ("cpu", 2),
+            ("pids", 8),
+            ("ram", 4096),
+            ("ram_soft", 2048),
+            ("swap", 1024),
+        ],
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "cgroup-compute-memory-receipt",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[
+                ("cpu", 2),
+                ("pids", 8),
+                ("ram", 4096),
+                ("ram_soft", 2048),
+                ("swap", 1024)
+            ],
+        )
+        .status
+        .success()
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let owner = fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let leaf = fs::read_dir(&owner)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    fs::write(
+        leaf.join("cpu.stat"),
+        "usage_usec 100\nnr_throttled 1\nthrottled_usec 20\n",
+    )
+    .unwrap();
+    fs::write(leaf.join("pids.current"), "3\n").unwrap();
+    fs::write(leaf.join("pids.peak"), "5\n").unwrap();
+    fs::write(leaf.join("pids.events"), "max 1\n").unwrap();
+    fs::write(leaf.join("memory.current"), "100\n").unwrap();
+    fs::write(leaf.join("memory.peak"), "200\n").unwrap();
+    fs::write(
+        leaf.join("memory.events"),
+        "high 1\nmax 1\noom 1\noom_kill 1\noom_group_kill 0\n",
+    )
+    .unwrap();
+    fs::write(
+        leaf.join("memory.pressure"),
+        "some avg10=0.01 avg60=0.00 avg300=0.00 total=5\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+    )
+    .unwrap();
+    fs::write(leaf.join("memory.swap.current"), "20\n").unwrap();
+    fs::write(leaf.join("memory.swap.peak"), "30\n").unwrap();
+    fs::write(leaf.join("memory.swap.events"), "high 0\nmax 0\nfail 1\n").unwrap();
+
+    wait_for(Duration::from_secs(5), || {
+        let row = status(&state, submission.run_id);
+        row["resource_receipt"]["peak"]["pids"] == 5
+            && row["resource_receipt"]["peak"]["ram"] == 200
+            && row["resource_receipt"]["peak"]["swap"] == 30
+    });
+    let sampled = status(&state, submission.run_id);
+    let events = sampled["resource_receipt"]["events"].as_array().unwrap();
+    for code in [
+        "cpu-throttled",
+        "pids-limit-hit",
+        "memory-max-hit",
+        "memory-oom",
+        "memory-high-throttled",
+        "memory-pressure",
+        "swap-limit-hit",
+    ] {
+        assert_eq!(
+            events.iter().filter(|event| event["code"] == code).count(),
+            1,
+            "event {code} was missing or duplicated"
+        );
+    }
+
+    fs::write(leaf.join("memory.current"), "300\n").unwrap();
+    fs::write(leaf.join("memory.peak"), "400\n").unwrap();
+    fs::write(&release, "release").unwrap();
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert_eq!(passed["resource_receipt"]["peak"]["ram"], 400);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_fixture_applies_and_measures_directional_io_controls() {
+    let temporary = TestDirectory::new("cgroup-io-receipt");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let scratch = temporary.path().join("scratch");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    for path in [&state, &root, &scratch, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "read_bps": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"read-bytes-per-second"},
+                "write_bps": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"write-bytes-per-second"},
+                "read_iops": {"backend":"cgroup-v2", "kind":"io-operations", "mode":"required", "unit":"read-operations-per-second"},
+                "write_iops": {"backend":"cgroup-v2", "kind":"io-operations", "mode":"required", "unit":"write-operations-per-second"},
+                "weight": {"backend":"cgroup-v2", "kind":"io-weight", "mode":"required", "unit":"weight"}
+            },
+            "cgroup_root": root,
+            "cgroup_io": {"paths": [scratch]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let requested = [
+        ("read_bps", 8_000_000),
+        ("write_bps", 6_000_000),
+        ("read_iops", 80),
+        ("write_iops", 60),
+        ("weight", 250),
+    ];
+    let mut capacities = vec![("jobs", 1)];
+    capacities.extend(requested);
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &capacities,
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "cgroup-io-receipt",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &requested)
+            .status
+            .success()
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let owner = fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let leaf = fs::read_dir(&owner)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let io_max = fs::read_to_string(leaf.join("io.max")).unwrap();
+    for setting in ["rbps=8000000", "wbps=6000000", "riops=80", "wiops=60"] {
+        assert!(io_max.contains(setting), "missing {setting} in {io_max:?}");
+    }
+    assert!(
+        fs::read_to_string(leaf.join("io.weight"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "7:31 250")
+    );
+    fs::write(
+        leaf.join("io.stat"),
+        "7:31 rbytes=10000000 wbytes=8000000 rios=100 wios=80 dbytes=0 dios=0\n",
+    )
+    .unwrap();
+    wait_for(Duration::from_secs(5), || {
+        let receipt = status(&state, submission.run_id)["resource_receipt"].clone();
+        ["read_bps", "write_bps", "read_iops", "write_iops"]
+            .into_iter()
+            .all(|name| {
+                receipt["peak"][name]
+                    .as_u64()
+                    .is_some_and(|units| units > 0)
+            })
+    });
+    let running = status(&state, submission.run_id);
+    assert_eq!(
+        running["resource_receipt"]["applied"],
+        json!({
+            "read_bps": 8_000_000,
+            "write_bps": 6_000_000,
+            "read_iops": 80,
+            "write_iops": 60,
+            "weight": 250,
+        })
+    );
+    fs::write(&release, "release").unwrap();
+    assert_eq!(
+        wait_status(&state, submission.run_id, "passed")["status"],
+        "passed"
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_fixture_applies_and_measures_bidirectional_io_units() {
+    let temporary = TestDirectory::new("cgroup-io-combined");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let scratch = temporary.path().join("scratch");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    for path in [&state, &root, &scratch, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "bandwidth": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"bytes-per-second"},
+                "operations": {"backend":"cgroup-v2", "kind":"io-operations", "mode":"required", "unit":"operations-per-second"}
+            },
+            "cgroup_root": root,
+            "cgroup_io": {"paths": [scratch]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let requested = [("bandwidth", 5_000_000), ("operations", 50)];
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), requested[0], requested[1]],
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "cgroup-io-combined",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &requested)
+            .status
+            .success()
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let owner = fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let leaf = fs::read_dir(owner)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let limits = fs::read_to_string(leaf.join("io.max")).unwrap();
+    for expected in ["rbps=5000000", "wbps=5000000", "riops=50", "wiops=50"] {
+        assert!(
+            limits.contains(expected),
+            "missing {expected} in {limits:?}"
+        );
+    }
+    fs::write(
+        leaf.join("io.stat"),
+        "7:31 rbytes=9000000 wbytes=7000000 rios=90 wios=70 dbytes=0 dios=0\n",
+    )
+    .unwrap();
+    wait_for(Duration::from_secs(5), || {
+        let receipt = status(&state, submission.run_id)["resource_receipt"].clone();
+        ["bandwidth", "operations"].into_iter().all(|name| {
+            receipt["peak"][name]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        })
+    });
+    fs::write(&release, "release").unwrap();
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert_eq!(
+        passed["resource_receipt"]["applied"],
+        json!({"bandwidth": 5_000_000, "operations": 50})
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn invalid_cgroup_tmpfs_policy_refuses_before_user_code() {
+    let temporary = TestDirectory::new("cgroup-tmpfs-policy");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("must-not-run");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[
+            ("jobs", 1),
+            ("scratch", 16 * 1024 * 1024),
+            ("scratch_inodes", 128),
+        ],
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "cgroup-tmpfs-policy",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("scratch", 16 * 1024 * 1024), ("scratch_inodes", 128)],
+        )
+        .status
+        .success()
+    );
+    let failed = wait_status(&state, submission.run_id, "failed");
+    assert_eq!(failed["exit_status"], 125);
+    assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+    assert!(
+        failed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["code"] == "tmpfs-memory-required")
+    );
+    assert!(!marker.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_fixture_provisions_private_tmpfs_and_retains_usage_receipt() {
+    let temporary = TestDirectory::new("cgroup-tmpfs-setup");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let observed_target = temporary.path().join("observed-target");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let requested = [
+        ("ram", 64 * 1024 * 1024),
+        ("scratch", 16 * 1024 * 1024),
+        ("scratch_inodes", 128),
+    ];
+    let mut capacities = vec![("jobs", 1)];
+    capacities.extend(requested);
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &capacities,
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let submission = Submission {
+        run_id: "cgroup-tmpfs-setup",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "import os,pathlib,sys; assert os.environ['TMPDIR'] == os.environ['TMP'] == os.environ['TEMP']; target = pathlib.Path(os.environ['TMPDIR']); pathlib.Path(sys.argv[1]).write_text(str(target), encoding='ascii'); (target / 'payload').write_bytes(b'x' * 8192); (target / 'extra').touch()".to_owned(),
+            observed_target.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &requested)
+            .status
+            .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert_eq!(
+        passed["resource_receipt"]["applied"],
+        json!({
+            "ram": 64 * 1024 * 1024,
+            "scratch": 16 * 1024 * 1024,
+            "scratch_inodes": 128,
+        })
+    );
+    assert!(
+        passed["resource_receipt"]["peak"]["scratch"]
+            .as_u64()
+            .unwrap()
+            >= 8192
+    );
+    assert!(
+        passed["resource_receipt"]["peak"]["scratch_inodes"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    assert!(
+        passed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["code"] == "tmpfs-mounted")
+    );
+    let target = PathBuf::from(fs::read_to_string(&observed_target).unwrap());
+    assert!(!target.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn cgroup_tmpfs_mount_failure_obeys_required_or_disk_fallback_mode() {
+    let temporary = TestDirectory::new("cgroup-tmpfs-worker-failure");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+
+    for (mode, expected_status, expected_event_status, user_code_runs) in [
+        ("required", "failed", "failed", false),
+        ("best-effort", "passed", "unapplied", true),
+    ] {
+        let state = temporary.path().join(format!("state-{mode}"));
+        let root = temporary.path().join(format!("delegated-{mode}"));
+        let marker = temporary.path().join(format!("user-code-{mode}"));
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            state.join("config.json"),
+            serde_json::to_vec(&json!({
+                "bindings": {
+                    "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                    "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":mode, "unit":"bytes"},
+                    "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":mode, "unit":"inodes"}
+                },
+                "cgroup_root": root,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let requested = [
+            ("ram", 64 * 1024 * 1024),
+            ("scratch", 16 * 1024 * 1024),
+            ("scratch_inodes", 128),
+        ];
+        let mut capacities = vec![("jobs", 1)];
+        capacities.extend(requested);
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &capacities,
+            &[
+                "--cgroup-fixture",
+                root.to_str().unwrap(),
+                "--worker-fault",
+                "tmpfs-mount-unavailable",
+            ],
+        );
+        let submission = Submission {
+            run_id: mode,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(&state, &submission, &requested)
+                .status
+                .success()
+        );
+        let finished = wait_status(&state, submission.run_id, expected_status);
+        assert_eq!(marker.exists(), user_code_runs);
+        assert_eq!(
+            finished["failure_reason"],
+            if mode == "required" {
+                json!("resource-enforcement-failed")
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            finished["resource_receipt"]["applied"],
+            json!({"ram": 64 * 1024 * 1024})
+        );
+        for name in ["scratch", "scratch_inodes"] {
+            assert!(
+                finished["resource_receipt"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["resource"] == name
+                        && event["stage"] == "attach"
+                        && event["status"] == expected_event_status
+                        && event["code"] == "tmpfs-mount-unavailable")
+            );
+        }
+        assert!(
+            !fs::read_dir(&root)
+                .unwrap()
+                .any(|entry| entry.unwrap().path().is_dir())
+        );
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn cgroup_namespace_setup_failure_is_never_released_to_user_code() {
+    let temporary = TestDirectory::new("cgroup-namespace-worker-failure");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("must-not-run");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"best-effort", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &[
+            "--cgroup-fixture",
+            root.to_str().unwrap(),
+            "--worker-fault",
+            "namespace-isolation-unavailable",
+        ],
+    );
+    let submission = Submission {
+        run_id: "cgroup-namespace-worker-failure",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    let failed = wait_status(&state, submission.run_id, "failed");
+    assert_eq!(failed["exit_status"], 125);
+    assert_eq!(failed["failure_reason"], "resource-enforcement-failed");
+    assert_eq!(failed["resource_receipt"]["applied"], json!({}));
+    assert!(
+        failed["resource_receipt"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["resource"] == "cgroup_slot"
+                && event["stage"] == "attach"
+                && event["status"] == "unapplied"
+                && event["code"] == "namespace-isolation-unavailable")
+    );
+    assert!(!marker.exists());
+    assert!(
+        !fs::read_dir(&root)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().is_dir())
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn real_cgroup_tmpfs_enforces_bytes_inodes_and_private_teardown() {
+    let Some(root) = real_cgroup_root() else {
+        return;
+    };
+    const MIB: u64 = 1024 * 1024;
+    let temporary = TestDirectory::new("real-cgroup-tmpfs");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("limits.json");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(
+        &state,
+        &[
+            ("jobs", 1),
+            ("ram", 128 * MIB),
+            ("scratch", 64 * MIB),
+            ("scratch_inodes", 2048),
+        ],
+    );
+    let script = r#"
+import errno
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+target = Path(os.environ['TMPDIR'])
+mount = None
+for line in Path('/proc/self/mountinfo').read_text(encoding='ascii').splitlines():
+    left, separator, right = line.partition(' - ')
+    if separator and left.split()[4] == str(target):
+        mount = {
+            'filesystem': right.split()[0],
+            'options': sorted(set(left.split()[5].split(',') + right.split()[2].split(','))),
+        }
+        break
+if mount is None:
+    raise AssertionError('TMPDIR is not a mount')
+created = []
+inode_exhausted = False
+for index in range(256):
+    try:
+        path = target / f'inode-{index}'
+        path.touch(exist_ok=False)
+        created.append(path)
+    except OSError as exc:
+        if exc.errno != errno.ENOSPC:
+            raise
+        inode_exhausted = True
+        break
+time.sleep(0.2)
+for path in created:
+    path.unlink()
+written = 0
+byte_exhausted = False
+descriptor = os.open(target / 'payload', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    block = b'x' * (1024 * 1024)
+    while True:
+        try:
+            written += os.write(descriptor, block)
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+            byte_exhausted = True
+            break
+finally:
+    os.close(descriptor)
+time.sleep(0.2)
+Path(sys.argv[1]).write_text(json.dumps({
+    'byte_exhausted': byte_exhausted,
+    'created': len(created),
+    'inode_exhausted': inode_exhausted,
+    'mount': mount,
+    'target': str(target),
+    'written': written,
+}), encoding='ascii')
+"#;
+    let submission = Submission {
+        run_id: "real-cgroup-tmpfs",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            report.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    let requested = [
+        ("ram", 128 * MIB),
+        ("scratch", 16 * MIB),
+        ("scratch_inodes", 32),
+    ];
+    assert!(
+        submit_with_resources(&state, &submission, &requested)
+            .status
+            .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(observed["byte_exhausted"], true);
+    assert_eq!(observed["inode_exhausted"], true);
+    assert!((1..32).contains(&observed["created"].as_u64().unwrap()));
+    assert!((1..=16 * MIB).contains(&observed["written"].as_u64().unwrap()));
+    assert_eq!(observed["mount"]["filesystem"], "tmpfs");
+    for option in ["nodev", "noexec", "nosuid"] {
+        assert!(
+            observed["mount"]["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == option)
+        );
+    }
+    assert!(!PathBuf::from(observed["target"].as_str().unwrap()).exists());
+    let codes: BTreeSet<_> = passed["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(
+        [
+            "tmpfs-byte-limit-hit",
+            "tmpfs-inode-limit-hit",
+            "tmpfs-mounted"
+        ]
+        .into_iter()
+        .all(|code| codes.contains(code))
+    );
+    assert!(
+        passed["resource_receipt"]["peak"]["ram"].as_u64().unwrap()
+            >= passed["resource_receipt"]["peak"]["scratch"]
+                .as_u64()
+                .unwrap()
+    );
+    assert_no_cgroup_owner(&root);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn real_cgroup_io_covers_combined_directional_and_weight_units() {
+    let Some(root) = real_cgroup_root() else {
+        return;
+    };
+    if std::env::var("AGCOORD_TEST_CGROUP_IO").as_deref() != Ok("1") {
+        return;
+    }
+    const MIB: u64 = 1024 * 1024;
+    for command in ["dd", "mkfs.ext4", "mount", "umount"] {
+        assert!(Command::new(command).arg("--help").output().is_ok());
+    }
+
+    let temporary = TestDirectory::new("real-cgroup-io");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let image = temporary.path().join("block-io.ext4");
+    let mountpoint = temporary.path().join("mounted");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::create_dir(&mountpoint).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&image)
+        .unwrap()
+        .set_len(128 * MIB)
+        .unwrap();
+    assert!(
+        Command::new("mkfs.ext4")
+            .args(["-q", "-F"])
+            .arg(&image)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("mount")
+            .args(["-o", "loop"])
+            .arg(&image)
+            .arg(&mountpoint)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _mount = MountGuard(mountpoint.clone());
+    fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o777)).unwrap();
+    let input = mountpoint.join("input");
+    fs::write(&input, vec![b'x'; 4 * MIB as usize]).unwrap();
+    assert!(Command::new("sync").status().unwrap().success());
+
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "bandwidth": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"bytes-per-second"},
+                "iops": {"backend":"cgroup-v2", "kind":"io-operations", "mode":"required", "unit":"operations-per-second"},
+                "read_bps": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"read-bytes-per-second"},
+                "write_bps": {"backend":"cgroup-v2", "kind":"io-bandwidth", "mode":"required", "unit":"write-bytes-per-second"},
+                "read_iops": {"backend":"cgroup-v2", "kind":"io-operations", "mode":"required", "unit":"read-operations-per-second"},
+                "write_iops": {"backend":"cgroup-v2", "kind":"io-operations", "mode":"required", "unit":"write-operations-per-second"},
+                "io_weight": {"backend":"cgroup-v2", "kind":"io-weight", "mode":"required", "unit":"weight"}
+            },
+            "cgroup_root": root,
+            "cgroup_io": {"paths": [mountpoint]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capacities = [
+        ("jobs", 1),
+        ("bandwidth", 8 * MIB),
+        ("iops", 128),
+        ("read_bps", 10 * MIB),
+        ("write_bps", 8 * MIB),
+        ("read_iops", 160),
+        ("write_iops", 128),
+        ("io_weight", 250),
+    ];
+    let mut broker = RunningBroker::start(&state, &capacities);
+    assert_eq!(
+        snapshot(&state).unwrap()["resource_capabilities"]["cgroup-v2"]["available"],
+        true
+    );
+
+    let workload = r#"
+set -eu
+touch "$1"
+while [ ! -e "$2" ]; do sleep 0.01; done
+dd if="$IO_SCRATCH/input" of=/dev/null bs=65536 count=64 iflag=direct status=none
+dd if=/dev/zero of="$IO_SCRATCH/$3" bs=65536 count=64 oflag=direct conv=fsync status=none
+"#;
+    let find_leaf = || {
+        let owners: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry.path().is_dir()
+                    && entry.file_name().to_string_lossy().starts_with("agcoord-u")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(owners.len(), 1);
+        let leaves: Vec<_> = fs::read_dir(&owners[0])
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry.path().is_dir() && entry.file_name().to_string_lossy().starts_with("run-")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(leaves.len(), 1);
+        leaves[0].clone()
+    };
+
+    let combined_entered = temporary.path().join("combined-entered");
+    let combined_release = temporary.path().join("combined-release");
+    let combined = Submission {
+        run_id: "real-cgroup-io-combined",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            workload.to_owned(),
+            "agcoord-io".to_owned(),
+            combined_entered.to_string_lossy().into_owned(),
+            combined_release.to_string_lossy().into_owned(),
+            "combined-output".to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    let combined_resources = [("bandwidth", 8 * MIB), ("iops", 128), ("io_weight", 250)];
+    assert!(
+        submit_with_resources_and_environment(
+            &state,
+            &combined,
+            &combined_resources,
+            &[("IO_SCRATCH", mountpoint.to_str().unwrap())],
+        )
+        .status
+        .success()
+    );
+    wait_for(Duration::from_secs(5), || combined_entered.exists());
+    let combined_leaf = find_leaf();
+    let combined_limits = fs::read_to_string(combined_leaf.join("io.max")).unwrap();
+    assert!(combined_limits.contains(&format!("rbps={} ", 8 * MIB)));
+    assert!(combined_limits.contains(&format!("wbps={} ", 8 * MIB)));
+    assert!(combined_limits.contains("riops=128"));
+    assert!(combined_limits.contains("wiops=128"));
+    assert!(
+        fs::read_to_string(combined_leaf.join("io.weight"))
+            .unwrap()
+            .lines()
+            .any(|line| line.ends_with(" 250"))
+    );
+    fs::write(&combined_release, "release").unwrap();
+    let combined_finished = wait_status(&state, combined.run_id, "passed");
+    assert_eq!(
+        combined_finished["resource_receipt"]["applied"],
+        json!({"bandwidth": 8 * MIB, "iops": 128, "io_weight": 250})
+    );
+    assert!(
+        combined_finished["resource_receipt"]["peak"]["bandwidth"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        combined_finished["resource_receipt"]["peak"]["iops"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let directional_entered = temporary.path().join("directional-entered");
+    let directional_release = temporary.path().join("directional-release");
+    let directional = Submission {
+        run_id: "real-cgroup-io-directional",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            workload.to_owned(),
+            "agcoord-io".to_owned(),
+            directional_entered.to_string_lossy().into_owned(),
+            directional_release.to_string_lossy().into_owned(),
+            "directional-output".to_owned(),
+        ],
+        gate_run_id: None,
+    };
+    let directional_resources = [
+        ("read_bps", 10 * MIB),
+        ("write_bps", 8 * MIB),
+        ("read_iops", 160),
+        ("write_iops", 128),
+        ("io_weight", 250),
+    ];
+    assert!(
+        submit_with_resources_and_environment(
+            &state,
+            &directional,
+            &directional_resources,
+            &[("IO_SCRATCH", mountpoint.to_str().unwrap())],
+        )
+        .status
+        .success()
+    );
+    wait_for(Duration::from_secs(5), || directional_entered.exists());
+    let directional_leaf = find_leaf();
+    let directional_limits = fs::read_to_string(directional_leaf.join("io.max")).unwrap();
+    assert!(directional_limits.contains(&format!("rbps={} ", 10 * MIB)));
+    assert!(directional_limits.contains(&format!("wbps={} ", 8 * MIB)));
+    assert!(directional_limits.contains("riops=160"));
+    assert!(directional_limits.contains("wiops=128"));
+    fs::write(&directional_release, "release").unwrap();
+    let directional_finished = wait_status(&state, directional.run_id, "passed");
+    assert_eq!(
+        directional_finished["resource_receipt"]["applied"],
+        json!({
+            "read_bps": 10 * MIB,
+            "write_bps": 8 * MIB,
+            "read_iops": 160,
+            "write_iops": 128,
+            "io_weight": 250,
+        })
+    );
+    for name in ["read_bps", "write_bps", "read_iops", "write_iops"] {
+        assert!(
+            directional_finished["resource_receipt"]["peak"][name]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+    assert_no_cgroup_owner(&root);
+    assert!(broker.terminate().success());
+}
+
+#[test]
 fn running_owner_retains_the_configuration_loaded_at_startup() {
     let temporary = TestDirectory::new("config-snapshot");
     let state = temporary.path().join("state");
@@ -1226,6 +3461,183 @@ fn running_owner_retains_the_configuration_loaded_at_startup() {
             == "passed"
     });
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn corrupt_resource_receipt_fails_stably_without_rewriting_state() {
+    let temporary = TestDirectory::new("resource-receipt-corruption");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "corrupt-resource-receipt",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: vec!["/usr/bin/true".to_owned()],
+            gate_run_id: None,
+        },
+    );
+    wait_status(&state, "corrupt-resource-receipt", "passed");
+    assert!(broker.terminate().success());
+
+    let database = state.join("queue.sqlite3");
+    let db = Connection::open(&database).unwrap();
+    let invalid_receipt =
+        r#"{"requested":{"jobs":1},"applied":{"unknown":1},"peak":{},"events":[]}"#;
+    db.execute(
+        "UPDATE runs SET resource_receipt_json = ?1 WHERE run_id = 'corrupt-resource-receipt'",
+        params![invalid_receipt],
+    )
+    .unwrap();
+    let metadata_before: Vec<(String, String)> = db
+        .prepare("SELECT key, value FROM coordinator_meta ORDER BY key")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    drop(db);
+
+    for operation in ["migrate", "serve"] {
+        let result = if operation == "migrate" {
+            run(&["migrate", "--state-dir", state_argument(&state)])
+        } else {
+            run(&[
+                "serve",
+                "--state-dir",
+                state_argument(&state),
+                "--capacity",
+                "jobs=1",
+            ])
+        };
+        assert!(!result.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.stderr).unwrap()["code"],
+            "broker-row-invalid"
+        );
+    }
+
+    let db = Connection::open(&database).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT resource_receipt_json FROM runs WHERE run_id = 'corrupt-resource-receipt'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        invalid_receipt
+    );
+    let metadata_after: Vec<(String, String)> = db
+        .prepare("SELECT key, value FROM coordinator_meta ORDER BY key")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(metadata_after, metadata_before);
+}
+
+#[test]
+fn corrupt_resource_contract_or_state_fails_before_owner_mutation() {
+    let temporary = TestDirectory::new("resource-record-corruption");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "corrupt-resource-record",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: vec!["/usr/bin/true".to_owned()],
+            gate_run_id: None,
+        },
+    );
+    wait_status(&state, "corrupt-resource-record", "passed");
+    assert!(broker.terminate().success());
+
+    let database = state.join("queue.sqlite3");
+    for (column, invalid) in [
+        (
+            "resource_contract_json",
+            r#"{"unknown":{"backend":null,"kind":"generic","mode":"admission-only","unit":"admission-unit"}}"#,
+        ),
+        (
+            "resource_state_json",
+            r#"{"cgroup-v2":{"handle":{},"resources":["jobs"],"finished":false,"cancelled":false}}"#,
+        ),
+    ] {
+        let db = Connection::open(&database).unwrap();
+        let original: String = db
+            .query_row(
+                &format!("SELECT {column} FROM runs WHERE run_id = 'corrupt-resource-record'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            &format!("UPDATE runs SET {column} = ?1 WHERE run_id = 'corrupt-resource-record'"),
+            params![invalid],
+        )
+        .unwrap();
+        let metadata_before: Vec<(String, String)> = db
+            .prepare("SELECT key, value FROM coordinator_meta ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        drop(db);
+
+        for result in [
+            run(&["migrate", "--state-dir", state_argument(&state)]),
+            run(&[
+                "serve",
+                "--state-dir",
+                state_argument(&state),
+                "--capacity",
+                "jobs=1",
+                "--idle-timeout",
+                "0.05",
+            ]),
+        ] {
+            assert!(!result.status.success(), "{column} corruption was accepted");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&result.stderr).unwrap()["code"],
+                "broker-row-invalid"
+            );
+        }
+
+        let db = Connection::open(&database).unwrap();
+        assert_eq!(
+            db.query_row(
+                &format!("SELECT {column} FROM runs WHERE run_id = 'corrupt-resource-record'"),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            invalid
+        );
+        let metadata_after: Vec<(String, String)> = db
+            .prepare("SELECT key, value FROM coordinator_meta ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(metadata_after, metadata_before);
+        db.execute(
+            &format!("UPDATE runs SET {column} = ?1 WHERE run_id = 'corrupt-resource-record'"),
+            params![original],
+        )
+        .unwrap();
+    }
 }
 
 #[test]

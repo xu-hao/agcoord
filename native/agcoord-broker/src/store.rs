@@ -2,8 +2,12 @@ use crate::error::{AppError, Result};
 use crate::platform::{
     OwnerLock, live_owner_metadata, prepare_private_directory, same_worker_process, sync_file,
 };
+use crate::resources::{
+    BackendState, Binding, initial_receipt, parse_backend_state, parse_bindings,
+    parse_bindings_json, parse_capabilities_json, receipt_valid, resource_contract,
+};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, params};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -156,6 +160,8 @@ impl Paths {
 pub struct OwnerInfo {
     pub pid: u32,
     pub capacities: BTreeMap<String, u64>,
+    pub resource_bindings: BTreeMap<String, Binding>,
+    pub resource_capabilities: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +212,7 @@ pub struct RunRecord {
     pub resources: BTreeMap<String, u64>,
     pub resource_contract: Value,
     pub resource_receipt: Value,
+    pub resource_state: BTreeMap<String, BackendState>,
     pub gate_run_id: Option<String>,
     pub publication_adapter: Option<String>,
     pub publication_request: Option<Value>,
@@ -669,7 +676,26 @@ pub fn owner_info(paths: &Paths) -> Result<OwnerInfo> {
             "live owner capacities are missing",
         )
     })?)?;
-    Ok(OwnerInfo { pid, capacities })
+    let resource_bindings =
+        parse_bindings_json(fields.get("resource_bindings").ok_or_else(|| {
+            AppError::new(
+                "broker-owner-metadata-invalid",
+                "live owner resource bindings are missing",
+            )
+        })?)?;
+    let resource_capabilities =
+        parse_capabilities_json(fields.get("resource_capabilities").ok_or_else(|| {
+            AppError::new(
+                "broker-owner-metadata-invalid",
+                "live owner resource capabilities are missing",
+            )
+        })?)?;
+    Ok(OwnerInfo {
+        pid,
+        capacities,
+        resource_bindings,
+        resource_capabilities,
+    })
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(
@@ -750,6 +776,96 @@ fn run_from_row(row: &Row<'_>) -> Result<RunRecord> {
             })
         })
         .transpose()?;
+    let resource_receipt: Value = parse_json(
+        row.get("resource_receipt_json")
+            .map_err(map_database_error)?,
+        &run_id,
+        "resource receipt",
+    )?;
+    if !receipt_valid(&resource_receipt, &resources) {
+        return Err(AppError::new(
+            "broker-row-invalid",
+            format!("run {run_id} has invalid stored resource receipt"),
+        ));
+    }
+    let resource_contract: Value = parse_json(
+        row.get("resource_contract_json")
+            .map_err(map_database_error)?,
+        &run_id,
+        "resource contract",
+    )?;
+    let contract_bindings = parse_bindings(Some(&resource_contract)).map_err(|_| {
+        AppError::new(
+            "broker-row-invalid",
+            format!("run {run_id} has invalid stored resource contract"),
+        )
+    })?;
+    if contract_bindings.keys().collect::<BTreeSet<_>>()
+        != resources.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(AppError::new(
+            "broker-row-invalid",
+            format!("run {run_id} resource contract does not match its request"),
+        ));
+    }
+    let resource_state = {
+        let value: Value = parse_json(
+            row.get("resource_state_json").map_err(map_database_error)?,
+            &run_id,
+            "resource state",
+        )?;
+        parse_backend_state(&value).ok_or_else(|| {
+            AppError::new(
+                "broker-row-invalid",
+                format!("run {run_id} has invalid stored resource state"),
+            )
+        })?
+    };
+    if resource_state.iter().any(|(backend, state)| {
+        state.resources.iter().any(|name| {
+            contract_bindings
+                .get(name)
+                .and_then(|binding| binding.backend.as_deref())
+                != Some(backend)
+        })
+    }) {
+        return Err(AppError::new(
+            "broker-row-invalid",
+            format!("run {run_id} resource state does not match its contract"),
+        ));
+    }
+    let receipt_resources_match = |section: &str| {
+        resource_receipt
+            .get(section)
+            .and_then(Value::as_object)
+            .is_some_and(|values| {
+                values
+                    .keys()
+                    .all(|name| contract_bindings.get(name).is_some_and(Binding::enforced))
+            })
+    };
+    let receipt_events_match = resource_receipt
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| {
+            events.iter().all(|event| {
+                event
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .and_then(|name| contract_bindings.get(name))
+                    .and_then(|binding| binding.backend.as_deref())
+                    == event.get("backend").and_then(Value::as_str)
+            })
+        });
+    if !receipt_resources_match("applied")
+        || !receipt_resources_match("peak")
+        || !receipt_events_match
+    {
+        return Err(AppError::new(
+            "broker-row-invalid",
+            format!("run {run_id} resource receipt does not match its contract"),
+        ));
+    }
     Ok(RunRecord {
         sequence: row.get("sequence").map_err(map_database_error)?,
         run_id: run_id.clone(),
@@ -769,18 +885,9 @@ fn run_from_row(row: &Row<'_>) -> Result<RunRecord> {
         head_sha: row.get("head_sha").map_err(map_database_error)?,
         barrier: row.get::<_, i64>("barrier").map_err(map_database_error)? != 0,
         resources,
-        resource_contract: parse_json(
-            row.get("resource_contract_json")
-                .map_err(map_database_error)?,
-            &run_id,
-            "resource contract",
-        )?,
-        resource_receipt: parse_json(
-            row.get("resource_receipt_json")
-                .map_err(map_database_error)?,
-            &run_id,
-            "resource receipt",
-        )?,
+        resource_contract,
+        resource_receipt,
+        resource_state,
         gate_run_id: row.get("gate_run_id").map_err(map_database_error)?,
         publication_adapter: row.get("publication_adapter").map_err(map_database_error)?,
         publication_request,
@@ -994,8 +1101,8 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
         "captured_at": now(&connection)?,
         "capacities": owner.capacities,
         "allocations": selected_allocations,
-        "resource_bindings": {},
-        "resource_capabilities": {},
+        "resource_bindings": crate::resources::bindings_value(&owner.resource_bindings),
+        "resource_capabilities": owner.resource_capabilities,
         "active": active.iter().map(|run| public_run(paths, run, None, Vec::new())).collect::<Vec<_>>(),
         "queued": queued_public,
         "recent": recent,
@@ -1137,22 +1244,6 @@ fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
     Ok(())
 }
 
-fn resource_contract(resources: &BTreeMap<String, u64>) -> Value {
-    let mut contract = Map::new();
-    for name in resources.keys() {
-        contract.insert(
-            name.clone(),
-            json!({
-                "backend": null,
-                "kind": "generic",
-                "mode": "admission-only",
-                "unit": "admission-unit",
-            }),
-        );
-    }
-    Value::Object(contract)
-}
-
 pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
     let owner = owner_info(paths)?;
     validate_submit(request, &owner)?;
@@ -1217,13 +1308,8 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
         }
     }
     let timestamp = now(&connection)?;
-    let contract = resource_contract(&request.resources);
-    let receipt = json!({
-        "requested": request.resources,
-        "applied": {},
-        "peak": {},
-        "events": [],
-    });
+    let contract = resource_contract(&request.resources, &owner.resource_bindings)?;
+    let receipt = initial_receipt(&request.resources);
     connection
         .execute(
             "INSERT INTO runs (
@@ -1572,7 +1658,10 @@ fn migrate_protocol_2_to_3(connection: &Connection) -> Result<()> {
                     resource_receipt_json = ?2, resource_state_json = '{}'
                  WHERE run_id = ?3",
                 params![
-                    serde_json::to_string(&resource_contract(&resources)).unwrap(),
+                    serde_json::to_string(
+                        &resource_contract(&resources, &BTreeMap::new()).unwrap(),
+                    )
+                    .unwrap(),
                     serde_json::to_string(&receipt).unwrap(),
                     run_id,
                 ],
