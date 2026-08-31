@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Preserve every identity-verified live worker when a broker exits unexpectedly, allowing a
+  replacement owner to adopt it instead of recording an unrequested cancellation; explicit
+  broker shutdown remains a graceful cancellation boundary.
+- Put current queue databases in WAL mode, retry transient SQLite contention in the pump and
+  idle health check, defer contended activity heartbeats without masking successful operations,
+  and add a positive `database_timeout` setting (10 seconds by default).
+
 ## 0.2.1 — 2026-08-31
 
 - Use one stable `unnamed` identity when neither `--agent` nor `AGCOORD_AGENT` is set, retain

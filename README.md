@@ -52,8 +52,12 @@ Machine capacity defaults to two concurrent job slots. One JSON file, `config.js
 state directory, configures the broker that owns it:
 
 ```json
-{"capacities": {"jobs": 4, "cpu": 8, "browser": 1}}
+{"capacities": {"jobs": 4, "cpu": 8, "browser": 1}, "database_timeout": 10}
 ```
+
+`database_timeout` is the optional positive SQLite lock-wait limit in seconds and defaults to
+10. Current-protocol spools use WAL mode automatically so ordinary readers do not block behind
+writers; transient broker-pump and idle-check contention is retried.
 
 ## Run work
 
