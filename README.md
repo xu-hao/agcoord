@@ -53,8 +53,9 @@ shape and current backend availability.
 On Linux, the built-in `cgroup-v2` backend can own the complete descendant lifecycle for an
 explicitly delegated, namespace-safe cgroup root. It attaches the blocked launcher before user
 code, kills detached descendants on finish or cancellation, and recovers ownership across broker
-restart. This stage provides generic lifecycle containment; typed CPU, memory, PID, and I/O
-controller values are separate contracts. See
+restart. Typed `cpu/logical-cpu` and `processes/processes` bindings add aggregate `cpu.max` and
+`pids.max` limits plus peak and violation reporting; they do not imply CPU affinity. Memory and
+I/O controller values remain separate contracts. See
 [delegated cgroup setup](docs/coordinator.md#delegated-cgroup-v2-lifecycle) before enabling a
 required binding.
 

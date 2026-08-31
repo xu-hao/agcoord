@@ -109,21 +109,28 @@ configured backend is never silently treated as successful.
 
 ### Delegated cgroup v2 lifecycle
 
-The built-in `cgroup-v2` backend currently owns process-tree lifecycle only. Bind an explicitly
-named generic capacity and configure one exclusive delegated root before the broker starts:
+The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
+are delegated, aggregate CPU bandwidth and task counts. Configure one exclusive delegated root
+and explicitly bind the capacity names before the broker starts:
 
 ```bash
-export AGCOORD_CAPACITIES='jobs=2,cgroup-slot=2'
+export AGCOORD_CAPACITIES='jobs=2,cpu=4,pids=128'
 export AGCOORD_RESOURCE_BINDINGS='{
-  "cgroup-slot": {
-    "kind": "generic",
-    "unit": "admission-unit",
+  "cpu": {
+    "kind": "cpu",
+    "unit": "logical-cpu",
+    "mode": "required",
+    "backend": "cgroup-v2"
+  },
+  "pids": {
+    "kind": "processes",
+    "unit": "processes",
     "mode": "required",
     "backend": "cgroup-v2"
   }
 }'
 export AGCOORD_CGROUP_ROOT=/sys/fs/cgroup/user.slice/example.slice/agcoord.service
-agc run --resource cgroup-slot=1 -- python -m pytest -q
+agc run --resource cpu=2 --resource pids=64 -- python -m pytest -q
 ```
 
 The root must be an absolute, real directory on the unified cgroup v2 hierarchy, writable by
@@ -132,17 +139,24 @@ children can be moved within the delegation boundary. Its cgroup2 mount must be 
 `nsdelegate`; unprivileged user, cgroup, and mount namespaces must also be available. The probe
 creates and removes an empty child to verify delegation, `cgroup.kill`, namespace rooting, and
 controller-file protection. It publishes only stable refusal codes and controller
-capabilities—never the configured path or an operating-system exception. An unavailable backend
+capabilities—never the configured path or an operating-system exception. Missing CPU or PID
+controllers, an unsupported valid kind/unit, or a setting that cannot be written and read back
 fails a `required` run before user code with exit status 125; `best-effort` records the refusal
-and runs without claiming application.
+and runs without claiming application. A syntactically invalid binding is rejected when the
+broker configuration is loaded.
+
+Before creating a typed leaf, AGCoord enables only its requested controllers in
+`cgroup.subtree_control` at the configured root and private owner node. Both must be empty inner
+nodes for domain controllers; a populated or partially delegated boundary is a preparation
+failure, never a reason to run a required job without its limit.
 
 For systemd-managed hosts, place the broker in a dedicated service or scope with `Delegate=yes`
 and give AGCoord that unit's delegated cgroup, rather than a slice or the hierarchy root. On
 systemd 254 or newer, `DelegateSubgroup=supervisor` keeps the broker out of the inner node that
-will later distribute controllers. Keep systemd as the single writer above that boundary. For
+distributes controllers. Keep systemd as the single writer above that boundary. For
 direct delegation, a privileged manager must create one exclusive subtree, place the broker in
-that boundary, and grant only the delegatable directory and membership files to the broker user;
-do not recursively change ownership of controller files. The kernel's
+a supervisor child of that boundary, and grant only the delegatable directory and membership
+files to the broker user; do not recursively change ownership of controller files. The kernel's
 [cgroup v2 delegation contract](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#delegation)
 and systemd's
 [delegation guidance](https://systemd.io/CGROUP_DELEGATION/) are the authoritative host setup
@@ -156,15 +170,34 @@ keeps the parent controller files kernel-unwritable while descendants may only r
 resources beneath the run boundary. The configured root and internal isolation marker are
 removed from the job environment.
 
+`cpu/logical-cpu=N` is a hard aggregate fair-scheduler bandwidth ceiling, not a worker count or
+affinity request. AGCoord uses a fixed 100000µs period and writes `cpu.max` as
+`N*100000 100000`; integer allocations therefore need no quota rounding. It deliberately leaves
+`cpu.weight` unchanged. It does not write `cpuset.cpus`, so a CPU binding makes no placement,
+NUMA, exclusive-core, or affinity claim. Realtime scheduling is outside this bandwidth contract.
+
+CPU peak measurement samples `cpu.stat usage_usec`, divides each usage delta by elapsed wall
+time, and rounds a positive fractional result upward to a conservative integer logical-CPU
+peak. If `nr_throttled` or `throttled_usec` reports throttling, one deduplicated
+`cpu-throttled` resource event is retained. The event is a stable violation fact rather than raw
+kernel text; the applied map retains the exact logical-CPU limit.
+
+`processes/processes=N` writes `pids.max=N` for the complete run subtree. The kernel counts tasks,
+including threads, so the blocked launcher and every later descendant consume this shared limit;
+PID exhaustion returns `EAGAIN` to the owning run and does not cancel sibling runs. Peak usage
+comes from `pids.peak` when the host provides it, otherwise from broker samples of
+`pids.current`. A nonzero `pids.events max` counter records one deduplicated `pids-limit-hit`
+event. Normal completion and cancellation capture final CPU and PID measurements after the leaf
+is unpopulated but before it is removed.
+
 Normal finish and cancellation use `cgroup.kill`, wait for `cgroup.events` to report
 `populated 0`, and remove only the identity recorded for that run. A replacement broker adopts a
 still-live durable handle without creating a second leaf. Missing partial state is cleaned
 idempotently, while a changed device/inode, mismatched token, unrecorded collision, or populated
 stale leaf is refused and never removed as if it were owned.
 
-This lifecycle does not yet translate typed CPU, memory, PID, or I/O units into controller
-values, and cgroups remain resource controls rather than a filesystem, credential, network, or
-general security sandbox.
+This backend does not yet translate memory or I/O units, and cgroups remain resource controls
+rather than a filesystem, credential, network, or general security sandbox.
 
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an
@@ -208,8 +241,10 @@ including implicit `jobs=1`. `resource_contract` freezes each requested name's e
 each event has exactly `at`, `backend`, `resource`, `stage`, `status`, and a stable `code`.
 Applied values are recorded only after a successful pre-release attach; peak values are
 backend measurements in the bound unit. Admission-only claims have empty applied, peak, and
-event fields. Backend handles and host paths remain private spool state and never enter the
-public row;
+event fields. A backend sample may also return stable, sanitized observations such as a
+controller-limit event; the broker validates the resource and code, records each observation
+once, and never exposes a raw controller file or exception. Backend handles and host paths remain
+private spool state and never enter the public row;
 `blocked_by` identifies durable predecessors currently preventing admission. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
 operators. Missing times and kind-specific values are null rather than guessed. A queued

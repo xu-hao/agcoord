@@ -36,7 +36,8 @@ smoke-tested from the built wheel.
    with `agc land` so the verdict and publication cannot be separated.
    Run the deterministic cgroup lifecycle suite on every host; when an exclusive delegated v2
    subtree is available, also set `AGCOORD_TEST_CGROUP_ROOT` and require the opt-in kernel test
-   to prove namespace-root protection and complete cleanup.
+   to prove namespace-root protection, aggregate CPU throttling, PID exhaustion, terminal
+   metrics, and complete cleanup.
 3. Build both artifacts with `python -m build` and validate them with
    `python -m twine check dist/*`.
 4. Create a fresh virtual environment outside the checkout. Install the wheel, with each

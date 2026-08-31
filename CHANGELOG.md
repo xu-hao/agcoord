@@ -23,6 +23,10 @@ versioning; dates use ISO 8601.
   descendants behind an `nsdelegate` boundary, kills the full tree, and recovers or cleans only
   identity-verified run leaves across broker restarts, with explicit required and best-effort
   fallback.
+- Enforce typed CPU allocations as aggregate `cpu.max` bandwidth with a fixed 100ms period and
+  typed process allocations as subtree-wide `pids.max` task limits. Preserve CPU weight and
+  affinity as separate policies, measure conservative CPU and PID peaks, and retain deduplicated
+  throttle or PID-exhaustion events through normal completion and cancellation.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 
