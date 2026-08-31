@@ -14,6 +14,7 @@ import tempfile
 
 import pytest
 
+from agcoord.config import config_path
 from agcoord.queue import (
     CoordinatorBroker,
     CoordinatorClient,
@@ -24,7 +25,12 @@ from agcoord.queue import (
 )
 from agcoord.resources import ResourceMeasurement, ResourceObservation
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import (
+    RunningCoordinator,
+    caller_environment,
+    wait_for,
+    write_broker_config,
+)
 
 
 ROW_KEYS = {
@@ -337,30 +343,18 @@ def test_default_state_is_user_scoped_and_overrideable(monkeypatch, tmp_path: Pa
     assert state_dir_for() == explicit.resolve()
 
 
-@pytest.mark.parametrize(
-    ("configured", "expected"),
-    [
-        ('{"jobs": 3, "cpu": 8, "browser": 1}', {"jobs": 3, "cpu": 8, "browser": 1}),
-        ("jobs=3,cpu=8,browser=1", {"jobs": 3, "cpu": 8, "browser": 1}),
-    ],
-)
-def test_capacity_environment_accepts_json_or_name_unit_pairs(
-    monkeypatch,
-    tmp_path: Path,
-    configured: str,
-    expected: dict[str, int],
-):
-    monkeypatch.setenv("AGCOORD_CAPACITIES", configured)
-    running = RunningCoordinator(tmp_path / "state", capacities=None)
+def test_capacities_come_from_the_state_directory_configuration_file(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    write_broker_config(state_dir, capacities={"jobs": 3, "cpu": 8, "browser": 1})
+    running = RunningCoordinator(state_dir, capacities=None)
     client = running.start()
     try:
-        assert client.snapshot()["capacities"] == expected
+        assert client.snapshot()["capacities"] == {"jobs": 3, "cpu": 8, "browser": 1}
     finally:
         running.stop()
 
 
-def test_absent_capacity_configuration_defaults_to_two_job_slots(monkeypatch, tmp_path: Path):
-    monkeypatch.delenv("AGCOORD_CAPACITIES", raising=False)
+def test_absent_configuration_file_defaults_to_two_job_slots(tmp_path: Path):
     running = RunningCoordinator(tmp_path / "state", capacities=None)
     client = running.start()
     try:
@@ -369,24 +363,57 @@ def test_absent_capacity_configuration_defaults_to_two_job_slots(monkeypatch, tm
         running.stop()
 
 
-def test_resource_binding_environment_is_frozen_in_broker_metadata(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv(
-        "AGCOORD_RESOURCE_BINDINGS",
-        json.dumps(
-            {
-                "memory": {
-                    "backend": "cgroup-v2",
-                    "kind": "memory",
-                    "mode": "best-effort",
-                    "unit": "bytes",
-                }
-            }
-        ),
-    )
-    running = RunningCoordinator(
-        tmp_path / "state",
+def test_capacity_environment_variable_no_longer_configures_a_broker(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("AGCOORD_CAPACITIES", '{"jobs": 9, "cpu": 9}')
+    running = RunningCoordinator(tmp_path / "state", capacities=None)
+    client = running.start()
+    try:
+        assert client.snapshot()["capacities"] == {"jobs": 2}
+    finally:
+        running.stop()
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "{not json",
+        "[]",
+        '{"capacities": {"jobs": 2}, "unknown": 1}',
+        '{"capacities": []}',
+        '{"cgroup_root": ""}',
+    ],
+)
+def test_malformed_configuration_file_is_rejected_when_the_broker_loads(
+    tmp_path: Path,
+    document: str,
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    config_path(state_dir).write_text(document, encoding="utf-8")
+    with pytest.raises(CoordinatorError, match="configuration"):
+        CoordinatorBroker(state_dir, idle_timeout=None)
+
+
+def test_resource_bindings_from_the_configuration_file_freeze_in_broker_metadata(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    configuration = write_broker_config(
+        state_dir,
         capacities={"jobs": 1, "memory": 1024},
+        bindings={
+            "memory": {
+                "backend": "cgroup-v2",
+                "kind": "memory",
+                "mode": "best-effort",
+                "unit": "bytes",
+            }
+        },
     )
+    running = RunningCoordinator(state_dir, capacities=None)
     client = running.start()
     repository = _repository(tmp_path / "repository")
     try:
@@ -406,7 +433,7 @@ def test_resource_binding_environment_is_frozen_in_broker_metadata(monkeypatch, 
                 "units": [],
             }
         }
-        monkeypatch.setenv("AGCOORD_RESOURCE_BINDINGS", "{}")
+        configuration.write_text(json.dumps({"bindings": {}}), encoding="utf-8")
         run_id = _submit(
             client,
             _python("print('frozen binding')"),

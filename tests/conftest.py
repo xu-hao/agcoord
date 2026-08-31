@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import threading
@@ -8,6 +9,7 @@ from typing import Callable, TypeVar
 
 import pytest
 
+from agcoord.config import config_path
 from agcoord.queue import CoordinatorBroker, CoordinatorClient, CoordinatorError
 
 
@@ -32,6 +34,14 @@ def wait_for(
         time.sleep(0.01)
     detail = f"; last error: {last_error}" if last_error is not None else ""
     pytest.fail(f"{failure}{detail}")
+
+
+def write_broker_config(state_dir: Path, **sections: object) -> Path:
+    """Write one test-owned state directory's configuration file before its broker starts."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = config_path(state_dir)
+    path.write_text(json.dumps(sections), encoding="utf-8")
+    return path
 
 
 def caller_environment() -> dict[str, str]:

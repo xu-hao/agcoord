@@ -32,6 +32,11 @@ versioning; dates use ISO 8601.
   pressure or limit evidence, and expose `memory-oom` without overriding cancellation.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
+- Configure every broker from one `config.json` in its state directory, holding `capacities`,
+  `bindings`, and `cgroup_root`. **Breaking:** `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`,
+  and `AGCOORD_CGROUP_ROOT`, and the comma-separated `name=units` capacity syntax, are removed
+  with no deprecation period; move those values into the file. `AGCOORD_STATE_DIR` is unchanged
+  and now selects which configuration file a client and broker share.
 
 ## 0.1.1 — 2026-08-30
 

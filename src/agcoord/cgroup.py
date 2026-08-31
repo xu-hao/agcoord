@@ -26,7 +26,6 @@ from .resources import (
 )
 
 
-CGROUP_ROOT_ENV = "AGCOORD_CGROUP_ROOT"
 CGROUP_BACKEND = "cgroup-v2"
 CGROUP_ISOLATE_ENV = "_AGCOORD_CGROUP_ISOLATE"
 _CGROUP_V2_FILES = frozenset({"cgroup.procs", "cgroup.events"})
@@ -722,12 +721,14 @@ class CgroupV2Backend:
         return isinstance(self.system, LinuxCgroupV2System)
 
     @classmethod
-    def from_environment(
+    def from_config(
         cls,
+        cgroup_root: str | None,
         *,
         state_dir: str | os.PathLike[str],
     ) -> CgroupV2Backend:
-        return cls(os.environ.get(CGROUP_ROOT_ENV), state_dir=state_dir)
+        """Build the backend from one state directory's configured delegated root."""
+        return cls(cgroup_root, state_dir=state_dir)
 
     def _probe(self) -> CgroupProbe:
         if self._probe_result is not None:
