@@ -212,8 +212,18 @@ cancellation, and cleanup. It enforces CPU, process, memory, memory-pressure, sw
 bandwidth, IOPS, and I/O-weight bindings, and retains conservative peaks and deduplicated events
 in the same receipt shape as the Python owner. Required setup failures stop before user code;
 best-effort tmpfs mount failures can receive an explicit second release onto the owned disk
-directory only after capability and descriptor cleanup still verifies. Project quota remains an
-independent backend and implementation ticket rather than part of cgroup parity.
+directory only after capability and descriptor cleanup still verifies.
+
+The native `project-quota` backend implements the same independent persistent-scratch contract as
+the Python owner. It resolves a directly identifiable local ext4 or XFS mount, allocates a
+collision-safe high-range project ID under a mount-global lock, applies and reads back byte and
+inode limits, and records the exact mount, tree, and project identity for recovery. Required
+failures stop before user code, and best-effort fallback is allowed only before allocation and
+after the launcher proves capability cleanup and `no_new_privs`. Completion, cancellation, and
+replacement-broker recovery retain terminal usage before clearing limits and removing only the
+identity-verified owned tree. Unsupported or changed topology and durable state are refused
+without enabling filesystem features, editing system project databases, or mutating an
+unverified tree.
 
 ### Client-authored operations
 
