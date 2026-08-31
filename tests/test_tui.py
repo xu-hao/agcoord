@@ -248,7 +248,16 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
         await _settled(pilot)
 
         table = _table(app)
-        assert _headers(table) == ["STATE", "KIND", "REPO", "RUN", "LABEL", "AGE", "DUR"]
+        assert _headers(table) == [
+            "STATE",
+            "KIND",
+            "REPO",
+            "RUN",
+            "BRANCH",
+            "LABEL",
+            "AGE",
+            "DUR",
+        ]
         assert table.max_scroll_x == 0
         assert _table_ids(app) == ["check-active", "full-waiting", "merge-recent"]
         selected = _screen_text(app)
@@ -356,7 +365,10 @@ async def test_rendered_table_separates_columns_and_marks_truncated_detail_value
         table = _table(app)
         rendered_row = table.render_line(table.header_height).text
         has_column_gutter = bool(
-            re.search(r"\bcheck +repo-123456\b", rendered_row)
+            re.search(
+                r"\bcheck +repo-\S*… +check-\S*… +feature/1 +LONGLABEL-\S*…",
+                rendered_row,
+            )
         )
         has_label_ellipsis = bool(
             re.search(r"LONGLABEL-\S*… +45s\b", rendered_row)
@@ -402,10 +414,13 @@ async def test_default_width_long_queue_keeps_gutters_without_horizontal_scrollb
 
 
 @pytest.mark.asyncio
-async def test_label_uses_wide_terminal_space_and_returns_to_compact_ellipsis():
+async def test_branch_and_label_use_wide_space_and_return_to_compact_ellipsis():
+    full_branch = "feature/stable-work-context"
     full_label = "integration release validation"
     snapshot = _snapshot()
-    snapshot["active"] = [_row("check-wide", 1, "running", label=full_label)]
+    row = _row("check-wide", 1, "running", label=full_label)
+    row["branch"] = full_branch
+    snapshot["active"] = [row]
     snapshot["queued"] = []
     snapshot["recent"] = []
     app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
@@ -414,7 +429,18 @@ async def test_label_uses_wide_terminal_space_and_returns_to_compact_ellipsis():
         await _settled(pilot)
 
         table = _table(app)
+        assert _headers(table) == [
+            "STATE",
+            "KIND",
+            "REPO",
+            "RUN",
+            "BRANCH",
+            "LABEL",
+            "AGE",
+            "DUR",
+        ]
         wide_row = table.render_line(table.header_height).text
+        assert full_branch in wide_row
         assert full_label in wide_row
         assert table.max_scroll_x == 0
 
@@ -422,8 +448,11 @@ async def test_label_uses_wide_terminal_space_and_returns_to_compact_ellipsis():
         await _settled(pilot)
 
         compact_row = table.render_line(table.header_height).text
+        assert full_branch not in compact_row
         assert full_label not in compact_row
-        assert re.search(r"integration… +45s\b", compact_row), compact_row
+        assert re.search(
+            r"feature/\S*… +integr\S*… +45s\b", compact_row
+        ), compact_row
         assert table.max_scroll_x == 0
 
 
