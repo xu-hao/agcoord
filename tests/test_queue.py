@@ -2010,6 +2010,77 @@ def test_merge_submission_consumes_only_an_exact_repository_receipt(
         _row(client, blocker_id, "passed")
 
 
+def test_rollback_cutoff_prevents_reusing_any_pre_rollback_gate(
+    coordinator,
+    tmp_path: Path,
+):
+    broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    receipt_id = _submit(
+        client,
+        _python("print('receipt before native migration')"),
+        repository,
+        kind="full",
+    )
+    receipt = _row(client, receipt_id, "passed")
+    with sqlite3.connect(broker.paths.database) as db:
+        db.execute(
+            "INSERT INTO coordinator_meta(key, value) VALUES "
+            "('invalid_gate_through_sequence', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(receipt["sequence"]),),
+        )
+
+    with pytest.raises(CoordinatorError, match="stale|rollback|new full"):
+        client.submit_merge(
+            "github",
+            123,
+            checkout=str(repository),
+            gate_run_id=receipt_id,
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+        )
+    with pytest.raises(CoordinatorError, match="full-gate|rollback|new full"):
+        client.submit_merge(
+            "github",
+            124,
+            checkout=str(repository),
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+        )
+
+    fresh_id = _submit(
+        client,
+        _python("print('receipt after rollback')"),
+        repository,
+        kind="full",
+    )
+    fresh = _row(client, fresh_id, "passed")
+    assert fresh["sequence"] > receipt["sequence"]
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    blocker_id = _submit(
+        client,
+        _blocking_command(entered, release, "post-rollback lane blocker"),
+        repository,
+    )
+    wait_for(entered.exists, "the post-rollback lane blocker did not start")
+    try:
+        merge_id = client.submit_merge(
+            "github",
+            125,
+            checkout=str(repository),
+            gate_run_id=fresh_id,
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+        )
+        assert client.status(merge_id)["status"] == "queued"
+        assert client.cancel(merge_id)["status"] == "cancelled"
+    finally:
+        release.touch()
+        _row(client, blocker_id, "passed")
+
+
 def test_nested_coordinated_submission_is_rejected_without_a_row(
     coordinator,
     tmp_path: Path,
