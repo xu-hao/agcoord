@@ -219,6 +219,19 @@ and systemd's
 [delegation guidance](https://systemd.io/CGROUP_DELEGATION/) are the authoritative host setup
 references.
 
+Ubuntu hosts may additionally set `kernel.apparmor_restrict_unprivileged_userns=1`. On those
+hosts, an otherwise correct systemd delegation can probe as unavailable with
+`reason=namespace-mapping-failed`: the unconfined broker is moved into Ubuntu's restrictive
+user-namespace profile before it can write its private UID and GID maps. Do not disable that
+host-wide policy merely to start the broker, and do not switch a binding to `required` until the
+backend probe succeeds. Attaching `userns` permission to a general-purpose Python interpreter,
+including one copied into a root-owned virtual environment, is not a narrow workaround: the
+broker account could invoke that interpreter directly with arbitrary code under the same
+permission. The Python broker therefore has no supported AppArmor exception for this host
+policy. Keep the cgroup backend disabled on such a host unless the administrator deliberately
+accepts a broader account-level user-namespace opt-in; a future native enforcement boundary is
+required for a broker-specific exception.
+
 For each run, AGCoord creates an owner-specific, collision-safe leaf and records device/inode
 identities plus a random ownership token in the private spool. The existing launcher stays
 blocked while the broker moves it into that leaf and verifies membership. On real cgroupfs, the

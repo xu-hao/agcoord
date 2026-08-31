@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Document that Ubuntu's unprivileged user-namespace restriction can make an explicitly
+  delegated cgroup v2 backend fail with `namespace-mapping-failed`, and that granting `userns`
+  permission to a copied Python interpreter or root-owned virtual environment is not a narrow
+  broker-specific workaround.
+
 ## 0.2.2 — 2026-08-31
 
 - Preserve every identity-verified live worker when a broker exits unexpectedly, allowing a
