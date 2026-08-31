@@ -1,19 +1,19 @@
 use crate::error::{AppError, Result};
 use crate::platform::{
-    OwnerLock, process_start_token, same_process, shell_exit_status, signal_process_group,
+    OwnerLock, process_group_exists, same_worker_process, signal_process_group,
+    worker_identity_conflicts,
 };
 use crate::store::{
     Paths, RunRecord, allocations, blocked_by, connect, initialize_native, load_run, load_runs,
     map_database_error, now,
 };
+use crate::worker::{NativeWorker, PendingWorker, WorkerFault};
 use rusqlite::{Connection, params};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -28,6 +28,7 @@ pub struct ServeOptions {
     pub capacities: BTreeMap<String, u64>,
     pub idle_timeout: Duration,
     pub crash_after: Option<String>,
+    pub worker_fault: Option<WorkerFault>,
 }
 
 pub struct Broker {
@@ -35,9 +36,11 @@ pub struct Broker {
     capacities: BTreeMap<String, u64>,
     idle_timeout: Duration,
     crash_after: Option<String>,
+    worker_fault: Option<WorkerFault>,
     _owner: OwnerLock,
-    children: HashMap<String, Child>,
+    children: HashMap<String, NativeWorker>,
     cancellation_started: HashMap<String, Instant>,
+    group_drain_started: HashMap<String, Instant>,
     last_repository: Option<String>,
     stopped: Arc<AtomicBool>,
     idle_since: Option<Instant>,
@@ -97,9 +100,11 @@ impl Broker {
             capacities: options.capacities,
             idle_timeout: options.idle_timeout,
             crash_after: options.crash_after,
+            worker_fault: options.worker_fault,
             _owner: owner,
             children: HashMap::new(),
             cancellation_started: HashMap::new(),
+            group_drain_started: HashMap::new(),
             last_repository: None,
             stopped,
             idle_since: None,
@@ -249,7 +254,10 @@ impl Broker {
             else {
                 return Ok(());
             };
-            let exit_status = shell_exit_status(exit);
+            let exit_status = exit;
+            if !self.drain_finished_process_group(run)? {
+                return Ok(());
+            }
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
                 ("cancelled", 130, None)
             } else if exit_status == 0 {
@@ -261,14 +269,20 @@ impl Broker {
             self.crash("terminal-commit");
             self.children.remove(&run.run_id);
             self.cancellation_started.remove(&run.run_id);
+            self.group_drain_started.remove(&run.run_id);
             self.crash("worker-cleanup");
             return Ok(());
         }
 
-        if same_process(run.worker_pid, run.worker_start_token.as_deref()) {
+        if same_worker_process(run.worker_pid, run.worker_start_token.as_deref()) {
             if run.cancel_requested {
                 Self::signal_cancel(&mut self.cancellation_started, run)?;
             }
+            return Ok(());
+        }
+        if !worker_identity_conflicts(run.worker_pid, run.worker_start_token.as_deref())
+            && !self.drain_finished_process_group(run)?
+        {
             return Ok(());
         }
         let (status, exit_status, failure_reason) = if run.cancel_requested {
@@ -278,7 +292,39 @@ impl Broker {
         };
         self.finish_run(connection, run, status, exit_status, failure_reason)?;
         self.cancellation_started.remove(&run.run_id);
+        self.group_drain_started.remove(&run.run_id);
         Ok(())
+    }
+
+    fn drain_finished_process_group(&mut self, run: &RunRecord) -> Result<bool> {
+        let Some(process_group) = run.worker_pid else {
+            return Ok(true);
+        };
+        if !process_group_exists(process_group) {
+            self.group_drain_started.remove(&run.run_id);
+            return Ok(true);
+        }
+        let started = if run.cancel_requested {
+            self.cancellation_started
+                .entry(run.run_id.clone())
+                .or_insert_with(Instant::now)
+        } else {
+            self.group_drain_started
+                .entry(run.run_id.clone())
+                .or_insert_with(Instant::now)
+        };
+        let signal = if started.elapsed() >= CANCEL_GRACE {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        signal_process_group(process_group, signal)?;
+        if process_group_exists(process_group) {
+            Ok(false)
+        } else {
+            self.group_drain_started.remove(&run.run_id);
+            Ok(true)
+        }
     }
 
     fn signal_cancel(
@@ -390,68 +436,45 @@ impl Broker {
                     format!("cannot open worker log: {error}"),
                 )
             })?;
-        let error_output = output.try_clone().map_err(|error| {
-            AppError::new(
-                "broker-worker-start-failed",
-                format!("cannot duplicate worker log: {error}"),
-            )
-        })?;
-        let mut command = Command::new(&current.command[0]);
-        command
-            .args(&current.command[1..])
-            .current_dir(&current.checkout)
-            .env_clear()
-            .envs(&current.environment)
-            .env(
-                "PATH",
-                current
-                    .environment
-                    .get("PATH")
-                    .map(String::as_str)
-                    .unwrap_or("/usr/bin:/bin"),
-            )
-            .env("AGCOORD_RUN_ID", &current.run_id)
-            .env("AGCOORD_RUN_KIND", &current.kind)
-            .env("AGCOORD_STATE_DIR", &self.paths.state_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(output))
-            .stderr(Stdio::from(error_output))
-            .process_group(0);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let mut environment = current.environment.clone();
+        environment.retain(|name, _value| !name.starts_with("_AGCOORD_"));
+        environment
+            .entry("PATH".to_owned())
+            .or_insert_with(|| "/usr/bin:/bin".to_owned());
+        environment.insert("AGCOORD_RUN_ID".to_owned(), current.run_id.clone());
+        environment.insert("AGCOORD_RUN_KIND".to_owned(), current.kind.clone());
+        environment.insert(
+            "AGCOORD_STATE_DIR".to_owned(),
+            self.paths.state_dir.to_string_lossy().into_owned(),
+        );
+        let mut pending = match PendingWorker::spawn(
+            &current.command,
+            &environment,
+            &current.checkout,
+            &output,
+            self.worker_fault,
+        ) {
+            Ok(worker) => worker,
             Err(error) => {
+                let start_failure = error.code == "broker-worker-start-failed";
+                let exit_status = if start_failure { 127 } else { 125 };
+                let failure_reason = if start_failure {
+                    "worker-start-failed"
+                } else {
+                    error.code
+                };
                 self.finish_run(
                     &connection,
                     &current,
                     "failed",
-                    127,
-                    Some("worker-start-failed"),
+                    exit_status,
+                    Some(failure_reason),
                 )?;
-                let _ = error;
                 return Ok(());
             }
         };
-        let pid = child.id();
-        let mut token = process_start_token(pid);
-        for _ in 0..20 {
-            if token.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-            token = process_start_token(pid);
-        }
-        let Some(token) = token else {
-            let _ = signal_process_group(pid, libc::SIGKILL);
-            let _ = child.wait();
-            self.finish_run(
-                &connection,
-                &current,
-                "failed",
-                125,
-                Some("worker-identity-unavailable"),
-            )?;
-            return Ok(());
-        };
+        let pid = pending.pid();
+        let token = pending.start_token().to_owned();
         loop {
             match connection
                 .execute_batch("BEGIN IMMEDIATE")
@@ -461,11 +484,7 @@ impl Broker {
                 Err(error) if error.code == "broker-database-busy" => {
                     thread::sleep(POLL_INTERVAL);
                 }
-                Err(error) => {
-                    let _ = signal_process_group(pid, libc::SIGKILL);
-                    let _ = child.wait();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         let identity_commit = (|| {
@@ -481,7 +500,8 @@ impl Broker {
             }
             connection
                 .execute(
-                    "UPDATE runs SET worker_pid = ?1, worker_start_token = ?2 WHERE run_id = ?3",
+                    "UPDATE runs SET worker_pid = ?1, worker_start_token = ?2,
+                     environment_json = '{}' WHERE run_id = ?3",
                     params![i64::from(pid), token, current.run_id],
                 )
                 .map_err(map_database_error)?;
@@ -491,11 +511,31 @@ impl Broker {
         })();
         if let Err(error) = identity_commit {
             let _ = connection.execute_batch("ROLLBACK");
-            let _ = signal_process_group(pid, libc::SIGKILL);
-            let _ = child.wait();
             return Err(error);
         }
         self.crash("worker-identity-commit");
+        if let Err(error) = pending.verify_setup() {
+            drop(pending);
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+            return Ok(());
+        }
+        self.crash("worker-setup-commit");
+        let refreshed = load_run(&connection, &current.run_id)?;
+        if refreshed.cancel_requested {
+            drop(pending);
+            self.finish_run(&connection, &refreshed, "cancelled", 130, None)?;
+            return Ok(());
+        }
+        let child = match pending.release() {
+            Ok(child) => child,
+            Err(error) => {
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+                return Ok(());
+            }
+        };
+        self.crash("worker-release");
         self.children.insert(current.run_id, child);
         Ok(())
     }
