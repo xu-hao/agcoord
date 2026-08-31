@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+artifact=${1:?usage: check-native-licenses ARTIFACT}
+artifact=$(readlink -f "$artifact")
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+actual=$(mktemp)
+expected=$(mktemp)
+trap 'rm -f "$actual" "$expected"' EXIT
+cd "$repository"
+
+if ! cmp -s native/THIRD_PARTY_LICENSES.tsv "$(dirname -- "$artifact")/THIRD_PARTY_LICENSES.tsv"; then
+    printf 'distributed native license inventory does not match the reviewed source inventory\n' >&2
+    exit 1
+fi
+
+metadata=$(cargo metadata --frozen --format-version 1)
+if ! jq -e '
+    all(.packages[];
+        .source == null
+        or .source == "registry+https://github.com/rust-lang/crates.io-index")
+' <<<"$metadata" >/dev/null; then
+    printf 'native dependency graph contains an unapproved source\n' >&2
+    exit 1
+fi
+
+jq -r '
+    .packages[]
+    | select(.source != null)
+    | [.name, .version, (.license // "UNDECLARED")]
+    | @tsv
+' <<<"$metadata" >"$actual"
+sqlite_version=$(env -i "$artifact" identity --json | jq -er '.sqlite')
+printf 'sqlite\t%s\tPublic-Domain\n' "$sqlite_version" >>"$actual"
+LC_ALL=C sort -o "$actual" "$actual"
+
+grep -v '^#' native/THIRD_PARTY_LICENSES.tsv | awk 'NF' >"$expected"
+LC_ALL=C sort -o "$expected" "$expected"
+diff -u "$expected" "$actual"
+
+while IFS=$'\t' read -r name version license; do
+    case "$license" in
+        MIT|MIT\ OR\ Apache-2.0|MIT/Apache-2.0|Public-Domain) ;;
+        *)
+            printf 'unapproved native dependency license: %s %s (%s)\n' "$name" "$version" "$license" >&2
+            exit 1
+            ;;
+    esac
+done <"$actual"
+
+printf 'native license inventory passed (%s entries)\n' "$(wc -l <"$actual")"

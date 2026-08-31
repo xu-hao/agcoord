@@ -1,0 +1,16 @@
+[workspace]
+members = ["native/agcoord-broker"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.0-dev.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+repository = "https://github.com/xu-hao/agcoord"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"

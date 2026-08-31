@@ -1,0 +1,13 @@
+# Generated dependency and bundled-library inventory. Columns: name, version, SPDX/license.
+bitflags	2.13.1	MIT OR Apache-2.0
+cc	1.4.4	MIT OR Apache-2.0
+fallible-iterator	0.3.0	MIT/Apache-2.0
+fallible-streaming-iterator	0.1.9	MIT/Apache-2.0
+find-msvc-tools	0.1.11	MIT OR Apache-2.0
+libsqlite3-sys	0.38.2	MIT
+pkg-config	0.3.34	MIT OR Apache-2.0
+rusqlite	0.40.2	MIT
+shlex	2.0.1	MIT OR Apache-2.0
+smallvec	1.15.2	MIT OR Apache-2.0
+sqlite	3.53.2	Public-Domain
+vcpkg	0.2.15	MIT/Apache-2.0

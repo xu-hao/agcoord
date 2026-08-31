@@ -15,6 +15,47 @@ The source uses the `src/agcoord/` layout and tests live in `tests/`. Runtime co
 import a parent application or assume a sibling source checkout. A wheel must work in a
 clean environment with no project checkout on `PYTHONPATH`.
 
+## Native broker artifact
+
+The native broker is a separate Linux release artifact, not a copied Python interpreter or a
+file silently injected into a universal Python wheel. The currently supported release matrix
+has one target: `x86_64-unknown-linux-musl`. Other architectures remain unsupported until they
+have a native CI runner and the same kernel conformance coverage.
+
+Build inputs are pinned by `rust-toolchain.toml`, `Cargo.lock`, exact direct dependency
+requirements, and the source digest produced by `scripts/native-source-id`. The artifact embeds
+that digest as its build identity and reports protocol, implementation, target, and bundled
+SQLite version through `identity --json`. Install Rust 1.94.1 with the declared musl target and
+Ubuntu's `musl-tools`, then run:
+
+```bash
+./scripts/build-native-broker
+./scripts/audit-native-broker \
+  dist/native/agcoord-broker-x86_64-unknown-linux-musl
+./scripts/check-native-licenses \
+  dist/native/agcoord-broker-x86_64-unknown-linux-musl
+./scripts/check-native-reproducible
+```
+
+The build emits the executable, a SHA-256 sidecar, and JSON provenance recording the artifact
+and source digests, Rust and Cargo versions, C compiler, target, protocol, and source epoch. The
+audit requires a static or static-PIE ELF, no program interpreter, no `DT_NEEDED` entry, a valid
+checksum, and an exact release identity from an empty environment. Bundled SQLite is part of
+that ELF. The dependency graph must exactly match `native/THIRD_PARTY_LICENSES.tsv`, use only
+the crates.io registry or workspace source, and contain only the reviewed license expressions.
+
+Reproducibility CI builds two fresh checkout copies with separate Cargo target directories,
+path remapping, disabled incremental compilation, a fixed source epoch, and the same recorded
+toolchains; their executable bytes must match. This proves reproducibility for the declared
+runner and compiler inputs. It does not claim byte identity across different C compilers or
+host toolchain builds. `AGCOORD_MUSL_CC=cc` is an explicit local compatibility escape hatch for
+an audited x86_64 compiler when `musl-gcc` cannot be installed; release CI never uses it.
+
+Building the artifact does not activate it. Host packaging installs the verified executable at
+`/usr/libexec/agcoord/agcoord-broker`, and a development configuration may select another
+absolute path. Protocol-5 clients verify `identity --json`, file ownership, and policy before
+startup; they never search `PATH` or silently fall back to the Python broker.
+
 ## Dependency posture
 
 Queue ownership, durable state, scheduling, process supervision, and the forge-neutral
@@ -41,8 +82,9 @@ interface and must be smoke-tested from the built wheel.
    to prove namespace-root protection, aggregate CPU throttling, PID exhaustion, terminal
    metrics, and complete cleanup. On an init-namespace-root host, set
    `AGCOORD_TEST_CGROUP_IO=1` for the test-owned loop-device bandwidth and IOPS checks.
-3. Build both artifacts with `python -m build` and validate them with
-   `python -m twine check dist/*`.
+3. Build both Python artifacts with `python -m build` and validate them with
+   `python -m twine check dist/*`. Build and audit the native artifact with the commands above;
+   retain its executable, checksum, provenance, and reviewed license inventory together.
 4. Create a fresh virtual environment outside the checkout. Install the wheel, with each
    supported optional extra in at least one smoke environment, and exercise both
    `python -m agcoord --help` and `agc --help`. Verify that no `agcoord` console executable

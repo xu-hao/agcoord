@@ -130,7 +130,7 @@ pid=12345
 protocol=5
 implementation=rust-native
 version=0.3.0
-build=sha256:0123456789abcdef
+build=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 capacities={"cpu":8,"jobs":2}
 resource_bindings={}
 resource_capabilities={}
@@ -139,6 +139,19 @@ started_at=2026-08-31T17:00:00+00:00
 
 The build digest may be `development` only for an explicitly selected development binary. A
 release client refuses that value when its configured policy requires a release artifact.
+
+### Executable discovery
+
+Native-client integration must select an absolute executable path explicitly. A host package
+uses `/usr/libexec/agcoord/agcoord-broker`; a development operator may instead configure a
+different absolute path. Clients never search `PATH`, copy an interpreter, import a checkout,
+or fall back to Python after selecting protocol 5. Before starting an owner, the client runs
+`identity --json` and requires the configured protocol, `rust-native` implementation, supported
+target, non-development build policy, and expected executable ownership.
+
+The protocol-4 Python broker remains the current owner until the explicit migration and client
+integration tickets land. Merely building or placing the native artifact does not change a live
+broker or state directory.
 
 ### Client-authored operations
 

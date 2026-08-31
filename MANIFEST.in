@@ -1,4 +1,10 @@
 include AGENTS.md
 include CHANGELOG.md
+include Cargo.lock
+include Cargo.toml
+include LICENSE
+include rust-toolchain.toml
 recursive-include docs *.md *.png
+recursive-include native *.rs *.toml *.tsv
+include scripts/*native*
 recursive-include tests *.py
