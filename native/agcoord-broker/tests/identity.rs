@@ -108,11 +108,18 @@ fn copied_binary_runs_without_python_or_checkout_files() {
 
 #[test]
 fn internal_worker_mode_is_not_a_public_command() {
-    let result = output(&["worker"]);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(
-        String::from_utf8(result.stderr)
-            .unwrap()
-            .contains("unknown command: worker")
-    );
+    for command in ["worker", "internal-worker", "__worker"] {
+        let result = Command::new(BROKER)
+            .arg(command)
+            .env("_AGCOORD_WORKER_TOKEN", "forged")
+            .env("_AGCOORD_WORKER_RELEASE_FD", "3")
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(
+            String::from_utf8(result.stderr)
+                .unwrap()
+                .contains(&format!("unknown command: {command}"))
+        );
+    }
 }

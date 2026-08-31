@@ -2,6 +2,7 @@ mod broker;
 mod error;
 mod platform;
 mod store;
+mod worker;
 
 use broker::{Broker, ServeOptions};
 use error::{AppError, Result};
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use store::{PROTOCOL, Paths, PhaseRequest, SubmitRequest};
+use worker::WorkerFault;
 
 const NAME: &str = "agcoord-broker";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -131,6 +133,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
     let mut capacities = BTreeMap::new();
     let mut idle_timeout = Duration::from_secs(60);
     let mut crash_after = None;
+    let mut worker_fault = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -164,12 +167,24 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                     "owner-lock"
                         | "admission-commit"
                         | "worker-identity-commit"
+                        | "worker-setup-commit"
+                        | "worker-release"
                         | "terminal-commit"
                         | "worker-cleanup"
                 ) {
                     return Err(AppError::usage("unknown broker crash point"));
                 }
                 crash_after = Some(point);
+            }
+            "--worker-fault" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --worker-fault"));
+                }
+                let value = option_value(arguments, &mut index, "--worker-fault")?;
+                worker_fault = Some(
+                    WorkerFault::parse(&value)
+                        .ok_or_else(|| AppError::usage("unknown worker fault"))?,
+                );
             }
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
         }
@@ -183,6 +198,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
         capacities,
         idle_timeout,
         crash_after,
+        worker_fault,
     })
 }
 
