@@ -2,7 +2,7 @@
 
 Clients append strict requests to SQLite; one detached, flock-owned broker admits them
 against machine resource capacities and per-repository FIFO barriers.  Workers run in
-their submitted checkouts with private tmpfs roots and process-group supervision.  The
+their submitted checkouts with private scratch roots and process-group supervision.  The
 module opens no network listener and has no dependency on a product repository.
 """
 
@@ -35,6 +35,7 @@ from .cgroup import (
     CgroupV2Backend,
 )
 from .config import BrokerConfig, BrokerConfigError, load_broker_config
+from .project_quota import PROJECT_QUOTA_BACKEND, ProjectQuotaBackend
 from .resources import (
     ResourceBackend,
     ResourceBackendError,
@@ -54,7 +55,7 @@ from .resources import (
     validate_resource_measurement,
     validate_resource_receipt,
 )
-from .worker import TMPFS_SETUP_ENV
+from .worker import PROJECT_QUOTA_DROP_ENV, TMPFS_SETUP_ENV
 
 
 PROTOCOL = 4
@@ -836,6 +837,13 @@ class CoordinatorBroker:
                 self.resource_backends[CGROUP_BACKEND] = CgroupV2Backend.from_config(
                     configuration.cgroup_root,
                     state_dir=self.paths.state_dir,
+                )
+            if (
+                PROJECT_QUOTA_BACKEND in referenced_backends
+                and PROJECT_QUOTA_BACKEND not in self.resource_backends
+            ):
+                self.resource_backends[PROJECT_QUOTA_BACKEND] = ProjectQuotaBackend(
+                    self.paths.state_dir
                 )
             self.resource_capabilities = probe_resource_backends(
                 self.resource_backends,
@@ -2860,7 +2868,7 @@ class CoordinatorBroker:
                     if (
                         backend_name == CGROUP_BACKEND
                         and contract[name]["kind"] in {"inodes", "tmpfs"}
-                    ):
+                    ) or backend_name == PROJECT_QUOTA_BACKEND:
                         continue
                     applied[name] = units
                     self._append_resource_event(
@@ -3054,6 +3062,110 @@ class CoordinatorBroker:
             and binding["kind"] in {"inodes", "tmpfs"}
         ]
 
+    def _project_quota_scratch_path(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> Path | None:
+        state = self._row_resource_state(row)
+        record = state.get(PROJECT_QUOTA_BACKEND)
+        if record is None:
+            return None
+        backend = self.resource_backends.get(PROJECT_QUOTA_BACKEND)
+        try:
+            if not isinstance(backend, ProjectQuotaBackend):
+                raise ResourceContractError(
+                    "project quota scratch backend is unavailable"
+                )
+            request = self._resource_request(
+                row,
+                PROJECT_QUOTA_BACKEND,
+                record["resources"],
+            )
+            return backend.scratch_path(request, record["handle"])
+        except Exception as exc:
+            receipt = self._row_resource_receipt(row)
+            contract = self._row_resource_contract(row)
+            code = _resource_failure_code(exc, "quota-tree-unavailable")
+            required = False
+            for name in record["resources"]:
+                mode = str(contract[name]["mode"])
+                required = required or mode == "required"
+                self._append_resource_event(
+                    receipt,
+                    backend=PROJECT_QUOTA_BACKEND,
+                    resource=name,
+                    stage="attach",
+                    status="failed" if mode == "required" else "unapplied",
+                    code=code,
+                )
+            self._cleanup_resource_records(
+                row,
+                receipt,
+                state,
+                only={PROJECT_QUOTA_BACKEND},
+            )
+            self._save_resource_records(db, row, receipt, state)
+            cleanup_failed = any(
+                event["backend"] == PROJECT_QUOTA_BACKEND
+                and event["stage"] == "cleanup"
+                and event["status"] == "failed"
+                for event in receipt["events"]
+            )
+            if required or cleanup_failed:
+                raise _ResourceEnforcementError(
+                    "project quota scratch path is unavailable"
+                ) from exc
+            return None
+
+    def _record_project_quota_worker_setup(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        code: str,
+    ) -> bool:
+        state = self._row_resource_state(row)
+        record = state.get(PROJECT_QUOTA_BACKEND)
+        if record is None:
+            raise CoordinatorError("project quota setup has no backend state")
+        receipt = self._row_resource_receipt(row)
+        contract = self._row_resource_contract(row)
+        requested = self._row_resources(row)
+        applied = receipt["applied"]
+        if not isinstance(applied, dict):
+            raise CoordinatorError("resource receipt application record is not mutable")
+        if code == "ok":
+            for name in record["resources"]:
+                applied[name] = requested[name]
+                self._append_resource_event(
+                    receipt,
+                    backend=PROJECT_QUOTA_BACKEND,
+                    resource=name,
+                    stage="attach",
+                    status="applied",
+                    code="quota-ready",
+                )
+            failed = False
+        else:
+            if not _SETUP_CODE.fullmatch(code):
+                code = "worker-setup-failed"
+            for name in record["resources"]:
+                mode = str(contract[name]["mode"])
+                self._append_resource_event(
+                    receipt,
+                    backend=PROJECT_QUOTA_BACKEND,
+                    resource=name,
+                    stage="attach",
+                    status="failed" if mode == "required" else "unapplied",
+                    code=code,
+                )
+            # A command must never inherit the broker's quota-administration power,
+            # even when the quota resources themselves were requested best-effort.
+            failed = True
+        self._save_resource_records(db, row, receipt, state)
+        return failed
+
     def _record_tmpfs_setup(
         self,
         db: sqlite3.Connection,
@@ -3216,6 +3328,7 @@ class CoordinatorBroker:
         environment[RUN_KIND_ENV] = row["kind"]
         environment[STATE_DIR_ENV] = str(self.paths.state_dir)
         environment.pop(CGROUP_ISOLATE_ENV, None)
+        environment.pop(PROJECT_QUOTA_DROP_ENV, None)
         environment.pop(TMPFS_SETUP_ENV, None)
         worker_tmp = self._worker_tmp_path(run_id)
         release_read = -1
@@ -3262,15 +3375,20 @@ class CoordinatorBroker:
                     "--",
                     *command,
                 ]
-            worker_tmp.mkdir(mode=0o700)
-            worker_tmp.chmod(0o700)
             prepared_row = db.execute(
                 "SELECT * FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
+            quota_scratch = self._project_quota_scratch_path(db, prepared_row)
+            scratch_target = worker_tmp if quota_scratch is None else quota_scratch
+            if quota_scratch is None:
+                scratch_target.mkdir(mode=0o700)
+                scratch_target.chmod(0o700)
+            else:
+                environment[PROJECT_QUOTA_DROP_ENV] = "1"
             tmpfs_setup = self._prepare_tmpfs_setup(
                 db,
                 prepared_row,
-                worker_tmp,
+                scratch_target,
             )
             if tmpfs_setup is not None:
                 environment[TMPFS_SETUP_ENV] = json.dumps(
@@ -3278,9 +3396,10 @@ class CoordinatorBroker:
                     separators=(",", ":"),
                 )
             for variable in ("TMPDIR", "TMP", "TEMP"):
-                environment[variable] = str(worker_tmp)
+                environment[variable] = str(scratch_target)
             release_read, release_write = os.pipe()
-            if tmpfs_setup is not None:
+            worker_setup_required = tmpfs_setup is not None or quota_scratch is not None
+            if worker_setup_required:
                 setup_read, setup_write = os.pipe()
             with log_path.open("ab", buffering=0) as output:
                 log_path.chmod(0o600)
@@ -3330,24 +3449,31 @@ class CoordinatorBroker:
             db.commit()
             self._children[run_id] = process
             os.write(release_write, b"1")
-            if tmpfs_setup is not None:
+            if worker_setup_required:
                 setup_code = self._read_worker_setup(setup_read)
                 os.close(setup_read)
                 setup_read = -1
                 setup_row = db.execute(
                     "SELECT * FROM runs WHERE run_id = ?", (run_id,)
                 ).fetchone()
-                required_failure = self._record_tmpfs_setup(
-                    db,
-                    setup_row,
-                    code=setup_code,
-                    setup=tmpfs_setup,
-                )
+                if tmpfs_setup is not None:
+                    setup_failure = self._record_tmpfs_setup(
+                        db,
+                        setup_row,
+                        code=setup_code,
+                        setup=tmpfs_setup,
+                    )
+                else:
+                    setup_failure = self._record_project_quota_worker_setup(
+                        db,
+                        setup_row,
+                        code=setup_code,
+                    )
                 db.commit()
-                os.write(release_write, b"0" if required_failure else b"1")
-                if required_failure:
+                os.write(release_write, b"0" if setup_failure else b"1")
+                if setup_failure:
                     raise _ResourceEnforcementError(
-                        "a required tmpfs could not be mounted"
+                        "required worker resource setup failed"
                     )
             released = True
         except Exception as exc:
