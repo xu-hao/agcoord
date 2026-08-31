@@ -12,6 +12,8 @@ procedure is in [the contributor workflow](contributing.md).
 - [Coordinator contract and operations](coordinator.md) — machine-local topology,
   resource scheduling, repository lanes, atomic landing, cleanup, recovery, CLI, and
   TUI.
+- [Native broker architecture](native_broker.md) — single-executable scope, trust model,
+  durable protocol, worker boundary, compatibility, and migration requirements.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
   publication, optional adapters, and release posture.
 - [Session handoff format](session_handoff_format.md) — closing changed work with concise
