@@ -63,7 +63,10 @@ subtree that satisfies the
 [delegated cgroup contract](coordinator.md#delegated-cgroup-v2-lifecycle), set
 `AGCOORD_TEST_CGROUP_ROOT` to it, run the test process inside that delegation boundary, and run
 `tests/test_cgroup.py tests/test_cgroup_compute.py`. The tests remove only their own owner and run
-leaves; they never create, change ownership of, or remove the configured root.
+leaves; they never create, change ownership of, or remove the configured root. To additionally
+exercise block-I/O enforcement as init-namespace root, set `AGCOORD_TEST_CGROUP_IO=1`; the I/O
+test formats and mounts its own loop-backed ext4 image, runs buffered and direct workloads, and
+unmounts only that test-owned filesystem.
 
 Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is a barrier for its repository, not an undeclared

@@ -13,8 +13,9 @@ import re
 import select
 import signal
 import stat
+import sys
 import time
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from .resources import (
@@ -40,7 +41,7 @@ _OWNER_KEYS = frozenset(
         "owner_inode",
     }
 )
-_HANDLE_KEYS = frozenset(
+_HANDLE_KEYS_V1 = frozenset(
     {
         "version",
         "owner",
@@ -52,12 +53,14 @@ _HANDLE_KEYS = frozenset(
         "token",
     }
 )
+_HANDLE_KEYS_V2 = _HANDLE_KEYS_V1 | {"io_devices"}
 _MANIFEST_KEYS = frozenset({"version", "run_id", "handle"})
 _OWNER_NAME = re.compile(r"^agcoord-u[0-9]+-[0-9a-f]{16}$")
 _LEAF_NAME = re.compile(r"^run-[0-9a-f]{16}-[0-9a-f]{12}$")
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _TOKEN_OR_REASON = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _CONTROLLER = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_DEVICE = re.compile(r"^[0-9]+:[0-9]+$")
 _MAX_METADATA_BYTES = 64 * 1024
 _CLONE_NEWNS = 0x00020000
 _CLONE_NEWCGROUP = 0x02000000
@@ -78,9 +81,26 @@ _CONTROL_BINDINGS = {
     ("tmpfs", "bytes"): "tmpfs.size",
     ("inodes", "inodes"): "tmpfs.nr_inodes",
 }
+_IO_LIMIT_BINDINGS = {
+    ("io-bandwidth", "bytes-per-second"): ("rbps", "wbps"),
+    ("io-bandwidth", "read-bytes-per-second"): ("rbps",),
+    ("io-bandwidth", "write-bytes-per-second"): ("wbps",),
+    ("io-operations", "operations-per-second"): ("riops", "wiops"),
+    ("io-operations", "read-operations-per-second"): ("riops",),
+    ("io-operations", "write-operations-per-second"): ("wiops",),
+}
+_IO_WEIGHT_BINDING = ("io-weight", "weight")
+_IO_COUNTER_BY_LIMIT = {
+    "rbps": "rbytes",
+    "wbps": "wbytes",
+    "riops": "rios",
+    "wiops": "wios",
+}
+_IO_STAT_REQUIRED = frozenset(_IO_COUNTER_BY_LIMIT.values())
+_IO_SUPPORTED_FILESYSTEMS = frozenset({"ext2", "ext4", "f2fs", "xfs"})
 _LIFECYCLE_BINDING = ("generic", "admission-unit")
 _CONTROLLER_FILE = re.compile(
-    r"^(?:cpu|pids|memory(?:\.swap)?)\.[a-z][a-z0-9_.-]{0,31}$"
+    r"^(?:cpu|io|pids|memory(?:\.swap)?)\.[a-z][a-z0-9_.-]{0,31}$"
 )
 _METRIC_KEY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _TMPFS_REPORT_KEYS = frozenset(
@@ -123,6 +143,35 @@ class CgroupProbe:
     available: bool
     reason: str | None
     controllers: frozenset[str]
+
+
+@dataclass(frozen=True)
+class IoDevice:
+    """One directly controlled local block device, without a host path."""
+
+    number: str
+    filesystem: str
+
+
+@dataclass(frozen=True)
+class _IoMount:
+    path: Path
+    root: Path
+    filesystem: str
+    source: Path
+    device: str
+    options: frozenset[str]
+
+
+@dataclass
+class _IoSample:
+    at_ns: int
+    counters: dict[str, int]
+    peaks: dict[str, int]
+
+
+class IoDeviceResolver(Protocol):
+    def resolve(self, paths: tuple[Path, ...]) -> tuple[IoDevice, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -253,6 +302,185 @@ def _filesystem_mounts(
             continue
         mounts.append((mounted, filesystem, options))
     return mounts
+
+
+class LinuxIoDeviceResolver:
+    """Resolve real local filesystem roots to one safe cgroup I/O device each."""
+
+    def __init__(
+        self,
+        *,
+        mountinfo: Path = Path("/proc/self/mountinfo"),
+        sys_dev_block: Path = Path("/sys/dev/block"),
+    ) -> None:
+        self.mountinfo = mountinfo
+        self.sys_dev_block = sys_dev_block
+
+    def _mounts(self) -> list[_IoMount]:
+        try:
+            lines = self.mountinfo.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise CgroupV2Error(
+                "io-mountinfo-unavailable",
+                "mount information for cgroup I/O is unavailable",
+            ) from exc
+        mounts: list[_IoMount] = []
+        for line in lines:
+            try:
+                left, right = line.split(" - ", 1)
+                fields = left.split()
+                right_fields = right.split()
+                path = Path(_decode_mount_path(fields[4]))
+                root = Path(_decode_mount_path(fields[3]))
+                filesystem = right_fields[0]
+                source = Path(_decode_mount_path(right_fields[1]))
+                device = fields[2]
+                options = frozenset(
+                    fields[5].split(",") + right_fields[2].split(",")
+                )
+            except (IndexError, ValueError):
+                continue
+            if path.is_absolute() and _DEVICE.fullmatch(device):
+                mounts.append(
+                    _IoMount(
+                        path=path,
+                        root=root,
+                        filesystem=filesystem,
+                        source=source,
+                        device=device,
+                        options=options,
+                    )
+                )
+        return mounts
+
+    @staticmethod
+    def _covers(parent: Path, child: Path) -> bool:
+        try:
+            child.relative_to(parent)
+        except ValueError:
+            return False
+        return True
+
+    def _resolve_one(self, path: Path, mounts: Sequence[_IoMount]) -> IoDevice:
+        try:
+            details = path.lstat()
+            target = path.resolve(strict=True)
+        except OSError as exc:
+            raise CgroupV2Error(
+                "io-path-unavailable",
+                "configured cgroup I/O path is unavailable",
+            ) from exc
+        if (
+            not path.is_absolute()
+            or target != path
+            or stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISDIR(details.st_mode)
+        ):
+            raise CgroupV2Error(
+                "io-path-invalid",
+                "configured cgroup I/O path must be one real absolute directory",
+            )
+        candidates = [mount for mount in mounts if self._covers(mount.path, target)]
+        if not candidates:
+            raise CgroupV2Error(
+                "io-mount-unavailable",
+                "configured cgroup I/O path has no covering mount",
+            )
+        depth = max(len(candidate.path.parts) for candidate in candidates)
+        effective = [
+            candidate
+            for candidate in candidates
+            if len(candidate.path.parts) == depth
+        ]
+        if len(effective) != 1:
+            raise CgroupV2Error(
+                "io-mount-ambiguous",
+                "configured cgroup I/O path has stacked covering mounts",
+            )
+        mount = effective[0]
+        if mount.filesystem not in _IO_SUPPORTED_FILESYSTEMS:
+            raise CgroupV2Error(
+                "io-filesystem-unsupported",
+                "configured cgroup I/O path uses an unsupported filesystem",
+            )
+        if mount.root != Path("/"):
+            raise CgroupV2Error(
+                "io-mount-ambiguous",
+                "configured cgroup I/O path uses a bind or subdirectory mount",
+            )
+        if "ro" in mount.options or "rw" not in mount.options:
+            raise CgroupV2Error(
+                "io-path-read-only",
+                "configured cgroup I/O path must be writable",
+            )
+        try:
+            source = mount.source.resolve(strict=True)
+            source_details = source.stat()
+        except OSError as exc:
+            raise CgroupV2Error(
+                "io-device-unavailable",
+                "configured cgroup I/O backing device is unavailable",
+            ) from exc
+        if not stat.S_ISBLK(source_details.st_mode):
+            raise CgroupV2Error(
+                "io-device-ambiguous",
+                "configured cgroup I/O path has no direct block device",
+            )
+        major, minor = map(int, mount.device.split(":"))
+        if (
+            os.major(details.st_dev) != major
+            or os.minor(details.st_dev) != minor
+            or os.major(source_details.st_rdev) != major
+            or os.minor(source_details.st_rdev) != minor
+        ):
+            raise CgroupV2Error(
+                "io-device-ambiguous",
+                "filesystem and block-device identities do not agree",
+            )
+        try:
+            sys_device = (self.sys_dev_block / mount.device).resolve(strict=True)
+            slaves = sys_device / "slaves"
+            layered = (
+                (sys_device / "dm").exists()
+                or (sys_device / "md").exists()
+                or (sys_device / "partition").exists()
+                or (slaves.is_dir() and any(slaves.iterdir()))
+            )
+        except OSError as exc:
+            raise CgroupV2Error(
+                "io-device-unavailable",
+                "cgroup I/O device topology is unavailable",
+            ) from exc
+        if layered:
+            raise CgroupV2Error(
+                "io-device-ambiguous",
+                "layered, partitioned, or device-mapped storage is unsupported",
+            )
+        return IoDevice(mount.device, mount.filesystem)
+
+    def resolve(self, paths: tuple[Path, ...]) -> tuple[IoDevice, ...]:
+        if not sys.platform.startswith("linux"):
+            raise CgroupV2Error(
+                "io-platform-unsupported",
+                "cgroup block I/O requires Linux",
+            )
+        if not paths:
+            raise CgroupV2Error(
+                "io-path-unconfigured",
+                "no cgroup I/O path was configured",
+            )
+        mounts = self._mounts()
+        selected: dict[str, IoDevice] = {}
+        for path in paths:
+            device = self._resolve_one(path, mounts)
+            previous = selected.get(device.number)
+            if previous is not None and previous != device:
+                raise CgroupV2Error(
+                    "io-device-ambiguous",
+                    "one block-device identity resolved inconsistently",
+                )
+            selected[device.number] = device
+        return tuple(selected[number] for number in sorted(selected))
 
 
 def _covering_mounts(mounts: list[CgroupMount]) -> list[CgroupMount]:
@@ -861,6 +1089,8 @@ class CgroupV2Backend:
         *,
         state_dir: str | os.PathLike[str],
         system: CgroupV2System | None = None,
+        io_paths: Sequence[str | os.PathLike[str]] | None = None,
+        io_resolver: IoDeviceResolver | None = None,
         empty_timeout: float = 5.0,
     ) -> None:
         if empty_timeout <= 0:
@@ -868,6 +1098,35 @@ class CgroupV2Backend:
         self.state_dir = Path(state_dir).absolute()
         self.metadata_dir = self.state_dir / "cgroup-v2"
         self.system = LinuxCgroupV2System() if system is None else system
+        if isinstance(io_paths, (str, bytes, os.PathLike)):
+            raise CgroupV2Error(
+                "io-config-invalid",
+                "cgroup I/O paths must be a list of absolute directories",
+            )
+        selected_io_paths: list[Path] = []
+        for raw_path in () if io_paths is None else io_paths:
+            try:
+                selected = Path(raw_path)
+            except TypeError as exc:
+                raise CgroupV2Error(
+                    "io-config-invalid",
+                    "cgroup I/O path is invalid",
+                ) from exc
+            if not selected.is_absolute() or "\0" in os.fspath(selected):
+                raise CgroupV2Error(
+                    "io-config-invalid",
+                    "cgroup I/O paths must be absolute",
+                )
+            if selected in selected_io_paths:
+                raise CgroupV2Error(
+                    "io-config-invalid",
+                    "cgroup I/O paths must be unique",
+                )
+            selected_io_paths.append(selected)
+        self.io_paths = tuple(selected_io_paths)
+        self.io_resolver = (
+            LinuxIoDeviceResolver() if io_resolver is None else io_resolver
+        )
         self.empty_timeout = empty_timeout
         self._configuration_reason: str | None = None
         if root is None or not os.fspath(root):
@@ -892,6 +1151,7 @@ class CgroupV2Backend:
         self._pids_peaks: dict[str, int] = {}
         self._memory_peaks: dict[str, int] = {}
         self._swap_peaks: dict[str, int] = {}
+        self._io_samples: dict[str, _IoSample] = {}
 
     @property
     def isolate_workers(self) -> bool:
@@ -905,9 +1165,28 @@ class CgroupV2Backend:
         cgroup_root: str | None,
         *,
         state_dir: str | os.PathLike[str],
+        cgroup_io: Mapping[str, object] | None = None,
     ) -> CgroupV2Backend:
         """Build the backend from one state directory's configured delegated root."""
-        return cls(cgroup_root, state_dir=state_dir)
+        if cgroup_io is None:
+            paths: object = ()
+        elif not isinstance(cgroup_io, Mapping) or set(cgroup_io) != {"paths"}:
+            raise CgroupV2Error(
+                "io-config-invalid",
+                "cgroup_io must contain exactly paths",
+            )
+        else:
+            paths = cgroup_io["paths"]
+        if (
+            not isinstance(paths, (list, tuple))
+            or (cgroup_io is not None and not paths)
+            or not all(isinstance(path, str) and path for path in paths)
+        ):
+            raise CgroupV2Error(
+                "io-config-invalid",
+                "cgroup_io paths must be a string list",
+            )
+        return cls(cgroup_root, state_dir=state_dir, io_paths=paths)
 
     def _probe(self) -> CgroupProbe:
         if self._probe_result is not None:
@@ -941,6 +1220,19 @@ class CgroupV2Backend:
         if "memory" in result.controllers:
             kinds.update({"inodes", "memory", "memory-high", "swap", "tmpfs"})
             units.update({"bytes", "inodes"})
+        if "io" in result.controllers:
+            kinds.update({"io-bandwidth", "io-operations", "io-weight"})
+            units.update(
+                {
+                    "bytes-per-second",
+                    "operations-per-second",
+                    "read-bytes-per-second",
+                    "read-operations-per-second",
+                    "weight",
+                    "write-bytes-per-second",
+                    "write-operations-per-second",
+                }
+            )
         return {
             "available": result.available,
             "kinds": sorted(kinds) if result.available else [],
@@ -958,7 +1250,12 @@ class CgroupV2Backend:
             raise CgroupV2Error("request-invalid", "cgroup request is invalid")
         for name, binding in request.bindings.items():
             pair = (binding["kind"], binding["unit"])
-            if pair != _LIFECYCLE_BINDING and pair not in _CONTROL_BINDINGS:
+            if (
+                pair != _LIFECYCLE_BINDING
+                and pair not in _CONTROL_BINDINGS
+                and pair not in _IO_LIMIT_BINDINGS
+                and pair != _IO_WEIGHT_BINDING
+            ):
                 raise CgroupV2Error(
                     "request-unsupported",
                     "cgroup backend does not support the requested typed unit",
@@ -977,6 +1274,51 @@ class CgroupV2Backend:
                 )
             selected[control] = name
         return selected
+
+    def _io_resources(self, request: ResourceRequest) -> dict[str, str]:
+        selected: dict[str, str] = {}
+        for name, binding in request.bindings.items():
+            pair = (str(binding["kind"]), str(binding["unit"]))
+            controls = _IO_LIMIT_BINDINGS.get(pair)
+            if pair == _IO_WEIGHT_BINDING:
+                controls = ("weight",)
+            if controls is None:
+                continue
+            for control in controls:
+                if control in selected:
+                    raise CgroupV2Error(
+                        "controller-ambiguous",
+                        "one run cannot bind two names to the same cgroup I/O control",
+                    )
+                selected[control] = name
+        return selected
+
+    def _resolve_io_devices(self, request: ResourceRequest) -> tuple[IoDevice, ...]:
+        if not self._io_resources(request):
+            return ()
+        if not self.io_paths:
+            raise CgroupV2Error(
+                "io-path-unconfigured",
+                "cgroup I/O resources need at least one configured path",
+            )
+        devices = self.io_resolver.resolve(self.io_paths)
+        if (
+            not isinstance(devices, tuple)
+            or not devices
+            or any(
+                not isinstance(device, IoDevice)
+                or not _DEVICE.fullmatch(device.number)
+                or device.filesystem not in _IO_SUPPORTED_FILESYSTEMS
+                for device in devices
+            )
+            or len({device.number for device in devices}) != len(devices)
+            or tuple(sorted(devices, key=lambda device: device.number)) != devices
+        ):
+            raise CgroupV2Error(
+                "io-device-response-invalid",
+                "cgroup I/O device resolver returned an invalid response",
+            )
+        return devices
 
     def _controller_settings(self, request: ResourceRequest) -> dict[str, str]:
         resources = self._controller_resources(request)
@@ -1077,6 +1419,8 @@ class CgroupV2Backend:
             for control in self._controller_resources(request)
             if control in controller_by_control
         }
+        if self._io_resources(request):
+            controllers.add("io")
         if not controllers:
             return
         result = self._probe()
@@ -1093,6 +1437,8 @@ class CgroupV2Backend:
         self,
         request: ResourceRequest,
         leaf_path: Path,
+        *,
+        io_devices: tuple[IoDevice, ...] = (),
     ) -> None:
         for name, expected in self._controller_settings(request).items():
             self.system.write_file(leaf_path, name, expected)
@@ -1101,6 +1447,147 @@ class CgroupV2Backend:
                 raise CgroupV2Error(
                     "controller-value-unverified",
                     "cgroup controller value could not be verified",
+                )
+        self._configure_io_values(request, leaf_path, io_devices)
+
+    @staticmethod
+    def _io_max_values(raw: str) -> dict[str, dict[str, str]]:
+        selected: dict[str, dict[str, str]] = {}
+        allowed = frozenset(_IO_COUNTER_BY_LIMIT)
+        try:
+            for line in raw.splitlines():
+                fields = line.split()
+                if len(fields) < 2 or not _DEVICE.fullmatch(fields[0]):
+                    raise ValueError
+                device = fields[0]
+                if device in selected:
+                    raise ValueError
+                values: dict[str, str] = {}
+                for field in fields[1:]:
+                    key, separator, value = field.partition("=")
+                    if (
+                        not separator
+                        or key not in allowed
+                        or key in values
+                        or (
+                            value != "max"
+                            and (
+                                not value.isascii()
+                                or not value.isdecimal()
+                                or int(value) <= 0
+                            )
+                        )
+                    ):
+                        raise ValueError
+                    values[key] = value
+                selected[device] = values
+        except ValueError as exc:
+            raise CgroupV2Error(
+                "io-controller-value-invalid",
+                "io.max returned an invalid value",
+            ) from exc
+        return selected
+
+    @staticmethod
+    def _io_weight_values(raw: str) -> tuple[int, dict[str, int]]:
+        default: int | None = None
+        selected: dict[str, int] = {}
+        try:
+            for line in raw.splitlines():
+                fields = line.split()
+                if (
+                    len(fields) != 2
+                    or not fields[1].isascii()
+                    or not fields[1].isdecimal()
+                ):
+                    raise ValueError
+                value = int(fields[1])
+                if not 1 <= value <= 10_000:
+                    raise ValueError
+                if fields[0] == "default":
+                    if default is not None:
+                        raise ValueError
+                    default = value
+                elif _DEVICE.fullmatch(fields[0]) and fields[0] not in selected:
+                    selected[fields[0]] = value
+                else:
+                    raise ValueError
+            if default is None:
+                raise ValueError
+        except ValueError as exc:
+            raise CgroupV2Error(
+                "io-controller-value-invalid",
+                "io.weight returned an invalid value",
+            ) from exc
+        return default, selected
+
+    def _configure_io_values(
+        self,
+        request: ResourceRequest,
+        leaf_path: Path,
+        devices: tuple[IoDevice, ...],
+    ) -> None:
+        resources = self._io_resources(request)
+        if not resources:
+            return
+        if not devices:
+            raise CgroupV2Error(
+                "io-device-missing",
+                "cgroup I/O controls have no recorded device",
+            )
+        limits = {
+            control: request.resources[name]
+            for control, name in resources.items()
+            if control in _IO_COUNTER_BY_LIMIT
+        }
+        if limits:
+            for device in devices:
+                value = " ".join(
+                    [
+                        device.number,
+                        *(
+                            f"{control}={limit}"
+                            for control, limit in sorted(limits.items())
+                        ),
+                    ]
+                )
+                self.system.write_file(leaf_path, "io.max", value)
+            observed = self._io_max_values(
+                self.system.read_file(leaf_path, "io.max")
+            )
+            for device in devices:
+                values = observed.get(device.number, {})
+                if any(
+                    values.get(control) != str(limit)
+                    for control, limit in limits.items()
+                ):
+                    raise CgroupV2Error(
+                        "controller-value-unverified",
+                        "cgroup I/O limit could not be verified",
+                    )
+        if weight_name := resources.get("weight"):
+            weight = request.resources[weight_name]
+            if not 1 <= weight <= 10_000:
+                raise CgroupV2Error(
+                    "io-weight-invalid",
+                    "cgroup I/O weight must be between 1 and 10000",
+                )
+            for device in devices:
+                self.system.write_file(
+                    leaf_path,
+                    "io.weight",
+                    f"{device.number} {weight}",
+                )
+            _default, observed_weights = self._io_weight_values(
+                self.system.read_file(leaf_path, "io.weight")
+            )
+            if any(
+                observed_weights.get(device.number) != weight
+                for device in devices
+            ):
+                raise CgroupV2Error(
+                    "controller-value-unverified",
+                    "cgroup I/O weight could not be verified",
                 )
 
     def _start_cpu_sample(self, request: ResourceRequest, leaf_path: Path) -> None:
@@ -1156,6 +1643,27 @@ class CgroupV2Backend:
             )
             self._flat_values(self.system.read_file(leaf_path, "memory.swap.events"))
             self._swap_peaks[request.run_id] = max(current, peak)
+
+    def _start_io_sample(
+        self,
+        request: ResourceRequest,
+        leaf_path: Path,
+        devices: tuple[IoDevice, ...],
+    ) -> None:
+        resources = self._io_resources(request)
+        measured = {
+            control: name
+            for control, name in resources.items()
+            if control in _IO_COUNTER_BY_LIMIT
+        }
+        if not measured:
+            return
+        counters = self._io_counter_totals(leaf_path, devices)
+        self._io_samples[request.run_id] = _IoSample(
+            at_ns=self.system.monotonic_ns(),
+            counters=counters,
+            peaks={name: 0 for name in set(measured.values())},
+        )
 
     def _require_available(self) -> None:
         result = self._probe()
@@ -1358,14 +1866,39 @@ class CgroupV2Backend:
             raise
         return owner_path, owner_identity
 
+    @staticmethod
+    def _io_device_record(devices: tuple[IoDevice, ...]) -> list[dict[str, str]]:
+        return [
+            {"device": device.number, "filesystem": device.filesystem}
+            for device in devices
+        ]
+
+    @staticmethod
+    def _io_devices_from_handle(handle: Mapping[str, object]) -> tuple[IoDevice, ...]:
+        if handle.get("version") == 1:
+            return ()
+        raw_devices = handle.get("io_devices")
+        assert isinstance(raw_devices, list)
+        return tuple(
+            IoDevice(str(raw["device"]), str(raw["filesystem"]))
+            for raw in raw_devices
+            if isinstance(raw, Mapping)
+        )
+
     def _validate_handle(self, raw: object) -> dict[str, object]:
-        if not isinstance(raw, Mapping) or set(raw) != _HANDLE_KEYS:
+        if not isinstance(raw, Mapping):
             raise CgroupOwnershipError("handle-invalid", "cgroup handle is invalid")
         selected = dict(raw)
+        version = selected.get("version")
+        expected_keys = _HANDLE_KEYS_V1 if version == 1 else _HANDLE_KEYS_V2
         if (
-            type(selected["version"]) is not int
-            or selected["version"] != 1
-            or selected["owner"] != self.owner_name
+            set(selected) != expected_keys
+            or type(version) is not int
+            or version not in {1, 2}
+        ):
+            raise CgroupOwnershipError("handle-invalid", "cgroup handle is invalid")
+        if (
+            selected["owner"] != self.owner_name
             or not isinstance(selected["owner_device"], int)
             or isinstance(selected["owner_device"], bool)
             or selected["owner_device"] < 0
@@ -1384,6 +1917,33 @@ class CgroupV2Backend:
             or not _TOKEN.fullmatch(selected["token"])
         ):
             raise CgroupOwnershipError("handle-invalid", "cgroup handle fields are invalid")
+        if version == 2:
+            raw_devices = selected.get("io_devices")
+            if (
+                not isinstance(raw_devices, list)
+                or not raw_devices
+                or any(
+                    not isinstance(device, Mapping)
+                    or set(device) != {"device", "filesystem"}
+                    or not isinstance(device.get("device"), str)
+                    or not _DEVICE.fullmatch(str(device.get("device")))
+                    or device.get("filesystem") not in _IO_SUPPORTED_FILESYSTEMS
+                    for device in raw_devices
+                )
+            ):
+                raise CgroupOwnershipError(
+                    "handle-invalid",
+                    "cgroup I/O handle devices are invalid",
+                )
+            devices = self._io_devices_from_handle(selected)
+            if (
+                len({device.number for device in devices}) != len(devices)
+                or tuple(sorted(devices, key=lambda device: device.number)) != devices
+            ):
+                raise CgroupOwnershipError(
+                    "handle-invalid",
+                    "cgroup I/O handle devices are ambiguous",
+                )
         return selected
 
     def _manifest(
@@ -1450,6 +2010,7 @@ class CgroupV2Backend:
     def prepare(self, request: ResourceRequest) -> Mapping[str, object]:
         self._validate_request(request)
         self._require_available()
+        io_devices = self._resolve_io_devices(request)
         self._prepare_metadata()
         owner_path, owner_identity = self._ensure_owner()
         try:
@@ -1460,6 +2021,11 @@ class CgroupV2Backend:
         manifest_path = self._manifest_path(request.run_id)
         if manifest_path.exists():
             _path, handle = self._read_manifest(request)
+            if self._io_devices_from_handle(handle) != io_devices:
+                raise CgroupOwnershipError(
+                    "io-device-changed",
+                    "configured cgroup I/O device changed during recovery",
+                )
             leaf_path = self._resolve(request, handle, allow_missing=True)
             if leaf_path is not None:
                 if self.system.populated(leaf_path):
@@ -1468,14 +2034,20 @@ class CgroupV2Backend:
                         "existing run cgroup is still populated",
                     )
                 try:
-                    self._configure_controller_values(request, leaf_path)
+                    self._configure_controller_values(
+                        request,
+                        leaf_path,
+                        io_devices=io_devices,
+                    )
                     self._start_cpu_sample(request, leaf_path)
                     self._start_memory_sample(request, leaf_path)
+                    self._start_io_sample(request, leaf_path, io_devices)
                 except BaseException:
                     self._cpu_samples.pop(request.run_id, None)
                     self._pids_peaks.pop(request.run_id, None)
                     self._memory_peaks.pop(request.run_id, None)
                     self._swap_peaks.pop(request.run_id, None)
+                    self._io_samples.pop(request.run_id, None)
                     self.system.remove_group(leaf_path)
                     manifest_path.unlink(missing_ok=True)
                     self._cleanup_owner()
@@ -1492,7 +2064,7 @@ class CgroupV2Backend:
             except FileExistsError:
                 continue
             handle = {
-                "version": 1,
+                "version": 2 if io_devices else 1,
                 "owner": self.owner_name,
                 "owner_device": owner_identity.device,
                 "owner_inode": owner_identity.inode,
@@ -1501,16 +2073,28 @@ class CgroupV2Backend:
                 "leaf_inode": leaf_identity.inode,
                 "token": token,
             }
+            if io_devices:
+                handle["io_devices"] = self._io_device_record(io_devices)
             try:
-                self._configure_controller_values(request, owner_path / leaf_name)
+                self._configure_controller_values(
+                    request,
+                    owner_path / leaf_name,
+                    io_devices=io_devices,
+                )
                 self._start_cpu_sample(request, owner_path / leaf_name)
                 self._start_memory_sample(request, owner_path / leaf_name)
+                self._start_io_sample(
+                    request,
+                    owner_path / leaf_name,
+                    io_devices,
+                )
                 self._write_json(manifest_path, self._manifest(request, handle))
             except BaseException:
                 self._cpu_samples.pop(request.run_id, None)
                 self._pids_peaks.pop(request.run_id, None)
                 self._memory_peaks.pop(request.run_id, None)
                 self._swap_peaks.pop(request.run_id, None)
+                self._io_samples.pop(request.run_id, None)
                 try:
                     self.system.remove_group(owner_path / leaf_name)
                 except OSError:
@@ -1527,6 +2111,13 @@ class CgroupV2Backend:
         worker_pid: int,
     ) -> None:
         self._validate_request(request)
+        expected_devices = self._resolve_io_devices(request)
+        handle = self._validate_handle(state)
+        if self._io_devices_from_handle(handle) != expected_devices:
+            raise CgroupOwnershipError(
+                "io-device-changed",
+                "configured cgroup I/O device changed before attach",
+            )
         leaf_path = self._resolve(request, state, allow_missing=False)
         assert leaf_path is not None
         self.system.attach(leaf_path, worker_pid)
@@ -1602,6 +2193,109 @@ class CgroupV2Backend:
         return selected
 
     @staticmethod
+    def _io_stat_values(raw: str) -> dict[str, dict[str, int]]:
+        selected: dict[str, dict[str, int]] = {}
+        try:
+            for line in raw.splitlines():
+                fields = line.split()
+                if len(fields) < 2 or not _DEVICE.fullmatch(fields[0]):
+                    raise ValueError
+                device = fields[0]
+                if device in selected:
+                    raise ValueError
+                values: dict[str, int] = {}
+                for field in fields[1:]:
+                    key, separator, value = field.partition("=")
+                    if (
+                        not separator
+                        or not _METRIC_KEY.fullmatch(key)
+                        or key in values
+                        or not value.isascii()
+                        or not value.isdecimal()
+                    ):
+                        raise ValueError
+                    values[key] = int(value)
+                if not _IO_STAT_REQUIRED <= set(values):
+                    raise ValueError
+                selected[device] = values
+        except ValueError as exc:
+            raise CgroupV2Error(
+                "io-stat-invalid",
+                "io.stat contains invalid device counters",
+            ) from exc
+        return selected
+
+    def _io_counter_totals(
+        self,
+        leaf_path: Path,
+        devices: tuple[IoDevice, ...],
+    ) -> dict[str, int]:
+        values = self._io_stat_values(self.system.read_file(leaf_path, "io.stat"))
+        return {
+            limit: sum(
+                values.get(device.number, {}).get(counter, 0)
+                for device in devices
+            )
+            for limit, counter in _IO_COUNTER_BY_LIMIT.items()
+        }
+
+    def _measure_io(
+        self,
+        request: ResourceRequest,
+        leaf_path: Path,
+        devices: tuple[IoDevice, ...],
+    ) -> dict[str, int]:
+        resources = self._io_resources(request)
+        measured = {
+            control: name
+            for control, name in resources.items()
+            if control in _IO_COUNTER_BY_LIMIT
+        }
+        if not measured:
+            return {}
+        counters = self._io_counter_totals(leaf_path, devices)
+        now_ns = self.system.monotonic_ns()
+        sample = self._io_samples.get(request.run_id)
+        if sample is None:
+            sample = _IoSample(
+                at_ns=now_ns,
+                counters=counters,
+                peaks={name: 0 for name in set(measured.values())},
+            )
+            self._io_samples[request.run_id] = sample
+            return dict(sample.peaks)
+        if now_ns < sample.at_ns or any(
+            counters[control] < sample.counters.get(control, 0)
+            for control in measured
+        ):
+            raise CgroupV2Error(
+                "io-stat-invalid",
+                "cgroup I/O counters moved backwards",
+            )
+        elapsed_ns = now_ns - sample.at_ns
+        if elapsed_ns > 0:
+            rates = {
+                control: (
+                    (counters[control] - sample.counters.get(control, 0))
+                    * 1_000_000_000
+                    + elapsed_ns
+                    - 1
+                )
+                // elapsed_ns
+                for control in measured
+            }
+            for name in set(measured.values()):
+                observed = max(
+                    rates[control]
+                    for control, resource_name in measured.items()
+                    if resource_name == name
+                )
+                sample.peaks[name] = max(sample.peaks.get(name, 0), observed)
+        sample.at_ns = now_ns
+        sample.counters = counters
+        return dict(sample.peaks)
+
+    @staticmethod
     def _single_value(raw: str, *, code: str) -> int:
         value = raw.strip()
         if not value.isascii() or not value.isdecimal():
@@ -1668,6 +2362,7 @@ class CgroupV2Backend:
         self,
         request: ResourceRequest,
         leaf_path: Path,
+        backend_handle: Mapping[str, object],
     ) -> ResourceMeasurement:
         resources = self._controller_resources(request)
         peak: dict[str, int] = {}
@@ -1854,6 +2549,10 @@ class CgroupV2Backend:
                         )
                     )
 
+        io_devices = self._io_devices_from_handle(backend_handle)
+        if self._io_resources(request):
+            peak.update(self._measure_io(request, leaf_path, io_devices))
+
         return ResourceMeasurement(peak, tuple(observations))
 
     def usage(
@@ -1862,11 +2561,12 @@ class CgroupV2Backend:
         state: Mapping[str, object],
     ) -> Mapping[str, int] | ResourceMeasurement:
         self._validate_request(request)
+        handle = self._validate_handle(state)
         leaf_path = self._resolve(request, state, allow_missing=False)
         assert leaf_path is not None
-        if not self._controller_resources(request):
+        if not self._controller_resources(request) and not self._io_resources(request):
             return {}
-        return self._measurement(request, leaf_path)
+        return self._measurement(request, leaf_path, handle)
 
     def _kill_and_wait(self, leaf_path: Path) -> None:
         if self.system.populated(leaf_path):
@@ -1886,11 +2586,12 @@ class CgroupV2Backend:
         state: Mapping[str, object],
     ) -> Mapping[str, int] | ResourceMeasurement:
         self._validate_request(request)
+        handle = self._validate_handle(state)
         leaf_path = self._resolve(request, state, allow_missing=True)
         if leaf_path is not None:
             self._kill_and_wait(leaf_path)
-            if self._controller_resources(request):
-                return self._measurement(request, leaf_path)
+            if self._controller_resources(request) or self._io_resources(request):
+                return self._measurement(request, leaf_path, handle)
         return {}
 
     def cancel(
@@ -1943,6 +2644,7 @@ class CgroupV2Backend:
         self._pids_peaks.pop(request.run_id, None)
         self._memory_peaks.pop(request.run_id, None)
         self._swap_peaks.pop(request.run_id, None)
+        self._io_samples.pop(request.run_id, None)
         self._tmpfs_report_path(request.run_id).unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
         self._cleanup_owner()

@@ -1,8 +1,8 @@
 """The one JSON file that configures a state directory's broker.
 
-Capacity, resource bindings, and the delegated cgroup root are operator contracts for
-one state directory, so they live beside that directory's spool rather than in ambient
-process environment.  This module owns only file location, JSON shape, and section
+Capacity, resource bindings, the delegated cgroup root, and block-I/O paths are operator
+contracts for one state directory, so they live beside that directory's spool rather than in
+ambient process environment.  This module owns only file location, JSON shape, and section
 types; capacity semantics stay in :mod:`agcoord.queue`, binding semantics in
 :mod:`agcoord.resources`, and delegation semantics in :mod:`agcoord.cgroup`.
 """
@@ -17,7 +17,7 @@ from typing import Any, Mapping
 
 
 CONFIG_FILENAME = "config.json"
-_CONFIG_KEYS = frozenset({"capacities", "bindings", "cgroup_root"})
+_CONFIG_KEYS = frozenset({"capacities", "bindings", "cgroup_root", "cgroup_io"})
 
 
 class BrokerConfigError(RuntimeError):
@@ -26,11 +26,12 @@ class BrokerConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class BrokerConfig:
-    """One state directory's unvalidated configuration sections."""
+    """One state directory's normalized configuration sections."""
 
     capacities: Mapping[str, Any] | None
     bindings: Mapping[str, Any] | None
     cgroup_root: str | None
+    cgroup_io: Mapping[str, Any] | None
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -44,7 +45,12 @@ def load_broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
     try:
         raw_text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return BrokerConfig(capacities=None, bindings=None, cgroup_root=None)
+        return BrokerConfig(
+            capacities=None,
+            bindings=None,
+            cgroup_root=None,
+            cgroup_io=None,
+        )
     except OSError as exc:
         raise BrokerConfigError(f"cannot read broker configuration {path}: {exc}") from exc
     return parse_broker_config(raw_text, source=path)
@@ -55,7 +61,7 @@ def parse_broker_config(
     *,
     source: str | os.PathLike[str] = CONFIG_FILENAME,
 ) -> BrokerConfig:
-    """Normalize one configuration document without interpreting its sections."""
+    """Normalize one configuration document and its strict host-path shape."""
     try:
         document = json.loads(raw_text)
     except json.JSONDecodeError as exc:
@@ -69,6 +75,7 @@ def parse_broker_config(
         )
     capacities = _section(document, "capacities", source=source)
     bindings = _section(document, "bindings", source=source)
+    cgroup_io = _cgroup_io_section(document, source=source)
     cgroup_root = document.get("cgroup_root")
     if cgroup_root is not None and (
         not isinstance(cgroup_root, str) or not cgroup_root.strip()
@@ -80,6 +87,7 @@ def parse_broker_config(
         capacities=capacities,
         bindings=bindings,
         cgroup_root=cgroup_root,
+        cgroup_io=cgroup_io,
     )
 
 
@@ -97,3 +105,42 @@ def _section(
             f"broker configuration {source} section {key!r} must be a JSON object"
         )
     return value
+
+
+def _cgroup_io_section(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> Mapping[str, Any] | None:
+    value = document.get("cgroup_io")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"paths"}:
+        raise BrokerConfigError(
+            f"broker configuration {source} cgroup_io must contain exactly paths"
+        )
+    paths = value["paths"]
+    if not isinstance(paths, list) or not paths:
+        raise BrokerConfigError(
+            f"broker configuration {source} cgroup_io paths must be a non-empty list"
+        )
+    selected: list[str] = []
+    identities: set[Path] = set()
+    for raw_path in paths:
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or "\0" in raw_path
+            or not Path(raw_path).is_absolute()
+        ):
+            raise BrokerConfigError(
+                f"broker configuration {source} cgroup_io paths must be absolute strings"
+            )
+        identity = Path(raw_path)
+        if identity in identities:
+            raise BrokerConfigError(
+                f"broker configuration {source} cgroup_io paths must be unique"
+            )
+        identities.add(identity)
+        selected.append(raw_path)
+    return {"paths": selected}

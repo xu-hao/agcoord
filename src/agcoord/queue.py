@@ -837,6 +837,7 @@ class CoordinatorBroker:
                 self.resource_backends[CGROUP_BACKEND] = CgroupV2Backend.from_config(
                     configuration.cgroup_root,
                     state_dir=self.paths.state_dir,
+                    cgroup_io=configuration.cgroup_io,
                 )
             if (
                 PROJECT_QUOTA_BACKEND in referenced_backends
