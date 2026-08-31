@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import re
 import shlex
 import threading
 from typing import Callable
@@ -36,6 +37,7 @@ _COMPACT_TABLE_WIDTH = 80
 _COMPACT_BRANCH_WIDTH = 10
 _COMPACT_LABEL_WIDTH = 11
 _WIDE_BRANCH_WIDTH = 27
+_LEGACY_PID_AGENT = re.compile(r"pid:[1-9][0-9]*\Z")
 
 
 def _flexible_widths(viewport_width: int) -> tuple[int, int]:
@@ -712,7 +714,11 @@ def build_app(
 
         def action_agent(self) -> None:
             agents = sorted(
-                {str(row["agent"]) for row in self._filter_rows()},
+                {
+                    str(row["agent"])
+                    for row in self._filter_rows()
+                    if not _LEGACY_PID_AGENT.fullmatch(str(row["agent"]))
+                },
                 key=str.casefold,
             )
             choices = [(agent, agent) for agent in agents]
