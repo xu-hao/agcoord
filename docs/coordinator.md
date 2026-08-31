@@ -829,13 +829,16 @@ without changing the current filter. Repository choices show their complete read
 local identity rather than the internal hashed lane key.
 
 Refresh preserves the selected run and both viewport offsets when that row still exists.
-At 80 columns the compact table is exactly `STATE · KIND · REPO · RUN · LABEL · AGE · DUR`
-and does not require horizontal navigation, including when a long queue also needs its vertical
-scrollbar. Adjacent columns retain a visible gutter; `LABEL` yields the small amount of width
-needed by that scrollbar instead of creating a horizontal one. A value wider than its compact
-cell ends in a visible ellipsis instead of running into the next column or disappearing at a
-hard edge. Above 80 columns, `LABEL` consumes the additional width and contracts back to the
-compact ellipsis form when the terminal narrows. `REPO`
+At 80 columns the compact table is exactly
+`STATE · KIND · REPO · RUN · BRANCH · LABEL · AGE · DUR` and does not require horizontal
+navigation, including when a long queue also needs its vertical scrollbar. Adjacent columns
+retain a visible gutter; `LABEL` yields the small amount of width needed by that scrollbar
+instead of creating a horizontal one. A value wider than its compact cell ends in a visible
+ellipsis instead of running into the next column or disappearing at a hard edge. Above 80
+columns, `BRANCH` consumes additional width up to its useful cap before `LABEL` expands into the
+remaining space; both contract back to compact ellipsis forms when the terminal narrows.
+`BRANCH` shows the exact captured Git branch rather than relying on the caller-supplied label.
+`REPO`
 shows the compact repository name derived from the credential-free normalized remote
 identity, or from the local Git identity when the checkout has no remote. The
 repository-filter header and persistent selection detail retain the complete readable value
