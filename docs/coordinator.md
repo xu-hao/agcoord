@@ -553,7 +553,10 @@ once, and never exposes a raw controller file or exception. Backend handles and 
 private spool state and never enter the public row;
 `blocked_by` identifies durable predecessors currently preventing admission. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
-operators. Missing times and kind-specific values are null rather than guessed. A queued
+operators. `agent` is the explicit `--agent` value, then `AGCOORD_AGENT`, or the stable value
+`unnamed` when neither is set; `caller_pid` remains the exact submitting process diagnostic and
+is never used as the fallback identity. Missing times and kind-specific values are null rather
+than guessed. A queued
 position is one-based; active and terminal rows use null.
 
 The durable status state machine is
@@ -827,6 +830,9 @@ choices, `Tab` moves into the scrollable result menu, and `Enter` applies the hi
 choice. `All repositories` or `All agents` clears that filter directly; `Esc` closes the picker
 without changing the current filter. Repository choices show their complete readable remote or
 local identity rather than the internal hashed lane key.
+The agent picker includes stable named identities and the single `unnamed` value. It omits
+legacy `pid:<positive integer>` fallback choices from older retained history; those rows remain
+visible in the unfiltered snapshot with their separate caller PID diagnostic intact.
 
 Refresh reconciles keyed rows in place, preserving the selected run and both viewport offsets
 when that row still exists without first painting a reset-to-top frame.
