@@ -34,7 +34,11 @@ work.
 The broker may exit after the queue is empty and idle. Durable history and logs remain, and a
 later client starts a replacement owner against the same spool. An unclean restart observes
 the recorded process identity before classifying a live job; it never reruns an already
-spawned command merely because the old broker disappeared.
+spawned command merely because the old broker disappeared. An exception that ends the broker
+does not request cancellation or signal live process groups: ownership is released so a
+replacement can adopt each worker whose recorded PID and process-start token still match.
+An explicit broker close remains a graceful cancellation boundary and reaps safe workers
+before releasing ownership.
 
 A land worker reports its final overall status durably while its row is still running. After
 an unclean owner loss, a replacement preserves the live worker's lane and resources, never
@@ -56,11 +60,13 @@ the entire machine:
   identifiable in migrated history but are not the normal public landing workflow.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
-directory. It holds at most `capacities`, `bindings`, `cgroup_root`, and `cgroup_io`; invalid
-JSON, a top-level value that is not an object, an unknown key, a section that is not an object,
-or an empty `cgroup_root` is refused when the broker loads its configuration. When present,
-`cgroup_io` contains exactly one nonempty `paths` list of unique absolute strings. An absent
-file is the default configuration, and capacity then defaults to `jobs=2`.
+directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`, and
+`database_timeout`; invalid JSON, a top-level value that is not an object, an unknown key, a
+section that is not an object, or an empty `cgroup_root` is refused when the broker loads its
+configuration. When present, `cgroup_io` contains exactly one nonempty `paths` list of unique
+absolute strings. `database_timeout` is a positive finite number of seconds no greater than
+`2147483.647` (SQLite's millisecond limit) and defaults to `10`. An absent file is the default
+configuration, and capacity then defaults to `jobs=2`.
 
 ```json
 {
@@ -68,14 +74,25 @@ file is the default configuration, and capacity then defaults to `jobs=2`.
   "bindings": {
     "cpu": {"kind": "cpu", "unit": "logical-cpu", "mode": "required", "backend": "cgroup-v2"}
   },
-  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service"
+  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service",
+  "database_timeout": 30
 }
 ```
 
 No environment variable configures capacity, bindings, the delegated cgroup root, or block-I/O
-paths; `AGCOORD_STATE_DIR` selects which state directory, and therefore which configuration
-file, a client and broker share. A live owner keeps the configuration with which it acquired
-the spool, so editing the file changes the next broker rather than the running one.
+paths or the database timeout; `AGCOORD_STATE_DIR` selects which state directory, and therefore
+which configuration file, a client and broker share. A live owner keeps the capacity and
+enforcement configuration with which it acquired the spool, so editing those sections changes
+the next broker rather than the running one. Each process retains the `database_timeout` it
+read when opening the spool; newly started clients or brokers can therefore use an updated lock
+wait without changing existing connections.
+
+Schema setup places every current-protocol spool in SQLite WAL journal mode, including an
+existing spool the next time a compatible client or broker opens it. Readers therefore do not
+block behind an ordinary writer. The configured timeout bounds each remaining lock wait;
+transient busy or locked results in the broker pump and idle health check are retried, and a
+contended best-effort activity heartbeat never changes an already successful public operation
+into an apparent failure.
 
 Every job implicitly requests `jobs=1`. Jobs add resources with repeatable
 `--resource NAME=UNITS` options. Names are generic machine capabilities such as `cpu`,
