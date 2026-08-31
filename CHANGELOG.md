@@ -5,6 +5,9 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add a pinned Rust workspace and reproducible static x86_64 Linux broker artifact with bundled
+  SQLite, exact protocol/build identity, checksums, provenance, dependency inventory, and
+  automated ELF and clean-copy reproducibility audits.
 - Define the target single-executable Rust broker architecture, including its trust boundary,
   durable protocol 5, native worker handshake, AppArmor transition, explicit protocol-4
   migration, Python client compatibility, and ordered implementation constraints.

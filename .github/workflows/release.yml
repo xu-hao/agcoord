@@ -8,6 +8,30 @@ permissions:
   contents: read
 
 jobs:
+  native-broker:
+    name: native-broker (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install static-link audit prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-musl
+      - run: cargo fetch --locked
+      - run: cargo fmt --all --check
+      - run: cargo clippy --frozen --workspace --all-targets -- -D warnings
+      - run: cargo test --frozen --workspace
+      - run: ./scripts/build-native-broker
+      - run: ./scripts/audit-native-broker dist/native/agcoord-broker-x86_64-unknown-linux-musl
+      - run: ./scripts/check-native-licenses dist/native/agcoord-broker-x86_64-unknown-linux-musl
+      - run: ./scripts/check-native-reproducible
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agcoord-broker-x86_64-unknown-linux-musl
+          path: dist/native/*
+
   verify:
     runs-on: ubuntu-latest
     steps:
