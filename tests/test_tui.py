@@ -17,7 +17,7 @@ from agcoord.queue import CoordinatorError, PROTOCOL
 textual = pytest.importorskip("textual", reason="the TUI dependency is not installed")
 
 from agcoord.tui import build_app  # noqa: E402
-from textual.widgets import Button, DataTable, Static  # noqa: E402
+from textual.widgets import Button, DataTable, Input, OptionList, Static  # noqa: E402
 
 
 def _row(
@@ -229,7 +229,15 @@ def _headers(table: DataTable) -> list[str]:
 
 
 def _screen_text(app) -> str:
-    return "\n".join(str(widget.content) for widget in app.screen.query(Static))
+    return "\n".join(_widget_text(widget) for widget in app.screen.query(Static))
+
+
+def _widget_text(widget: Static) -> str:
+    if hasattr(widget, "content"):
+        return str(widget.content)
+    # Textual 1 wraps the same rendered value instead of exposing `content`.
+    visual = widget.render()
+    return str(visual._renderable)
 
 
 @pytest.mark.asyncio
@@ -453,19 +461,122 @@ async def test_repository_table_and_filter_show_remote_and_local_names_not_inter
 
         await pilot.press("p")
         await pilot.pause()
+        options = app.screen.query_one("#filter-options", OptionList)
+        prompts = [
+            str(options.get_option_at_index(index).prompt)
+            for index in range(options.option_count)
+        ]
+        assert prompts == [
+            "All repositories",
+            "/srv/projects/widgets/.git",
+            "github.com/example/widgets",
+        ]
+        assert "repo-local-identity" not in prompts
+        assert "repo-remote-identity" not in prompts
+        for key in "/srv":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await pilot.pause()
         assert table.row_count == 1
         assert str(table.get_row_at(0)[2]) == "widgets"
-        subject = str(app.query_one("#gate-subject", Static).content)
+        subject = _widget_text(app.query_one("#gate-subject", Static))
         assert "/srv/projects/widgets/.git" in subject
         assert "repo-local-identity" not in subject
 
         await pilot.press("p")
         await pilot.pause()
+        for key in "github":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await pilot.pause()
         assert table.row_count == 1
         assert str(table.get_row_at(0)[2]) == "widgets"
-        subject = str(app.query_one("#gate-subject", Static).content)
+        subject = _widget_text(app.query_one("#gate-subject", Static))
         assert "github.com/example/widgets" in subject
         assert "repo-remote-identity" not in subject
+
+
+@pytest.mark.asyncio
+async def test_repository_and_agent_filters_use_searchable_cancelable_picker_menus():
+    snapshot = _snapshot()
+    rows = []
+    for index in range(50):
+        repository = f"github.com/example/project-{index:03d}"
+        agent = f"agent-{index:03d}"
+        if index == 37:
+            repository = "github.com/example/needle-project"
+            agent = "agent-special"
+        row = _row(
+            f"check-{index:03d}",
+            index + 1,
+            "running",
+            repository_id=f"repo-{index:03d}",
+            repository=repository,
+        )
+        row["agent"] = agent
+        rows.append(row)
+    snapshot["active"] = rows
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+
+        await pilot.press("p")
+        await pilot.pause()
+        query = app.screen.query_one("#filter-query", Input)
+        options = app.screen.query_one("#filter-options", OptionList)
+        assert query.has_focus
+        assert str(options.get_option_at_index(0).prompt) == "All repositories"
+        for key in "needle":
+            await pilot.press(key)
+        await pilot.pause()
+        assert options.option_count == 2
+        assert str(options.get_option_at_index(1).prompt) == (
+            "github.com/example/needle-project"
+        )
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _table(app).row_count == 1
+        assert "github.com/example/needle-project" in _screen_text(app)
+
+        await pilot.press("p")
+        await pilot.pause()
+        for key in "project-001":
+            await pilot.press(key)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert _table(app).row_count == 1
+        assert "github.com/example/needle-project" in _screen_text(app)
+
+        await pilot.press("a")
+        await pilot.pause()
+        query = app.screen.query_one("#filter-query", Input)
+        options = app.screen.query_one("#filter-options", OptionList)
+        assert query.has_focus
+        assert str(options.get_option_at_index(0).prompt) == "All agents"
+        for key in "special":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _table(app).row_count == 1
+        assert "agent-special" in _screen_text(app)
+
+        await pilot.press("p")
+        await pilot.pause()
+        await pilot.press("tab", "home", "enter")
+        await pilot.pause()
+        assert _table(app).row_count == 1
+        assert "all repos" in _screen_text(app)
+        assert "agent-special" in _screen_text(app)
+
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.press("tab", "home", "enter")
+        await pilot.pause()
+        assert _table(app).row_count == 50
+        assert "all agents" in _screen_text(app)
 
 
 @pytest.mark.asyncio
