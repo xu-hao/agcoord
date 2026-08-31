@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repository"
+
+mapfile -t inputs < <(
+    {
+        printf '%s\n' \
+            Cargo.lock Cargo.toml LICENSE native/THIRD_PARTY_LICENSES.tsv rust-toolchain.toml
+        find native/agcoord-broker -type f -print
+        find scripts -maxdepth 1 -type f -name '*native*' -print
+    } | LC_ALL=C sort -u
+)
+
+for path in "${inputs[@]}"; do
+    if [[ ! -f "$path" ]]; then
+        printf 'native source input is missing: %s\n' "$path" >&2
+        exit 1
+    fi
+done
+
+{
+    for path in "${inputs[@]}"; do
+        printf '%s\n' "$path"
+        sha256sum "$path" | awk '{print $1}'
+    done
+} | sha256sum | awk '{print $1}'

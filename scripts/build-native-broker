@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repository"
+
+target=${AGCOORD_NATIVE_TARGET:-x86_64-unknown-linux-musl}
+if [[ "$target" != x86_64-unknown-linux-musl ]]; then
+    printf 'unsupported native broker target: %s\n' "$target" >&2
+    exit 2
+fi
+
+rustc_version=$(rustc --version)
+cargo_version=$(cargo --version)
+if [[ "$rustc_version" != "rustc 1.94.1 "* ]] || [[ "$cargo_version" != "cargo 1.94.1 "* ]]; then
+    printf 'native broker builds require the pinned Rust 1.94.1 toolchain\n' >&2
+    exit 2
+fi
+
+musl_cc=${AGCOORD_MUSL_CC:-}
+if [[ -z "$musl_cc" ]]; then
+    musl_cc=$(command -v x86_64-linux-musl-gcc || true)
+fi
+if [[ -z "$musl_cc" ]]; then
+    musl_cc=$(command -v musl-gcc || true)
+fi
+if [[ -z "$musl_cc" ]] || ! command -v "$musl_cc" >/dev/null 2>&1; then
+    printf '%s\n' \
+        'musl-gcc is required; set AGCOORD_MUSL_CC only for an audited compatible compiler' >&2
+    exit 2
+fi
+musl_cc_path=$(command -v "$musl_cc")
+musl_cc_version=$("$musl_cc" --version | head -n 1)
+
+output_directory=${1:-"$repository/dist/native"}
+mkdir -p "$output_directory"
+output_directory=$(CDPATH= cd -- "$output_directory" && pwd)
+target_directory=${CARGO_TARGET_DIR:-"$repository/target/native-release"}
+source_id=$("$repository/scripts/native-source-id")
+build_id="sha256:$source_id"
+
+export AGCOORD_BUILD_ID=$build_id
+export CARGO_INCREMENTAL=0
+export CARGO_TARGET_DIR=$target_directory
+export CC_x86_64_unknown_linux_musl=$musl_cc
+export CFLAGS_x86_64_unknown_linux_musl="-ffile-prefix-map=$repository=/usr/src/agcoord"
+export LC_ALL=C
+export RUSTFLAGS="--remap-path-prefix=$repository=/usr/src/agcoord -C link-arg=-Wl,--build-id=sha1"
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
+export TZ=UTC
+
+cargo build --frozen --release --target "$target" --package agcoord-broker
+
+artifact_name="agcoord-broker-$target"
+artifact="$output_directory/$artifact_name"
+install -m 0755 "$target_directory/$target/release/agcoord-broker" "$artifact"
+install -m 0644 LICENSE "$output_directory/AGCOORD_LICENSE"
+install -m 0644 native/THIRD_PARTY_LICENSES.tsv "$output_directory/THIRD_PARTY_LICENSES.tsv"
+artifact_sha256=$(sha256sum "$artifact" | awk '{print $1}')
+printf '%s  %s\n' "$artifact_sha256" "$artifact_name" >"$artifact.sha256"
+
+identity=$(env -i "$artifact" identity --json)
+if ! jq -e \
+    --arg build "$build_id" \
+    --arg target "$target" \
+    '.build == $build and .target == $target and .protocol == 5 and .implementation == "rust-native"' \
+    <<<"$identity" >/dev/null; then
+    printf 'built artifact reported incompatible identity: %s\n' "$identity" >&2
+    exit 1
+fi
+
+jq -n \
+    --arg artifact "$artifact_name" \
+    --arg artifact_sha256 "$artifact_sha256" \
+    --arg build "$build_id" \
+    --arg c_compiler "$musl_cc_path" \
+    --arg c_compiler_version "$musl_cc_version" \
+    --arg cargo "$cargo_version" \
+    --argjson identity "$identity" \
+    --arg rustc "$rustc_version" \
+    --arg source_date_epoch "$SOURCE_DATE_EPOCH" \
+    --arg source_sha256 "$source_id" \
+    --arg target "$target" \
+    '{
+        artifact: $artifact,
+        artifact_sha256: $artifact_sha256,
+        build: $build,
+        c_compiler: $c_compiler,
+        c_compiler_version: $c_compiler_version,
+        cargo: $cargo,
+        identity: $identity,
+        license_inventory: "THIRD_PARTY_LICENSES.tsv",
+        protocol: 5,
+        rustc: $rustc,
+        source_date_epoch: $source_date_epoch,
+        source_sha256: $source_sha256,
+        target: $target
+    }' >"$artifact.provenance.json"
+
+printf '%s\n' "$artifact"

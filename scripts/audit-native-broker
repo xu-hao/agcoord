@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+artifact=${1:?usage: audit-native-broker ARTIFACT}
+artifact=$(readlink -f "$artifact")
+checksum="$artifact.sha256"
+provenance="$artifact.provenance.json"
+license_file="$(dirname -- "$artifact")/AGCOORD_LICENSE"
+license_inventory="$(dirname -- "$artifact")/THIRD_PARTY_LICENSES.tsv"
+
+if [[ ! -x "$artifact" ]] \
+    || [[ ! -f "$checksum" ]] \
+    || [[ ! -f "$provenance" ]] \
+    || [[ ! -f "$license_file" ]] \
+    || [[ ! -f "$license_inventory" ]]; then
+    printf 'artifact, checksum, provenance, or license inventory is missing: %s\n' "$artifact" >&2
+    exit 2
+fi
+
+(
+    cd "$(dirname -- "$artifact")"
+    sha256sum --check "$(basename -- "$checksum")"
+)
+
+file_description=$(file "$artifact")
+if [[ "$file_description" != *"statically linked"* ]] && [[ "$file_description" != *"static-pie linked"* ]]; then
+    printf 'artifact is not statically linked: %s\n' "$file_description" >&2
+    exit 1
+fi
+if readelf --program-headers "$artifact" | grep -q 'Requesting program interpreter'; then
+    printf 'artifact has a runtime ELF interpreter\n' >&2
+    exit 1
+fi
+if readelf --dynamic "$artifact" | grep -q '(NEEDED)'; then
+    printf 'artifact has a dynamic library dependency\n' >&2
+    exit 1
+fi
+
+identity=$(env -i "$artifact" identity --json)
+if ! jq -e \
+    '.name == "agcoord-broker"
+     and .protocol == 5
+     and .implementation == "rust-native"
+     and (.build | test("^sha256:[0-9a-f]{64}$"))
+     and .target == "x86_64-unknown-linux-musl"
+     and (.sqlite | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+    <<<"$identity" >/dev/null; then
+    printf 'artifact identity failed audit: %s\n' "$identity" >&2
+    exit 1
+fi
+
+artifact_name=$(basename -- "$artifact")
+artifact_sha256=$(sha256sum "$artifact" | awk '{print $1}')
+if ! jq -e \
+    --arg artifact "$artifact_name" \
+    --arg artifact_sha256 "$artifact_sha256" \
+    --argjson identity "$identity" \
+    '.artifact == $artifact
+     and .artifact_sha256 == $artifact_sha256
+     and .build == $identity.build
+     and .identity == $identity
+     and .license_inventory == "THIRD_PARTY_LICENSES.tsv"
+     and .protocol == $identity.protocol
+     and .source_sha256 == ($identity.build | sub("^sha256:"; ""))
+     and .target == $identity.target
+     and (.rustc | startswith("rustc 1.94.1 "))
+     and (.cargo | startswith("cargo 1.94.1 "))
+     and (.c_compiler | length > 0)
+     and (.c_compiler_version | length > 0)' \
+    "$provenance" >/dev/null; then
+    printf 'artifact provenance does not match its identity or checksum\n' >&2
+    exit 1
+fi
+
+printf 'static audit passed: %s\n' "$identity"

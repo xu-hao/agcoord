@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+
+for copy in a b; do
+    mkdir -p "$temporary/$copy/source"
+    tar \
+        --exclude=.git \
+        --exclude=.worktrees \
+        --exclude=dist \
+        --exclude=target \
+        -C "$repository" -cf - . \
+        | tar -C "$temporary/$copy/source" -xf -
+    (
+        cd "$temporary/$copy/source"
+        CARGO_TARGET_DIR="$temporary/$copy/target" \
+        SOURCE_DATE_EPOCH=0 \
+        ./scripts/build-native-broker "$temporary/$copy/dist"
+    )
+done
+
+artifact=agcoord-broker-x86_64-unknown-linux-musl
+if ! cmp -s "$temporary/a/dist/$artifact" "$temporary/b/dist/$artifact"; then
+    printf 'native broker rebuilds were not byte-for-byte identical\n' >&2
+    sha256sum "$temporary/a/dist/$artifact" "$temporary/b/dist/$artifact" >&2
+    exit 1
+fi
+
+"$repository/scripts/audit-native-broker" "$temporary/a/dist/$artifact"
+printf 'reproducible native artifact: '
+sha256sum "$temporary/a/dist/$artifact" | awk '{print $1}'
