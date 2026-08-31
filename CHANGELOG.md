@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Bring the Rust broker's persistent project-quota scratch backend to parity: resolve supported
+  ext4 and XFS mounts, allocate collision-safe project identities, apply and verify byte and inode
+  ceilings, isolate quota authority from workers, retain terminal usage, and recover or clean up
+  only identity-verified state across completion, cancellation, and broker crashes.
 - Bring the Rust broker's cgroup v2 backend to enforcement and receipt parity: verify delegated
   namespace rooting, own collision-safe leaves, apply and measure CPU, process, memory, pressure,
   swap, tmpfs, bandwidth, IOPS, and I/O-weight controls, retain terminal and recovery evidence,

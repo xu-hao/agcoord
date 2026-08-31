@@ -191,6 +191,7 @@ impl SetupCode {
 pub struct WorkerSetup {
     pub isolate_cgroup: bool,
     pub tmpfs: Option<TmpfsSetup>,
+    pub project_quota: Option<PathBuf>,
 }
 
 #[repr(C)]

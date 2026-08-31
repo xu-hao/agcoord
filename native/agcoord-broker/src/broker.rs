@@ -8,7 +8,7 @@ use crate::store::{
     map_database_error, now,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
-use crate::{cgroup, resources};
+use crate::{cgroup, project_quota, resources};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -32,6 +32,7 @@ pub struct ServeOptions {
     pub crash_after: Option<String>,
     pub worker_fault: Option<WorkerFault>,
     pub cgroup_fixture: Option<PathBuf>,
+    pub project_quota_fixture: Option<PathBuf>,
 }
 
 pub struct Broker {
@@ -42,6 +43,7 @@ pub struct Broker {
     worker_fault: Option<WorkerFault>,
     resource_capabilities: Value,
     cgroup_backend: Option<cgroup::CgroupBackend>,
+    project_quota_backend: Option<project_quota::ProjectQuotaBackend>,
     _owner: OwnerLock,
     children: HashMap<String, NativeWorker>,
     cancellation_started: HashMap<String, Instant>,
@@ -80,6 +82,14 @@ impl Broker {
                 "cgroup fixture requires at least one cgroup-v2 binding",
             ));
         }
+        if options.project_quota_fixture.is_some()
+            && !referenced_backends.contains(project_quota::PROJECT_QUOTA_BACKEND)
+        {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                "project quota fixture requires at least one project-quota binding",
+            ));
+        }
         let mut cgroup_backend = if referenced_backends.contains(resources::CGROUP_BACKEND) {
             Some(
                 cgroup::CgroupBackend::new(
@@ -97,9 +107,28 @@ impl Broker {
         } else {
             None
         };
+        let project_quota_backend =
+            if referenced_backends.contains(project_quota::PROJECT_QUOTA_BACKEND) {
+                Some(
+                    project_quota::ProjectQuotaBackend::new(
+                        &paths.state_dir,
+                        options.project_quota_fixture.as_deref(),
+                    )
+                    .map_err(|error| {
+                        AppError::new(
+                            "broker-config-invalid",
+                            format!("cannot initialize project-quota backend: {}", error.code),
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
         for backend in &referenced_backends {
             let capability = if backend == resources::CGROUP_BACKEND {
                 cgroup_backend.as_mut().unwrap().capability()
+            } else if backend == project_quota::PROJECT_QUOTA_BACKEND {
+                project_quota_backend.as_ref().unwrap().capability()
             } else {
                 resources::Capability::unavailable("backend-unavailable")
             };
@@ -122,6 +151,17 @@ impl Broker {
                 "stored cgroup recovery state has no configured native backend",
             ));
         }
+        if project_quota_backend.is_none()
+            && runs.iter().any(|run| {
+                run.resource_state
+                    .contains_key(project_quota::PROJECT_QUOTA_BACKEND)
+            })
+        {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "stored project quota recovery state has no configured native backend",
+            ));
+        }
         if let Some(backend) = &cgroup_backend {
             for run in &runs {
                 let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
@@ -135,6 +175,26 @@ impl Broker {
                             "broker-row-invalid",
                             format!(
                                 "run {} has invalid cgroup recovery state: {}",
+                                run.run_id, error.code
+                            ),
+                        )
+                    })?;
+            }
+        }
+        if let Some(backend) = &project_quota_backend {
+            for run in &runs {
+                let Some(record) = run.resource_state.get(project_quota::PROJECT_QUOTA_BACKEND)
+                else {
+                    continue;
+                };
+                let request = Self::project_quota_request(run, &record.resources)?;
+                backend
+                    .validate_recovery(&request, &record.handle)
+                    .map_err(|error| {
+                        AppError::new(
+                            "broker-row-invalid",
+                            format!(
+                                "run {} has invalid project quota recovery state: {}",
                                 run.run_id, error.code
                             ),
                         )
@@ -194,6 +254,7 @@ impl Broker {
             worker_fault: options.worker_fault,
             resource_capabilities,
             cgroup_backend,
+            project_quota_backend,
             _owner: owner,
             children: HashMap::new(),
             cancellation_started: HashMap::new(),
@@ -335,16 +396,18 @@ impl Broker {
 
     fn observe(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
         let cgroup_managed = run.resource_state.contains_key(resources::CGROUP_BACKEND);
-        if cgroup_managed {
+        let resource_managed = !run.resource_state.is_empty();
+        if resource_managed {
             let refreshed = load_run(connection, &run.run_id)?;
             self.capture_resource_usage(connection, &refreshed)?;
         }
         if self.children.contains_key(&run.run_id) {
             if run.cancel_requested {
-                if cgroup_managed {
+                if resource_managed {
                     let refreshed = load_run(connection, &run.run_id)?;
                     let _ = self.cancel_resources(connection, &refreshed)?;
-                } else {
+                }
+                if !cgroup_managed {
                     Self::signal_cancel(&mut self.cancellation_started, run)?;
                 }
             }
@@ -364,6 +427,9 @@ impl Broker {
                 self.finish_and_cleanup_resources(connection, &refreshed)?;
             } else if !self.drain_finished_process_group(run)? {
                 return Ok(());
+            } else if resource_managed {
+                let refreshed = load_run(connection, &run.run_id)?;
+                self.finish_and_cleanup_resources(connection, &refreshed)?;
             }
             let run = load_run(connection, &run.run_id)?;
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
@@ -386,10 +452,11 @@ impl Broker {
 
         if same_worker_process(run.worker_pid, run.worker_start_token.as_deref()) {
             if run.cancel_requested {
-                if cgroup_managed {
+                if resource_managed {
                     let refreshed = load_run(connection, &run.run_id)?;
                     let _ = self.cancel_resources(connection, &refreshed)?;
-                } else {
+                }
+                if !cgroup_managed {
                     Self::signal_cancel(&mut self.cancellation_started, run)?;
                 }
             }
@@ -402,6 +469,9 @@ impl Broker {
             && !self.drain_finished_process_group(run)?
         {
             return Ok(());
+        } else if resource_managed {
+            let refreshed = load_run(connection, &run.run_id)?;
+            self.finish_and_cleanup_resources(connection, &refreshed)?;
         }
         let run = load_run(connection, &run.run_id)?;
         let (status, exit_status, failure_reason) = if run.cancel_requested {
@@ -556,68 +626,159 @@ impl Broker {
         Ok(request)
     }
 
+    fn project_quota_request(
+        run: &RunRecord,
+        names: &[String],
+    ) -> Result<project_quota::QuotaRequest> {
+        let bindings = Self::run_bindings(run)?;
+        let selected_resources = names
+            .iter()
+            .map(|name| {
+                run.resources
+                    .get(name)
+                    .copied()
+                    .map(|units| (name.clone(), units))
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "broker-row-invalid",
+                            format!("run {} has inconsistent resource state", run.run_id),
+                        )
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let request = project_quota::QuotaRequest::new(&run.run_id, &selected_resources, &bindings);
+        if request.names() != names {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} has inconsistent project quota state", run.run_id),
+            ));
+        }
+        Ok(request)
+    }
+
+    fn quota_result<T>(
+        result: std::result::Result<T, project_quota::QuotaError>,
+    ) -> std::result::Result<T, cgroup::CgroupError> {
+        result.map_err(|error| cgroup::CgroupError { code: error.code })
+    }
+
     fn prepare_worker_setup(
         &mut self,
         connection: &Connection,
         run: &RunRecord,
     ) -> Result<(WorkerSetup, bool)> {
-        let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
-            return Ok((WorkerSetup::default(), true));
-        };
-        let request = Self::cgroup_request(run, &record.resources)?;
-        let backend = self.cgroup_backend.as_ref().ok_or_else(|| {
-            AppError::new("broker-config-invalid", "cgroup-v2 backend is unavailable")
-        })?;
-        let isolate_cgroup = !backend.fixture();
-        match backend.tmpfs_setup(&request, &record.handle) {
-            Ok(tmpfs) => Ok((
-                WorkerSetup {
-                    isolate_cgroup,
-                    tmpfs,
-                },
-                true,
-            )),
-            Err(error) => {
-                let bindings = Self::run_bindings(run)?;
-                let affected: Vec<_> = record
-                    .resources
-                    .iter()
-                    .filter(|name| matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes"))
-                    .cloned()
-                    .collect();
-                if affected.is_empty() {
-                    return Err(AppError::new(
-                        "broker-row-invalid",
-                        format!("run {} failed unrelated worker setup", run.run_id),
-                    ));
+        let mut setup = WorkerSetup::default();
+        if let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) {
+            let request = Self::cgroup_request(run, &record.resources)?;
+            let backend = self.cgroup_backend.as_ref().ok_or_else(|| {
+                AppError::new("broker-config-invalid", "cgroup-v2 backend is unavailable")
+            })?;
+            setup.isolate_cgroup = !backend.fixture();
+            match backend.tmpfs_setup(&request, &record.handle) {
+                Ok(tmpfs) => setup.tmpfs = tmpfs,
+                Err(error) => {
+                    let bindings = Self::run_bindings(run)?;
+                    let affected: Vec<_> = record
+                        .resources
+                        .iter()
+                        .filter(|name| matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes"))
+                        .cloned()
+                        .collect();
+                    if affected.is_empty() {
+                        return Err(AppError::new(
+                            "broker-row-invalid",
+                            format!("run {} failed unrelated worker setup", run.run_id),
+                        ));
+                    }
+                    let mut receipt = run.resource_receipt.clone();
+                    let required_failure = affected.iter().any(|name| bindings[name].required());
+                    for name in affected {
+                        Self::append_resource_event(
+                            connection,
+                            &mut receipt,
+                            resources::CGROUP_BACKEND,
+                            &name,
+                            "attach",
+                            if bindings[&name].required() {
+                                "failed"
+                            } else {
+                                "unapplied"
+                            },
+                            &error.code,
+                        )?;
+                    }
+                    Self::save_resource_records(connection, run, &receipt, &run.resource_state)?;
+                    if required_failure {
+                        return Ok((setup, false));
+                    }
                 }
-                let mut receipt = run.resource_receipt.clone();
-                let required_failure = affected.iter().any(|name| bindings[name].required());
-                for name in affected {
-                    Self::append_resource_event(
-                        connection,
-                        &mut receipt,
-                        resources::CGROUP_BACKEND,
-                        &name,
-                        "attach",
-                        if bindings[&name].required() {
-                            "failed"
-                        } else {
-                            "unapplied"
-                        },
-                        &error.code,
-                    )?;
-                }
-                Self::save_resource_records(connection, run, &receipt, &run.resource_state)?;
-                Ok((
-                    WorkerSetup {
-                        isolate_cgroup,
-                        tmpfs: None,
-                    },
-                    !required_failure,
-                ))
             }
         }
+
+        if let Some(record) = run.resource_state.get(project_quota::PROJECT_QUOTA_BACKEND) {
+            let request = Self::project_quota_request(run, &record.resources)?;
+            let result = self
+                .project_quota_backend
+                .as_ref()
+                .ok_or_else(|| project_quota::QuotaError {
+                    code: "backend-unavailable".to_owned(),
+                })
+                .and_then(|backend| backend.scratch_path(&request, &record.handle));
+            match result {
+                Ok(path) => setup.project_quota = Some(path),
+                Err(error) => {
+                    let bindings = Self::run_bindings(run)?;
+                    let required_failure = record
+                        .resources
+                        .iter()
+                        .any(|name| bindings[name].required());
+                    let mut receipt = run.resource_receipt.clone();
+                    for name in &record.resources {
+                        Self::append_resource_event(
+                            connection,
+                            &mut receipt,
+                            project_quota::PROJECT_QUOTA_BACKEND,
+                            name,
+                            "attach",
+                            if bindings[name].required() {
+                                "failed"
+                            } else {
+                                "unapplied"
+                            },
+                            &error.code,
+                        )?;
+                    }
+                    let mut selected = BTreeMap::from([(
+                        project_quota::PROJECT_QUOTA_BACKEND.to_owned(),
+                        record.clone(),
+                    )]);
+                    self.cleanup_resource_records(connection, run, &mut receipt, &mut selected)?;
+                    let cleanup_failed = Self::resource_event_exists(
+                        &receipt,
+                        project_quota::PROJECT_QUOTA_BACKEND,
+                        None,
+                        Some("cleanup"),
+                        "cleanup-failed",
+                    ) || receipt
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                event["backend"] == project_quota::PROJECT_QUOTA_BACKEND
+                                    && event["stage"] == "cleanup"
+                                    && event["status"] == "failed"
+                            })
+                        });
+                    let mut state = run.resource_state.clone();
+                    state.remove(project_quota::PROJECT_QUOTA_BACKEND);
+                    Self::save_resource_records(connection, run, &receipt, &state)?;
+                    if required_failure || cleanup_failed {
+                        return Ok((setup, false));
+                    }
+                }
+            }
+        }
+        Ok((setup, true))
     }
 
     fn record_worker_setup(
@@ -625,57 +786,103 @@ impl Broker {
         run: &RunRecord,
         setup: &WorkerSetup,
     ) -> Result<()> {
-        if setup.tmpfs.is_none() {
+        if setup.tmpfs.is_none() && setup.project_quota.is_none() {
             return Ok(());
         }
-        let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
+        let bindings = Self::run_bindings(run)?;
+        let mut receipt = run.resource_receipt.clone();
+        if let Some(tmpfs) = &setup.tmpfs {
+            let record = run
+                .resource_state
+                .get(resources::CGROUP_BACKEND)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} lost its cgroup resource state", run.run_id),
+                    )
+                })?;
+            let applied_names: Vec<_> = record
+                .resources
+                .iter()
+                .filter(|name| matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes"))
+                .cloned()
+                .collect();
+            let applied = receipt
+                .get_mut("applied")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} has an invalid resource receipt", run.run_id),
+                    )
+                })?;
+            for name in &applied_names {
+                let units = match bindings[name].kind.as_str() {
+                    "tmpfs" => tmpfs.size,
+                    "inodes" => tmpfs.inodes,
+                    _ => unreachable!(),
+                };
+                if units == 0 || units > run.resources[name] {
+                    return Err(AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} received an invalid tmpfs setup", run.run_id),
+                    ));
+                }
+                applied.insert(name.clone(), json!(units));
+            }
+            for name in applied_names {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    resources::CGROUP_BACKEND,
+                    &name,
+                    "attach",
+                    "applied",
+                    "tmpfs-mounted",
+                )?;
+            }
+        }
+        if setup.project_quota.is_some() {
+            let record = run
+                .resource_state
+                .get(project_quota::PROJECT_QUOTA_BACKEND)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!("run {} lost its project quota state", run.run_id),
+                    )
+                })?;
+            {
+                let applied = receipt
+                    .get_mut("applied")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "broker-row-invalid",
+                            format!("run {} has an invalid resource receipt", run.run_id),
+                        )
+                    })?;
+                for name in &record.resources {
+                    applied.insert(name.clone(), json!(run.resources[name]));
+                }
+            }
+            for name in &record.resources {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    project_quota::PROJECT_QUOTA_BACKEND,
+                    name,
+                    "attach",
+                    "applied",
+                    "quota-ready",
+                )?;
+            }
+        }
+        if setup.tmpfs.is_some() && setup.project_quota.is_some() {
             return Err(AppError::new(
                 "broker-row-invalid",
-                format!("run {} lost its cgroup resource state", run.run_id),
+                format!("run {} combined two scratch providers", run.run_id),
             ));
-        };
-        let bindings = Self::run_bindings(run)?;
-        let applied_names: Vec<_> = record
-            .resources
-            .iter()
-            .filter(|name| matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes"))
-            .cloned()
-            .collect();
-        let mut receipt = run.resource_receipt.clone();
-        let applied = receipt
-            .get_mut("applied")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                AppError::new(
-                    "broker-row-invalid",
-                    format!("run {} has an invalid resource receipt", run.run_id),
-                )
-            })?;
-        let tmpfs = setup.tmpfs.as_ref().unwrap();
-        for name in &applied_names {
-            let units = match bindings[name].kind.as_str() {
-                "tmpfs" => tmpfs.size,
-                "inodes" => tmpfs.inodes,
-                _ => unreachable!(),
-            };
-            if units == 0 || units > run.resources[name] {
-                return Err(AppError::new(
-                    "broker-row-invalid",
-                    format!("run {} received an invalid tmpfs setup", run.run_id),
-                ));
-            }
-            applied.insert(name.clone(), json!(units));
-        }
-        for name in applied_names {
-            Self::append_resource_event(
-                connection,
-                &mut receipt,
-                resources::CGROUP_BACKEND,
-                &name,
-                "attach",
-                "applied",
-                "tmpfs-mounted",
-            )?;
         }
         Self::save_resource_records(connection, run, &receipt, &run.resource_state)
     }
@@ -691,39 +898,58 @@ impl Broker {
                 format!("run {} returned an invalid setup refusal", run.run_id),
             ));
         }
-        let record = run
-            .resource_state
-            .get(resources::CGROUP_BACKEND)
-            .ok_or_else(|| {
-                AppError::new(
-                    "broker-row-invalid",
-                    format!("run {} lost its cgroup resource state", run.run_id),
-                )
-            })?;
         let bindings = Self::run_bindings(run)?;
         let namespace_failure = code.starts_with("namespace-")
             || matches!(
                 code,
                 "controller-files-exposed" | "tmpfs-namespace-required"
             );
-        let affected: Vec<_> = record
-            .resources
-            .iter()
-            .filter(|name| {
-                namespace_failure || matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes")
-            })
-            .cloned()
-            .collect();
-        if affected.is_empty() {
-            return Err(AppError::new(
-                "broker-row-invalid",
-                format!("run {} returned an unrelated setup refusal", run.run_id),
-            ));
-        }
         let mut receipt = run.resource_receipt.clone();
-        let required_failure =
-            namespace_failure || affected.iter().any(|name| bindings[name].required());
-        if namespace_failure {
+        let mut required_failure = false;
+        let mut recorded = false;
+        if let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) {
+            let affected: Vec<_> = record
+                .resources
+                .iter()
+                .filter(|name| {
+                    namespace_failure || matches!(bindings[*name].kind.as_str(), "tmpfs" | "inodes")
+                })
+                .cloned()
+                .collect();
+            required_failure |=
+                namespace_failure || affected.iter().any(|name| bindings[name].required());
+            if namespace_failure {
+                let applied = receipt
+                    .get_mut("applied")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "broker-row-invalid",
+                            format!("run {} has an invalid resource receipt", run.run_id),
+                        )
+                    })?;
+                for name in &affected {
+                    applied.remove(name);
+                }
+            }
+            for name in affected {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    resources::CGROUP_BACKEND,
+                    &name,
+                    "attach",
+                    if bindings[&name].required() {
+                        "failed"
+                    } else {
+                        "unapplied"
+                    },
+                    code,
+                )?;
+                recorded = true;
+            }
+        }
+        if let Some(record) = run.resource_state.get(project_quota::PROJECT_QUOTA_BACKEND) {
             let applied = receipt
                 .get_mut("applied")
                 .and_then(Value::as_object_mut)
@@ -733,24 +959,34 @@ impl Broker {
                         format!("run {} has an invalid resource receipt", run.run_id),
                     )
                 })?;
-            for name in &affected {
+            for name in &record.resources {
                 applied.remove(name);
             }
+            for name in &record.resources {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    project_quota::PROJECT_QUOTA_BACKEND,
+                    name,
+                    "attach",
+                    if bindings[name].required() {
+                        "failed"
+                    } else {
+                        "unapplied"
+                    },
+                    code,
+                )?;
+                recorded = true;
+            }
+            // Quota administration power must never be lent to user code, even when
+            // the capacity bindings themselves are best effort.
+            required_failure = true;
         }
-        for name in affected {
-            Self::append_resource_event(
-                connection,
-                &mut receipt,
-                resources::CGROUP_BACKEND,
-                &name,
-                "attach",
-                if bindings[&name].required() {
-                    "failed"
-                } else {
-                    "unapplied"
-                },
-                code,
-            )?;
+        if !recorded {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                format!("run {} returned an unrelated setup refusal", run.run_id),
+            ));
         }
         Self::save_resource_records(connection, run, &receipt, &run.resource_state)?;
         Ok(required_failure)
@@ -950,6 +1186,16 @@ impl Broker {
                         code: "backend-unavailable".to_owned(),
                     })
                     .and_then(|backend| backend.cleanup(&request, &record.handle))
+            } else if backend_name == project_quota::PROJECT_QUOTA_BACKEND {
+                let request = Self::project_quota_request(run, &record.resources)?;
+                self.project_quota_backend
+                    .as_mut()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| {
+                        Self::quota_result(backend.cleanup(&request, &record.handle))
+                    })
             } else {
                 Err(cgroup::CgroupError {
                     code: "backend-unavailable".to_owned(),
@@ -1031,6 +1277,14 @@ impl Broker {
                             code: "backend-unavailable".to_owned(),
                         })
                         .and_then(|backend| backend.prepare(&request))
+                } else if backend_name == project_quota::PROJECT_QUOTA_BACKEND {
+                    let request = Self::project_quota_request(run, &names)?;
+                    self.project_quota_backend
+                        .as_mut()
+                        .ok_or_else(|| cgroup::CgroupError {
+                            code: "backend-unavailable".to_owned(),
+                        })
+                        .and_then(|backend| Self::quota_result(backend.prepare(&request)))
                 } else {
                     Err(cgroup::CgroupError {
                         code: "backend-unavailable".to_owned(),
@@ -1113,6 +1367,16 @@ impl Broker {
                         code: "backend-unavailable".to_owned(),
                     })
                     .and_then(|backend| backend.cancel(&request, &record.handle))
+            } else if backend_name == project_quota::PROJECT_QUOTA_BACKEND {
+                let request = Self::project_quota_request(run, &record.resources)?;
+                self.project_quota_backend
+                    .as_ref()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| {
+                        Self::quota_result(backend.cancel(&request, &record.handle))
+                    })
             } else {
                 Err(cgroup::CgroupError {
                     code: "backend-unavailable".to_owned(),
@@ -1158,6 +1422,14 @@ impl Broker {
                         code: "backend-unavailable".to_owned(),
                     })
                     .and_then(|backend| backend.usage(&request, &record.handle))
+            } else if backend_name == project_quota::PROJECT_QUOTA_BACKEND {
+                let request = Self::project_quota_request(run, &record.resources)?;
+                self.project_quota_backend
+                    .as_ref()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| Self::quota_result(backend.usage(&request, &record.handle)))
             } else {
                 Err(cgroup::CgroupError {
                     code: "backend-unavailable".to_owned(),
@@ -1231,6 +1503,16 @@ impl Broker {
                         code: "backend-unavailable".to_owned(),
                     })
                     .and_then(|backend| backend.attach(&request, &record.handle, worker_pid))
+            } else if backend_name == project_quota::PROJECT_QUOTA_BACKEND {
+                let request = Self::project_quota_request(run, &record.resources)?;
+                self.project_quota_backend
+                    .as_ref()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| {
+                        Self::quota_result(backend.attach(&request, &record.handle, worker_pid))
+                    })
             } else {
                 Err(cgroup::CgroupError {
                     code: "backend-unavailable".to_owned(),
@@ -1241,7 +1523,10 @@ impl Broker {
                     let applied_names: Vec<_> = record
                         .resources
                         .iter()
-                        .filter(|name| !matches!(bindings[*name].kind.as_str(), "inodes" | "tmpfs"))
+                        .filter(|name| {
+                            backend_name != project_quota::PROJECT_QUOTA_BACKEND
+                                && !matches!(bindings[*name].kind.as_str(), "inodes" | "tmpfs")
+                        })
                         .cloned()
                         .collect();
                     {
@@ -1336,6 +1621,16 @@ impl Broker {
                         code: "backend-unavailable".to_owned(),
                     })
                     .and_then(|backend| backend.finish(&request, &record.handle))
+            } else if backend_name == project_quota::PROJECT_QUOTA_BACKEND {
+                let request = Self::project_quota_request(run, &record.resources)?;
+                self.project_quota_backend
+                    .as_ref()
+                    .ok_or_else(|| cgroup::CgroupError {
+                        code: "backend-unavailable".to_owned(),
+                    })
+                    .and_then(|backend| {
+                        Self::quota_result(backend.finish(&request, &record.handle))
+                    })
             } else {
                 Err(cgroup::CgroupError {
                     code: "backend-unavailable".to_owned(),
@@ -1465,6 +1760,12 @@ impl Broker {
             environment.insert("TMP".to_owned(), target.clone());
             environment.insert("TEMP".to_owned(), target);
         }
+        if let Some(project_quota) = &worker_setup.project_quota {
+            let target = project_quota.to_string_lossy().into_owned();
+            environment.insert("TMPDIR".to_owned(), target.clone());
+            environment.insert("TMP".to_owned(), target.clone());
+            environment.insert("TEMP".to_owned(), target);
+        }
         let mut pending = match PendingWorker::spawn(
             &current.command,
             &environment,
@@ -1555,12 +1856,29 @@ impl Broker {
             Ok(code) => code,
             Err(error) => {
                 let refreshed = load_run(&connection, &current.run_id)?;
+                let quota_failure = refreshed
+                    .resource_state
+                    .contains_key(project_quota::PROJECT_QUOTA_BACKEND);
+                if quota_failure {
+                    let _ = Self::record_worker_setup_failure(&connection, &refreshed, error.code)?;
+                }
+                let refreshed = load_run(&connection, &current.run_id)?;
                 let _ = self.cancel_resources(&connection, &refreshed)?;
                 drop(pending);
                 let refreshed = load_run(&connection, &current.run_id)?;
                 self.finish_and_cleanup_resources(&connection, &refreshed)?;
                 let refreshed = load_run(&connection, &current.run_id)?;
-                self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+                self.finish_run(
+                    &connection,
+                    &refreshed,
+                    "failed",
+                    125,
+                    Some(if quota_failure {
+                        "resource-enforcement-failed"
+                    } else {
+                        error.code
+                    }),
+                )?;
                 return Ok(());
             }
         };
