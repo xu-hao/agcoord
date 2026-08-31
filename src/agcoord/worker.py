@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from .resources import ResourceBackendError
 
 
 TMPFS_SETUP_ENV = "_AGCOORD_TMPFS_SETUP"
+PROJECT_QUOTA_DROP_ENV = "_AGCOORD_PROJECT_QUOTA_DROP_ADMIN"
 _TMPFS_SPEC_KEYS = frozenset(
     {"version", "target", "size", "inodes", "report", "token"}
 )
@@ -40,6 +42,86 @@ _TMPFS_REPORT_KEYS = frozenset(
 )
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_LINUX_CAPABILITY_VERSION_3 = 0x20080522
+_PR_SET_NO_NEW_PRIVS = 38
+_PR_CAP_AMBIENT = 47
+_PR_CAP_AMBIENT_CLEAR_ALL = 4
+
+
+class _CapabilityHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class _CapabilityData(ctypes.Structure):
+    _fields_ = [
+        ("effective", ctypes.c_uint32),
+        ("permitted", ctypes.c_uint32),
+        ("inheritable", ctypes.c_uint32),
+    ]
+
+
+def _drop_initial_admin_capabilities() -> None:
+    """Prevent a privileged quota broker from lending its powers to user code."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    capset = libc.capset
+    capset.argtypes = [
+        ctypes.POINTER(_CapabilityHeader),
+        ctypes.POINTER(_CapabilityData),
+    ]
+    capset.restype = ctypes.c_int
+    header = _CapabilityHeader(_LINUX_CAPABILITY_VERSION_3, 0)
+    data = (_CapabilityData * 2)()
+    operations = (
+        prctl(
+            _PR_CAP_AMBIENT,
+            _PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        ),
+        capset(ctypes.byref(header), data),
+        prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+    )
+    if any(result != 0 for result in operations):
+        error = ctypes.get_errno()
+        raise CgroupIsolationError(
+            "worker-privilege-drop-failed",
+            f"worker privileges could not be dropped: {os.strerror(error)}",
+        )
+    try:
+        status = Path("/proc/self/status").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise CgroupIsolationError(
+            "worker-privilege-drop-unverified",
+            "worker privilege state could not be verified",
+        ) from exc
+    expected_zero = ("CapEff", "CapPrm", "CapInh", "CapAmb")
+    values = {
+        name: value
+        for name, value in re.findall(
+            r"^(CapEff|CapPrm|CapInh|CapAmb|NoNewPrivs):\s*([0-9a-fA-F]+)$",
+            status,
+            re.MULTILINE,
+        )
+    }
+    if (
+        any(int(values.get(name, "1"), 16) != 0 for name in expected_zero)
+        or values.get("NoNewPrivs") != "1"
+    ):
+        raise CgroupIsolationError(
+            "worker-privilege-drop-unverified",
+            "worker retained administrative privilege",
+        )
 
 
 def _tmpfs_spec(raw: str) -> dict[str, object]:
@@ -237,6 +319,9 @@ def launcher_main() -> None:
     if not command:
         raise SystemExit(125)
     isolate_cgroup = os.environ.pop(CGROUP_ISOLATE_ENV, None) == "1"
+    drop_admin = os.environ.pop(PROJECT_QUOTA_DROP_ENV, None)
+    if drop_admin not in {None, "1"}:
+        raise SystemExit(125)
     raw_spec = os.environ.pop(TMPFS_SETUP_ENV, None)
     if not _read_release(release_fd):
         os.close(release_fd)
@@ -251,6 +336,8 @@ def launcher_main() -> None:
     try:
         if isolate_cgroup:
             isolate_current_cgroup()
+        if drop_admin == "1":
+            _drop_initial_admin_capabilities()
         if raw_spec is not None:
             if not isolate_cgroup:
                 raise CgroupIsolationError(
@@ -279,7 +366,8 @@ def launcher_main() -> None:
     except Exception:
         code = "tmpfs-setup-failed"
 
-    if raw_spec is not None:
+    setup_required = raw_spec is not None or drop_admin == "1"
+    if setup_required:
         try:
             _write_setup_result(setup_fd, code)
         except OSError:
@@ -291,22 +379,30 @@ def launcher_main() -> None:
         continue_run = _read_release(release_fd)
         os.close(release_fd)
         if code != "ok":
-            print(f"AGCoord: tmpfs setup unavailable: {code}", file=sys.stderr, flush=True)
-            if continue_run:
+            print(f"AGCoord: worker setup unavailable: {code}", file=sys.stderr, flush=True)
+            if continue_run and raw_spec is not None and drop_admin is None:
                 _exec(command, os.environ)
             raise SystemExit(125)
-        if not continue_run or spec is None:
+        if not continue_run:
             if mounted and spec is not None:
                 unmount_current_tmpfs(str(spec["target"]))
             raise SystemExit(125)
-        _run_tmpfs_command(
-            command,
-            os.environ,
-            spec,
-            baseline_inodes=baseline_inodes,
-        )
-        raise AssertionError("tmpfs supervisor returned")  # pragma: no cover
+        if spec is not None:
+            _run_tmpfs_command(
+                command,
+                os.environ,
+                spec,
+                baseline_inodes=baseline_inodes,
+            )
+            raise AssertionError("tmpfs supervisor returned")  # pragma: no cover
+        _exec(command, os.environ)
 
+    if code != "ok":
+        print(f"AGCoord: worker setup unavailable: {code}", file=sys.stderr, flush=True)
+        os.close(release_fd)
+        if setup_fd >= 0:
+            os.close(setup_fd)
+        raise SystemExit(125)
     os.close(release_fd)
     if setup_fd >= 0:
         os.close(setup_fd)

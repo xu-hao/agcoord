@@ -33,6 +33,9 @@ versioning; dates use ISO 8601.
 - Provision optional per-run tmpfs scratch with byte and inode ceilings, safe private mount
   options, memory-cgroup accounting, a pre-exec setup handshake, best-effort directory fallback,
   durable usage/limit evidence, and namespace-owned teardown across completion or cancellation.
+- Provision optional persistent scratch trees on explicitly project-quota-enabled ext4 or XFS
+  filesystems, with atomic byte/inode limits, collision-safe project identities, terminal usage,
+  capability-stripped workers, crash recovery, and required or best-effort fallback semantics.
 - Keep the default-width TUI free of an unnecessary horizontal scrollbar when long queues
   require vertical scrolling, without removing the visible gutters between columns.
 - Configure every broker from one `config.json` in its state directory, holding `capacities`,

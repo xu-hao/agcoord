@@ -133,9 +133,9 @@ the `capacities` section before a job can request it.
 Backends expose a sanitized capability probe and the idempotent lifecycle `prepare`, `attach`,
 `usage`, `finish`, `cancel`, and `cleanup`. Attach happens before user code can start; usage,
 finish, cancellation, and cleanup remain owned by the broker. The core currently defines this
-backend-neutral seam and a Linux cgroup v2 lifecycle backend. Controller values, provisioned
-persistent filesystems, process-specific adapters, and containers remain separate
-implementations; a configured backend is never silently treated as successful.
+backend-neutral seam, a Linux cgroup v2 lifecycle backend, and a Linux project-quota scratch
+backend. Controller values, provisioned filesystems, process-specific adapters, and executors
+remain separate implementations; a configured backend is never silently treated as successful.
 
 ### Delegated cgroup v2 lifecycle
 
@@ -264,19 +264,30 @@ The `cgroup-v2` backend can replace a run's ordinary private temporary directory
 tmpfs. Bind one `tmpfs/bytes` name and one `inodes/inodes` name to that backend, and bind a
 required `memory/bytes` name in the same run:
 
+```json
+{
+  "capacities": {
+    "jobs": 2,
+    "memory": 2147483648,
+    "tmpfs": 1073741824,
+    "tmpfs_inodes": 131072
+  },
+  "bindings": {
+    "memory": {
+      "kind": "memory", "unit": "bytes", "mode": "required", "backend": "cgroup-v2"
+    },
+    "tmpfs": {
+      "kind": "tmpfs", "unit": "bytes", "mode": "required", "backend": "cgroup-v2"
+    },
+    "tmpfs_inodes": {
+      "kind": "inodes", "unit": "inodes", "mode": "required", "backend": "cgroup-v2"
+    }
+  },
+  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service"
+}
+```
+
 ```bash
-export AGCOORD_CAPACITIES='jobs=2,memory=2147483648,tmpfs=1073741824,tmpfs_inodes=131072'
-export AGCOORD_RESOURCE_BINDINGS='{
-  "memory": {
-    "kind": "memory", "unit": "bytes", "mode": "required", "backend": "cgroup-v2"
-  },
-  "tmpfs": {
-    "kind": "tmpfs", "unit": "bytes", "mode": "required", "backend": "cgroup-v2"
-  },
-  "tmpfs_inodes": {
-    "kind": "inodes", "unit": "inodes", "mode": "required", "backend": "cgroup-v2"
-  }
-}'
 agc run --resource memory=1073741824 --resource tmpfs=536870912 \
   --resource tmpfs_inodes=65536 -- python -m pytest -q
 ```
@@ -320,14 +331,95 @@ temporary virtual memory rather than a general filesystem sandbox; the kernel's
 [tmpfs contract](https://www.kernel.org/doc/html/latest/filesystems/tmpfs.html) defines its size,
 inode, and swap behavior.
 
+### Persistent quota-backed scratch
+
+The optional `project-quota` backend provides disk-backed scratch with a hard storage-byte limit
+and a separate hard inode limit. Put the state directory on a dedicated local ext4 or XFS block
+filesystem that was prepared by an operator for project quotas and mounted read-write with
+`prjquota` (or XFS `pquota`). Then bind one `storage/bytes` name and one `inodes/inodes` name to
+the backend with the same enforcement mode:
+
+```json
+{
+  "capacities": {
+    "jobs": 2,
+    "disk": 107374182400,
+    "disk_inodes": 2000000
+  },
+  "bindings": {
+    "disk": {
+      "kind": "storage",
+      "unit": "bytes",
+      "mode": "required",
+      "backend": "project-quota"
+    },
+    "disk_inodes": {
+      "kind": "inodes",
+      "unit": "inodes",
+      "mode": "required",
+      "backend": "project-quota"
+    }
+  }
+}
+```
+
+```bash
+agc run --resource disk=8589934592 --resource disk_inodes=200000 \
+  -- python -m pytest -q
+```
+
+The two resources form one atomic policy and cannot be requested separately or with different
+modes. Byte limits must be exact multiples of 1024 bytes, the common granularity used by this
+backend across ext4 and XFS. The inode ceiling includes the scratch root itself, and filesystem
+directory blocks and other quota-accounted data consume part of the byte ceiling. A run cannot
+combine persistent quota scratch with bounded tmpfs scratch because both would claim `TMPDIR`.
+
+The backend supports only a directly identifiable ext4 or XFS local block device. It refuses
+overlay, network, read-only, quota-disabled, invisible, and device-mapper-backed mounts rather
+than inferring that a directory is constrained. It never enables a filesystem feature, changes a
+mount, or edits `/etc/projects` or `/etc/projid`. Quota administration and project-inherit
+attributes require `CAP_SYS_ADMIN` in the initial user namespace; provision that capability only
+for the explicitly managed broker. Before user code starts, the worker clears its effective,
+permitted, inheritable, and ambient capabilities and enables `no_new_privs`, so the broker's
+quota authority is not lent to the command. It reports that verified state to the broker and
+waits for a second durable release before executing the command.
+
+Preparation creates an owned `0700` tree below `<state_dir>/project-quota/runs`, applies a fresh
+high-range project ID and project inheritance, installs both hard limits, reads them back, and
+only then exposes the path through `TMPDIR`, `TMP`, and `TEMP`. Allocation takes a mount-global
+advisory lock, verifies that the selected quota record has no limits or usage, and records the
+path device/inode, project ID, mount identity, token, and request in a private durable manifest.
+Concurrent coordinators using this backend therefore cannot knowingly reuse a live AGCoord
+project identity on the same mount.
+
+Receipts retain the greatest sampled kernel quota usage for bytes and inodes, including the final
+sample after the worker tree is gone, and record `storage-byte-limit-hit` or
+`storage-inode-limit-hit` when usage reaches a hard ceiling. Cancellation uses the same terminal
+sample. Cleanup validates the manifest and exact path identity, removes only that owned tree,
+waits for its quota usage to reach zero, clears the limits, verifies the project ID is reusable,
+and then removes the manifest. A replacement broker adopts an incomplete or live allocation from
+the manifest; a changed path, mount, attributes, limits, or token is refused rather than removed.
+
+Required probe or setup failures stop before user code with
+`failure_reason=resource-enforcement-failed`. When both bindings are `best-effort`, an unavailable
+backend or pre-spawn setup failure is recorded as unapplied and the command uses AGCoord's normal
+private disk directory. A worker that cannot prove it dropped the broker's capabilities is never
+released, regardless of quota mode. The checkout, bind mounts, and every path outside `TMPDIR`
+remain outside the quota. Project quotas are resource accounting, not a confidentiality boundary:
+processes of the same account may be able to name sibling paths. The kernel [`quotactl(2)`
+contract](https://man7.org/linux/man-pages/man2/quotactl.2.html), [ext4 project-quota
+options](https://www.man7.org/linux/man-pages/man5/ext4.5.html), and [XFS project-tree
+semantics](https://www.man7.org/linux/man-pages/man8/xfs_quota.8.html) define the underlying
+enforcement.
+
 Normal finish and cancellation use `cgroup.kill`, wait for `cgroup.events` to report
 `populated 0`, and remove only the identity recorded for that run. A replacement broker adopts a
 still-live durable handle without creating a second leaf. Missing partial state is cleaned
 idempotently, while a changed device/inode, mismatched token, unrecorded collision, or populated
 stale leaf is refused and never removed as if it were owned.
 
-This backend does not yet translate persistent-storage or I/O units, and its optional private
-tmpfs is scratch rather than a credential, network, or general security sandbox.
+The cgroup backend does not yet translate I/O units. Optional tmpfs and project-quota trees are
+scratch resource controls rather than credential, network, or general security sandboxes.
 
 Fairness applies across lane barriers and capacity: a compatible check can overlap work in
 another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an
