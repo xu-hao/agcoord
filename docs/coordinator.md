@@ -162,8 +162,9 @@ remain separate implementations; a configured backend is never silently treated 
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
 are delegated, aggregate CPU bandwidth, task counts, memory, swap, and explicitly mapped block
-I/O. Configure one exclusive delegated root and explicitly bind the capacity names before the
-broker starts:
+I/O. The future single-executable implementation follows the separate
+[native broker architecture and security contract](native_broker.md). Configure one exclusive
+delegated root and explicitly bind the capacity names before the broker starts:
 
 ```json
 {
