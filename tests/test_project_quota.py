@@ -794,9 +794,12 @@ def test_changed_quota_tree_identity_is_refused_without_removing_replacement(
     request = _request("check-project-quota-reused")
     handle = backend.prepare(request)
     target = backend.scratch_path(request, handle)
+    replacement = target.with_name(f"{target.name}-replacement")
+    replacement.mkdir(mode=0o700)
+    replacement_inode = replacement.stat().st_ino
+    assert replacement_inode != target.stat().st_ino
     target.rmdir()
-    target.mkdir(mode=0o700)
-    replacement_inode = target.stat().st_ino
+    replacement.rename(target)
 
     with pytest.raises(ProjectQuotaError) as raised:
         backend.cleanup(request, handle)
