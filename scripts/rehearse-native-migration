@@ -452,7 +452,7 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         receipt = rehearse(
-            arguments.python.expanduser().resolve(),
+            Path(os.path.abspath(arguments.python.expanduser())),
             arguments.agc.expanduser().resolve(),
             arguments.broker.expanduser().resolve(),
         )
