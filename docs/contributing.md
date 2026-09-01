@@ -97,6 +97,21 @@ independently of publication. It is a barrier for its repository, not an undecla
 machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside
 an admitted AGCoord job; nested submissions are rejected to prevent self-deadlock.
 
+The canonical native release check is the versioned
+[cross-implementation conformance gate](conformance.md):
+
+```bash
+agc land <request> \
+  --label "conformance gate and publish" \
+  --resource cpu=4 \
+  -- ./scripts/check-conformance
+```
+
+The checker validates collected Python/native selectors before running both complete suites.
+It uses four Rust build jobs, then one pytest worker and one Rust test thread so process-lifecycle
+tests retain exclusive ownership of every broker and child they create. Do not replace it in a
+native release path with an unversioned `cargo test` invocation.
+
 In a fresh AGCoord development environment, direct package installation and focused
 tests are allowed only long enough to make `agc run` available. Bootstrap is never
 an exception for a direct full gate or publication.
