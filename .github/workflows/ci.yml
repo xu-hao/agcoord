@@ -153,6 +153,7 @@ jobs:
             cat native-host-receipt.json >&2
             run_id=$(jq -er '.run_id' native-host-receipt.json)
             agc log "$run_id" >&2 || true
+            sudo journalctl --dmesg --no-pager >&2 || true
             exit 1
           fi
           jq -e '
