@@ -70,6 +70,22 @@ def test_native_apparmor_policy_compiles_with_all_three_domains():
     }
 
 
+def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
+    parser = shutil.which("apparmor_parser")
+    if parser is None:
+        pytest.skip("apparmor_parser is unavailable")
+    completed = subprocess.run(
+        [parser, "--skip-kernel-load", "--skip-cache", "--debug", str(PROFILE)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    diagnostics = completed.stdout + completed.stderr
+    assert diagnostics.count("Mode: enforce") == 3, diagnostics
+    assert "Mode: default_allow" not in diagnostics
+
+
 def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 

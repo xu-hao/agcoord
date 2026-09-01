@@ -365,7 +365,8 @@ arbitrary setup-domain exec path. The authenticated worker exec transition moves
 commands into `agcoord-admitted`; an admitted command that invokes the broker transitions to
 `agcoord-broker-client` instead of regaining setup permission. Both restricted domains deny
 user-namespace creation and changing back to the setup domain, and arbitrary interpreters
-inherit the admitted restriction. A failure to verify the loaded setup profile, service cgroup,
+inherit the admitted restriction. Every domain is compiled in explicit enforce mode rather than
+Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded setup profile, service cgroup,
 global restriction, or backend namespace probe makes required work unavailable.
 The complete package and transition contract is in [the native host runbook](native_host.md).
 

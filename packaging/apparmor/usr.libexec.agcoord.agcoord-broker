@@ -1,9 +1,21 @@
 abi <abi/4.0>,
 include <tunables/global>
 
-# The fixed broker process and its pre-exec launcher inherit this domain. It grants only the
-# user-namespace operation that Ubuntu's global restriction removes from unconfined processes.
-profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(default_allow,attach_disconnected,mediate_deleted) {
+# Keep ordinary host operations broad while using a real enforcing domain. Ubuntu 24.04's
+# AppArmor parser implements default_allow as an unconfined profile, which would neither report
+# enforce mode nor apply the explicit denials below.
+profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
   allow userns create,
   deny ptrace,
 
@@ -15,7 +27,19 @@ profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(default_allow,
 }
 
 # Calls from admitted work transition here instead of reattaching to the setup profile.
-profile agcoord-broker-client flags=(default_allow,attach_disconnected,mediate_deleted) {
+profile agcoord-broker-client flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow ptrace,
   deny userns,
   deny change_profile -> agcoord-broker,
   deny /proc/@{pid}/attr/{current,exec} w,
@@ -26,7 +50,19 @@ profile agcoord-broker-client flags=(default_allow,attach_disconnected,mediate_d
   /** px -> agcoord-admitted,
 }
 
-profile agcoord-admitted flags=(default_allow,attach_disconnected,mediate_deleted) {
+profile agcoord-admitted flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow ptrace,
   deny userns,
   deny change_profile -> agcoord-broker,
   deny /proc/@{pid}/attr/{current,exec} w,
