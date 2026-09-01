@@ -12,6 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "packaging/systemd/agcoord-broker.service"
 PROFILE = ROOT / "packaging/apparmor/usr.libexec.agcoord.agcoord-broker"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 
 
 def test_native_user_service_passes_systemd_verification(tmp_path: Path):
@@ -67,3 +68,12 @@ def test_native_apparmor_policy_compiles_with_all_three_domains():
         "agcoord-broker",
         "agcoord-broker-client",
     }
+
+
+def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "timeout --signal=KILL 2s agc list" in workflow
+    assert "cat native-host-client-error.txt" in workflow
+    assert "systemctl --user --no-pager status agcoord-broker.service" in workflow
+    assert "journalctl --user --unit agcoord-broker.service --no-pager" in workflow

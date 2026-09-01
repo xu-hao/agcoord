@@ -126,16 +126,23 @@ jobs:
           sudo dist/host/install-native-host activate "$HOME/.local/state/agcoord"
           systemctl --user daemon-reload
           systemctl --user start agcoord-broker.service
+          : >native-host-client-error.txt
+          ready=0
           for attempt in {1..50}; do
-            if agc list >/dev/null 2>&1; then
+            if timeout --signal=KILL 2s agc list \
+              >/dev/null 2>native-host-client-error.txt; then
+              ready=1
               break
-            fi
-            if ((attempt == 50)); then
-              printf 'native broker was not ready after %s attempts\n' "$attempt" >&2
-              exit 1
             fi
             sleep 0.2
           done
+          if ((ready == 0)); then
+            printf 'native broker was not ready after %s bounded attempts\n' "$attempt" >&2
+            cat native-host-client-error.txt >&2
+            systemctl --user --no-pager status agcoord-broker.service >&2 || true
+            journalctl --user --unit agcoord-broker.service --no-pager >&2 || true
+            exit 1
+          fi
           systemctl --user --no-pager status agcoord-broker.service
           agc list
       - name: Retain the real enforced CPU receipt
