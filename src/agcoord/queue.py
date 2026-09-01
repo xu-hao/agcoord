@@ -35,6 +35,12 @@ from .cgroup import (
     CgroupV2Backend,
 )
 from .config import BrokerConfig, BrokerConfigError, load_broker_config
+from .native_client import (
+    NATIVE_IMPLEMENTATION,
+    NATIVE_PROTOCOL,
+    NativeBrokerCommand,
+    NativeClientError,
+)
 from .project_quota import PROJECT_QUOTA_BACKEND, ProjectQuotaBackend
 from .resources import (
     ResourceBackend,
@@ -444,6 +450,32 @@ def broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
         raise CoordinatorError(str(exc)) from exc
 
 
+def _spool_protocol(paths: CoordinatorPaths) -> int | None:
+    """Read an existing idle spool generation without creating or migrating it."""
+    if not paths.database.exists():
+        return None
+    try:
+        uri = paths.database.resolve().as_uri() + "?mode=ro"
+        with sqlite3.connect(uri, uri=True) as database:
+            row = database.execute(
+                "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise CoordinatorError(
+            f"cannot inspect gate queue protocol in {paths.database}: {exc}"
+        ) from exc
+    if row is None:
+        raise CoordinatorError(
+            f"gate queue database {paths.database} has no protocol metadata"
+        )
+    try:
+        return int(row[0])
+    except (TypeError, ValueError) as exc:
+        raise CoordinatorError(
+            f"gate queue database {paths.database} has invalid protocol metadata"
+        ) from exc
+
+
 def _validate_resources(
     resources: Mapping[str, int] | None,
     capacities: Mapping[str, int],
@@ -461,8 +493,8 @@ def _validate_resources(
     return selected
 
 
-def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
-    """Read the live flock owner, ignoring stale bytes left after a dead broker."""
+def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
+    """Read either supported live flock owner, ignoring bytes from a dead broker."""
     try:
         descriptor = os.open(paths.owner_lock, os.O_RDWR)
     except FileNotFoundError:
@@ -478,7 +510,7 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             try:
                 raw = os.pread(
                     descriptor,
-                    MAX_OWNER_METADATA_BYTES,
+                    MAX_OWNER_METADATA_BYTES + 1,
                     0,
                 ).decode("utf-8", errors="strict")
             except (OSError, UnicodeDecodeError) as exc:
@@ -491,6 +523,10 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             return None
     finally:
         os.close(descriptor)
+    if len(raw.encode("utf-8")) > MAX_OWNER_METADATA_BYTES:
+        raise _OwnerMetadataError(
+            f"live gate broker ownership metadata is oversized in {paths.owner_lock}"
+        )
     fields: dict[str, str] = {}
     for line in raw.splitlines():
         key, separator, value = line.partition("=")
@@ -511,11 +547,6 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
         raise _OwnerMetadataError(
             f"live gate broker wrote incomplete ownership metadata in {paths.owner_lock}"
         ) from exc
-    if protocol != PROTOCOL:
-        raise CoordinatorError(
-            f"gate coordinator protocol mismatch: broker has {protocol}, "
-            f"client needs {PROTOCOL}"
-        )
     try:
         bindings = validate_resource_bindings(
             json.loads(fields["resource_bindings"])
@@ -534,13 +565,49 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
         ) from exc
     if owner_pid <= 0:
         raise _OwnerMetadataError("live gate broker wrote invalid numeric metadata")
-    return {
+    owner: dict[str, Any] = {
         "pid": owner_pid,
         "protocol": protocol,
         "capacities": capacities,
         "resource_bindings": bindings,
         "resource_capabilities": capabilities,
     }
+    if protocol == NATIVE_PROTOCOL:
+        try:
+            implementation = fields["implementation"]
+            version = fields["version"]
+            build = fields["build"]
+        except KeyError as exc:
+            raise _OwnerMetadataError(
+                f"live native broker wrote incomplete identity metadata in "
+                f"{paths.owner_lock}"
+            ) from exc
+        if (
+            implementation != NATIVE_IMPLEMENTATION
+            or not version
+            or not build
+            or any("\0" in value or "\n" in value for value in (version, build))
+        ):
+            raise _OwnerMetadataError(
+                f"live native broker wrote invalid identity metadata in {paths.owner_lock}"
+            )
+        owner.update(
+            implementation=implementation,
+            version=version,
+            build=build,
+        )
+    return owner
+
+
+def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
+    """Read only the legacy protocol-4 owner used by the Python reference broker."""
+    owner = _read_broker_owner(paths)
+    if owner is not None and owner["protocol"] != PROTOCOL:
+        raise CoordinatorError(
+            f"gate coordinator protocol mismatch: broker has {owner['protocol']}, "
+            f"Python reference broker needs {PROTOCOL}"
+        )
+    return owner
 
 
 def _create_child_cpu_lease_table(db: sqlite3.Connection) -> None:
@@ -3896,6 +3963,7 @@ class CoordinatorClient:
         self.autostart = autostart
         self.connect_timeout = connect_timeout
         self._catalogue_instance: CoordinatorBroker | None = None
+        self._native_command_instance: NativeBrokerCommand | None = None
 
     def _catalogue(self) -> CoordinatorBroker:
         if self._catalogue_instance is None:
@@ -3905,12 +3973,64 @@ class CoordinatorClient:
             )
         return self._catalogue_instance
 
+    def _native_command(self) -> NativeBrokerCommand:
+        if self._native_command_instance is None:
+            config = broker_config(self.paths.state_dir)
+            try:
+                self._native_command_instance = NativeBrokerCommand.select(
+                    config.native_broker
+                )
+            except NativeClientError as exc:
+                raise CoordinatorError(str(exc)) from exc
+        return self._native_command_instance
+
+    def _validate_native_owner(self, owner: Mapping[str, Any]) -> None:
+        selected = self._native_command().identity
+        if owner.get("implementation") != NATIVE_IMPLEMENTATION:
+            raise CoordinatorError(
+                "live protocol-5 owner is not the native Rust broker"
+            )
+        mismatches = [
+            name
+            for name, expected in (
+                ("version", selected.version),
+                ("build", selected.build),
+            )
+            if owner.get(name) != expected
+        ]
+        if mismatches:
+            raise CoordinatorError(
+                "live native broker does not match the selected executable: "
+                + ", ".join(mismatches)
+                + "; wait for the current owner to stop or restore its exact binary"
+            )
+
+    @staticmethod
+    def _public_owner(owner: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "protocol": owner["protocol"],
+            "broker_pid": owner["pid"],
+            "capacities": owner["capacities"],
+            "resource_bindings": owner["resource_bindings"],
+            "resource_capabilities": owner["resource_capabilities"],
+        }
+
+    def _native_invoke(self, command: str, arguments: Sequence[str] = ()) -> Any:
+        try:
+            return self._native_command().invoke(
+                command,
+                state_dir=self.paths.state_dir,
+                arguments=arguments,
+            )
+        except NativeClientError as exc:
+            raise CoordinatorError(str(exc)) from exc
+
     def _ensure_broker(self) -> dict[str, Any]:
         deadline = time.monotonic() + self.connect_timeout
         last_metadata_error: _OwnerMetadataError | None = None
         while True:
             try:
-                owner = _broker_owner(self.paths)
+                owner = _read_broker_owner(self.paths)
                 break
             except _OwnerMetadataError as exc:
                 # flock ownership becomes visible a few instructions before its metadata
@@ -3921,13 +4041,20 @@ class CoordinatorClient:
                     raise CoordinatorError(str(exc)) from exc
                 time.sleep(0.01)
         if owner is not None:
-            return {
-                "protocol": owner["protocol"],
-                "broker_pid": owner["pid"],
-                "capacities": owner["capacities"],
-                "resource_bindings": owner["resource_bindings"],
-                "resource_capabilities": owner["resource_capabilities"],
-            }
+            if owner["protocol"] == NATIVE_PROTOCOL:
+                self._validate_native_owner(owner)
+            elif owner["protocol"] == PROTOCOL and self.autostart:
+                raise CoordinatorError(
+                    "a legacy protocol-4 Python broker still owns this state directory; "
+                    "let it finish and stop, then run 'agc migrate' before retrying"
+                )
+            elif owner["protocol"] != PROTOCOL:
+                raise CoordinatorError(
+                    f"gate coordinator protocol mismatch: broker has "
+                    f"{owner['protocol']}; client supports {PROTOCOL} and "
+                    f"{NATIVE_PROTOCOL}"
+                )
+            return self._public_owner(owner)
         if not self.autostart:
             if last_metadata_error is not None:
                 raise CoordinatorError(str(last_metadata_error))
@@ -3952,7 +4079,22 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            return self._native_submit(
+                command,
+                checkout=checkout,
+                kind=kind,
+                label=label,
+                resources=resources,
+                agent=agent,
+                repository=repository,
+                branch=branch,
+                head_sha=head_sha,
+                caller_pid=caller_pid,
+                environment=environment,
+                owner=owner,
+            )
         return self._catalogue().submit(
             command,
             checkout=checkout,
@@ -3966,6 +4108,149 @@ class CoordinatorClient:
             caller_pid=caller_pid,
             environment=environment,
         )
+
+    def _native_submit(
+        self,
+        command: Sequence[str],
+        *,
+        checkout: str,
+        kind: str,
+        label: str,
+        resources: Mapping[str, int] | None,
+        agent: str | None,
+        repository: str | None,
+        branch: str | None,
+        head_sha: str | None,
+        caller_pid: int | None,
+        environment: Mapping[str, str] | None,
+        owner: Mapping[str, Any],
+    ) -> str:
+        selected_command = _validate_command(command)
+        if kind not in RUN_KINDS:
+            raise CoordinatorError(
+                "kind must be exactly 'check', 'full', 'merge', or 'land'"
+            )
+        if kind in {"merge", "land"}:
+            raise CoordinatorError(f"{kind} can only be submitted through submit_{kind}")
+        if not isinstance(label, str) or not label.strip():
+            raise CoordinatorError("label must be a non-empty string")
+        identity = discover_repository(checkout, repository=repository)
+        selected_branch = (
+            branch.strip()
+            if isinstance(branch, str)
+            else _git_branch(identity.checkout)
+        )
+        if not selected_branch:
+            raise CoordinatorError("branch must be a non-empty string")
+        selected_head = _validate_head_sha(head_sha, required=False)
+        if kind == "full":
+            selected_head = selected_head or _git_head(identity.checkout)
+            _assert_clean_head(identity.checkout, selected_head)
+        selected_pid = os.getpid() if caller_pid is None else caller_pid
+        if (
+            not isinstance(selected_pid, int)
+            or isinstance(selected_pid, bool)
+            or selected_pid <= 0
+        ):
+            raise CoordinatorError("caller_pid must be a positive integer")
+        selected_resources = _validate_resources(resources, owner["capacities"])
+        selected_environment = _validate_environment(environment)
+        run_id = f"{kind}-{uuid4().hex[:12]}"
+        arguments = [
+            "--run-id",
+            run_id,
+            "--kind",
+            kind,
+            "--label",
+            label.strip(),
+            "--agent",
+            _agent_identity(agent),
+            "--repository-id",
+            identity.repository_id,
+            "--repository",
+            identity.repository,
+            "--worktree-id",
+            identity.worktree_id,
+            "--checkout",
+            str(identity.checkout),
+            "--branch",
+            selected_branch,
+            "--caller-pid",
+            str(selected_pid),
+        ]
+        if selected_head is not None:
+            arguments.extend(("--head", selected_head))
+        for name, units in selected_resources.items():
+            arguments.extend(("--resource", f"{name}={units}"))
+        for name, value in selected_environment.items():
+            arguments.extend(("--env", f"{name}={value}"))
+        arguments.append("--")
+        arguments.extend(selected_command)
+        result = self._native_invoke("submit", arguments)
+        if not isinstance(result, dict) or result != {"run_id": run_id}:
+            raise CoordinatorError("native broker returned an invalid submission receipt")
+        return run_id
+
+    @staticmethod
+    def _native_submission_arguments(
+        *,
+        run_id: str,
+        kind: str,
+        label: str,
+        identity: RepositoryIdentity,
+        branch: str,
+        head_sha: str | None,
+        resources: Mapping[str, int],
+        agent: str,
+        caller_pid: int,
+        environment: Mapping[str, str],
+        command: Sequence[str],
+        publication: tuple[str, object] | None = None,
+        gate_run_id: str | None = None,
+    ) -> list[str]:
+        arguments = [
+            "--run-id",
+            run_id,
+            "--kind",
+            kind,
+            "--label",
+            label,
+            "--agent",
+            agent,
+            "--repository-id",
+            identity.repository_id,
+            "--repository",
+            identity.repository,
+            "--worktree-id",
+            identity.worktree_id,
+            "--checkout",
+            str(identity.checkout),
+            "--branch",
+            branch,
+            "--caller-pid",
+            str(caller_pid),
+        ]
+        if head_sha is not None:
+            arguments.extend(("--head", head_sha))
+        if gate_run_id is not None:
+            arguments.extend(("--gate-run-id", gate_run_id))
+        if publication is not None:
+            adapter, request = publication
+            arguments.extend(
+                (
+                    "--publication-adapter",
+                    adapter,
+                    "--publication-request-json",
+                    json.dumps(request, separators=(",", ":")),
+                )
+            )
+        for name, units in resources.items():
+            arguments.extend(("--resource", f"{name}={units}"))
+        for name, value in environment.items():
+            arguments.extend(("--env", f"{name}={value}"))
+        arguments.append("--")
+        arguments.extend(command)
+        return arguments
 
     def submit_merge(
         self,
@@ -3982,7 +4267,22 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            return self._native_submit_merge(
+                adapter,
+                request,
+                checkout=checkout,
+                gate_run_id=gate_run_id,
+                resources=resources,
+                agent=agent,
+                repository=repository,
+                branch=branch,
+                head_sha=head_sha,
+                caller_pid=caller_pid,
+                environment=environment,
+                owner=owner,
+            )
         return self._catalogue().submit_merge(
             adapter,
             request,
@@ -3997,6 +4297,92 @@ class CoordinatorClient:
             environment=environment,
             worker_python=sys.executable,
         )
+
+    def _native_submit_merge(
+        self,
+        adapter: str,
+        request: object,
+        *,
+        checkout: str,
+        gate_run_id: str | None,
+        resources: Mapping[str, int] | None,
+        agent: str | None,
+        repository: str | None,
+        branch: str | None,
+        head_sha: str | None,
+        caller_pid: int | None,
+        environment: Mapping[str, str] | None,
+        owner: Mapping[str, Any],
+    ) -> str:
+        if adapter != "github":
+            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
+        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
+            raise CoordinatorError(
+                "the GitHub publication request must be a positive PR number"
+            )
+        if gate_run_id is not None and (
+            not isinstance(gate_run_id, str) or not gate_run_id
+        ):
+            raise CoordinatorError("gate_run_id must be a non-empty string")
+        identity = discover_repository(checkout, repository=repository)
+        selected_branch = (
+            branch.strip()
+            if isinstance(branch, str)
+            else _git_branch(identity.checkout)
+        )
+        if not selected_branch:
+            raise CoordinatorError("branch must be a non-empty string")
+        selected_head = (
+            _validate_head_sha(head_sha, required=False) or _git_head(identity.checkout)
+        )
+        _assert_clean_head(identity.checkout, selected_head)
+        selected_pid = os.getpid() if caller_pid is None else caller_pid
+        if (
+            not isinstance(selected_pid, int)
+            or isinstance(selected_pid, bool)
+            or selected_pid <= 0
+        ):
+            raise CoordinatorError("caller_pid must be a positive integer")
+        selected_environment = _validate_environment(environment)
+        executable = str(Path(sys.executable).expanduser().resolve())
+        if not Path(executable).is_file():
+            raise CoordinatorError(f"merge worker Python does not exist: {executable}")
+        run_id = f"merge-{uuid4().hex[:12]}"
+        worker = [
+            executable,
+            "-m",
+            "agcoord.github",
+            "--run-id",
+            run_id,
+            "--state-dir",
+            str(self.paths.state_dir),
+            "--checkout",
+            str(identity.checkout),
+            "--branch",
+            selected_branch,
+            "--head-sha",
+            selected_head,
+            str(request),
+        ]
+        arguments = self._native_submission_arguments(
+            run_id=run_id,
+            kind="merge",
+            label=f"merge GitHub PR #{request}",
+            identity=identity,
+            branch=selected_branch,
+            head_sha=selected_head,
+            resources=_validate_resources(resources, owner["capacities"]),
+            agent=_agent_identity(agent),
+            caller_pid=selected_pid,
+            environment=selected_environment,
+            publication=(adapter, request),
+            gate_run_id=gate_run_id,
+            command=worker,
+        )
+        result = self._native_invoke("submit", arguments)
+        if not isinstance(result, dict) or result != {"run_id": run_id}:
+            raise CoordinatorError("native broker returned an invalid merge receipt")
+        return run_id
 
     def submit_land(
         self,
@@ -4014,7 +4400,23 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            return self._native_submit_land(
+                adapter,
+                request,
+                command,
+                checkout=checkout,
+                label=label,
+                resources=resources,
+                agent=agent,
+                repository=repository,
+                branch=branch,
+                head_sha=head_sha,
+                caller_pid=caller_pid,
+                environment=environment,
+                owner=owner,
+            )
         return self._catalogue().submit_land(
             adapter,
             request,
@@ -4030,21 +4432,130 @@ class CoordinatorClient:
             environment=environment,
         )
 
+    def _native_submit_land(
+        self,
+        adapter: str,
+        request: object,
+        command: Sequence[str],
+        *,
+        checkout: str,
+        label: str,
+        resources: Mapping[str, int] | None,
+        agent: str | None,
+        repository: str | None,
+        branch: str | None,
+        head_sha: str | None,
+        caller_pid: int | None,
+        environment: Mapping[str, str] | None,
+        owner: Mapping[str, Any],
+    ) -> str:
+        selected_command = _validate_command(command)
+        if adapter != "github":
+            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
+        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
+            raise CoordinatorError(
+                "the GitHub publication request must be a positive PR number"
+            )
+        if not isinstance(label, str) or not label.strip():
+            raise CoordinatorError("label must be a non-empty string")
+        identity = discover_repository(checkout, repository=repository)
+        selected_branch = (
+            branch.strip()
+            if isinstance(branch, str)
+            else _git_branch(identity.checkout)
+        )
+        if not selected_branch:
+            raise CoordinatorError("branch must be a non-empty string")
+        selected_head = (
+            _validate_head_sha(head_sha, required=False) or _git_head(identity.checkout)
+        )
+        _assert_clean_head(identity.checkout, selected_head)
+        selected_pid = os.getpid() if caller_pid is None else caller_pid
+        if (
+            not isinstance(selected_pid, int)
+            or isinstance(selected_pid, bool)
+            or selected_pid <= 0
+        ):
+            raise CoordinatorError("caller_pid must be a positive integer")
+        selected_environment = _validate_environment(environment)
+        if "_AGCOORD_LAND_PYTHON" in selected_environment:
+            raise CoordinatorError(
+                "gate environment uses the reserved _AGCOORD_LAND_PYTHON name"
+            )
+        executable = str(Path(sys.executable).expanduser().resolve())
+        if not Path(executable).is_file():
+            raise CoordinatorError(f"land worker Python does not exist: {executable}")
+        selected_environment["_AGCOORD_LAND_PYTHON"] = executable
+        run_id = f"land-{uuid4().hex[:12]}"
+        arguments = self._native_submission_arguments(
+            run_id=run_id,
+            kind="land",
+            label=label.strip(),
+            identity=identity,
+            branch=selected_branch,
+            head_sha=selected_head,
+            resources=_validate_resources(resources, owner["capacities"]),
+            agent=_agent_identity(agent),
+            caller_pid=selected_pid,
+            environment=selected_environment,
+            publication=(adapter, request),
+            command=selected_command,
+        )
+        result = self._native_invoke("submit", arguments)
+        if not isinstance(result, dict) or result != {"run_id": run_id}:
+            raise CoordinatorError("native broker returned an invalid land receipt")
+        return run_id
+
     def snapshot(self) -> dict[str, Any]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            result = self._native_invoke("snapshot")
+            if not isinstance(result, dict):
+                raise CoordinatorError("native broker returned an invalid snapshot")
+            return result
         return self._catalogue().snapshot()
 
     def status(self, run_id: str) -> dict[str, Any]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            result = self._native_invoke("status", ("--run-id", run_id))
+            if not isinstance(result, dict):
+                raise CoordinatorError("native broker returned an invalid run status")
+            return result
         return self._catalogue().status(run_id)
 
     def cancel(self, run_id: str) -> dict[str, Any]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            result = self._native_invoke("cancel", ("--run-id", run_id))
+            if not isinstance(result, dict):
+                raise CoordinatorError("native broker returned an invalid cancellation receipt")
+            return result
         return self._catalogue().cancel(run_id)
 
     def clear(self) -> dict[str, int]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            result = self._native_invoke("clear")
+            if (
+                not isinstance(result, dict)
+                or set(result) != {"cleared"}
+                or not isinstance(result["cleared"], int)
+            ):
+                raise CoordinatorError("native broker returned an invalid clear receipt")
+            return result
         return self._catalogue().clear()
+
+    def migrate(self) -> dict[str, Any]:
+        """Run the selected executable's explicit idle-spool migration."""
+        if _read_broker_owner(self.paths) is not None:
+            raise CoordinatorError(
+                "cannot migrate while a gate broker owns the state directory"
+            )
+        result = self._native_invoke("migrate")
+        if not isinstance(result, dict):
+            raise CoordinatorError("native broker returned an invalid migration receipt")
+        return result
 
     def acquire_child_cpu_lease(
         self,
@@ -4080,12 +4591,53 @@ class CoordinatorClient:
                 "child CPU lease state does not match the admitted run context"
             )
         selected_minimum = requested if minimum is None else minimum
-        self._ensure_broker()
-        row = self._catalogue().request_child_cpu_lease(
-            selected_run,
-            requested=requested,
-            minimum=selected_minimum,
-        )
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            if (
+                not isinstance(requested, int)
+                or isinstance(requested, bool)
+                or requested <= 0
+            ):
+                raise CoordinatorError("child CPU lease request must be a positive integer")
+            if (
+                not isinstance(selected_minimum, int)
+                or isinstance(selected_minimum, bool)
+                or selected_minimum <= 0
+                or selected_minimum > requested
+            ):
+                raise CoordinatorError(
+                    "child CPU lease minimum must be positive and no greater than requested"
+                )
+            owner_pid = os.getpid()
+            owner_token = _process_start_token(owner_pid)
+            if owner_token is None:
+                raise CoordinatorError("cannot identify child CPU lease owner process")
+            lease_id = f"cpu-lease-{uuid4().hex[:12]}"
+            row = self._native_invoke(
+                "lease-request",
+                (
+                    "--lease-id",
+                    lease_id,
+                    "--run-id",
+                    selected_run,
+                    "--requested",
+                    str(requested),
+                    "--minimum",
+                    str(selected_minimum),
+                    "--owner-pid",
+                    str(owner_pid),
+                    "--owner-start-token",
+                    owner_token,
+                ),
+            )
+            if not isinstance(row, dict) or row.get("lease_id") != lease_id:
+                raise CoordinatorError("native broker returned an invalid child lease receipt")
+        else:
+            row = self._catalogue().request_child_cpu_lease(
+                selected_run,
+                requested=requested,
+                minimum=selected_minimum,
+            )
         lease_id = row["lease_id"]
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
@@ -4096,12 +4648,12 @@ class CoordinatorClient:
                         f"timed out waiting for child CPU lease {lease_id}"
                     )
                 time.sleep(poll_interval)
-                row = self._catalogue().child_cpu_lease_status(lease_id)
+                row = self._child_cpu_lease_status(lease_id)
         except BaseException:
             try:
-                current = self._catalogue().child_cpu_lease_status(lease_id)
+                current = self._child_cpu_lease_status(lease_id)
                 if current["status"] in {"waiting", "active"}:
-                    self._catalogue().cancel_child_cpu_lease(lease_id)
+                    self.cancel_child_cpu_lease(lease_id)
             except CoordinatorError:
                 pass
             raise
@@ -4118,25 +4670,81 @@ class CoordinatorClient:
             _client=self,
         )
 
+    def _child_cpu_lease_status(self, lease_id: str) -> dict[str, Any]:
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            result = self._native_invoke(
+                "lease-status",
+                ("--lease-id", lease_id),
+            )
+            if not isinstance(result, dict) or result.get("lease_id") != lease_id:
+                raise CoordinatorError("native broker returned an invalid child lease status")
+            return result
+        return self._catalogue().child_cpu_lease_status(lease_id)
+
     def child_cpu_leases(
         self,
         run_id: str | None = None,
         *,
         include_terminal: bool = False,
     ) -> list[dict[str, Any]]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            arguments: list[str] = []
+            if run_id is not None:
+                if not isinstance(run_id, str) or not run_id:
+                    raise CoordinatorError("child CPU lease parent run ID must be non-empty")
+                arguments.extend(("--run-id", run_id))
+            if include_terminal:
+                arguments.append("--include-terminal")
+            result = self._native_invoke("lease-list", arguments)
+            if not isinstance(result, list) or any(
+                not isinstance(row, dict) for row in result
+            ):
+                raise CoordinatorError("native broker returned an invalid child lease list")
+            return result
         return self._catalogue().child_cpu_leases(
             run_id,
             include_terminal=include_terminal,
         )
 
     def release_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            return self._native_finish_child_lease(lease_id, "lease-release")
         return self._catalogue().release_child_cpu_lease(lease_id)
 
     def cancel_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            return self._native_finish_child_lease(lease_id, "lease-cancel")
         return self._catalogue().cancel_child_cpu_lease(lease_id)
+
+    def _native_finish_child_lease(
+        self,
+        lease_id: str,
+        command: str,
+    ) -> dict[str, Any]:
+        if not isinstance(lease_id, str) or not lease_id:
+            raise CoordinatorError("child CPU lease ID must be non-empty")
+        owner_pid = os.getpid()
+        owner_token = _process_start_token(owner_pid)
+        if owner_token is None:
+            raise CoordinatorError("cannot identify child CPU lease owner process")
+        result = self._native_invoke(
+            command,
+            (
+                "--lease-id",
+                lease_id,
+                "--owner-pid",
+                str(owner_pid),
+                "--owner-start-token",
+                owner_token,
+            ),
+        )
+        if not isinstance(result, dict) or result.get("lease_id") != lease_id:
+            raise CoordinatorError("native broker returned an invalid child lease receipt")
+        return result
 
     def verify_admission(
         self,
@@ -4147,7 +4755,35 @@ class CoordinatorClient:
         head_sha: str,
         worker_pid: int,
     ) -> None:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            if kind not in {"full", "merge", "land"}:
+                raise CoordinatorError(
+                    "broker admission kind must be 'full', 'merge', or 'land'"
+                )
+            token = _process_start_token(worker_pid)
+            if token is None:
+                raise CoordinatorError("cannot identify admitted worker process")
+            result = self._native_invoke(
+                "verify",
+                (
+                    "--run-id",
+                    run_id,
+                    "--kind",
+                    kind,
+                    "--worker-pid",
+                    str(worker_pid),
+                    "--worker-start-token",
+                    token,
+                    "--checkout",
+                    str(_absolute(checkout)),
+                    "--head",
+                    _validate_head_sha(head_sha, required=True) or "",
+                ),
+            )
+            if result != {"verified": True}:
+                raise CoordinatorError("native broker returned an invalid admission receipt")
+            return
         self._catalogue().verify_admission(
             run_id,
             kind=kind,
@@ -4164,7 +4800,32 @@ class CoordinatorClient:
         gate_exit_status: int | None,
         worker_pid: int,
     ) -> None:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            token = _process_start_token(worker_pid)
+            if token is None:
+                raise CoordinatorError("cannot identify admitted land worker process")
+            row = self.status(run_id)
+            arguments = [
+                "--run-id",
+                run_id,
+                "--worker-pid",
+                str(worker_pid),
+                "--worker-start-token",
+                token,
+                "--checkout",
+                str(row["checkout"]),
+                "--head",
+                str(row["head_sha"]),
+                "--phase",
+                phase,
+            ]
+            if gate_exit_status is not None:
+                arguments.extend(("--gate-exit-status", str(gate_exit_status)))
+            result = self._native_invoke("phase", arguments)
+            if not isinstance(result, dict) or result.get("run_id") != run_id:
+                raise CoordinatorError("native broker returned an invalid land phase receipt")
+            return
         self._catalogue().update_land_phase(
             run_id,
             phase=phase,
@@ -4179,7 +4840,27 @@ class CoordinatorClient:
         exit_status: int,
         worker_pid: int,
     ) -> None:
-        self._ensure_broker()
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            token = _process_start_token(worker_pid)
+            if token is None:
+                raise CoordinatorError("cannot identify admitted land worker process")
+            result = self._native_invoke(
+                "report",
+                (
+                    "--run-id",
+                    run_id,
+                    "--worker-pid",
+                    str(worker_pid),
+                    "--worker-start-token",
+                    token,
+                    "--exit-status",
+                    str(exit_status),
+                ),
+            )
+            if result != {"reported": True}:
+                raise CoordinatorError("native broker returned an invalid land result receipt")
+            return
         self._catalogue().report_land_result(
             run_id,
             exit_status=exit_status,
@@ -4193,56 +4874,110 @@ class CoordinatorClient:
         offset: int = 0,
         limit: int = MAX_LOG_BYTES,
     ) -> dict[str, Any]:
-        self._ensure_broker()
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise CoordinatorError("gate log offset must be a non-negative integer")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LOG_BYTES:
+            raise CoordinatorError(
+                f"gate log limit must be between 1 and {MAX_LOG_BYTES}"
+            )
+        owner = self._ensure_broker()
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            result = self._native_invoke(
+                "log",
+                (
+                    "--run-id",
+                    run_id,
+                    "--offset",
+                    str(offset),
+                    "--limit",
+                    str(limit),
+                ),
+            )
+            if not isinstance(result, dict):
+                raise CoordinatorError("native broker returned an invalid log page")
+            return result
         return self._catalogue().log(run_id, offset=offset, limit=limit)
 
     def ping(self) -> dict[str, Any]:
-        owner = _broker_owner(self.paths)
+        owner = _read_broker_owner(self.paths)
         if owner is None:
             raise CoordinatorError(
                 f"no gate broker owns {self.paths.state_dir}"
             )
-        return {
-            "protocol": owner["protocol"],
-            "broker_pid": owner["pid"],
-            "capacities": owner["capacities"],
-            "resource_bindings": owner["resource_bindings"],
-            "resource_capabilities": owner["resource_capabilities"],
-        }
+        if owner["protocol"] == NATIVE_PROTOCOL:
+            self._validate_native_owner(owner)
+        elif owner["protocol"] == PROTOCOL and self.autostart:
+            raise CoordinatorError(
+                "a legacy protocol-4 Python broker still owns this state directory; "
+                "let it finish and stop, then run 'agc migrate' before retrying"
+            )
+        elif owner["protocol"] != PROTOCOL:
+            raise CoordinatorError(
+                f"gate coordinator protocol mismatch: broker has {owner['protocol']}"
+            )
+        return self._public_owner(owner)
 
     def _start_broker(self) -> None:
-        # Prepare and protocol-check the private spool before a detached process is born.
-        # This also closes the interval in which its redirected log could inherit loose
-        # permissions from a pre-existing operator-selected directory.
-        self._catalogue()
+        existing_protocol = _spool_protocol(self.paths)
+        if existing_protocol is not None and existing_protocol != NATIVE_PROTOCOL:
+            if 1 <= existing_protocol <= PROTOCOL:
+                raise CoordinatorError(
+                    f"gate queue uses protocol {existing_protocol}; run 'agc migrate' "
+                    "while it is idle before starting the native broker"
+                )
+            raise CoordinatorError(
+                f"gate queue protocol {existing_protocol} is unsupported by this client"
+            )
+        selected = self._native_command()
+        config = broker_config(self.paths.state_dir)
+        capacities = configured_capacities(config.capacities)
         try:
-            log = self.paths.daemon_log.open("ab", buffering=0)
+            self.paths.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            details = self.paths.state_dir.lstat()
+        except OSError as exc:
+            raise CoordinatorError(
+                f"cannot prepare gate queue directory {self.paths.state_dir}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+            raise CoordinatorError(
+                f"gate queue path is not a real directory: {self.paths.state_dir}"
+            )
+        if details.st_uid != os.getuid():
+            raise CoordinatorError(
+                f"gate queue directory {self.paths.state_dir} belongs to another user"
+            )
+        if details.st_mode & 0o077:
+            self.paths.state_dir.chmod(0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.paths.daemon_log, flags, 0o600)
         except OSError as exc:
             raise CoordinatorError(
                 f"cannot open gate broker log {self.paths.daemon_log}: {exc}"
             ) from exc
-        os.chmod(self.paths.daemon_log, 0o600)
-        command = [
-            sys.executable,
-            "-m",
-            "agcoord.queue",
-            "serve",
-            "--state-dir",
-            str(self.paths.state_dir),
-        ]
         try:
-            subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
-            )
-        except OSError as exc:
-            raise CoordinatorError(f"cannot start gate coordinator: {exc}") from exc
+            log_details = os.fstat(descriptor)
+            if not stat.S_ISREG(log_details.st_mode) or log_details.st_uid != os.getuid():
+                raise CoordinatorError(
+                    f"gate broker log is not a current-user regular file: "
+                    f"{self.paths.daemon_log}"
+                )
+            os.fchmod(descriptor, 0o600)
+            try:
+                subprocess.Popen(
+                    selected.serve_arguments(self.paths.state_dir, capacities),
+                    stdin=subprocess.DEVNULL,
+                    stdout=descriptor,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                raise CoordinatorError(f"cannot start gate coordinator: {exc}") from exc
         finally:
-            log.close()
+            os.close(descriptor)
 
         deadline = time.monotonic() + self.connect_timeout
         last_error: CoordinatorError | None = None

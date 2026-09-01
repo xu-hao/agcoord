@@ -458,12 +458,35 @@ fn submit_with_resources_and_environment(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         "--resource".to_owned(),
         "jobs=1".to_owned(),
+        "--caller-pid".to_owned(),
+        std::process::id().to_string(),
     ];
     for (name, units) in resources {
         arguments.extend(["--resource".to_owned(), format!("{name}={units}")]);
     }
     if let Some(gate_run_id) = submission.gate_run_id {
         arguments.extend(["--gate-run-id".to_owned(), gate_run_id.to_owned()]);
+    }
+    if matches!(submission.kind, "merge" | "land") {
+        arguments.extend([
+            "--publication-adapter".to_owned(),
+            "github".to_owned(),
+            "--publication-request-json".to_owned(),
+            "1".to_owned(),
+        ]);
+    }
+    if submission.kind == "land" {
+        let passthrough = submission.checkout.join("agcoord-test-land-python");
+        fs::write(
+            &passthrough,
+            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&passthrough, fs::Permissions::from_mode(0o755)).unwrap();
+        arguments.extend([
+            "--env".to_owned(),
+            format!("_AGCOORD_LAND_PYTHON={}", passthrough.to_string_lossy()),
+        ]);
     }
     for (name, value) in environment {
         arguments.extend(["--env".to_owned(), format!("{name}={value}")]);

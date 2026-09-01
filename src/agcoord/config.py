@@ -19,13 +19,29 @@ from typing import Any, Mapping
 
 CONFIG_FILENAME = "config.json"
 MAX_DATABASE_TIMEOUT = 2_147_483.647
+DEFAULT_NATIVE_BROKER_PATH = "/usr/libexec/agcoord/agcoord-broker"
 _CONFIG_KEYS = frozenset(
-    {"capacities", "bindings", "cgroup_root", "cgroup_io", "database_timeout"}
+    {
+        "capacities",
+        "bindings",
+        "cgroup_root",
+        "cgroup_io",
+        "database_timeout",
+        "native_broker",
+    }
 )
 
 
 class BrokerConfigError(RuntimeError):
     """A missing, unreadable, or malformed broker configuration file."""
+
+
+@dataclass(frozen=True)
+class NativeBrokerConfig:
+    """The one explicitly selected native executable and its trust policy."""
+
+    path: str
+    allow_development: bool
 
 
 @dataclass(frozen=True)
@@ -37,6 +53,7 @@ class BrokerConfig:
     cgroup_root: str | None
     cgroup_io: Mapping[str, Any] | None
     database_timeout: float | None
+    native_broker: NativeBrokerConfig
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -56,6 +73,10 @@ def load_broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
             cgroup_root=None,
             cgroup_io=None,
             database_timeout=None,
+            native_broker=NativeBrokerConfig(
+                path=DEFAULT_NATIVE_BROKER_PATH,
+                allow_development=False,
+            ),
         )
     except OSError as exc:
         raise BrokerConfigError(f"cannot read broker configuration {path}: {exc}") from exc
@@ -83,6 +104,7 @@ def parse_broker_config(
     bindings = _section(document, "bindings", source=source)
     cgroup_io = _cgroup_io_section(document, source=source)
     database_timeout = _database_timeout(document, source=source)
+    native_broker = _native_broker_section(document, source=source)
     cgroup_root = document.get("cgroup_root")
     if cgroup_root is not None and (
         not isinstance(cgroup_root, str) or not cgroup_root.strip()
@@ -96,6 +118,49 @@ def parse_broker_config(
         cgroup_root=cgroup_root,
         cgroup_io=cgroup_io,
         database_timeout=database_timeout,
+        native_broker=native_broker,
+    )
+
+
+def _native_broker_section(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> NativeBrokerConfig:
+    value = document.get("native_broker")
+    if value is None:
+        return NativeBrokerConfig(
+            path=DEFAULT_NATIVE_BROKER_PATH,
+            allow_development=False,
+        )
+    if not isinstance(value, dict):
+        raise BrokerConfigError(
+            f"broker configuration {source} section 'native_broker' must be a JSON object"
+        )
+    unknown = sorted(set(value) - {"path", "allow_development"})
+    if unknown:
+        raise BrokerConfigError(
+            f"broker configuration {source} native_broker has unknown keys: "
+            + ", ".join(unknown)
+        )
+    path = value.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\0" in path
+        or not Path(path).is_absolute()
+    ):
+        raise BrokerConfigError(
+            f"broker configuration {source} native_broker path must be an absolute string"
+        )
+    allow_development = value.get("allow_development", False)
+    if not isinstance(allow_development, bool):
+        raise BrokerConfigError(
+            f"broker configuration {source} native_broker allow_development must be boolean"
+        )
+    return NativeBrokerConfig(
+        path=path,
+        allow_development=allow_development,
     )
 
 

@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Route the Python CLI, client, TUI, atomic publication worker, and pytest-xdist child leases
+  through the protocol-5 Rust broker. Native selection now verifies one explicit executable and
+  exact live-owner identity, concurrent autostart elects one owner, protocol-4 state requires an
+  explicit idle migration, and missing, stale, or incompatible binaries fail without a Python
+  fallback.
 - Bring the Rust broker's persistent project-quota scratch backend to parity: resolve supported
   ext4 and XFS mounts, allocate collision-safe project identities, apply and verify byte and inode
   ceilings, isolate quota authority from workers, retain terminal usage, and recover or clean up
