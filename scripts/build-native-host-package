@@ -72,12 +72,15 @@ package="$output_directory/agcoord-native-host-x86_64-linux.tar.gz"
 epoch=${SOURCE_DATE_EPOCH:-0}
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
     -C "$root" -cf - . | gzip -n >"$package"
+chmod 0644 "$package"
 package_sha=$(sha256sum "$package" | awk '{print $1}')
 printf '%s  %s\n' "$package_sha" "$(basename -- "$package")" >"$package.sha256"
+chmod 0644 "$package.sha256"
 "$repository/scripts/check-native-host-package" "$package"
 for helper in check-native-host-package install-native-host test-native-host-enforcement; do
     install -m 0755 "$repository/scripts/$helper" "$output_directory/$helper"
     helper_sha=$(sha256sum "$output_directory/$helper" | awk '{print $1}')
     printf '%s  %s\n' "$helper_sha" "$helper" >"$output_directory/$helper.sha256"
+    chmod 0644 "$output_directory/$helper.sha256"
 done
 printf '%s\n' "$package"

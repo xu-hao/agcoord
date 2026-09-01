@@ -709,7 +709,7 @@ fn a_stale_selected_binary_cannot_replace_or_command_the_live_owner() {
         &stale,
         r#"#!/bin/sh
 if [ "$1" = identity ] && [ "$2" = --json ]; then
-  printf '%s\n' '{"name":"agcoord-broker","version":"0.3.0-dev.0","protocol":5,"implementation":"rust-native","build":"sha256:0000000000000000000000000000000000000000000000000000000000000000","target":"x86_64-unknown-linux-musl","sqlite":"3"}'
+  printf '%s\n' '{"name":"agcoord-broker","version":"0.3.0","protocol":5,"implementation":"rust-native","build":"sha256:0000000000000000000000000000000000000000000000000000000000000000","target":"x86_64-unknown-linux-musl","sqlite":"3"}'
   exit 0
 fi
 exit 97
@@ -779,6 +779,65 @@ fn python_migrate_routes_an_idle_protocol_four_spool_through_the_native_binary()
     assert_eq!(parse_json_output(&check)["status"], "passed");
     let (_guard, owner) = owner_guard(&state).expect("migrated spool has no native owner");
     assert!(owner.contains("protocol=5\n"));
+}
+
+#[test]
+fn migration_runbook_rehearses_backup_rollback_and_final_native_ownership() {
+    let temporary = TestDirectory::new("migration-runbook");
+    let selected_broker = installed_broker(&temporary);
+    let executable = python_command(&[
+        "-c".to_owned(),
+        "import sys; print(sys.executable)".to_owned(),
+    ]);
+    assert_success(&executable, "Python executable discovery");
+    let python = String::from_utf8(executable.stdout).unwrap();
+    let python = python.trim();
+    let agc = temporary.path().join("agc");
+    fs::write(
+        &agc,
+        format!("#!{python}\nfrom agcoord.cli import main\nraise SystemExit(main())\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&agc, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let result = Command::new(repository_root().join("scripts/rehearse-native-migration"))
+        .args([
+            "--python",
+            python,
+            "--agc",
+            agc.to_str().unwrap(),
+            "--broker",
+            selected_broker.to_str().unwrap(),
+        ])
+        .env("PYTHONPATH", repository_root().join("src"))
+        .env_remove("AGCOORD_RUN_ID")
+        .env_remove("AGCOORD_RUN_KIND")
+        .env_remove("AGCOORD_STATE_DIR")
+        .output()
+        .unwrap();
+    assert_success(&result, "native migration runbook rehearsal");
+    let receipt = parse_json_output(&result);
+    assert_eq!(receipt["final_protocol"], 5);
+    assert_eq!(receipt["rollback_protocol"], 4);
+    assert_eq!(receipt["broker_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(receipt["broker_build"], "development");
+    assert!(
+        receipt["backup_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(
+        receipt["legacy_run_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("check-")
+    );
+    assert!(
+        receipt["native_run_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("check-")
+    );
 }
 
 #[test]

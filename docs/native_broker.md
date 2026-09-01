@@ -16,6 +16,7 @@ external:
 
 - the state directory, `config.json`, SQLite spool, logs, and recovery manifests;
 - the systemd service and AppArmor policy;
+- the package manifest, checksums, provenance, and reviewed license inventory;
 - the submitted command, its repository, and its own runtime dependencies;
 - the Python `agc` CLI, TUI, pytest-xdist plugin, and optional publication adapters.
 
@@ -412,7 +413,10 @@ must finish and stop, and an idle protocol-1-through-4 spool requires `agc migra
 broker refuses an old spool until that explicit migration succeeds, while the old Python
 `serve` entry point refuses protocol 5. Internal non-autostart compatibility access remains
 available only for migration tests and already admitted legacy workers; it is not a public
-startup fallback.
+startup fallback. Operators use the separately tested
+[native migration and rollback runbook](native_migration.md) for compatibility selection,
+whole-spool backup, rollback rehearsal, live transition, capability evidence, troubleshooting,
+and retirement of the old production path.
 
 ## Implementation and release order
 

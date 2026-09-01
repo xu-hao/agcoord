@@ -946,7 +946,9 @@ files.
 
 Protocol migration is explicit and out of band. Normal broker or client initialization fails
 closed on an older spool and names the required command; it never mutates schema on a hot
-path. With no live old owner or jobs, run:
+path. Production upgrades must first drain, copy the whole owner-locked spool, and prove the
+installed binary's rollback against a disposable copy by following the
+[native migration runbook](native_migration.md). With no live old owner or jobs, run:
 
 ```bash
 agc migrate
@@ -954,7 +956,7 @@ agc migrate
 agc --state-dir /path/to/state migrate
 ```
 
-Back up the owner-only state directory first when its history matters. After migration,
+After migration,
 `agc list` starts or joins a broker using the new protocol. Migration preserves only
 facts represented by the old schema; it never upgrades a legacy label into an exact-head
 receipt, fuses separate full and merge rows into a land, or invents a gate phase/status that
@@ -972,4 +974,7 @@ run a new exact-head full gate before any legacy merge workflow. The installed `
 selects and verifies the configured native executable, requires the old owner and queue to be
 idle, and invokes that executable's migration command. Ordinary client commands refuse a live
 protocol-4 owner or an idle older spool and name this procedure; installing or building the
-native artifact alone never performs the transition.
+native artifact alone never performs the transition. The canonical runbook also defines the
+0.3 compatibility matrix, whole-spool backup, capability proof, rollback, Python production-path
+retirement, and safe actions for every migration refusal; this section defines only the durable
+protocol semantics.

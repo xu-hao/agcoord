@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-01
+
+- Add a tested native migration and rollback runbook with a compatibility matrix, whole-spool
+  backup rehearsal, mixed-owner refusals, capability verification, retirement criteria, and
+  stable troubleshooting actions. A clean-install release verifier now binds the Python, native,
+  and host artifacts to one versioned manifest and aggregate checksum set before publication.
 - Add the verified native host bundle, long-lived delegated systemd user service, and
   three-domain enforcing AppArmor boundary without `default_allow`/unconfined policy. Staged
   installation and upgrade refuse live work and never

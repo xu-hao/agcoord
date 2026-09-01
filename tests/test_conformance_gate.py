@@ -47,7 +47,7 @@ def test_public_checker_lists_both_implementation_selector_sets():
     selectors = json.loads(completed.stdout)
     assert set(selectors) == {"python_reference", "rust_native"}
     assert len(selectors["python_reference"]) == 23
-    assert len(selectors["rust_native"]) == 24
+    assert len(selectors["rust_native"]) == 25
     assert (
         "tests/test_queue.py::test_submit_and_snapshot_have_the_strict_generic_schema"
         in selectors["python_reference"]
