@@ -43,6 +43,7 @@ pub struct Broker {
     paths: Paths,
     capacities: BTreeMap<String, u64>,
     idle_timeout: Option<Duration>,
+    managed_host: bool,
     crash_after: Option<String>,
     worker_fault: Option<WorkerFault>,
     resource_capabilities: Value,
@@ -113,6 +114,7 @@ impl Broker {
         Ok(command)
     }
     pub fn start(options: ServeOptions) -> Result<Self> {
+        let managed_host = options.host_preflight.is_some();
         if let Some(preflight) = &options.host_preflight {
             host::preflight(preflight)?;
         }
@@ -319,6 +321,7 @@ impl Broker {
             paths,
             capacities,
             idle_timeout: options.idle_timeout,
+            managed_host,
             crash_after: options.crash_after,
             worker_fault: options.worker_fault,
             resource_capabilities,
@@ -749,7 +752,10 @@ impl Broker {
         connection: &Connection,
         run: &RunRecord,
     ) -> Result<(WorkerSetup, bool)> {
-        let mut setup = WorkerSetup::default();
+        let mut setup = WorkerSetup {
+            apparmor_admitted: self.managed_host,
+            ..WorkerSetup::default()
+        };
         if let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) {
             let request = Self::cgroup_request(run, &record.resources)?;
             let backend = self.cgroup_backend.as_ref().ok_or_else(|| {
