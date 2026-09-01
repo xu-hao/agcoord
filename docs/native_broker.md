@@ -1,6 +1,6 @@
 # Native broker architecture and security contract
 
-This document defines the target boundary for AGCoord's single-executable Rust broker. It is
+This document defines the boundary for AGCoord's single-executable Rust broker. It is
 normative for the native implementation, Python client compatibility, host packaging, and the
 migration from the protocol-4 Python broker.
 
@@ -142,24 +142,37 @@ release client refuses that value when its configured policy requires a release 
 
 ### Executable discovery
 
-Native-client integration must select an absolute executable path explicitly. A host package
-uses `/usr/libexec/agcoord/agcoord-broker`; a development operator may instead configure a
-different absolute path. Clients never search `PATH`, copy an interpreter, import a checkout,
-or fall back to Python after selecting protocol 5. Before starting an owner, the client runs
-`identity --json` and requires the configured protocol, `rust-native` implementation, supported
-target, non-development build policy, and expected executable ownership.
+Every Python client selects one absolute executable from the state directory's `config.json`.
+The default is the host-package path `/usr/libexec/agcoord/agcoord-broker`; clients never search
+`PATH`, copy an interpreter, import a checkout as the broker, or fall back to the Python owner.
+When selecting the command, the client rejects symlinks, non-executable or group/world writable
+files, unsupported hosts and targets, and incompatible identity JSON. A release binary must be
+root-owned, identify the `x86_64-unknown-linux-musl` target, and report a SHA-256 build identity;
+host artifact auditing establishes that it is static. A deliberately selected development
+binary may instead be owned by the current user and report `development` only when
+`allow_development` is true.
 
-The protocol-4 Python broker remains the current owner until the explicit migration and client
-integration tickets land. Merely building or placing the native artifact does not change a live
-broker or state directory.
+```json
+{
+  "native_broker": {
+    "path": "/absolute/path/to/target/debug/agcoord-broker",
+    "allow_development": true
+  }
+}
+```
+
+The selected executable and a live owner must have the same supported version and build
+identity. A missing, stale, malformed, or incompatible executable produces an actionable
+refusal without accepting work or replacing the live owner.
 
 ### Implemented scheduler and state boundary
 
-The native executable now implements the protocol-5 owner lock, SQLite spool initialization,
+The native executable implements the protocol-5 owner lock, SQLite spool initialization,
 submission validation, admission, repository barriers, queue-order-preserving round-robin
 selection, generic capacity accounting, cancellation, land-phase authority, history reads,
-worker observation, and explicit migration and rollback. This is the implementation boundary
-for scheduler conformance; it does not activate the native broker for the Python CLI yet.
+worker observation, child leases, and explicit migration and rollback. The Python CLI, client,
+TUI, and pytest-xdist adapter use these native commands while retaining their public JSON and
+environment contracts.
 
 `serve` validates the complete schema and every stored run before changing activity metadata,
 puts new and migrated databases in WAL mode, and uses `database_timeout` from the state
@@ -377,9 +390,13 @@ sequence observed before rollback. A protocol-4 client excludes every receipt at
 cutoff, whether selected automatically or named explicitly, so publication requires a new full
 gate after rollback.
 
-During rollout, Python clients may understand both owner records but start only the native
-binary for protocol 5. The old Python `serve` entry point refuses protocol 5. The native broker
-refuses protocol 4 until the explicit migration command succeeds.
+Python clients recognize protocol-4 history only to provide a controlled migration path. A
+default/autostart client never launches or joins the old Python owner: a live protocol-4 owner
+must finish and stop, and an idle protocol-1-through-4 spool requires `agc migrate`. The native
+broker refuses an old spool until that explicit migration succeeds, while the old Python
+`serve` entry point refuses protocol 5. Internal non-autostart compatibility access remains
+available only for migration tests and already admitted legacy workers; it is not a public
+startup fallback.
 
 ## Implementation and release order
 

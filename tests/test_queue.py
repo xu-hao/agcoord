@@ -2281,86 +2281,31 @@ report.write_text(json.dumps({
         running.stop()
 
 
-def test_first_client_starts_a_detached_broker_and_later_shell_recovers_the_job(
+def test_first_client_refuses_a_missing_native_broker_without_python_fallback(
     tmp_path: Path,
 ):
     state_dir = tmp_path / "detached-state"
     repository = _repository(tmp_path / "repository")
-    entered = tmp_path / "entered"
-    release = tmp_path / "release"
-    submitter = _python(
-        """
-import os
-import sys
-
-from agcoord.queue import CoordinatorClient
-
-state_dir, checkout, entered, release = sys.argv[1:]
-environment = dict(os.environ)
-environment.pop("AGCOORD_RUN_ID", None)
-client = CoordinatorClient(state_dir=state_dir, autostart=True)
-worker_source = (
-    "from pathlib import Path\\n"
-    "import sys\\n"
-    "import time\\n"
-    "entered, release = map(Path, sys.argv[1:])\\n"
-    "entered.touch()\\n"
-    "while not release.exists():\\n"
-    "    time.sleep(0.01)\\n"
-)
-run_id = client.submit(
-    [sys.executable, "-u", "-c", worker_source, entered, release],
-    checkout=checkout,
-    label="detached worker",
-    caller_pid=os.getpid(),
-    environment=environment,
-)
-print(os.getpid(), run_id, flush=True)
-""",
+    missing = tmp_path / "not-installed" / "agcoord-broker"
+    write_broker_config(
         state_dir,
-        repository,
-        entered,
-        release,
+        capacities={"jobs": 1},
+        native_broker={"path": str(missing)},
     )
-    client = CoordinatorClient(state_dir=state_dir, autostart=False)
-    broker_pid: int | None = None
-    try:
-        completed = subprocess.run(submitter, check=False, capture_output=True, text=True)
-        assert completed.returncode == 0, completed.stderr
-        caller_pid_text, run_id = completed.stdout.strip().splitlines()[-1].split()
-        caller_pid = int(caller_pid_text)
-        wait_for(entered.exists, "the detached worker did not survive its caller")
-        snapshot = client.snapshot()
-        broker_pid = snapshot["broker_pid"]
-        assert isinstance(broker_pid, int)
-        assert broker_pid != caller_pid
-        assert client.status(run_id)["status"] == "running"
+    client = CoordinatorClient(state_dir=state_dir, autostart=True)
 
-        release.touch()
-        assert _row(client, run_id, "passed")["exit_status"] == 0
-    finally:
-        release.touch()
-        if broker_pid is None:
-            try:
-                observed_pid = client.snapshot()["broker_pid"]
-                broker_pid = observed_pid if isinstance(observed_pid, int) else None
-            except (CoordinatorError, FileNotFoundError, KeyError):
-                broker_pid = None
-        if broker_pid is not None:
-            try:
-                os.kill(broker_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                broker_pid = None
+    with pytest.raises(
+        CoordinatorError,
+        match="native broker executable does not exist|install the host package",
+    ):
+        client.submit(
+            [sys.executable, "-c", "raise AssertionError('Python fallback ran')"],
+            checkout=str(repository),
+            environment=caller_environment(),
+        )
 
-            if broker_pid is not None:
-                def stopped() -> bool:
-                    try:
-                        os.kill(broker_pid, 0)
-                    except ProcessLookupError:
-                        return True
-                    return False
-
-                wait_for(stopped, "the test-owned detached broker did not stop")
+    assert not (state_dir / "broker.lock").exists()
+    assert not (state_dir / "queue.sqlite3").exists()
 
 
 @pytest.mark.parametrize("kind", ["check", "full"])

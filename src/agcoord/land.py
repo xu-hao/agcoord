@@ -224,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     client = CoordinatorClient(
         state_dir=args.state_dir,
         checkout=args.checkout,
-        autostart=True,
+        autostart=False,
     )
     try:
         client.verify_admission(
