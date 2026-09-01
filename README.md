@@ -32,21 +32,28 @@ The base package installs the supported Textual 8 release line (`textual>=8.2,<9
 terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
 after its real-TUI behavior is validated.
 
-### Upgrading from 0.1.x
+### Upgrading to 0.3.0
+
+Version 0.3.0 replaces the production Python queue owner with the fixed, statically linked Rust
+broker and durable protocol 5. Keep the old client and state backup through a tested rollback
+window; drain the protocol-4 owner, install and activate the matching host bundle without
+starting it, rehearse migrate/rollback against a copy, migrate the idle live spool explicitly,
+and then start the managed service. The complete commands, compatibility matrix, refusal modes,
+and rollback procedure are in the
+[native migration runbook](docs/native_migration.md). Neither package installation nor service
+activation changes the spool implicitly.
+
+If upgrading directly from 0.1.x, first apply the 0.2 command and configuration changes below.
 
 Version 0.2.0 removes the `agcoord` console executable. Replace downstream shell commands,
 service units, and automation with `agc`; the PyPI project, Python import, stable state-directory
 name, and `python -m agcoord` entry point remain `agcoord`.
 
-Before upgrading, let every 0.1.x job finish, wait for its on-demand broker to relinquish the
-idle spool, and back up the state directory when its history matters. Move capacity, resource
+Let every 0.1.x job finish and move capacity, resource
 binding, and cgroup-root values from `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`, and
 `AGCOORD_CGROUP_ROOT` into that state directory's single `config.json`; those three environment
-variables and the old comma-separated capacity syntax are no longer accepted. After installing
-the native-capable release and its host artifact, run `agc migrate` once for the idle default
-spool (or `agc --state-dir /path/to/state migrate`), then use `agc list` to start the new broker.
-Migration preserves historical meaning and never reinterprets legacy resource names as enforced
-limits.
+variables and the old comma-separated capacity syntax are no longer accepted. The 0.3 migration
+preserves historical meaning and never reinterprets legacy resource names as enforced limits.
 
 With the production host package configured, the first command asks systemd to start the
 long-lived user service; later shells and repositories join the same user-scoped coordinator.

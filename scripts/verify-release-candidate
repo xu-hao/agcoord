@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Verify and assemble one clean, version-coherent AGCoord release bundle."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+from email.parser import BytesParser
+from email.policy import default as email_policy
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from typing import Any, Iterable, Sequence
+import zipfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+TARGET = "x86_64-unknown-linux-musl"
+NATIVE_NAME = f"agcoord-broker-{TARGET}"
+HOST_NAME = "agcoord-native-host-x86_64-linux.tar.gz"
+HELPERS = (
+    "check-native-host-package",
+    "install-native-host",
+    "test-native-host-enforcement",
+)
+NATIVE_FILES = {
+    "AGCOORD_LICENSE",
+    "THIRD_PARTY_LICENSES.tsv",
+    NATIVE_NAME,
+    f"{NATIVE_NAME}.provenance.json",
+    f"{NATIVE_NAME}.sha256",
+}
+HOST_FILES = {
+    HOST_NAME,
+    f"{HOST_NAME}.sha256",
+    *(name for helper in HELPERS for name in (helper, f"{helper}.sha256")),
+}
+VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
+
+class CandidateError(RuntimeError):
+    """A stable release-candidate refusal."""
+
+
+def _run(
+    arguments: Sequence[str | os.PathLike[str]],
+    *,
+    cwd: Path = ROOT,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [os.fspath(argument) for argument in arguments]
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise CandidateError(
+            f"command exited {completed.returncode}: {command!r}\n"
+            f"stdout={completed.stdout}\nstderr={completed.stderr}"
+        )
+    return completed
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _regular_files(directory: Path) -> set[str]:
+    if not directory.is_dir() or directory.is_symlink():
+        raise CandidateError(f"release artifact directory is not real: {directory}")
+    files: set[str] = set()
+    for entry in directory.iterdir():
+        if entry.is_symlink() or not entry.is_file():
+            raise CandidateError(f"release artifact is not one regular file: {entry}")
+        files.add(entry.name)
+    return files
+
+
+def _require_exact_files(directory: Path, expected: set[str], subject: str) -> None:
+    observed = _regular_files(directory)
+    if observed != expected:
+        missing = sorted(expected - observed)
+        unexpected = sorted(observed - expected)
+        raise CandidateError(
+            f"{subject} has the wrong file set; missing={missing}, unexpected={unexpected}"
+        )
+
+
+def _require_mode(path: Path, expected: int) -> None:
+    observed = stat.S_IMODE(path.stat().st_mode)
+    if observed != expected:
+        raise CandidateError(
+            f"release artifact mode is {observed:04o}, expected {expected:04o}: {path}"
+        )
+
+
+def _sidecar(path: Path, expected_name: str) -> str:
+    try:
+        raw = path.read_text(encoding="ascii")
+    except OSError as exc:
+        raise CandidateError(f"cannot read checksum sidecar {path}: {exc}") from exc
+    match = re.fullmatch(r"([0-9a-f]{64})  ([^\n]+)\n", raw)
+    if match is None or match.group(2) != expected_name:
+        raise CandidateError(f"checksum sidecar is not canonical for {expected_name}: {path}")
+    return match.group(1)
+
+
+def source_versions() -> tuple[str, str, str]:
+    package = (ROOT / "src/agcoord/__init__.py").read_text(encoding="utf-8")
+    package_match = re.search(r'^__version__ = "([^"]+)"$', package, re.MULTILINE)
+    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    cargo_match = re.search(
+        r'^\[workspace\.package\]\s+version = "([^"]+)"$',
+        cargo,
+        re.MULTILINE,
+    )
+    lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    lock_match = re.search(
+        r'^\[\[package\]\]\s+name = "agcoord-broker"\s+version = "([^"]+)"$',
+        lock,
+        re.MULTILINE,
+    )
+    if package_match is None or cargo_match is None or lock_match is None:
+        raise CandidateError("cannot read all declared package versions")
+    return package_match.group(1), cargo_match.group(1), lock_match.group(1)
+
+
+def _metadata(raw: bytes, subject: str) -> Any:
+    message = BytesParser(policy=email_policy).parsebytes(raw)
+    if message.get("Name") != "agcoord":
+        raise CandidateError(f"{subject} package name is not agcoord")
+    return message
+
+
+def _wheel_metadata(wheel: Path, version: str) -> None:
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+        if any(
+            PurePosixPath(name).is_absolute()
+            or ".." in PurePosixPath(name).parts
+            or name.endswith("/agcoord-broker")
+            or "usr/libexec/agcoord" in name
+            for name in names
+        ):
+            raise CandidateError("wheel contains an unsafe path or native broker executable")
+        metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
+        entry_names = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
+        if len(metadata_names) != 1 or len(entry_names) != 1:
+            raise CandidateError("wheel has an invalid metadata or entry-point file set")
+        source_root = ROOT / "src/agcoord"
+        source_files = {
+            f"agcoord/{path.relative_to(source_root).as_posix()}": path
+            for path in source_root.rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        wheel_package_files = {
+            name for name in names if name.startswith("agcoord/") and not name.endswith("/")
+        }
+        if wheel_package_files != set(source_files):
+            raise CandidateError("wheel package files do not exactly match the source package")
+        for name, source in source_files.items():
+            if archive.read(name) != source.read_bytes():
+                raise CandidateError(f"wheel file was not built from this source: {name}")
+        message = _metadata(archive.read(metadata_names[0]), "wheel")
+        if message.get("Version") != version:
+            raise CandidateError("wheel version does not match the source release version")
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        parser.read_string(archive.read(entry_names[0]).decode("utf-8"))
+        console = dict(parser.items("console_scripts")) if parser.has_section("console_scripts") else {}
+        pytest = dict(parser.items("pytest11")) if parser.has_section("pytest11") else {}
+        if console != {"agc": "agcoord.cli:main"}:
+            raise CandidateError(f"wheel console entry points are invalid: {console!r}")
+        if pytest != {"agcoord-xdist": "agcoord.pytest_xdist"}:
+            raise CandidateError(f"wheel pytest entry points are invalid: {pytest!r}")
+
+
+def _sdist_metadata(sdist: Path, version: str) -> None:
+    prefix = f"agcoord-{version}/"
+    required = {
+        f"{prefix}PKG-INFO",
+        f"{prefix}docs/native_migration.md",
+        f"{prefix}scripts/rehearse-native-migration",
+        f"{prefix}scripts/verify-release-candidate",
+    }
+    with tarfile.open(sdist, "r:gz") as archive:
+        members = archive.getmembers()
+        names = {member.name for member in members}
+        for member in members:
+            path = PurePosixPath(member.name)
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or (
+                    member.name != prefix.rstrip("/")
+                    and not member.name.startswith(prefix)
+                )
+            ):
+                raise CandidateError(f"sdist contains an unsafe or foreign path: {member.name}")
+            if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+                raise CandidateError(f"sdist contains an unsupported member: {member.name}")
+        if not required <= names:
+            raise CandidateError(f"sdist is missing release contracts: {sorted(required - names)}")
+        for member in members:
+            if not member.isfile():
+                continue
+            relative = member.name.removeprefix(prefix)
+            source = ROOT / relative
+            if source.is_file():
+                archived = archive.extractfile(member)
+                if archived is None or archived.read() != source.read_bytes():
+                    raise CandidateError(
+                        f"sdist file was not built from this source: {relative}"
+                    )
+        package_info = archive.extractfile(f"{prefix}PKG-INFO")
+        if package_info is None:
+            raise CandidateError("sdist package metadata is unreadable")
+        message = _metadata(package_info.read(), "sdist")
+        if message.get("Version") != version:
+            raise CandidateError("sdist version does not match the source release version")
+        for script in ("rehearse-native-migration", "verify-release-candidate"):
+            member = archive.getmember(f"{prefix}scripts/{script}")
+            if member.mode & 0o111 == 0:
+                raise CandidateError(f"sdist release script is not executable: {script}")
+
+
+def _native_artifacts(directory: Path, version: str) -> dict[str, Any]:
+    _require_exact_files(directory, NATIVE_FILES, "native artifact directory")
+    artifact = directory / NATIVE_NAME
+    _require_mode(artifact, 0o755)
+    for name in NATIVE_FILES - {NATIVE_NAME}:
+        _require_mode(directory / name, 0o644)
+    expected = _sidecar(directory / f"{NATIVE_NAME}.sha256", NATIVE_NAME)
+    if _sha256(artifact) != expected:
+        raise CandidateError("native broker checksum does not match its sidecar")
+    _run([ROOT / "scripts/audit-native-broker", artifact])
+    _run([ROOT / "scripts/check-native-licenses", artifact])
+    try:
+        identity = json.loads(_run([artifact, "identity", "--json"]).stdout)
+        provenance = json.loads(
+            (directory / f"{NATIVE_NAME}.provenance.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CandidateError(f"native identity or provenance is invalid: {exc}") from exc
+    if identity.get("version") != version or provenance.get("identity") != identity:
+        raise CandidateError("native artifact version or provenance does not match the release")
+    source_sha256 = _run([ROOT / "scripts/native-source-id"]).stdout.strip()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+        or identity.get("build") != f"sha256:{source_sha256}"
+        or provenance.get("source_sha256") != source_sha256
+    ):
+        raise CandidateError("native artifact was not built from this exact source commit")
+    return identity
+
+
+def _host_artifacts(directory: Path, version: str) -> dict[str, Any]:
+    _require_exact_files(directory, HOST_FILES, "host artifact directory")
+    for name in HOST_FILES:
+        _require_mode(directory / name, 0o755 if name in HELPERS else 0o644)
+    for name in (HOST_NAME, *HELPERS):
+        expected = _sidecar(directory / f"{name}.sha256", name)
+        if _sha256(directory / name) != expected:
+            raise CandidateError(f"host artifact checksum does not match: {name}")
+    _run([directory / "check-native-host-package", directory / HOST_NAME])
+    with tarfile.open(directory / HOST_NAME, "r:gz") as archive:
+        manifest_file = archive.extractfile("./usr/share/doc/agcoord/native-host-manifest.json")
+        if manifest_file is None:
+            raise CandidateError("host package manifest is missing")
+        try:
+            manifest = json.load(manifest_file)
+        except json.JSONDecodeError as exc:
+            raise CandidateError("host package manifest is invalid JSON") from exc
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict) or identity.get("version") != version:
+        raise CandidateError("host package identity does not match the release version")
+    return manifest
+
+
+def _clean_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in (
+        "AGCOORD_RUN_ID",
+        "AGCOORD_RUN_KIND",
+        "AGCOORD_STATE_DIR",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "VIRTUAL_ENV",
+    ):
+        environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return environment
+
+
+def _installed_smoke(
+    python: Path,
+    artifact: Path,
+    version: str,
+    environment: dict[str, str],
+    *,
+    extra: str = "",
+) -> tuple[Path, Path]:
+    venv = artifact.parent / f"venv-{artifact.name}"
+    _run([python, "-m", "venv", venv], environment=environment)
+    installed_python = venv / "bin/python"
+    pip = venv / "bin/pip"
+    requirement = (
+        f"agcoord[{extra}] @ {artifact.as_uri()}" if extra else os.fspath(artifact)
+    )
+    _run([pip, "install", requirement], environment=environment)
+    agc = venv / "bin/agc"
+    if (venv / "bin/agcoord").exists():
+        raise CandidateError("clean install exposed the removed agcoord console command")
+    version_output = _run([agc, "--version"], environment=environment).stdout.strip()
+    if version_output != f"agc {version}":
+        raise CandidateError(f"clean install reported the wrong version: {version_output!r}")
+    _run([agc, "--help"], environment=environment)
+    _run([installed_python, "-m", "agcoord", "--help"], environment=environment)
+    location = _run(
+        [
+            installed_python,
+            "-c",
+            "import pathlib, agcoord; print(pathlib.Path(agcoord.__file__).resolve())",
+        ],
+        environment=environment,
+    ).stdout.strip()
+    if not Path(location).is_relative_to(venv):
+        raise CandidateError(f"clean install imported outside its environment: {location}")
+    return installed_python, agc
+
+
+def _clean_install_artifacts(
+    python: Path,
+    wheel: Path,
+    sdist: Path,
+    broker: Path,
+    version: str,
+) -> dict[str, Any]:
+    environment = _clean_environment()
+    with tempfile.TemporaryDirectory(prefix="agcoord-release-install-") as raw:
+        root = Path(raw)
+        staged_wheel = root / wheel.name
+        staged_sdist = root / sdist.name
+        shutil.copy2(wheel, staged_wheel)
+        shutil.copy2(sdist, staged_sdist)
+        wheel_python, wheel_agc = _installed_smoke(
+            python,
+            staged_wheel,
+            version,
+            environment,
+            extra="xdist",
+        )
+        entry_points = _run(
+            [
+                wheel_python,
+                "-c",
+                "from importlib.metadata import entry_points; "
+                "print(sum(ep.name == 'agcoord-xdist' for ep in "
+                "entry_points(group='pytest11')))",
+            ],
+            environment=environment,
+        ).stdout.strip()
+        if entry_points != "1":
+            raise CandidateError("clean wheel install did not expose one xdist entry point")
+        rehearsal = _run(
+            [
+                ROOT / "scripts/rehearse-native-migration",
+                "--python",
+                wheel_python,
+                "--agc",
+                wheel_agc,
+                "--broker",
+                broker,
+            ],
+            environment=environment,
+        )
+        try:
+            receipt = json.loads(rehearsal.stdout)
+        except json.JSONDecodeError as exc:
+            raise CandidateError("clean-install migration rehearsal emitted invalid JSON") from exc
+        if receipt.get("final_protocol") != 5 or receipt.get("rollback_protocol") != 4:
+            raise CandidateError("clean-install migration rehearsal did not round-trip")
+        _installed_smoke(python, staged_sdist, version, environment)
+        return receipt
+
+
+def _python_artifacts(directory: Path, version: str) -> tuple[Path, Path]:
+    normalized = version.replace("-", "_")
+    wheel_name = f"agcoord-{normalized}-py3-none-any.whl"
+    sdist_name = f"agcoord-{version}.tar.gz"
+    _require_exact_files(directory, {wheel_name, sdist_name}, "Python artifact directory")
+    wheel = directory / wheel_name
+    sdist = directory / sdist_name
+    _require_mode(wheel, 0o644)
+    _require_mode(sdist, 0o644)
+    _wheel_metadata(wheel, version)
+    _sdist_metadata(sdist, version)
+    return wheel, sdist
+
+
+def _assert_clean_source(tag: str | None) -> None:
+    dirty = _run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"]
+    ).stdout
+    if dirty:
+        raise CandidateError(f"release source checkout is dirty:\n{dirty}")
+    if tag is not None:
+        if tag != f"v{source_versions()[0]}":
+            raise CandidateError("release tag does not match the source version")
+        points_at = _run(["git", "tag", "--points-at", "HEAD"]).stdout.splitlines()
+        if tag not in points_at:
+            raise CandidateError("release tag does not point at the candidate commit")
+
+
+def _assemble(
+    output: Path,
+    sources: Iterable[Path],
+    version: str,
+    native_identity: dict[str, Any],
+    host_manifest: dict[str, Any],
+    migration_receipt: dict[str, Any],
+) -> Path:
+    if host_manifest.get("identity") != native_identity:
+        raise CandidateError("native and host-package identities differ")
+    if output.exists():
+        raise CandidateError(f"release output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.mkdir(mode=0o755)
+    copied: list[Path] = []
+    for source in sources:
+        destination = output / source.name
+        if destination.exists():
+            raise CandidateError(f"release bundle name collision: {source.name}")
+        shutil.copy2(source, destination)
+        copied.append(destination)
+    artifact_records = [
+        {"name": path.name, "sha256": _sha256(path), "size": path.stat().st_size}
+        for path in sorted(copied)
+    ]
+    manifest = {
+        "artifacts": artifact_records,
+        "compatibility": {
+            "client": f"{version}",
+            "native_broker": f"{version}",
+            "protocol": 5,
+            "python_rollback_protocol": 4,
+            "target": TARGET,
+        },
+        "format": 1,
+        "host_package_sha256": _sha256(output / HOST_NAME),
+        "migration_rehearsal": migration_receipt,
+        "native_identity": native_identity,
+        "version": version,
+    }
+    manifest_path = output / "release-manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+    checksummed = [*copied, manifest_path]
+    checksum_path = output / "SHA256SUMS"
+    checksum_path.write_text(
+        "".join(
+            f"{_sha256(path)}  {path.name}\n" for path in sorted(checksummed)
+        ),
+        encoding="ascii",
+    )
+    checksum_path.chmod(0o644)
+    for line in checksum_path.read_text(encoding="ascii").splitlines():
+        digest, name = line.split("  ", 1)
+        if _sha256(output / name) != digest:
+            raise CandidateError(f"assembled bundle checksum changed: {name}")
+    return manifest_path
+
+
+def verify_candidate(
+    python_dir: Path,
+    native_dir: Path,
+    host_dir: Path,
+    output: Path,
+    python: Path,
+    tag: str | None,
+) -> dict[str, Any]:
+    _assert_clean_source(tag)
+    versions = source_versions()
+    if len(set(versions)) != 1 or not VERSION_PATTERN.fullmatch(versions[0]):
+        raise CandidateError(f"source release versions are not exact and equal: {versions!r}")
+    version = versions[0]
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    if re.search(rf"^## {re.escape(version)} — [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$", changelog, re.MULTILINE) is None:
+        raise CandidateError("changelog has no dated section for the release version")
+    wheel, sdist = _python_artifacts(python_dir, version)
+    _run([python, "-m", "twine", "check", wheel, sdist])
+    native_identity = _native_artifacts(native_dir, version)
+    host_manifest = _host_artifacts(host_dir, version)
+    migration_receipt = _clean_install_artifacts(
+        python,
+        wheel,
+        sdist,
+        native_dir / NATIVE_NAME,
+        version,
+    )
+    sources = [
+        wheel,
+        sdist,
+        *(native_dir / name for name in sorted(NATIVE_FILES)),
+        *(host_dir / name for name in sorted(HOST_FILES)),
+    ]
+    manifest_path = _assemble(
+        output,
+        sources,
+        version,
+        native_identity,
+        host_manifest,
+        migration_receipt,
+    )
+    return {
+        "artifact_count": len(sources),
+        "bundle": os.fspath(output),
+        "manifest_sha256": _sha256(manifest_path),
+        "migration_backup_sha256": migration_receipt["backup_sha256"],
+        "protocol": 5,
+        "version": version,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="verify clean installs and assemble one AGCoord release candidate"
+    )
+    parser.add_argument("--python-dir", type=Path, required=True)
+    parser.add_argument("--native-dir", type=Path, required=True)
+    parser.add_argument("--host-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--python", type=Path, default=Path(sys.executable))
+    parser.add_argument("--tag")
+    arguments = parser.parse_args()
+    try:
+        receipt = verify_candidate(
+            arguments.python_dir.expanduser().resolve(),
+            arguments.native_dir.expanduser().resolve(),
+            arguments.host_dir.expanduser().resolve(),
+            arguments.output_dir.expanduser().resolve(),
+            Path(os.path.abspath(arguments.python.expanduser())),
+            arguments.tag,
+        )
+    except (CandidateError, OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
+        print(f"release candidate refused: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(receipt, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
