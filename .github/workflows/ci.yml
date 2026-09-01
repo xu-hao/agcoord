@@ -129,6 +129,10 @@ jobs:
             if agc list >/dev/null 2>&1; then
               break
             fi
+            if ((attempt == 50)); then
+              printf 'native broker was not ready after %s attempts\n' "$attempt" >&2
+              exit 1
+            fi
             sleep 0.2
           done
           systemctl --user --no-pager status agcoord-broker.service
