@@ -353,7 +353,7 @@ impl FixtureSystem {
             ("cpu.max", "max 100000\n"),
             (
                 "cpu.stat",
-                "usage_usec 0\nnr_throttled 0\nthrottled_usec 0\n",
+                "usage_usec 0\ncore_sched.force_idle_usec 0\nnr_throttled 0\nthrottled_usec 0\n",
             ),
             ("pids.max", "max\n"),
             ("pids.current", "0\n"),
@@ -1200,6 +1200,16 @@ fn controller_name_valid(value: &str) -> bool {
         && bytes[0].is_ascii_lowercase()
         && bytes[1..].iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn metric_name_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
         })
 }
 
@@ -2663,7 +2673,7 @@ impl CgroupBackend {
         for line in raw.lines() {
             let fields: Vec<_> = line.split_whitespace().collect();
             if fields.len() != 2
-                || !controller_name_valid(fields[0])
+                || !metric_name_valid(fields[0])
                 || fields[1].is_empty()
                 || !fields[1].bytes().all(|byte| byte.is_ascii_digit())
                 || selected
@@ -2765,7 +2775,7 @@ impl CgroupBackend {
                 let Some((name, value)) = field.split_once('=') else {
                     return Err(CgroupError::new("io-stat-invalid"));
                 };
-                if !controller_name_valid(name)
+                if !metric_name_valid(name)
                     || value.is_empty()
                     || !value.bytes().all(|byte| byte.is_ascii_digit())
                     || values

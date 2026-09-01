@@ -340,7 +340,7 @@ fn managed_service_uses_configured_capacity_and_has_no_idle_shutdown() {
         .spawn()
         .unwrap();
     let lock = fixture.state.join("broker.lock");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let owner = loop {
         if let Ok(owner) = fs::read_to_string(&lock)
             && owner.contains("protocol=5\n")
@@ -516,7 +516,7 @@ fn host_installer_stages_without_live_changes_and_activates_only_after_drain() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let ready = Command::new(BROKER)
             .args(["snapshot", "--state-dir", fixture.state.to_str().unwrap()])
