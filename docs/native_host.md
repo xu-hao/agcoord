@@ -72,11 +72,15 @@ On every managed start, the broker fails before acquiring the spool unless all o
 The cgroup backend then performs its destructive probe, including user-, cgroup-, and mount-
 namespace creation and controller-file protection. An unavailable required binding refuses the
 run before user code; it is never silently treated as admission-only.
-The capability refusal distinguishes `namespace-propagation-mount-failed` from
-`namespace-cgroup2-mount-failed-errno-N`, where `N` is the retained Linux error number; a later
-worker-side refusal is normalized to the stable `namespace-mount-failed` setup code. Inspect the
-kernel journal alongside that receipt to distinguish a kernel namespace refusal from an AppArmor
-denial.
+The capability probe first mounts the namespace-rooted cgroup2 view directly. Linux may report
+`EBUSY` when that view collides with the inherited cgroup2 mountpoint; in that case the broker bind
+mounts only its already-attached leaf over the inherited view. `CLONE_NEWCGROUP` and `nsdelegate`
+still protect the namespace root, and the probe verifies both properties before admitting work.
+Other refusals distinguish `namespace-propagation-mount-failed`,
+`namespace-cgroup2-mount-failed-errno-N`, and `namespace-cgroup2-bind-failed-errno-N`, where `N` is
+the retained Linux error number. A later worker-side refusal is normalized to the stable
+`namespace-mount-failed` setup code. Inspect the kernel journal alongside that receipt to
+distinguish a kernel namespace refusal from an AppArmor denial.
 
 ## First install
 
