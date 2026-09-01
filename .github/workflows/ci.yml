@@ -148,8 +148,13 @@ jobs:
       - name: Retain the real enforced CPU receipt
         run: |
           set -euo pipefail
-          agc --json run --label "native host enforcement" --resource cpu=1 \
-            -- dist/host/test-native-host-enforcement >native-host-receipt.json
+          if ! agc --json run --label "native host enforcement" --resource cpu=1 \
+            -- dist/host/test-native-host-enforcement >native-host-receipt.json; then
+            cat native-host-receipt.json >&2
+            run_id=$(jq -er '.run_id' native-host-receipt.json)
+            agc log "$run_id" >&2 || true
+            exit 1
+          fi
           jq -e '
             .status == "passed"
             and .resource_receipt.requested.cpu == 1

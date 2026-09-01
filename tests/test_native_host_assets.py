@@ -93,3 +93,5 @@ def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
     assert "cat native-host-client-error.txt" in workflow
     assert "systemctl --user --no-pager status agcoord-broker.service" in workflow
     assert "journalctl --user --unit agcoord-broker.service --no-pager" in workflow
+    assert "cat native-host-receipt.json" in workflow
+    assert 'agc log "$run_id"' in workflow
