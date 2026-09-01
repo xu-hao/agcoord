@@ -289,16 +289,6 @@ impl Broker {
                 format!("cannot encode resource capabilities: {error}"),
             )
         })?;
-        owner.publish(&format!(
-            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\nstarted_at={}\n",
-            std::process::id(),
-            env!("CARGO_PKG_VERSION"),
-            env!("AGCOORD_BUILD_ID"),
-            capacities_json,
-            bindings_json,
-            capabilities_json,
-            started_at,
-        ))?;
         let stopped = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(SIGTERM, Arc::clone(&stopped)).map_err(|error| {
             AppError::new(
@@ -312,6 +302,16 @@ impl Broker {
                 format!("cannot install SIGINT handler: {error}"),
             )
         })?;
+        owner.publish(&format!(
+            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\nstarted_at={}\n",
+            std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            env!("AGCOORD_BUILD_ID"),
+            capacities_json,
+            bindings_json,
+            capabilities_json,
+            started_at,
+        ))?;
         Ok(Self {
             paths,
             capacities,

@@ -11,6 +11,9 @@ versioning; dates use ISO 8601.
   cgroup, controllers, global namespace restriction, and setup profile, while admitted broker
   calls and arbitrary submitted commands remain namespace-restricted. A real-host probe proves
   an enforced CPU receipt without weakening Ubuntu's global policy.
+- Publish a native broker's live owner identity only after its termination handlers are ready,
+  and require crash-recovery startup checks to observe the exact replacement PID rather than
+  accepting stale metadata retained in the locked ownership file.
 - Add a strict version-1 Python/native conformance manifest and executable release gate covering
   commands, repositories, atomic publication, the real TUI, protocols, resources and receipts,
   migrations, contention, cancellation, crash recovery, malformed-input corpora, and the core
