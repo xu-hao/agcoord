@@ -503,10 +503,22 @@ fn host_installer_stages_without_live_changes_and_activates_only_after_drain() {
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !fixture.state.join("broker.lock").is_file() {
+    loop {
+        let ready = Command::new(BROKER)
+            .args(["snapshot", "--state-dir", fixture.state.to_str().unwrap()])
+            .output()
+            .unwrap();
+        if ready.status.success() {
+            break;
+        }
+        assert!(
+            broker.try_wait().unwrap().is_none(),
+            "managed broker exited early"
+        );
         assert!(
             std::time::Instant::now() < deadline,
-            "managed broker did not start"
+            "managed broker did not become queryable: {}",
+            String::from_utf8_lossy(&ready.stderr)
         );
         thread::sleep(Duration::from_millis(20));
     }
