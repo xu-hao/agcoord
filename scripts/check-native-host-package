@@ -99,6 +99,14 @@ if command -v apparmor_parser >/dev/null 2>&1; then
         printf 'host package has an unexpected AppArmor profile set\n' >&2
         exit 1
     fi
+    profile_debug=$(apparmor_parser --skip-kernel-load --skip-cache --debug "$profile" 2>&1)
+    enforce_modes=$(awk '$0 == "Mode: enforce" { count += 1 } END { print count + 0 }' \
+        <<<"$profile_debug")
+    if [[ "$enforce_modes" != 3 ]] || grep -q '^Mode: default_allow$' <<<"$profile_debug"; then
+        printf 'host package AppArmor domains are not all in enforce mode\n' >&2
+        printf '%s\n' "$profile_debug" >&2
+        exit 1
+    fi
 fi
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd_errors="$temporary/systemd-errors"
