@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "packaging/systemd/agcoord-broker.service"
 PROFILE = ROOT / "packaging/apparmor/usr.libexec.agcoord.agcoord-broker"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+WORKER = ROOT / "native/agcoord-broker/src/worker.rs"
 
 
 def test_native_user_service_passes_systemd_verification(tmp_path: Path):
@@ -86,12 +87,31 @@ def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
     assert "Mode: default_allow" not in diagnostics
 
 
+def test_native_apparmor_transitions_are_safe_after_no_new_privileges():
+    policy = PROFILE.read_text(encoding="utf-8")
+    broker = policy.split("profile agcoord-broker ", 1)[1].split("\n}", 1)[0]
+    client = policy.split("profile agcoord-broker-client ", 1)[1].split("\n}", 1)[0]
+    admitted = policy.split("profile agcoord-admitted ", 1)[1].split("\n}", 1)[0]
+    worker = WORKER.read_text(encoding="utf-8").split("fn child_main(", 1)[1]
+
+    assert "change_profile -> agcoord-admitted," in broker
+    assert "/** ix," in client
+    assert (
+        "/usr/libexec/agcoord/agcoord-broker px -> "
+        "agcoord-admitted//&agcoord-broker-client,"
+        in admitted
+    )
+    assert "/** ix," in admitted
+    assert worker.index("enter_admitted_profile(") < worker.index("drop_privileges()")
+
+
 def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
     assert "timeout --signal=KILL 2s agc list" in workflow
     assert "cat native-host-client-error.txt" in workflow
     assert "systemctl --user --no-pager status agcoord-broker.service" in workflow
-    assert "journalctl --user --unit agcoord-broker.service --no-pager" in workflow
+    assert workflow.count("journalctl --user --unit agcoord-broker.service --no-pager") == 2
     assert "cat native-host-receipt.json" in workflow
     assert 'agc log "$run_id"' in workflow
+    assert "sudo journalctl --dmesg --no-pager" in workflow

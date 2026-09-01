@@ -94,6 +94,7 @@ impl CgroupRequest {
 #[derive(Clone, Debug)]
 struct CgroupMount {
     path: PathBuf,
+    root: PathBuf,
     options: BTreeSet<String>,
 }
 
@@ -352,7 +353,7 @@ impl FixtureSystem {
             ("cpu.max", "max 100000\n"),
             (
                 "cpu.stat",
-                "usage_usec 0\nnr_throttled 0\nthrottled_usec 0\n",
+                "usage_usec 0\ncore_sched.force_idle_usec 0\nnr_throttled 0\nthrottled_usec 0\n",
             ),
             ("pids.max", "max\n"),
             ("pids.current", "0\n"),
@@ -803,7 +804,8 @@ fn cgroup_mounts() -> std::io::Result<Vec<CgroupMount>> {
             continue;
         }
         let path = PathBuf::from(decode_mount_path(fields[4]));
-        if !path.is_absolute() {
+        let root = PathBuf::from(decode_mount_path(fields[3]));
+        if !path.is_absolute() || !root.is_absolute() {
             continue;
         }
         let options = fields[5]
@@ -811,7 +813,11 @@ fn cgroup_mounts() -> std::io::Result<Vec<CgroupMount>> {
             .chain(right_fields[2].split(','))
             .map(str::to_owned)
             .collect();
-        mounts.push(CgroupMount { path, options });
+        mounts.push(CgroupMount {
+            path,
+            root,
+            options,
+        });
     }
     Ok(mounts)
 }
@@ -890,6 +896,30 @@ fn namespace_mapping(path: &Path, value: &str) -> CgroupResult<()> {
     write_kernel_file(path, value).map_err(|_| CgroupError::new("namespace-mapping-failed"))
 }
 
+fn current_cgroup_path() -> CgroupResult<PathBuf> {
+    let raw = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|_| CgroupError::new("namespace-verification-failed"))?;
+    let mut unified = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .map(PathBuf::from);
+    let current = unified
+        .next()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| CgroupError::new("namespace-verification-failed"))?;
+    if unified.next().is_some() {
+        return Err(CgroupError::new("namespace-verification-failed"));
+    }
+    Ok(current)
+}
+
+fn cgroup_bind_source(mount: &CgroupMount, current: &Path) -> CgroupResult<PathBuf> {
+    let relative = current
+        .strip_prefix(&mount.root)
+        .map_err(|_| CgroupError::new("namespace-mount-failed"))?;
+    Ok(mount.path.join(relative))
+}
+
 pub fn isolate_current_cgroup() -> CgroupResult<()> {
     let mounts = cgroup_mounts()
         .map(covering_cgroup_mounts)
@@ -901,6 +931,7 @@ pub fn isolate_current_cgroup() -> CgroupResult<()> {
     {
         return Err(CgroupError::new("namespace-delegation-unavailable"));
     }
+    let current = current_cgroup_path()?;
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     // SAFETY: unshare receives only the documented namespace bit mask.
@@ -927,7 +958,7 @@ pub fn isolate_current_cgroup() -> CgroupResult<()> {
         )
     } != 0
     {
-        return Err(CgroupError::new("namespace-mount-failed"));
+        return Err(CgroupError::new("namespace-propagation-mount-failed"));
     }
     let source = CString::new("none").unwrap();
     let filesystem = CString::new("cgroup2").unwrap();
@@ -945,7 +976,33 @@ pub fn isolate_current_cgroup() -> CgroupResult<()> {
             )
         } != 0
         {
-            return Err(CgroupError::new("namespace-mount-failed"));
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EBUSY) {
+                let errno = error.raw_os_error().unwrap_or(0);
+                return Err(CgroupError::new(&format!(
+                    "namespace-cgroup2-mount-failed-errno-{errno}"
+                )));
+            }
+            let bind_source = cgroup_bind_source(mount, &current)?;
+            let bind_source = CString::new(bind_source.as_os_str().as_bytes())
+                .map_err(|_| CgroupError::new("namespace-mount-failed"))?;
+            // SAFETY: source and target are live NUL-terminated paths; a null filesystem and
+            // data pointer are valid for a bind mount.
+            if unsafe {
+                libc::mount(
+                    bind_source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                return Err(CgroupError::new(&format!(
+                    "namespace-cgroup2-bind-failed-errno-{errno}"
+                )));
+            }
         }
     }
     let cgroups = fs::read_to_string("/proc/self/cgroup")
@@ -1143,6 +1200,16 @@ fn controller_name_valid(value: &str) -> bool {
         && bytes[0].is_ascii_lowercase()
         && bytes[1..].iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn metric_name_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
         })
 }
 
@@ -2606,7 +2673,7 @@ impl CgroupBackend {
         for line in raw.lines() {
             let fields: Vec<_> = line.split_whitespace().collect();
             if fields.len() != 2
-                || !controller_name_valid(fields[0])
+                || !metric_name_valid(fields[0])
                 || fields[1].is_empty()
                 || !fields[1].bytes().all(|byte| byte.is_ascii_digit())
                 || selected
@@ -2708,7 +2775,7 @@ impl CgroupBackend {
                 let Some((name, value)) = field.split_once('=') else {
                     return Err(CgroupError::new("io-stat-invalid"));
                 };
-                if !controller_name_valid(name)
+                if !metric_name_valid(name)
                     || value.is_empty()
                     || !value.bytes().all(|byte| byte.is_ascii_digit())
                     || values
@@ -3174,5 +3241,26 @@ impl CgroupBackend {
             return Err(CgroupError::new("leaf-missing"));
         };
         self.measurement(request, &leaf, handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BTreeSet, CgroupMount, cgroup_bind_source};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn busy_cgroup_mount_fallback_selects_only_the_attached_leaf() {
+        let mount = CgroupMount {
+            path: PathBuf::from("/sys/fs/cgroup"),
+            root: PathBuf::from("/user.slice"),
+            options: BTreeSet::new(),
+        };
+
+        assert_eq!(
+            cgroup_bind_source(&mount, Path::new("/user.slice/runner.scope/agcoord-leaf")).unwrap(),
+            PathBuf::from("/sys/fs/cgroup/runner.scope/agcoord-leaf"),
+        );
+        assert!(cgroup_bind_source(&mount, Path::new("/system.slice/unrelated.service")).is_err());
     }
 }
