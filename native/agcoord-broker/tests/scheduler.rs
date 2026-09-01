@@ -427,6 +427,31 @@ fn advance_land_phase(state_dir: &Path, run_id: &str, row: &Value, phase: &str) 
     run(&arguments)
 }
 
+fn update_land_head(state_dir: &Path, run_id: &str, row: &Value, new_head: &str) -> Output {
+    let worker_pid = row["worker_pid"].as_u64().unwrap();
+    let token = process_start_token(worker_pid);
+    let pid = worker_pid.to_string();
+    run(&[
+        "phase",
+        "--state-dir",
+        state_argument(state_dir),
+        "--run-id",
+        run_id,
+        "--worker-pid",
+        &pid,
+        "--worker-start-token",
+        &token,
+        "--checkout",
+        row["checkout"].as_str().unwrap(),
+        "--head",
+        row["head_sha"].as_str().unwrap(),
+        "--new-head",
+        new_head,
+        "--phase",
+        "preflight",
+    ])
+}
+
 fn wait_status(state_dir: &Path, run_id: &str, expected: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut observed = Value::Null;
@@ -5667,6 +5692,17 @@ fn land_phase_commit_is_the_atomic_cancellation_authority_boundary() {
     wait_for(Duration::from_secs(5), || entered.exists());
     let preflight = status(&state, "authoritative-land");
     assert_eq!(preflight["phase"], "preflight");
+
+    let synchronized_head = "b".repeat(40);
+    let retargeted = update_land_head(&state, "authoritative-land", &preflight, &synchronized_head);
+    assert!(
+        retargeted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retargeted.stderr)
+    );
+    let preflight: Value = serde_json::from_slice(&retargeted.stdout).unwrap();
+    assert_eq!(preflight["phase"], "preflight");
+    assert_eq!(preflight["head_sha"], synchronized_head);
 
     let gating = advance_land_phase(&state, "authoritative-land", &preflight, "gating");
     assert!(gating.status.success());

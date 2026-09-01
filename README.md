@@ -136,20 +136,27 @@ agc land 123 \
   -- ./scripts/test.sh
 # GitHub is the convenience default and may also be named explicitly.
 agc land 123 --adapter github -- ./scripts/test.sh
+# Opt out when the request must fail instead of merging an advanced target.
+agc land 123 --no-target-sync -- ./scripts/test.sh
 ```
 
 `land` stores the adapter, request, exact checkout/head, gate command, caller environment,
 and resource claim in one durable repository barrier. The core record keeps adapter and
 request separate even though the current installed adapter uses GitHub pull-request numbers.
-It rejects a stale target before the gate, runs the gate once, and publishes immediately
-after a green result without releasing the lane or resources. A red gate publishes nothing.
+If the target advanced while a same-repository request waited, the default GitHub adapter makes
+one ordinary merge commit from the current target into the unchanged request branch, pushes it
+with an exact lease, and records that commit as the durable head before running the gate. It
+then runs the gate once and publishes immediately after a green result without releasing the
+lane or resources. A red gate publishes nothing.
 `--adapter github` is the default when the option is omitted; the core request remains
 forge-neutral.
 
-AGCoord never refreshes, rebases, or rewrites the checkout. If the source head or target
-branch moves before or during the gate, the same job ends with a named handback and does not
-publish. Update the branch yourself, push it, and submit a fresh `agc land` request; a
-separate full-plus-merge sequence is not a landing substitute.
+Target synchronization never rebases or rewrites existing commits. A merge conflict is aborted
+and reported before the gate, with the checkout restored cleanly. A concurrent source change,
+failed lease-protected push, target movement during the gate, or changed post-gate observation
+ends with a named handback and does not update the target. Use `--no-target-sync` when even the
+pre-gate source merge is unwanted. A separate full-plus-merge sequence is not a landing
+substitute.
 
 Inspect or manage jobs from any terminal:
 
