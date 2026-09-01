@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const INSTALLED_EXECUTABLE: &str = "/usr/libexec/agcoord/agcoord-broker";
 const APPARMOR_PROFILE: &str = "agcoord-broker";
+const APPARMOR_ADMITTED_PROFILE: &str = "agcoord-admitted";
 const APPARMOR_CLIENT_PROFILE: &str = "agcoord-broker-client";
 const SERVICE_SUBGROUP: &str = "supervisor";
 const IMPLEMENTATION: &str = "rust-native";
@@ -56,6 +57,16 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn restricted_client_profile(profile: &str) -> bool {
+    let Some(profiles) = profile.strip_suffix(" (enforce)") else {
+        return false;
+    };
+    let profiles = profiles.split("//&").collect::<Vec<_>>();
+    profiles.len() == 2
+        && profiles.into_iter().collect::<BTreeSet<_>>()
+            == BTreeSet::from([APPARMOR_ADMITTED_PROFILE, APPARMOR_CLIENT_PROFILE])
 }
 
 fn selected_executable(options: &PreflightOptions) -> Result<PathBuf> {
@@ -425,10 +436,10 @@ pub fn client_preflight() -> Result<Value> {
                 format!("cannot read the client AppArmor profile: {error}"),
             )
         })?;
-    if profile != format!("{APPARMOR_CLIENT_PROFILE} (enforce)") {
+    if !restricted_client_profile(&profile) {
         return Err(refusal(
             "host-client-profile-mismatch",
-            "broker client command is not in the enforced restricted client profile",
+            "broker client command is not in the enforced admitted/client profile stack",
         ));
     }
 
@@ -734,5 +745,26 @@ pub fn drain_hold(state_dir: &Path) -> Result<()> {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restricted_client_profile;
+
+    #[test]
+    fn restricted_client_requires_the_exact_enforced_profile_stack() {
+        assert!(restricted_client_profile(
+            "agcoord-admitted//&agcoord-broker-client (enforce)"
+        ));
+        assert!(restricted_client_profile(
+            "agcoord-broker-client//&agcoord-admitted (enforce)"
+        ));
+        assert!(!restricted_client_profile(
+            "agcoord-broker-client (enforce)"
+        ));
+        assert!(!restricted_client_profile(
+            "agcoord-admitted//&agcoord-broker-client//&agcoord-broker-client (enforce)"
+        ));
     }
 }

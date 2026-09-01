@@ -145,13 +145,15 @@ jq -e '
 
 The setup-only `agcoord-broker` profile attaches only to the fixed root-owned executable; it is
 not selected by the user-editable systemd unit. The public binary has no internal-worker or
-arbitrary setup-domain exec command. The broker's authenticated in-process worker transitions
-the submitted command into `agcoord-admitted` before release. When that admitted command invokes
-the fixed broker, an explicit transition selects `agcoord-broker-client` instead of reattaching
-the setup profile. Both domains deny user-namespace creation and changing back to setup, and the
-admitted restriction persists across arbitrary interpreter execution. All three profiles use
-explicit enforce mode and broad enumerated host permissions; `default_allow` is not accepted
-because Ubuntu 24.04 implements it as an unconfined profile that does not apply these denials.
+arbitrary setup-domain exec command. The broker's authenticated in-process worker makes a one-way
+transition into `agcoord-admitted`, verifies it, and only then clears capabilities and sets
+`no_new_privs` before release. Arbitrary interpreter execution inherits that profile. When
+admitted work invokes the fixed broker, AppArmor stacks `agcoord-broker-client` onto the existing
+admitted confinement; this adds restrictions without requesting a replacement domain after
+`no_new_privs`. Both restricted profiles deny user-namespace creation and changing back to setup.
+All three profiles use explicit enforce mode and broad enumerated host permissions;
+`default_allow` is not accepted because Ubuntu 24.04 implements it as an unconfined profile that
+does not apply these denials.
 
 ## Upgrade, recovery, and rollback
 
