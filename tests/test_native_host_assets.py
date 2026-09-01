@@ -97,7 +97,8 @@ def test_native_apparmor_transitions_are_safe_after_no_new_privileges():
     assert "change_profile -> agcoord-admitted," in broker
     assert "/** ix," in client
     assert (
-        "/usr/libexec/agcoord/agcoord-broker px -> &agcoord-broker-client,"
+        "/usr/libexec/agcoord/agcoord-broker px -> "
+        "@{profile_name}//&agcoord-broker-client,"
         in admitted
     )
     assert "/** ix," in admitted
