@@ -57,6 +57,7 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
     assert default.native_broker == NativeBrokerConfig(
         path=DEFAULT_NATIVE_BROKER_PATH,
         allow_development=False,
+        managed_service=False,
     )
 
     selected = parse_broker_config(
@@ -65,6 +66,7 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
                 "native_broker": {
                     "path": "/opt/agcoord/agcoord-broker",
                     "allow_development": True,
+                    "managed_service": True,
                 }
             }
         )
@@ -72,12 +74,14 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
     assert selected.native_broker == NativeBrokerConfig(
         path="/opt/agcoord/agcoord-broker",
         allow_development=True,
+        managed_service=True,
     )
 
     for invalid in (
         {"native_broker": {}},
         {"native_broker": {"path": "relative"}},
         {"native_broker": {"path": "/bin/true", "allow_development": 1}},
+        {"native_broker": {"path": "/bin/true", "managed_service": 1}},
         {"native_broker": {"path": "/bin/true", "fallback": "python"}},
     ):
         with pytest.raises(BrokerConfigError, match="native_broker"):
@@ -183,3 +187,47 @@ def test_idle_protocol_four_spool_requires_explicit_migration_before_autostart(
     assert protocol == "4"
     owner_lock = state_dir / "broker.lock"
     assert not owner_lock.exists() or not owner_lock.read_text(encoding="utf-8")
+
+
+def test_managed_native_autostart_uses_the_user_service_and_never_spawns_directly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from agcoord import queue
+
+    state_dir = tmp_path / "agcoord"
+    executable = _identity_executable(tmp_path / "broker")
+    state_dir.mkdir()
+    (state_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "native_broker": {
+                    "path": str(executable),
+                    "allow_development": True,
+                    "managed_service": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(arguments, **_kwargs):
+        calls.append(list(arguments))
+        return __import__("subprocess").CompletedProcess(arguments, 0, b"", b"")
+
+    def forbidden_spawn(*_args, **_kwargs):
+        raise AssertionError("managed autostart spawned the broker directly")
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.delenv("AGCOORD_STATE_DIR", raising=False)
+    client = CoordinatorClient(
+        autostart=True,
+        connect_timeout=0.01,
+    )
+    client._native_command()
+    monkeypatch.setattr(queue.subprocess, "run", fake_run)
+    monkeypatch.setattr(queue.subprocess, "Popen", forbidden_spawn)
+    with pytest.raises(CoordinatorError, match="did not start"):
+        client.snapshot()
+    assert calls == [["/usr/bin/systemctl", "--user", "start", "agcoord-broker.service"]]

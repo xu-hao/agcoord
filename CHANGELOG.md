@@ -5,6 +5,19 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add the verified native host bundle, long-lived delegated systemd user service, and
+  three-domain enforcing AppArmor boundary without `default_allow`/unconfined policy. Staged
+  installation and upgrade refuse live work and never
+  restart implicitly; managed startup verifies the fixed root-owned release identity, service
+  cgroup, controllers, global namespace restriction, and setup profile, while admitted broker
+  calls and arbitrary submitted commands remain namespace-restricted. A real-host probe proves
+  an enforced CPU receipt without weakening Ubuntu's global policy and retains broker and kernel
+  diagnostics, including the failing cgroup2 mount's Linux error number, when namespace setup
+  fails. Namespace isolation falls back to a leaf-only bind mount when Linux reports that the
+  namespace-rooted cgroup2 view collides with the inherited mountpoint, and native metric parsing
+  accepts dotted cgroup fields emitted by Linux 6.17 and later. The trusted launcher enters the
+  admitted AppArmor profile before setting `no_new_privs`; later broker-client execution stacks
+  another restricted profile instead of requesting a forbidden replacement domain.
 - Retry native broker startup through a bounded transient ownership-lock collision while
   preserving the stable refusal for a genuinely live owner.
 - Publish a native broker's live owner identity only after its termination handlers are ready,

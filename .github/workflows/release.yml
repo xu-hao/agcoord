@@ -21,7 +21,7 @@ jobs:
       - name: Install static-link audit prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends musl-tools
+          sudo apt-get install --yes --no-install-recommends apparmor musl-tools
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-musl
       - run: cargo fetch --locked
@@ -33,10 +33,13 @@ jobs:
       - run: ./scripts/audit-native-broker dist/native/agcoord-broker-x86_64-unknown-linux-musl
       - run: ./scripts/check-native-licenses dist/native/agcoord-broker-x86_64-unknown-linux-musl
       - run: ./scripts/check-native-reproducible
+      - run: ./scripts/build-native-host-package dist/native/agcoord-broker-x86_64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
-          name: agcoord-broker-x86_64-unknown-linux-musl
-          path: dist/native/*
+          name: agcoord-native-host-x86_64-linux
+          path: |
+            dist/native/*
+            dist/host/*
 
   verify:
     runs-on: ubuntu-latest

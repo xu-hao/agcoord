@@ -46,6 +46,7 @@ impl Binding {
 
 #[derive(Clone, Debug)]
 pub struct ResourceConfiguration {
+    pub capacities: BTreeMap<String, u64>,
     pub bindings: BTreeMap<String, Binding>,
     pub cgroup_root: Option<PathBuf>,
     pub cgroup_io_paths: Vec<PathBuf>,
@@ -292,6 +293,7 @@ pub fn load_configuration(state_dir: &Path) -> Result<ResourceConfiguration> {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ResourceConfiguration {
+                capacities: BTreeMap::from([("jobs".to_owned(), 2)]),
                 bindings: BTreeMap::new(),
                 cgroup_root: None,
                 cgroup_io_paths: Vec::new(),
@@ -308,6 +310,28 @@ pub fn load_configuration(state_dir: &Path) -> Result<ResourceConfiguration> {
     let object = document
         .as_object()
         .ok_or_else(|| config_error("broker configuration must be one JSON object"))?;
+    let mut capacities = object
+        .get("capacities")
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(|| config_error("broker configuration capacities must be an object"))?
+                .iter()
+                .map(|(name, units)| {
+                    if !name_valid(name) {
+                        return Err(config_error("capacity name is invalid"));
+                    }
+                    let units = units
+                        .as_u64()
+                        .filter(|units| *units > 0 && *units <= i64::MAX as u64)
+                        .ok_or_else(|| config_error(format!("capacity {name} is invalid")))?;
+                    Ok((name.clone(), units))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    capacities.entry("jobs".to_owned()).or_insert(2);
     let bindings = parse_bindings(object.get("bindings"))?;
     let cgroup_root = object
         .get("cgroup_root")
@@ -332,6 +356,7 @@ pub fn load_configuration(state_dir: &Path) -> Result<ResourceConfiguration> {
         })
         .unwrap_or_default();
     Ok(ResourceConfiguration {
+        capacities,
         bindings,
         cgroup_root,
         cgroup_io_paths,

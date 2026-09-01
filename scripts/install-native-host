@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+helper_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [[ -x "$helper_directory/check-native-host-package" ]]; then
+    package_checker="$helper_directory/check-native-host-package"
+else
+    package_checker="$repository/scripts/check-native-host-package"
+fi
+
+usage() {
+    printf '%s\n' \
+        'usage:' \
+        '  install-native-host stage PACKAGE [--root ROOT]' \
+        '  install-native-host activate STATE_DIR [--root ROOT]' >&2
+    exit 2
+}
+
+action=${1:-}
+subject=${2:-}
+[[ -n "$action" && -n "$subject" ]] || usage
+shift 2
+install_root=/
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || usage
+            install_root=$2
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+install_root=$(readlink -m "$install_root")
+if [[ "$install_root" == / ]] && ((EUID != 0)); then
+    printf 'installing the live host boundary requires root\n' >&2
+    exit 2
+fi
+
+pending="$install_root/var/lib/agcoord/native-host-pending"
+active="$install_root/var/lib/agcoord/native-host-active"
+
+case "$action" in
+    stage)
+        package=$(readlink -f "$subject")
+        "$package_checker" "$package"
+        digest=$(sha256sum "$package" | awk '{print $1}')
+        mkdir -p "$pending"
+        chmod 0700 "$pending"
+        destination="$pending/$digest"
+        if [[ ! -d "$destination" ]]; then
+            temporary=$(mktemp -d "$pending/.stage.XXXXXX")
+            trap 'rm -rf -- "$temporary"' EXIT
+            mkdir "$temporary/root"
+            tar -xzf "$package" --no-same-owner -C "$temporary/root"
+            chmod 0700 "$temporary" "$temporary/root"
+            mv "$temporary" "$destination"
+            trap - EXIT
+        fi
+        marker="$pending/.current.$$"
+        printf '%s\n' "$digest" >"$marker"
+        chmod 0600 "$marker"
+        mv -f "$marker" "$pending/current"
+        printf 'staged native host package %s; no live file or service was changed\n' "$digest"
+        ;;
+    activate)
+        state_dir=$(readlink -m "$subject")
+        [[ -f "$pending/current" ]] || {
+            printf 'no staged native host package is selected\n' >&2
+            exit 2
+        }
+        digest=$(tr -d '\n' <"$pending/current")
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+            printf 'staged native host package marker is invalid\n' >&2
+            exit 1
+        }
+        staged="$pending/$digest/root"
+        manifest="$staged/usr/share/doc/agcoord/native-host-manifest.json"
+        binary="$staged/usr/libexec/agcoord/agcoord-broker"
+        [[ -f "$manifest" && -x "$binary" ]] || {
+            printf 'staged native host package is incomplete\n' >&2
+            exit 1
+        }
+        if [[ "$install_root" == / ]] && ! jq -e '.development == false' "$manifest" >/dev/null; then
+            printf 'a development host package cannot be activated on the live root\n' >&2
+            exit 1
+        fi
+        if [[ ! -d "$state_dir" || -L "$state_dir" ]]; then
+            printf 'state directory must already exist as a real owner-only directory\n' >&2
+            exit 1
+        fi
+        coproc AGCOORD_MAINTENANCE {
+            "$binary" host-drain-hold --state-dir "$state_dir"
+        }
+        maintenance_output=${AGCOORD_MAINTENANCE[0]}
+        maintenance_input=${AGCOORD_MAINTENANCE[1]}
+        maintenance_pid=$AGCOORD_MAINTENANCE_PID
+        if ! IFS= read -r maintenance_status <&"$maintenance_output"; then
+            wait "$maintenance_pid" || true
+            printf 'cannot acquire the native host maintenance lock\n' >&2
+            exit 1
+        fi
+        if ! jq -e '.drained == true and .live == 0' <<<"$maintenance_status" >/dev/null; then
+            printf 'native host maintenance returned an invalid readiness record\n' >&2
+            exit 1
+        fi
+
+        profile_source="$staged/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker"
+        unit_source="$staged/usr/lib/systemd/user/agcoord-broker.service"
+        checksum_source="$staged/usr/libexec/agcoord/agcoord-broker.sha256"
+        document_source="$staged/usr/share/doc/agcoord"
+        profile_target="$install_root/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker"
+        unit_target="$install_root/usr/lib/systemd/user/agcoord-broker.service"
+        binary_target="$install_root/usr/libexec/agcoord/agcoord-broker"
+        checksum_target="$install_root/usr/libexec/agcoord/agcoord-broker.sha256"
+        document_target="$install_root/usr/share/doc/agcoord"
+
+        install -D -m 0644 "$profile_source" "$profile_target"
+        if [[ "$install_root" == / ]]; then
+            chown root:root "$profile_target"
+            apparmor_parser --replace --skip-cache "$profile_target"
+        fi
+        install -D -m 0644 "$unit_source" "$unit_target"
+        install -D -m 0644 "$checksum_source" "$checksum_target"
+        mkdir -p "$document_target"
+        install -m 0644 "$document_source/AGCOORD_LICENSE" "$document_target/AGCOORD_LICENSE"
+        install -m 0644 "$document_source/THIRD_PARTY_LICENSES.tsv" \
+            "$document_target/THIRD_PARTY_LICENSES.tsv"
+        install -m 0644 "$manifest" "$document_target/native-host-manifest.json"
+        binary_temporary="$binary_target.new.$$"
+        install -D -m 0755 "$binary" "$binary_temporary"
+        if [[ "$install_root" == / ]]; then
+            chown root:root "$unit_target" "$checksum_target" "$document_target"/* \
+                "$binary_temporary"
+        fi
+        mv -f "$binary_temporary" "$binary_target"
+
+        (
+            cd "$(dirname -- "$binary_target")"
+            sha256sum --check "$(basename -- "$checksum_target")"
+        )
+        installed_identity=$(env -i "$binary_target" identity --json)
+        if ! jq -e --argjson identity "$installed_identity" '.identity == $identity' \
+            "$manifest" >/dev/null; then
+            printf 'installed native broker identity does not match the staged manifest\n' >&2
+            exit 1
+        fi
+        mkdir -p "$active"
+        chmod 0700 "$active"
+        install -m 0600 "$manifest" "$active/$digest.json"
+        printf '%s\n' "$digest" >"$active/current"
+        chmod 0600 "$active/current"
+        exec {maintenance_input}>&-
+        if ! wait "$maintenance_pid"; then
+            printf 'native host maintenance lock ended unexpectedly\n' >&2
+            exit 1
+        fi
+        printf '%s\n' \
+            "activated native host package $digest without restarting the broker" \
+            "run: systemctl --user daemon-reload" \
+            "then: systemctl --user start agcoord-broker.service"
+        ;;
+    *) usage ;;
+esac

@@ -4931,6 +4931,38 @@ class CoordinatorClient:
         selected = self._native_command()
         config = broker_config(self.paths.state_dir)
         capacities = configured_capacities(config.capacities)
+        if config.native_broker.managed_service:
+            if "AGCOORD_STATE_DIR" in os.environ or self.paths.state_dir != state_dir_for():
+                raise CoordinatorError(
+                    "the managed native service owns only the default XDG state directory; "
+                    "use an unmanaged development configuration for an isolated spool"
+                )
+            try:
+                completed = subprocess.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "--user",
+                        "start",
+                        "agcoord-broker.service",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise CoordinatorError(
+                    f"cannot start managed native broker service: {exc}"
+                ) from exc
+            if completed.returncode != 0:
+                detail = completed.stderr.decode("utf-8", errors="replace").strip()
+                raise CoordinatorError(
+                    "cannot start managed native broker service"
+                    + (f": {detail}" if detail else "")
+                )
+            self._wait_for_broker_start()
+            return
         try:
             self.paths.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             details = self.paths.state_dir.lstat()
@@ -4979,6 +5011,9 @@ class CoordinatorClient:
         finally:
             os.close(descriptor)
 
+        self._wait_for_broker_start()
+
+    def _wait_for_broker_start(self) -> None:
         deadline = time.monotonic() + self.connect_timeout
         last_error: CoordinatorError | None = None
         while time.monotonic() < deadline:

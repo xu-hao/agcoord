@@ -383,10 +383,12 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
                 "broker configuration native_broker must be a JSON object",
             )
         })?;
-        if native
-            .keys()
-            .any(|key| !matches!(key.as_str(), "path" | "allow_development"))
-        {
+        if native.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "path" | "allow_development" | "managed_service"
+            )
+        }) {
             return Err(AppError::new(
                 "broker-config-invalid",
                 "broker configuration native_broker has an unknown key",
@@ -411,6 +413,15 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             return Err(AppError::new(
                 "broker-config-invalid",
                 "broker configuration native_broker allow_development must be boolean",
+            ));
+        }
+        if native
+            .get("managed_service")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                "broker configuration native_broker managed_service must be boolean",
             ));
         }
     }

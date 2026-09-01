@@ -99,7 +99,7 @@ unrelated processes and cgroups, host filesystems, and credentials omitted from 
 | Malformed submitted or stored data | Refuse or interrupt only the owning row; never pass unchecked data to a syscall. |
 | PID reuse or forged worker identity | Match PID, start token, process group, and private inherited channel. |
 | Direct internal-worker invocation | No public worker subcommand; setup requires broker-created inherited descriptors and token. |
-| Command execs the broker binary | The admitted-command AppArmor profile denies execution of the setup executable. |
+| Command execs the broker binary | From admitted work it enters the restricted client profile and cannot regain the setup domain. The public setup binary exposes no arbitrary worker mode. |
 | Broker crash before worker release | Pipe EOF keeps the blocked launcher from executing user code. |
 | Broker crash after release | A replacement adopts only identity-verified live state and never executes the command again. |
 | Changed head or target during landing | Refuse publication and discard the prior verdict. |
@@ -161,7 +161,8 @@ binary may instead be owned by the current user and report `development` only wh
 {
   "native_broker": {
     "path": "/absolute/path/to/target/debug/agcoord-broker",
-    "allow_development": true
+    "allow_development": true,
+    "managed_service": false
   }
 }
 ```
@@ -207,14 +208,16 @@ PID/start token and clears the durable environment before the first release. EOF
 substituted channel, a stale token, launcher death, or broker death before final release exits
 the child with status 125 and cannot execute the submitted command.
 
-Between the releases, the child resets inherited broker signal handlers, clears effective,
-permitted, inheritable, and ambient capabilities, sets `no_new_privs`, and verifies those values
-from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the two
-private channels, reports the token-bound setup result, waits for final release, closes those
-channels, verifies the final descriptor set, and calls `execve`. Submitted `_AGCOORD_*`
-variables are removed; the broker supplies only the public admission context itself. Debug
-builds can inject bounded launcher, token, channel, privilege, descriptor, setup, and release
-failures; release builds do not accept those controls.
+Between the releases, the child resets inherited broker signal handlers and completes namespace
+and scratch setup. When it inherited the managed `agcoord-broker` AppArmor domain, it makes the
+one-way transition into `agcoord-admitted` and verifies that domain before clearing effective,
+permitted, inheritable, and ambient capabilities, setting `no_new_privs`, and verifying those
+values from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the
+two private channels, reports the token-bound setup result, waits for final release, closes those
+channels, verifies the final descriptor set, and calls `execve`. Submitted `_AGCOORD_*` variables
+are removed; the broker supplies only the public admission context itself. Debug builds can
+inject bounded launcher, token, channel, privilege, descriptor, setup, and release failures;
+release builds do not accept those controls.
 
 Cancellation targets the verified process group and keeps the row and allocation live until
 every descendant is gone, escalating from `SIGTERM` to `SIGKILL`. Recovery adopts only a live
@@ -332,7 +335,7 @@ The scheduler/state implementation freezes these refusal families:
 | Submission and admission | `broker-submission-invalid`, `broker-run-exists`, `broker-run-unknown`, `broker-run-terminal`, `broker-resource-unavailable`, `broker-active-state-invalid` |
 | Gate and land authority | `broker-gate-required`, `broker-gate-mismatch`, `stale-gate-verdict`, `broker-land-phase-invalid`, `broker-land-identity-mismatch`, `broker-land-cancelled`, `broker-publication-authoritative` |
 | Migration | `broker-migration-live-runs`, `broker-migration-row-invalid`, `broker-migration-state-changed`, `broker-migration-backup-failed`, `broker-migration-backup-invalid` |
-| Worker ownership | `broker-worker-start-failed`, `broker-worker-handshake-failed`, `broker-worker-identity-invalid`, `broker-worker-identity-mismatch`, `broker-worker-observation-failed`, `broker-worker-signal-failed`, `worker-privilege-drop-failed`, `worker-privilege-drop-unverified`, `worker-descriptor-leak` |
+| Worker ownership | `broker-worker-start-failed`, `broker-worker-handshake-failed`, `broker-worker-identity-invalid`, `broker-worker-identity-mismatch`, `broker-worker-observation-failed`, `broker-worker-signal-failed`, `worker-privilege-drop-failed`, `worker-privilege-drop-unverified`, `worker-profile-transition-failed`, `worker-profile-transition-unverified`, `worker-descriptor-leak` |
 
 Later resource backends may add backend-specific refusal or receipt-event codes without changing
 the meaning of these codes.
@@ -354,15 +357,23 @@ The broker then:
 6. releases setup exactly once.
 
 The child creates private user, cgroup and mount namespaces, maps only its broker UID and GID,
-roots the visible cgroup hierarchy at its leaf, provisions optional tmpfs, drops effective,
-permitted, inheritable and ambient capabilities, sets `no_new_privs`, reports verified setup,
-and waits for the final release. It then `execve`s the submitted command.
+roots the visible cgroup hierarchy at its leaf, provisions optional tmpfs, enters and verifies
+the admitted AppArmor domain when managed policy is active, drops effective, permitted,
+inheritable and ambient capabilities, sets `no_new_privs`, reports verified setup, and waits for
+the final release. It then `execve`s the submitted command.
 
-The AppArmor setup profile attaches only to the root-owned native binary. Its exec transition
-moves submitted commands into an admitted-command profile that denies user-namespace creation,
-administrative capabilities, and execution of the broker binary. The broker performs no other
-exec after startup. A failure to verify the loaded profile or transition makes required work
+The setup-only `agcoord-broker` AppArmor profile attaches to the immutable root-owned executable,
+not to a user-editable service directive. Its public command parser exposes no worker mode or
+arbitrary setup-domain exec path. The authenticated worker makes a one-way transition into
+`agcoord-admitted` before setting `no_new_privs` and before reporting successful setup. Arbitrary
+interpreters inherit that domain. When admitted work invokes the broker, AppArmor stacks
+`agcoord-broker-client` onto the admitted domain; adding confinement is compatible with
+`no_new_privs` and cannot regain setup permission. Both restricted profiles deny user-namespace
+creation and changing back to the setup domain. Every domain is compiled in explicit enforce
+mode rather than Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded
+setup profile, service cgroup, global restriction, or backend namespace probe makes required work
 unavailable.
+The complete package and transition contract is in [the native host runbook](native_host.md).
 
 ## Compatibility and migration
 
