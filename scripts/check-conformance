@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Validate and execute AGCoord's versioned cross-implementation contract."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MANIFEST = ROOT / "conformance" / "manifest-v1.json"
+IMPLEMENTATIONS = ("python_reference", "rust_native")
+REQUIRED_DOMAINS = (
+    "commands",
+    "repositories",
+    "publication",
+    "tui",
+    "protocol",
+    "resources",
+    "receipts",
+    "migrations",
+    "contention",
+    "cancellation",
+    "recovery",
+    "crash_database",
+    "crash_launcher",
+    "crash_cgroup",
+    "crash_publication",
+    "crash_cleanup",
+    "crash_replacement",
+    "fuzz_clients",
+    "fuzz_state",
+    "no_duplicate_execution",
+    "no_stale_publication",
+    "no_unrelated_kill",
+    "no_unverified_enforcement",
+)
+MANIFEST_KEYS = {
+    "manifest_version",
+    "protocols",
+    "required_domains",
+    "execution",
+    "behaviors",
+    "intentional_differences",
+}
+BEHAVIOR_KEYS = {"id", "domain", "description", "tests"}
+DIFFERENCE_KEYS = {
+    "id",
+    "description",
+    "python_reference",
+    "rust_native",
+    "rationale",
+    "tests",
+}
+ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
+PYTHON_SELECTOR = re.compile(r"^tests/[a-z0-9_]+\.py::test_[A-Za-z0-9_]+$")
+NATIVE_SELECTOR = re.compile(
+    r"^(client_compatibility|identity|scheduler)::[a-z][a-z0-9_]+$"
+)
+
+
+class ConformanceError(RuntimeError):
+    """A stable conformance-manifest or coverage refusal."""
+
+
+def _object(value: Any, subject: str, keys: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConformanceError(f"{subject} must be one JSON object")
+    unknown = sorted(set(value) - keys)
+    missing = sorted(keys - set(value))
+    if unknown or missing:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown {', '.join(unknown)}")
+        raise ConformanceError(f"{subject} has {'; '.join(details)}")
+    return value
+
+
+def _text(value: Any, subject: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ConformanceError(f"{subject} must be non-empty text without NUL")
+    return value
+
+
+def _selectors(value: Any, subject: str) -> dict[str, list[str]]:
+    mapping = _object(value, subject, set(IMPLEMENTATIONS))
+    selected: dict[str, list[str]] = {}
+    for implementation in IMPLEMENTATIONS:
+        entries = mapping[implementation]
+        if (
+            not isinstance(entries, list)
+            or not entries
+            or any(not isinstance(entry, str) for entry in entries)
+            or len(entries) != len(set(entries))
+        ):
+            raise ConformanceError(
+                f"{subject}.{implementation} must be a non-empty unique string list"
+            )
+        pattern = PYTHON_SELECTOR if implementation == "python_reference" else NATIVE_SELECTOR
+        for entry in entries:
+            if not pattern.fullmatch(entry):
+                raise ConformanceError(
+                    f"{subject}.{implementation} has invalid selector {entry!r}"
+                )
+        selected[implementation] = entries
+    return selected
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConformanceError(f"cannot read conformance manifest {path}: {exc}") from exc
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConformanceError(f"conformance manifest {path} is invalid JSON: {exc}") from exc
+    manifest = _object(document, "conformance manifest", MANIFEST_KEYS)
+    if manifest["manifest_version"] != 1:
+        raise ConformanceError("conformance manifest_version must be exactly 1")
+    if manifest["protocols"] != {"python_reference": 4, "rust_native": 5}:
+        raise ConformanceError(
+            "conformance protocols must identify Python reference 4 and Rust native 5"
+        )
+    if manifest["required_domains"] != list(REQUIRED_DOMAINS):
+        raise ConformanceError(
+            "conformance required_domains must exactly match the version-1 contract"
+        )
+    if manifest["execution"] != {
+        "rust_build_jobs": 4,
+        "python_test_workers": 1,
+        "rust_test_threads": 1,
+    }:
+        raise ConformanceError(
+            "conformance execution must use four Rust build jobs and serial process tests"
+        )
+
+    behaviors = manifest["behaviors"]
+    if not isinstance(behaviors, list) or not behaviors:
+        raise ConformanceError("conformance behaviors must be a non-empty list")
+    behavior_ids: set[str] = set()
+    covered_domains: Counter[str] = Counter()
+    for index, value in enumerate(behaviors):
+        subject = f"conformance behaviors[{index}]"
+        behavior = _object(value, subject, BEHAVIOR_KEYS)
+        behavior_id = _text(behavior["id"], f"{subject}.id")
+        if not ID_PATTERN.fullmatch(behavior_id) or behavior_id in behavior_ids:
+            raise ConformanceError(f"{subject}.id must be unique canonical dotted text")
+        behavior_ids.add(behavior_id)
+        domain = _text(behavior["domain"], f"{subject}.domain")
+        if domain not in REQUIRED_DOMAINS:
+            raise ConformanceError(f"{subject}.domain is not required by version 1")
+        covered_domains[domain] += 1
+        _text(behavior["description"], f"{subject}.description")
+        behavior["tests"] = _selectors(behavior["tests"], f"{subject}.tests")
+    missing_domains = [domain for domain in REQUIRED_DOMAINS if not covered_domains[domain]]
+    if missing_domains:
+        raise ConformanceError(
+            f"conformance behaviors do not cover domains: {', '.join(missing_domains)}"
+        )
+
+    differences = manifest["intentional_differences"]
+    if not isinstance(differences, list) or not differences:
+        raise ConformanceError("intentional_differences must be a non-empty list")
+    difference_ids: set[str] = set()
+    for index, value in enumerate(differences):
+        subject = f"intentional_differences[{index}]"
+        difference = _object(value, subject, DIFFERENCE_KEYS)
+        difference_id = _text(difference["id"], f"{subject}.id")
+        if not ID_PATTERN.fullmatch(difference_id) or difference_id in difference_ids:
+            raise ConformanceError(f"{subject}.id must be unique canonical dotted text")
+        difference_ids.add(difference_id)
+        for key in ("description", "python_reference", "rust_native", "rationale"):
+            _text(difference[key], f"{subject}.{key}")
+        difference["tests"] = _selectors(difference["tests"], f"{subject}.tests")
+    return manifest
+
+
+def _run(arguments: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    print(f"+ {shlex.join(arguments)}", flush=True)
+    completed = subprocess.run(
+        arguments,
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=capture,
+    )
+    if completed.returncode != 0:
+        if capture:
+            if completed.stdout:
+                print(completed.stdout, end="", file=sys.stderr)
+            if completed.stderr:
+                print(completed.stderr, end="", file=sys.stderr)
+        raise ConformanceError(
+            f"conformance command exited {completed.returncode}: {shlex.join(arguments)}"
+        )
+    return completed
+
+
+def _all_selectors(manifest: dict[str, Any], implementation: str) -> set[str]:
+    return {
+        selector
+        for section in (manifest["behaviors"], manifest["intentional_differences"])
+        for entry in section
+        for selector in entry["tests"][implementation]
+    }
+
+
+def verify_collected_coverage(manifest: dict[str, Any]) -> None:
+    python = _run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        capture=True,
+    )
+    collected_python = {
+        line.strip()
+        for line in python.stdout.splitlines()
+        if line.strip().startswith("tests/") and "::" in line
+    }
+    missing_python = sorted(
+        selector
+        for selector in _all_selectors(manifest, "python_reference")
+        if not any(
+            node == selector or node.startswith(f"{selector}[")
+            for node in collected_python
+        )
+    )
+
+    rust_jobs = str(manifest["execution"]["rust_build_jobs"])
+    native_by_target: dict[str, set[str]] = {}
+    for selector in _all_selectors(manifest, "rust_native"):
+        target, _name = selector.split("::", 1)
+        native_by_target.setdefault(target, set())
+    for target in sorted(native_by_target):
+        collected = _run(
+            [
+                "cargo",
+                "test",
+                "--frozen",
+                "-j",
+                rust_jobs,
+                "--package",
+                "agcoord-broker",
+                "--test",
+                target,
+                "--",
+                "--list",
+            ],
+            capture=True,
+        )
+        native_by_target[target] = {
+            line.removesuffix(": test").strip()
+            for line in collected.stdout.splitlines()
+            if line.strip().endswith(": test")
+        }
+    missing_native = sorted(
+        selector
+        for selector in _all_selectors(manifest, "rust_native")
+        if selector.split("::", 1)[1]
+        not in native_by_target[selector.split("::", 1)[0]]
+    )
+    missing = [
+        *(f"python_reference:{selector}" for selector in missing_python),
+        *(f"rust_native:{selector}" for selector in missing_native),
+    ]
+    if missing:
+        raise ConformanceError(
+            "conformance selectors were not collected: " + ", ".join(missing)
+        )
+
+
+def execute_gate(manifest: dict[str, Any]) -> None:
+    _run([sys.executable, "-m", "pytest", "-q", "-n", "0"])
+    execution = manifest["execution"]
+    _run(
+        [
+            "cargo",
+            "test",
+            "--frozen",
+            "-j",
+            str(execution["rust_build_jobs"]),
+            "--workspace",
+            "--",
+            f"--test-threads={execution['rust_test_threads']}",
+        ]
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="validate and run the versioned AGCoord conformance gate"
+    )
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--validate-only", action="store_true")
+    mode.add_argument("--coverage-only", action="store_true")
+    mode.add_argument("--list-selectors", action="store_true")
+    arguments = parser.parse_args()
+    try:
+        manifest = load_manifest(arguments.manifest.resolve())
+        if arguments.list_selectors:
+            print(
+                json.dumps(
+                    {
+                        implementation: sorted(
+                            _all_selectors(manifest, implementation)
+                        )
+                        for implementation in IMPLEMENTATIONS
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if not arguments.validate_only:
+            verify_collected_coverage(manifest)
+        if not arguments.validate_only and not arguments.coverage_only:
+            execute_gate(manifest)
+    except ConformanceError as exc:
+        print(f"conformance refused: {exc}", file=sys.stderr)
+        return 1
+    print(
+        "conformance manifest v1 passed: "
+        f"{len(manifest['behaviors'])} behaviors, "
+        f"{len(manifest['intentional_differences'])} intentional differences"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -4,8 +4,10 @@ include Cargo.lock
 include Cargo.toml
 include LICENSE
 include rust-toolchain.toml
+recursive-include conformance *.json
 recursive-include docs *.md *.png
 recursive-include native *.rs *.toml *.tsv
 recursive-include packaging *
 include scripts/*native*
+include scripts/check-conformance
 recursive-include tests *.py
