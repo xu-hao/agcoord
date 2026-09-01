@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const OWNER_LOCK_STARTUP_RETRY: Duration = Duration::from_millis(250);
+
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
@@ -199,7 +201,8 @@ impl Broker {
             capability_map.insert(backend.clone(), capability.to_value());
         }
         let resource_capabilities = Value::Object(capability_map);
-        let mut owner = OwnerLock::acquire(&options.state_dir)?;
+        let mut owner =
+            OwnerLock::acquire_with_retry(&options.state_dir, OWNER_LOCK_STARTUP_RETRY)?;
         if options.crash_after.as_deref() == Some("owner-lock") {
             std::process::exit(86);
         }

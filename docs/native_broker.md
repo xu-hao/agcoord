@@ -51,6 +51,11 @@ only process allowed to perform scheduler transitions, resource lifecycle operat
 release, publication-phase authority, recovery, and terminal receipt updates. Clients submit
 and observe through the private durable spool; there is no network listener.
 
+Native startup retries acquisition for at most 250 milliseconds so a short ownership probe
+cannot make the selected broker abandon startup. A lock held through that bounded interval is
+still a live-owner conflict and returns `broker-already-owned`; the retry never permits two
+owners or weakens the exclusive lock.
+
 ### Why the durable spool remains the client protocol
 
 Restricted agent sessions may refuse local socket creation, while SQLite transactions in a
