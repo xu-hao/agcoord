@@ -451,7 +451,10 @@ if first == 0:
     os.setsid()
     detached = os.fork()
     if detached == 0:
-        Path(os.environ["DETACHED_REPORT"]).write_text(
+        report = Path(os.environ["DETACHED_REPORT"])
+        report.touch()
+        time.sleep(0.2)
+        report.write_text(
             str(os.getpid()),
             encoding="utf-8",
         )
@@ -471,8 +474,14 @@ while True:
                 "DETACHED_REPORT": str(report),
             },
         )
-        wait_for(report.exists, "the double-forked descendant never reported")
-        detached_pid = int(report.read_text(encoding="utf-8"))
+        def reported_pid() -> int | None:
+            value = report.read_text(encoding="utf-8").strip()
+            return int(value) if value.isascii() and value.isdecimal() else None
+
+        detached_pid = wait_for(
+            reported_pid,
+            "the double-forked descendant never reported a complete PID",
+        )
 
         def inherited() -> bool:
             leaves = [path for path in system.groups() if path.name.startswith("run-")]
