@@ -69,6 +69,6 @@ profile agcoord-admitted flags=(enforce,attach_disconnected,mediate_deleted) {
   deny /proc/self/attr/{current,exec} w,
   deny /proc/thread-self/attr/{current,exec} w,
 
-  /usr/libexec/agcoord/agcoord-broker px -> @{profile_name}//&agcoord-broker-client,
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-admitted//&agcoord-broker-client,
   /** ix,
 }
