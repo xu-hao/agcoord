@@ -14,6 +14,8 @@ procedure is in [the contributor workflow](contributing.md).
   TUI.
 - [Native broker architecture](native_broker.md) — single-executable scope, trust model,
   durable protocol, worker boundary, compatibility, and migration requirements.
+- [Native host deployment](native_host.md) — supported host, package verification, managed
+  service, AppArmor boundary, enforced-host proof, upgrades, recovery, and rollback.
 - [Cross-implementation conformance](conformance.md) — versioned Python/native behavior,
   failure-injection coverage, intentional differences, and the executable release gate.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual

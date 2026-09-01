@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+artifact=${1:?usage: build-native-host-package ARTIFACT [OUTPUT_DIRECTORY]}
+artifact=$(readlink -f "$artifact")
+output_directory=${2:-"$repository/dist/host"}
+mkdir -p "$output_directory"
+output_directory=$(CDPATH= cd -- "$output_directory" && pwd)
+
+identity=$(env -i "$artifact" identity --json)
+development=false
+if [[ ${AGCOORD_HOST_ALLOW_DEVELOPMENT:-0} == 1 ]]; then
+    if ! jq -e '
+        .name == "agcoord-broker"
+        and .protocol == 5
+        and .implementation == "rust-native"
+        and .build == "development"
+        and (.target == "x86_64-unknown-linux-gnu"
+             or .target == "x86_64-unknown-linux-musl")
+    ' <<<"$identity" >/dev/null; then
+        printf 'development host artifact has an incompatible identity\n' >&2
+        exit 1
+    fi
+    development=true
+else
+    "$repository/scripts/audit-native-broker" "$artifact"
+    "$repository/scripts/check-native-licenses" "$artifact"
+fi
+
+temporary=$(mktemp -d)
+trap 'rm -rf -- "$temporary"' EXIT
+root="$temporary/root"
+install -D -m 0755 "$artifact" "$root/usr/libexec/agcoord/agcoord-broker"
+install -D -m 0644 \
+    "$repository/packaging/systemd/agcoord-broker.service" \
+    "$root/usr/lib/systemd/user/agcoord-broker.service"
+install -D -m 0644 \
+    "$repository/packaging/apparmor/usr.libexec.agcoord.agcoord-broker" \
+    "$root/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker"
+install -D -m 0644 "$repository/LICENSE" "$root/usr/share/doc/agcoord/AGCOORD_LICENSE"
+install -D -m 0644 \
+    "$repository/native/THIRD_PARTY_LICENSES.tsv" \
+    "$root/usr/share/doc/agcoord/THIRD_PARTY_LICENSES.tsv"
+
+binary_sha=$(sha256sum "$root/usr/libexec/agcoord/agcoord-broker" | awk '{print $1}')
+unit_sha=$(sha256sum "$root/usr/lib/systemd/user/agcoord-broker.service" | awk '{print $1}')
+profile_sha=$(sha256sum "$root/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker" | awk '{print $1}')
+printf '%s  agcoord-broker\n' "$binary_sha" \
+    >"$root/usr/libexec/agcoord/agcoord-broker.sha256"
+chmod 0644 "$root/usr/libexec/agcoord/agcoord-broker.sha256"
+
+jq -n \
+    --arg binary_sha256 "$binary_sha" \
+    --argjson development "$development" \
+    --argjson identity "$identity" \
+    --arg profile_sha256 "$profile_sha" \
+    --arg unit_sha256 "$unit_sha" \
+    '{
+        format: 1,
+        development: $development,
+        identity: $identity,
+        files: {
+            "/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker": $profile_sha256,
+            "/usr/lib/systemd/user/agcoord-broker.service": $unit_sha256,
+            "/usr/libexec/agcoord/agcoord-broker": $binary_sha256
+        }
+    }' >"$root/usr/share/doc/agcoord/native-host-manifest.json"
+chmod 0644 "$root/usr/share/doc/agcoord/native-host-manifest.json"
+
+package="$output_directory/agcoord-native-host-x86_64-linux.tar.gz"
+epoch=${SOURCE_DATE_EPOCH:-0}
+tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+    -C "$root" -cf - . | gzip -n >"$package"
+package_sha=$(sha256sum "$package" | awk '{print $1}')
+printf '%s  %s\n' "$package_sha" "$(basename -- "$package")" >"$package.sha256"
+"$repository/scripts/check-native-host-package" "$package"
+for helper in check-native-host-package install-native-host test-native-host-enforcement; do
+    install -m 0755 "$repository/scripts/$helper" "$output_directory/$helper"
+    helper_sha=$(sha256sum "$output_directory/$helper" | awk '{print $1}')
+    printf '%s  %s\n' "$helper_sha" "$helper" >"$output_directory/$helper.sha256"
+done
+printf '%s\n' "$package"

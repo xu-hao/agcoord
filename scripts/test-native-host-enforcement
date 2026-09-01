@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z ${AGCOORD_RUN_ID:-} || -z ${AGCOORD_STATE_DIR:-} ]]; then
+    printf '%s\n' \
+        'run this probe as an admitted job:' \
+        '  agc --json run --resource cpu=1 -- ./scripts/test-native-host-enforcement' >&2
+    exit 2
+fi
+
+profile=$(tr -d '\n' </proc/self/attr/current)
+if [[ "$profile" != 'agcoord-admitted (enforce)' ]]; then
+    printf 'submitted command has the wrong AppArmor profile: %s\n' "$profile" >&2
+    exit 1
+fi
+if unshare --user --map-root-user true 2>/dev/null; then
+    printf 'submitted command unexpectedly created a user namespace\n' >&2
+    exit 1
+fi
+
+if [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) != 1 ]]; then
+    printf 'Ubuntu unprivileged-user-namespace restriction is disabled\n' >&2
+    exit 1
+fi
+if [[ $(tr -d '\n' </proc/self/cgroup) != '0::/' ]]; then
+    printf 'submitted command does not see a cgroup namespace rooted at its owned leaf\n' >&2
+    exit 1
+fi
+if [[ $(tr -s ' ' </sys/fs/cgroup/cpu.max | tr -d '\n') != '100000 100000' ]]; then
+    printf 'the admitted cpu=1 allocation is not enforced by cpu.max\n' >&2
+    exit 1
+fi
+
+binary=/usr/libexec/agcoord/agcoord-broker
+client=$($binary host-client-preflight)
+jq -e '
+    .ready == true
+    and .profile == "agcoord-broker-client"
+    and .user_namespace_denied == true
+' <<<"$client" >/dev/null
+jq -e '
+    .native_broker.path == "/usr/libexec/agcoord/agcoord-broker"
+    and .native_broker.allow_development == false
+    and .native_broker.managed_service == true
+' "$AGCOORD_STATE_DIR/config.json" >/dev/null
+if ! grep -Eq '^implementation=rust-native$' "$AGCOORD_STATE_DIR/broker.lock" \
+    || ! grep -Eq '^build=sha256:[0-9a-f]{64}$' "$AGCOORD_STATE_DIR/broker.lock"; then
+    printf 'live broker ownership does not identify the audited native release\n' >&2
+    exit 1
+fi
+
+printf 'native host enforcement passed for %s\n' "$AGCOORD_RUN_ID"

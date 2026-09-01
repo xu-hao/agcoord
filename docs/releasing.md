@@ -35,6 +35,8 @@ Ubuntu's `musl-tools`, then run:
 ./scripts/check-native-licenses \
   dist/native/agcoord-broker-x86_64-unknown-linux-musl
 ./scripts/check-native-reproducible
+./scripts/build-native-host-package \
+  dist/native/agcoord-broker-x86_64-unknown-linux-musl
 ```
 
 The build emits the executable, a SHA-256 sidecar, and JSON provenance recording the artifact
@@ -50,6 +52,12 @@ toolchains; their executable bytes must match. This proves reproducibility for t
 runner and compiler inputs. It does not claim byte identity across different C compilers or
 host toolchain builds. `AGCOORD_MUSL_CC=cc` is an explicit local compatibility escape hatch for
 an audited x86_64 compiler when `musl-gcc` cannot be installed; release CI never uses it.
+
+The host-package build emits a deterministic root-owned tar archive, package checker, staged
+installer, enforced-host probe, and their SHA-256 sidecars under `dist/host/`. CI retains these
+together with the raw native executable. The archive's manifest binds the executable identity,
+service unit, and AppArmor policy; see the [native host runbook](native_host.md) for supported
+hosts, activation, and rollback.
 
 Building the artifact does not activate it. Host packaging installs the verified executable at
 `/usr/libexec/agcoord/agcoord-broker`, and a development configuration may explicitly select
@@ -90,7 +98,10 @@ interface and must be smoke-tested from the built wheel.
    `AGCOORD_TEST_CGROUP_IO=1` for the test-owned loop-device bandwidth and IOPS checks.
 3. Build both Python artifacts with `python -m build` and validate them with
    `python -m twine check dist/*`. Build and audit the native artifact with the commands above;
-   retain its executable, checksum, provenance, and reviewed license inventory together.
+   build and validate the native host package, and retain its executable, host bundle, helper
+   tools, checksums, provenance, and reviewed license inventory together. On a supported Ubuntu
+   runner, install the bundle through the staged runbook and require its real `cpu=1` enforced
+   receipt without disabling the global user-namespace restriction.
 4. Create a fresh virtual environment outside the checkout. Install the wheel, with each
    supported optional extra in at least one smoke environment, and exercise both
    `python -m agcoord --help` and `agc --help`. Verify that no `agcoord` console executable

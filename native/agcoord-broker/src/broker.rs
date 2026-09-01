@@ -1,4 +1,5 @@
 use crate::error::{AppError, Result};
+use crate::host;
 use crate::platform::{
     OwnerLock, process_group_exists, same_worker_process, signal_process_group,
     worker_identity_conflicts,
@@ -30,7 +31,8 @@ const CANCEL_GRACE: Duration = Duration::from_secs(2);
 pub struct ServeOptions {
     pub state_dir: PathBuf,
     pub capacities: BTreeMap<String, u64>,
-    pub idle_timeout: Duration,
+    pub idle_timeout: Option<Duration>,
+    pub host_preflight: Option<host::PreflightOptions>,
     pub crash_after: Option<String>,
     pub worker_fault: Option<WorkerFault>,
     pub cgroup_fixture: Option<PathBuf>,
@@ -40,7 +42,8 @@ pub struct ServeOptions {
 pub struct Broker {
     paths: Paths,
     capacities: BTreeMap<String, u64>,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    managed_host: bool,
     crash_after: Option<String>,
     worker_fault: Option<WorkerFault>,
     resource_capabilities: Value,
@@ -111,19 +114,28 @@ impl Broker {
         Ok(command)
     }
     pub fn start(options: ServeOptions) -> Result<Self> {
-        if options.capacities.is_empty()
-            || options.capacities.values().any(|units| *units == 0)
-            || !options.capacities.contains_key("jobs")
+        let managed_host = options.host_preflight.is_some();
+        if let Some(preflight) = &options.host_preflight {
+            host::preflight(preflight)?;
+        }
+        let paths = Paths::new(&options.state_dir);
+        paths.prepare()?;
+        let paths = paths.configured()?;
+        let resource_configuration = resources::load_configuration(&options.state_dir)?;
+        let capacities = if options.capacities.is_empty() {
+            resource_configuration.capacities.clone()
+        } else {
+            options.capacities.clone()
+        };
+        if capacities.is_empty()
+            || capacities.values().any(|units| *units == 0)
+            || !capacities.contains_key("jobs")
         {
             return Err(AppError::new(
                 "broker-config-invalid",
                 "capacities require a positive jobs entry",
             ));
         }
-        let paths = Paths::new(&options.state_dir);
-        paths.prepare()?;
-        let paths = paths.configured()?;
-        let resource_configuration = resources::load_configuration(&options.state_dir)?;
         let mut capability_map = Map::new();
         let referenced_backends: BTreeSet<String> = resource_configuration
             .bindings
@@ -196,7 +208,7 @@ impl Broker {
         if options.crash_after.as_deref() == Some("owner-lock") {
             std::process::exit(86);
         }
-        let connection = initialize_native(&paths, &options.capacities)?;
+        let connection = initialize_native(&paths, &capacities)?;
         let runs = load_runs(&connection)?;
         validate_child_cpu_leases(&connection)?;
         maintain_child_cpu_leases(&connection)?;
@@ -262,7 +274,7 @@ impl Broker {
         }
         let started_at = now(&connection)?;
         drop(connection);
-        let capacities_json = serde_json::to_string(&options.capacities).map_err(|error| {
+        let capacities_json = serde_json::to_string(&capacities).map_err(|error| {
             AppError::new(
                 "broker-config-invalid",
                 format!("cannot encode capacities: {error}"),
@@ -307,8 +319,9 @@ impl Broker {
         ))?;
         Ok(Self {
             paths,
-            capacities: options.capacities,
+            capacities,
             idle_timeout: options.idle_timeout,
+            managed_host,
             crash_after: options.crash_after,
             worker_fault: options.worker_fault,
             resource_capabilities,
@@ -362,9 +375,11 @@ impl Broker {
             if has_live {
                 self.idle_since = None;
             } else {
-                let since = self.idle_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= self.idle_timeout {
-                    return Ok(());
+                if let Some(idle_timeout) = self.idle_timeout {
+                    let since = self.idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= idle_timeout {
+                        return Ok(());
+                    }
                 }
             }
             thread::sleep(POLL_INTERVAL);
@@ -737,7 +752,10 @@ impl Broker {
         connection: &Connection,
         run: &RunRecord,
     ) -> Result<(WorkerSetup, bool)> {
-        let mut setup = WorkerSetup::default();
+        let mut setup = WorkerSetup {
+            apparmor_admitted: self.managed_host,
+            ..WorkerSetup::default()
+        };
         if let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) {
             let request = Self::cgroup_request(run, &record.resources)?;
             let backend = self.cgroup_backend.as_ref().ok_or_else(|| {

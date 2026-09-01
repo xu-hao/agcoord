@@ -68,6 +68,7 @@ _CLONE_NEWUSER = 0x10000000
 _MS_NOSUID = 2
 _MS_NODEV = 4
 _MS_NOEXEC = 8
+_MS_BIND = 4096
 _MS_REC = 16384
 _MS_PRIVATE = 1 << 18
 _MNT_DETACH = 2
@@ -177,6 +178,7 @@ class IoDeviceResolver(Protocol):
 @dataclass(frozen=True)
 class CgroupMount:
     path: Path
+    root: Path
     options: frozenset[str]
 
 
@@ -264,14 +266,15 @@ def _cgroup2_mounts(mountinfo: Path) -> list[CgroupMount]:
             if right_fields[0] != "cgroup2":
                 continue
             mounted = Path(_decode_mount_path(fields[4]))
-            if not mounted.is_absolute():
+            root = Path(_decode_mount_path(fields[3]))
+            if not mounted.is_absolute() or not root.is_absolute():
                 continue
             options = frozenset(
                 fields[5].split(",") + right_fields[2].split(",")
             )
         except (IndexError, ValueError):
             continue
-        mounts.append(CgroupMount(mounted, options))
+        mounts.append(CgroupMount(mounted, root, options))
     return mounts
 
 
@@ -529,6 +532,46 @@ def _write_namespace_map(path: Path, value: str) -> None:
         ) from exc
 
 
+def _current_cgroup_path(path: Path = Path("/proc/self/cgroup")) -> Path:
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise CgroupIsolationError(
+            "namespace-verification-failed",
+            "worker cgroup namespace membership is unavailable",
+        ) from exc
+    unified = [Path(line[3:]) for line in lines if line.startswith("0::/")]
+    if len(unified) != 1 or not unified[0].is_absolute():
+        raise CgroupIsolationError(
+            "namespace-verification-failed",
+            "worker unified cgroup membership is invalid",
+        )
+    return unified[0]
+
+
+def _mount_isolated_cgroup_view(mount: CgroupMount, current: Path) -> None:
+    flags = _MS_NOSUID | _MS_NODEV | _MS_NOEXEC
+    target = os.fsencode(mount.path)
+    try:
+        _call_libc("mount", b"none", target, b"cgroup2", flags, None)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EBUSY:
+            raise
+    try:
+        relative = current.relative_to(mount.root)
+    except ValueError as exc:
+        raise OSError(errno.EINVAL, "current cgroup is outside the visible mount") from exc
+    _call_libc(
+        "mount",
+        os.fsencode(mount.path / relative),
+        target,
+        None,
+        _MS_BIND,
+        None,
+    )
+
+
 def isolate_current_cgroup(
     *,
     mountinfo: Path = Path("/proc/self/mountinfo"),
@@ -548,6 +591,7 @@ def isolate_current_cgroup(
             "namespace-delegation-unavailable",
             "cgroup2 mounts do not provide namespace delegation",
         )
+    current = _current_cgroup_path()
     uid = os.getuid()
     gid = os.getgid()
     try:
@@ -569,14 +613,7 @@ def isolate_current_cgroup(
     try:
         _call_libc("mount", None, b"/", None, _MS_REC | _MS_PRIVATE, None)
         for mount in covering:
-            _call_libc(
-                "mount",
-                b"none",
-                os.fsencode(mount.path),
-                b"cgroup2",
-                _MS_NOSUID | _MS_NODEV | _MS_NOEXEC,
-                None,
-            )
+            _mount_isolated_cgroup_view(mount, current)
     except OSError as exc:
         raise CgroupIsolationError(
             "namespace-mount-failed",

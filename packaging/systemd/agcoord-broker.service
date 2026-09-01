@@ -1,0 +1,21 @@
+[Unit]
+Description=AGCoord native broker
+Documentation=https://github.com/xu-hao/agcoord/blob/main/docs/native_host.md
+ConditionFileIsExecutable=/usr/libexec/agcoord/agcoord-broker
+
+[Service]
+Type=simple
+Slice=app.slice
+ExecStart=/usr/libexec/agcoord/agcoord-broker serve --state-dir %S/agcoord --host-managed
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=infinity
+KillMode=mixed
+UMask=0077
+StateDirectory=agcoord
+StateDirectoryMode=0700
+Delegate=yes
+DelegateSubgroup=supervisor
+
+[Install]
+WantedBy=default.target

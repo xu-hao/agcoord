@@ -1,0 +1,74 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Keep ordinary host operations broad while using a real enforcing domain. Ubuntu 24.04's
+# AppArmor parser implements default_allow as an unconfined profile, which would neither report
+# enforce mode nor apply the explicit denials below.
+profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow userns create,
+  deny ptrace,
+  change_profile -> agcoord-admitted,
+
+  # The trusted launcher changes to admitted before no_new_privs. Any setup-domain exec fallback
+  # still leaves this profile rather than lending namespace setup to the new program.
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-broker-client,
+  /** px -> agcoord-admitted,
+}
+
+# Calls from admitted work retain that profile and stack this restriction instead of reattaching
+# to the setup profile.
+profile agcoord-broker-client flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow ptrace,
+  deny userns,
+  deny change_profile -> agcoord-broker,
+  deny /proc/@{pid}/attr/{current,exec} w,
+  deny /proc/self/attr/{current,exec} w,
+  deny /proc/thread-self/attr/{current,exec} w,
+
+  /** ix,
+}
+
+profile agcoord-admitted flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow ptrace,
+  deny userns,
+  deny change_profile -> agcoord-broker,
+  deny /proc/@{pid}/attr/{current,exec} w,
+  deny /proc/self/attr/{current,exec} w,
+  deny /proc/thread-self/attr/{current,exec} w,
+
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-admitted//&agcoord-broker-client,
+  /** ix,
+}

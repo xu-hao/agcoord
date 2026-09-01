@@ -1,6 +1,7 @@
 mod broker;
 mod cgroup;
 mod error;
+mod host;
 mod platform;
 mod project_quota;
 mod resources;
@@ -35,6 +36,9 @@ fn print_help() {
             "  {NAME} --version\n",
             "  {NAME} identity --json\n",
             "  {NAME} serve --state-dir PATH [--capacity NAME=UNITS]\n",
+            "  {NAME} host-preflight --state-dir PATH\n",
+            "  {NAME} host-client-preflight\n",
+            "  {NAME} host-drain-check|host-drain-hold --state-dir PATH\n",
             "  {NAME} submit --state-dir PATH [OPTIONS] -- COMMAND...\n",
             "  {NAME} snapshot|status|log|cancel|clear --state-dir PATH [OPTIONS]\n",
             "  {NAME} verify|phase|report --state-dir PATH [OPTIONS]\n",
@@ -44,6 +48,10 @@ fn print_help() {
             "Commands:\n",
             "  identity --json  Report the exact build and durable protocol identity\n",
             "  serve            Own and schedule one protocol-5 durable spool\n",
+            "  host-preflight   Verify the managed host trust boundary\n",
+            "  host-client-preflight Verify admitted client calls stay restricted\n",
+            "  host-drain-check Prove a spool is idle and unowned before activation\n",
+            "  host-drain-hold  Hold the verified maintenance lock until input closes\n",
             "  submit           Append one validated immutable run\n",
             "  snapshot         Read the live queue snapshot\n",
             "  status           Read one durable run\n",
@@ -119,6 +127,44 @@ fn parse_state_only(arguments: &[String]) -> Result<PathBuf> {
         return Ok(PathBuf::from(&arguments[1]));
     }
     Err(AppError::usage("command requires exactly --state-dir PATH"))
+}
+
+fn parse_host_preflight(arguments: &[String]) -> Result<host::PreflightOptions> {
+    let mut state_dir = None;
+    let mut fixture_root = None;
+    let mut executable = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir" | "--fixture-root" | "--executable" => {
+                option_value(arguments, &mut index, &option)?
+            }
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--fixture-root" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --fixture-root"));
+                }
+                fixture_root = Some(PathBuf::from(value));
+            }
+            "--executable" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --executable"));
+                }
+                executable = Some(PathBuf::from(value));
+            }
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    Ok(host::PreflightOptions {
+        state_dir: state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?,
+        fixture_root,
+        executable,
+    })
 }
 
 fn parse_run_selector(arguments: &[String], allow_crash: bool) -> Result<(Paths, String, bool)> {
@@ -205,7 +251,11 @@ fn parse_log(arguments: &[String]) -> Result<(Paths, String, u64, usize)> {
 fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
     let mut state_dir = None;
     let mut capacities = BTreeMap::new();
-    let mut idle_timeout = Duration::from_secs(60);
+    let mut idle_timeout = Some(Duration::from_secs(60));
+    let mut idle_timeout_explicit = false;
+    let mut host_managed = false;
+    let mut host_fixture_root = None;
+    let mut host_executable = None;
     let mut crash_after = None;
     let mut worker_fault = None;
     let mut cgroup_fixture = None;
@@ -231,7 +281,29 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                     .ok()
                     .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
                     .ok_or_else(|| AppError::usage("--idle-timeout must be a positive number"))?;
-                idle_timeout = Duration::from_secs_f64(seconds);
+                idle_timeout = Some(Duration::from_secs_f64(seconds));
+                idle_timeout_explicit = true;
+            }
+            "--host-managed" => host_managed = true,
+            "--host-fixture-root" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --host-fixture-root"));
+                }
+                host_fixture_root = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--host-fixture-root",
+                )?));
+            }
+            "--host-executable" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --host-executable"));
+                }
+                host_executable = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--host-executable",
+                )?));
             }
             "--crash-after" => {
                 if !cfg!(debug_assertions) {
@@ -286,13 +358,38 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
         }
         index += 1;
     }
-    if capacities.is_empty() {
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    if host_managed && (idle_timeout_explicit || !capacities.is_empty()) {
+        return Err(AppError::usage(
+            "--host-managed reads capacities from config.json and owns the spool until stopped",
+        ));
+    }
+    if !host_managed && (host_fixture_root.is_some() || host_executable.is_some()) {
+        return Err(AppError::usage(
+            "host fixture options require --host-managed",
+        ));
+    }
+    let host_preflight = host_managed.then(|| {
+        if host_fixture_root.is_none() && host_executable.is_none() {
+            host::PreflightOptions::production(state_dir.clone())
+        } else {
+            host::PreflightOptions {
+                state_dir: state_dir.clone(),
+                fixture_root: host_fixture_root,
+                executable: host_executable,
+            }
+        }
+    });
+    if host_managed {
+        idle_timeout = None;
+    } else if capacities.is_empty() {
         capacities.insert("jobs".to_owned(), 2);
     }
     Ok(ServeOptions {
-        state_dir: state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?,
+        state_dir,
         capacities,
         idle_timeout,
+        host_preflight,
         crash_after,
         worker_fault,
         cgroup_fixture,
@@ -828,6 +925,16 @@ fn run_command(arguments: &[String]) -> Result<()> {
         [command, rest @ ..] if command == "clear" => {
             let paths = Paths::new(&parse_state_only(rest)?).configured()?;
             emit_json(&store::clear(&paths)?)
+        }
+        [command, rest @ ..] if command == "host-preflight" => {
+            emit_json(&host::preflight(&parse_host_preflight(rest)?)?)
+        }
+        [command] if command == "host-client-preflight" => emit_json(&host::client_preflight()?),
+        [command, rest @ ..] if command == "host-drain-check" => {
+            emit_json(&host::drain_check(&parse_state_only(rest)?)?)
+        }
+        [command, rest @ ..] if command == "host-drain-hold" => {
+            host::drain_hold(&parse_state_only(rest)?)
         }
         [command, rest @ ..] if command == "verify" => {
             let (paths, request) = parse_admission(rest)?;
