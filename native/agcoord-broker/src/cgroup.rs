@@ -945,7 +945,10 @@ pub fn isolate_current_cgroup() -> CgroupResult<()> {
             )
         } != 0
         {
-            return Err(CgroupError::new("namespace-cgroup2-mount-failed"));
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(CgroupError::new(&format!(
+                "namespace-cgroup2-mount-failed-errno-{errno}"
+            )));
         }
     }
     let cgroups = fs::read_to_string("/proc/self/cgroup")

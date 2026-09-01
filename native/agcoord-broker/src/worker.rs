@@ -159,6 +159,9 @@ impl SetupCode {
     }
 
     fn from_resource_error(code: &str) -> Self {
+        if code.starts_with("namespace-cgroup2-mount-failed-errno-") {
+            return Self::NamespaceMountFailed;
+        }
         match code {
             "namespace-delegation-unavailable" => Self::NamespaceDelegationUnavailable,
             "namespace-isolation-unavailable" => Self::NamespaceIsolationUnavailable,
@@ -1262,5 +1265,18 @@ impl Drop for PendingWorker {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetupCode;
+
+    #[test]
+    fn cgroup_mount_errno_remains_a_stable_worker_mount_failure() {
+        assert_eq!(
+            SetupCode::from_resource_error("namespace-cgroup2-mount-failed-errno-13"),
+            SetupCode::NamespaceMountFailed,
+        );
     }
 }

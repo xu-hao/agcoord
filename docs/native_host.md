@@ -73,9 +73,10 @@ The cgroup backend then performs its destructive probe, including user-, cgroup-
 namespace creation and controller-file protection. An unavailable required binding refuses the
 run before user code; it is never silently treated as admission-only.
 The capability refusal distinguishes `namespace-propagation-mount-failed` from
-`namespace-cgroup2-mount-failed`; a later worker-side refusal is normalized to the stable
-`namespace-mount-failed` setup code. Inspect the kernel journal alongside the receipt to
-distinguish a kernel namespace refusal from an AppArmor denial.
+`namespace-cgroup2-mount-failed-errno-N`, where `N` is the retained Linux error number; a later
+worker-side refusal is normalized to the stable `namespace-mount-failed` setup code. Inspect the
+kernel journal alongside that receipt to distinguish a kernel namespace refusal from an AppArmor
+denial.
 
 ## First install
 
