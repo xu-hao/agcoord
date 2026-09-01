@@ -250,6 +250,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install twine
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo fetch --locked
       - name: Install artifact audit prerequisites
         run: |
           sudo apt-get update

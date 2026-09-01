@@ -88,6 +88,21 @@ def test_release_sources_declare_one_stable_version_and_ship_the_gate():
     assert "--output-dir" in help_result.stdout
 
 
+def test_fresh_release_candidate_jobs_fetch_locked_rust_dependencies():
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = (ROOT / ".github/workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        release_job = workflow.split("\n  release-candidate:\n", 1)[1]
+        toolchain = release_job.index(
+            "rustup toolchain install 1.94.1 --profile minimal"
+        )
+        fetch = release_job.index("cargo fetch --locked")
+        verify = release_job.index("./scripts/verify-release-candidate")
+
+        assert toolchain < fetch < verify
+
+
 def test_checksum_sidecar_binds_one_exact_basename(tmp_path: Path):
     sidecar = tmp_path / "artifact.sha256"
     digest = "a" * 64
