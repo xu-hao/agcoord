@@ -32,6 +32,10 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
 const PR_CAP_AMBIENT: libc::c_int = 47;
 const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+const APPARMOR_CURRENT: &str = "/proc/self/attr/current";
+const APPARMOR_SETUP_PROFILE: &str = "agcoord-broker (enforce)";
+const APPARMOR_ADMITTED_PROFILE: &str = "agcoord-admitted (enforce)";
+const APPARMOR_CHANGE_ADMITTED: &[u8] = b"changeprofile agcoord-admitted";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerFault {
@@ -86,6 +90,8 @@ enum SetupCode {
     TmpfsInodesUnverified = 15,
     TmpfsSetupFailed = 16,
     TmpfsReportFailed = 17,
+    ProfileTransitionFailed = 18,
+    ProfileTransitionUnverified = 19,
 }
 
 impl SetupCode {
@@ -109,6 +115,8 @@ impl SetupCode {
             15 => Some(Self::TmpfsInodesUnverified),
             16 => Some(Self::TmpfsSetupFailed),
             17 => Some(Self::TmpfsReportFailed),
+            18 => Some(Self::ProfileTransitionFailed),
+            19 => Some(Self::ProfileTransitionUnverified),
             _ => None,
         }
     }
@@ -127,6 +135,14 @@ impl SetupCode {
             Self::DescriptorLeak => Some(AppError::new(
                 "worker-descriptor-leak",
                 "native worker retained an internal descriptor before exec",
+            )),
+            Self::ProfileTransitionFailed => Some(AppError::new(
+                "worker-profile-transition-failed",
+                "native worker could not enter its admitted AppArmor profile",
+            )),
+            Self::ProfileTransitionUnverified => Some(AppError::new(
+                "worker-profile-transition-unverified",
+                "native worker AppArmor profile could not be verified",
             )),
             code => Some(AppError::new(
                 code.stable_code().unwrap(),
@@ -155,15 +171,24 @@ impl SetupCode {
             Self::TmpfsInodesUnverified => Some("tmpfs-inodes-unverified"),
             Self::TmpfsSetupFailed => Some("tmpfs-setup-failed"),
             Self::TmpfsReportFailed => Some("tmpfs-report-failed"),
+            Self::ProfileTransitionFailed => Some("worker-profile-transition-failed"),
+            Self::ProfileTransitionUnverified => Some("worker-profile-transition-unverified"),
         }
     }
 
     fn from_resource_error(code: &str) -> Self {
+        if code.starts_with("namespace-cgroup2-mount-failed-errno-")
+            || code.starts_with("namespace-cgroup2-bind-failed-errno-")
+        {
+            return Self::NamespaceMountFailed;
+        }
         match code {
             "namespace-delegation-unavailable" => Self::NamespaceDelegationUnavailable,
             "namespace-isolation-unavailable" => Self::NamespaceIsolationUnavailable,
             "namespace-mapping-failed" => Self::NamespaceMappingFailed,
-            "namespace-mount-failed" => Self::NamespaceMountFailed,
+            "namespace-mount-failed"
+            | "namespace-propagation-mount-failed"
+            | "namespace-cgroup2-mount-failed" => Self::NamespaceMountFailed,
             "namespace-verification-failed" => Self::NamespaceVerificationFailed,
             "controller-files-exposed" => Self::ControllerFilesExposed,
             "tmpfs-namespace-required" => Self::TmpfsNamespaceRequired,
@@ -181,7 +206,9 @@ impl SetupCode {
             Self::Ok
             | Self::PrivilegeDropFailed
             | Self::PrivilegeDropUnverified
-            | Self::DescriptorLeak => None,
+            | Self::DescriptorLeak
+            | Self::ProfileTransitionFailed
+            | Self::ProfileTransitionUnverified => None,
             code => code.stable_code(),
         }
     }
@@ -192,6 +219,7 @@ pub struct WorkerSetup {
     pub isolate_cgroup: bool,
     pub tmpfs: Option<TmpfsSetup>,
     pub project_quota: Option<PathBuf>,
+    pub apparmor_admitted: bool,
 }
 
 #[repr(C)]
@@ -568,6 +596,46 @@ fn descriptors_are_exactly(allowed: &[RawFd]) -> bool {
     })
 }
 
+fn enter_admitted_profile_with(
+    required: bool,
+    mut read_current: impl FnMut() -> io::Result<String>,
+    change_profile: impl FnOnce() -> io::Result<()>,
+) -> SetupCode {
+    let current = match read_current() {
+        Ok(current) => current,
+        Err(_) if !required => return SetupCode::Ok,
+        Err(_) => return SetupCode::ProfileTransitionUnverified,
+    };
+    if current.trim() != APPARMOR_SETUP_PROFILE {
+        return if required {
+            SetupCode::ProfileTransitionUnverified
+        } else {
+            SetupCode::Ok
+        };
+    }
+    if change_profile().is_err() {
+        return SetupCode::ProfileTransitionFailed;
+    }
+    match read_current() {
+        Ok(current) if current.trim() == APPARMOR_ADMITTED_PROFILE => SetupCode::Ok,
+        _ => SetupCode::ProfileTransitionUnverified,
+    }
+}
+
+fn enter_admitted_profile(required: bool) -> SetupCode {
+    enter_admitted_profile_with(
+        required,
+        || fs::read_to_string(APPARMOR_CURRENT),
+        || {
+            let mut current = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(APPARMOR_CURRENT)?;
+            current.write_all(APPARMOR_CHANGE_ADMITTED)
+        },
+    )
+}
+
 fn drop_privileges() -> SetupCode {
     // SAFETY: prctl is called with the documented scalar operations and zeroed unused
     // arguments; capset receives two initialized version-3 capability words.
@@ -927,6 +995,12 @@ fn child_main(
             }
         }
     }
+    if code == SetupCode::Ok {
+        let profile_code = enter_admitted_profile(plan.setup.apparmor_admitted);
+        if profile_code != SetupCode::Ok {
+            code = profile_code;
+        }
+    }
     let privilege_code = drop_privileges();
     if privilege_code != SetupCode::Ok {
         code = privilege_code;
@@ -1260,5 +1334,78 @@ impl Drop for PendingWorker {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SetupCode, enter_admitted_profile_with};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::io;
+
+    #[test]
+    fn cgroup_mount_errno_remains_a_stable_worker_mount_failure() {
+        for code in [
+            "namespace-cgroup2-mount-failed-errno-13",
+            "namespace-cgroup2-bind-failed-errno-13",
+        ] {
+            assert_eq!(
+                SetupCode::from_resource_error(code),
+                SetupCode::NamespaceMountFailed,
+            );
+        }
+    }
+
+    #[test]
+    fn setup_profile_enters_and_verifies_admitted_before_privilege_drop() {
+        let profiles = RefCell::new(VecDeque::from([
+            "agcoord-broker (enforce)\n".to_owned(),
+            "agcoord-admitted (enforce)\n".to_owned(),
+        ]));
+        let changed = Cell::new(false);
+
+        assert_eq!(
+            enter_admitted_profile_with(
+                true,
+                || {
+                    profiles
+                        .borrow_mut()
+                        .pop_front()
+                        .ok_or_else(|| io::Error::other("missing profile observation"))
+                },
+                || {
+                    changed.set(true);
+                    Ok(())
+                },
+            ),
+            SetupCode::Ok,
+        );
+        assert!(changed.get());
+    }
+
+    #[test]
+    fn non_setup_profile_does_not_request_an_apparmor_transition() {
+        let changed = Cell::new(false);
+        assert_eq!(
+            enter_admitted_profile_with(
+                false,
+                || Ok("unconfined\n".to_owned()),
+                || {
+                    changed.set(true);
+                    Ok(())
+                },
+            ),
+            SetupCode::Ok,
+        );
+        assert!(!changed.get());
+    }
+
+    #[test]
+    fn managed_worker_refuses_an_unexpected_setup_profile() {
+        assert_eq!(
+            enter_admitted_profile_with(true, || Ok("unconfined\n".to_owned()), || Ok(()),),
+            SetupCode::ProfileTransitionUnverified,
+        );
     }
 }
