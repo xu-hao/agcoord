@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tarfile
 import zipfile
 
@@ -17,6 +18,53 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/verify-release-candidate"
 RELEASE = runpy.run_path(str(SCRIPT))
 CandidateError = RELEASE["CandidateError"]
+
+
+def test_cli_preserves_the_supplied_virtualenv_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    base_python = tmp_path / "base-python"
+    base_python.write_text("base\n", encoding="utf-8")
+    virtualenv_bin = tmp_path / "release-venv/bin"
+    virtualenv_bin.mkdir(parents=True)
+    virtualenv_python = virtualenv_bin / "python"
+    virtualenv_python.symlink_to(base_python)
+    observed: dict[str, Path] = {}
+
+    def fake_verify_candidate(
+        python_dir: Path,
+        native_dir: Path,
+        host_dir: Path,
+        output: Path,
+        python: Path,
+        tag: str | None,
+    ) -> dict[str, str]:
+        observed["python"] = python
+        return {"version": "0.3.0"}
+
+    monkeypatch.setitem(
+        RELEASE["main"].__globals__, "verify_candidate", fake_verify_candidate
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--python-dir",
+            str(tmp_path / "python"),
+            "--native-dir",
+            str(tmp_path / "native"),
+            "--host-dir",
+            str(tmp_path / "host"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--python",
+            str(virtualenv_python),
+        ],
+    )
+
+    assert RELEASE["main"]() == 0
+    assert observed["python"] == virtualenv_python
 
 
 def test_release_sources_declare_one_stable_version_and_ship_the_gate():

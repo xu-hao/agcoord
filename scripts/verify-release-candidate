@@ -560,7 +560,7 @@ def main() -> int:
             arguments.native_dir.expanduser().resolve(),
             arguments.host_dir.expanduser().resolve(),
             arguments.output_dir.expanduser().resolve(),
-            arguments.python.expanduser().resolve(),
+            Path(os.path.abspath(arguments.python.expanduser())),
             arguments.tag,
         )
     except (CandidateError, OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
