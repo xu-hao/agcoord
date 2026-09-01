@@ -84,7 +84,7 @@ impl RunningBroker {
                 let stderr = child_stderr(&mut child);
                 panic!("native broker exited early with {status}: {stderr}");
             }
-            if snapshot(state_dir).is_some() {
+            if snapshot(state_dir).is_some_and(|value| value["broker_pid"] == json!(child.id())) {
                 break;
             }
             if Instant::now() >= deadline {
@@ -104,19 +104,23 @@ impl RunningBroker {
     }
 
     fn terminate(&mut self) -> std::process::ExitStatus {
-        let child = self.child.as_mut().unwrap();
-        if let Some(status) = child.try_wait().unwrap() {
-            self.child = None;
-            return status;
-        }
-        let status = Command::new("/bin/kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = child.wait().unwrap();
-        self.child = None;
-        status
+        self.terminate_with_stderr().0
+    }
+
+    fn terminate_with_stderr(&mut self) -> (std::process::ExitStatus, String) {
+        let mut child = self.child.take().unwrap();
+        let status = if let Some(status) = child.try_wait().unwrap() {
+            status
+        } else {
+            let signaled = Command::new("/bin/kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(signaled.success());
+            child.wait().unwrap()
+        };
+        let stderr = child_stderr(&mut child);
+        (status, stderr)
     }
 
     fn is_running(&mut self) -> bool {
@@ -166,7 +170,7 @@ fn start_crashing_broker(state_dir: &Path, crash_after: &str) -> Child {
             let stderr = child_stderr(&mut child);
             panic!("crash broker exited early with {status}: {stderr}");
         }
-        if snapshot(state_dir).is_some() {
+        if snapshot(state_dir).is_some_and(|value| value["broker_pid"] == json!(child.id())) {
             return child;
         }
         assert!(Instant::now() < deadline, "crash broker did not start");
@@ -5197,12 +5201,30 @@ fn worker_identity_and_terminal_commit_crashes_recover_durably() {
         status(&terminal_state, "terminal-crash")["status"],
         "passed"
     );
+    let terminal_database = Connection::open(terminal_state.join("queue.sqlite3")).unwrap();
+    terminal_database.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let release_database = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        terminal_database.execute_batch("COMMIT").unwrap();
+    });
     let mut terminal_replacement = RunningBroker::start(&terminal_state, &[("jobs", 1)]);
+    let replacement_pid = terminal_replacement.child.as_ref().unwrap().id();
+    let observed_owner = snapshot(&terminal_state).unwrap()["broker_pid"].clone();
+    release_database.join().unwrap();
+    assert_eq!(
+        observed_owner,
+        json!(replacement_pid),
+        "replacement startup accepted stale owner metadata"
+    );
     assert_eq!(
         status(&terminal_state, "terminal-crash")["status"],
         "passed"
     );
-    assert!(terminal_replacement.terminate().success());
+    let (terminal_status, terminal_stderr) = terminal_replacement.terminate_with_stderr();
+    assert!(
+        terminal_status.success(),
+        "terminal recovery broker exited with {terminal_status}: {terminal_stderr}"
+    );
 
     let cleanup_state = temporary.path().join("cleanup-state");
     let mut cleanup_crash = start_crashing_broker(&cleanup_state, "worker-cleanup");
