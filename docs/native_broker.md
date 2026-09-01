@@ -257,8 +257,10 @@ Clients continue to use short SQLite transactions rather than mutating live proc
   terminal atomically;
 - child lease acquisition inserts a waiting lease tied to the admitted run, PID and start token;
 - lease release or cancellation updates only the authenticated lease request;
-- an admitted land adapter reports phase and result only when run ID, kind, exact checkout head,
-  worker PID and start token all match.
+- an admitted land adapter reports phase and result only when run ID, kind, current durable
+  checkout head, worker PID and start token all match. During `preflight` only, that authenticated
+  adapter may atomically replace the durable head after a lease-protected target merge; later
+  phases cannot change it.
 
 Every mutation is committed before success is returned. The broker independently validates the
 complete row before acting. Client code never performs admission, attaches resources, releases

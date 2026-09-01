@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     land = state(commands.add_parser(
         "land",
-        help="gate and publish one fresh exact head without releasing its barrier",
+        help="prepare, gate, and publish one exact head without releasing its barrier",
     ))
     land.add_argument("request", type=int, help="adapter request (GitHub PR number)")
     land.add_argument("--adapter", default="github", help="publication adapter")
@@ -133,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="agent identity (default: AGCOORD_AGENT or unnamed)",
     )
     land.add_argument("--resource", action="append", default=[], metavar="NAME=UNITS")
+    land.add_argument(
+        "--no-target-sync",
+        dest="synchronize_target",
+        action="store_false",
+        help="refuse an advanced target instead of merging it into the request branch",
+    )
     land.add_argument("worker_command", nargs="+")
     return parser
 
@@ -235,6 +241,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             resources=claims,
             agent=args.agent,
             repository=args.repository,
+            synchronize_target=args.synchronize_target,
         )
     else:
         run_id = client.submit(

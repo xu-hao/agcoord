@@ -1,4 +1,4 @@
-"""Run one fresh-base gate and its exact publication as an indivisible job."""
+"""Prepare one exact head, gate it, and publish it as an indivisible job."""
 
 from __future__ import annotations
 
@@ -15,11 +15,12 @@ from .merge import (
     MergePublisher,
     PullRequestMetadataClient,
     execute as publish,
-    preflight,
+    prepare,
 )
 
 
 PhaseChanged = Callable[[str, int | None], None]
+HeadChanged = Callable[[str, str], None]
 
 
 def _command(value: Sequence[str]) -> list[str]:
@@ -111,15 +112,18 @@ def execute(
     out: TextIO,
     err: TextIO,
     phase_changed: PhaseChanged | None = None,
+    head_changed: HeadChanged | None = None,
+    synchronize_target: bool = True,
 ) -> int:
     """Preflight, gate, and publish without releasing the caller's reservation."""
     selected = Path(checkout).expanduser().resolve()
     command = _command(gate_command)
     selected_environment = _environment(environment)
     changed = phase_changed or (lambda _phase, _gate_status: None)
+    retargeted = head_changed or (lambda _old_head, _new_head: None)
 
     changed("preflight", None)
-    status = preflight(
+    status, effective_head = prepare(
         request,
         checkout=str(selected),
         branch=branch,
@@ -128,12 +132,14 @@ def execute(
         publisher=publisher,
         out=out,
         err=err,
+        synchronize_target=synchronize_target,
+        head_changed=retargeted,
     )
     if status != 0:
         return status
 
     changed("gating", None)
-    print(f"Land coordinator: gate started for {head_sha}", file=out, flush=True)
+    print(f"Land coordinator: gate started for {effective_head}", file=out, flush=True)
     gate_status = _run_gate(
         command,
         checkout=selected,
@@ -158,7 +164,7 @@ def execute(
         request,
         checkout=str(selected),
         branch=branch,
-        head_sha=head_sha,
+        head_sha=effective_head,
         metadata_client=metadata_client,
         publisher=publisher,
         out=out,
@@ -175,6 +181,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--request-json", required=True)
+    parser.add_argument("--no-target-sync", action="store_true")
     parser.add_argument("gate_command", nargs=argparse.REMAINDER)
     return parser
 
@@ -219,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_MERGE_ERROR
 
     from .github import GitHubMergePublisher, GitHubMetadataClient
-    from .queue import CoordinatorClient, CoordinatorError
+    from .queue import CoordinatorClient, CoordinatorError, LAND_TARGET_SYNC_ENV
 
     client = CoordinatorClient(
         state_dir=args.state_dir,
@@ -234,6 +241,11 @@ def main(argv: list[str] | None = None) -> int:
             head_sha=args.head_sha,
             worker_pid=os.getpid(),
         )
+        target_sync = os.environ.get(LAND_TARGET_SYNC_ENV, "1")
+        if target_sync not in {"0", "1"}:
+            raise CoordinatorError(
+                f"land admission has invalid {LAND_TARGET_SYNC_ENV} state"
+            )
 
         def phase_changed(phase: str, gate_exit_status: int | None) -> None:
             client.update_land_phase(
@@ -241,6 +253,15 @@ def main(argv: list[str] | None = None) -> int:
                 phase=phase,
                 gate_exit_status=gate_exit_status,
                 worker_pid=os.getpid(),
+            )
+
+        def head_changed(old_head: str, new_head: str) -> None:
+            client.update_land_phase(
+                args.run_id,
+                phase="preflight",
+                gate_exit_status=None,
+                worker_pid=os.getpid(),
+                new_head_sha=new_head,
             )
 
         result = execute(
@@ -255,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
             out=sys.stdout,
             err=sys.stderr,
             phase_changed=phase_changed,
+            head_changed=head_changed,
+            synchronize_target=(target_sync == "1" and not args.no_target_sync),
         )
         client.report_land_result(
             args.run_id,

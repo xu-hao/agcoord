@@ -85,6 +85,7 @@ DEFAULT_AGENT = "unnamed"
 CHILD_CPU_RESOURCE = "cpu"
 CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
+LAND_TARGET_SYNC_ENV = "_AGCOORD_LAND_TARGET_SYNC"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
 RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
@@ -1626,8 +1627,9 @@ class CoordinatorBroker:
         head_sha: str | None = None,
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
+        synchronize_target: bool = True,
     ) -> str:
-        """Queue one indivisible fresh-base gate and exact publication."""
+        """Queue one indivisible exact-head gate and publication."""
         selected_command = _validate_command(command)
         if adapter != "github":
             raise CoordinatorError(f"unknown publication adapter {adapter!r}")
@@ -1637,6 +1639,8 @@ class CoordinatorBroker:
             )
         if not isinstance(label, str) or not label.strip():
             raise CoordinatorError("label must be a non-empty string")
+        if not isinstance(synchronize_target, bool):
+            raise CoordinatorError("synchronize_target must be boolean")
         identity = discover_repository(checkout, repository=repository)
         selected_checkout = str(identity.checkout)
         selected_branch = (
@@ -1665,6 +1669,13 @@ class CoordinatorBroker:
         selected_contract = resource_contract(selected_resources, selected_bindings)
         selected_receipt = initial_resource_receipt(selected_resources)
         selected_environment = _validate_environment(environment)
+        if LAND_TARGET_SYNC_ENV in selected_environment:
+            raise CoordinatorError(
+                f"gate environment uses the reserved {LAND_TARGET_SYNC_ENV} name"
+            )
+        selected_environment[LAND_TARGET_SYNC_ENV] = (
+            "1" if synchronize_target else "0"
+        )
         run_id = f"land-{uuid4().hex[:12]}"
         with self._db_lock, self._connect() as db:
             db.execute(
@@ -2258,6 +2269,7 @@ class CoordinatorBroker:
         phase: str,
         gate_exit_status: int | None,
         worker_pid: int,
+        new_head_sha: str | None = None,
     ) -> None:
         """Advance one admitted land worker and establish its cancellation boundary."""
         if phase not in {"preflight", "gating", "publishing"}:
@@ -2270,6 +2282,11 @@ class CoordinatorBroker:
             raise CoordinatorError("gate exit status must be null or an integer from 0 to 255")
         if not isinstance(worker_pid, int) or isinstance(worker_pid, bool) or worker_pid <= 0:
             raise CoordinatorError("land worker PID must be positive")
+        selected_new_head = (
+            _validate_head_sha(new_head_sha, required=True)
+            if new_head_sha is not None
+            else None
+        )
         order = {"preflight": 0, "gating": 1, "publishing": 2}
         with self._db_lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2309,6 +2326,14 @@ class CoordinatorBroker:
                     mismatches.append("preflight cannot have a gate exit status")
                 if phase == "publishing" and selected_gate_status != 0:
                     mismatches.append("publication requires a passed gate")
+                if selected_new_head is not None and (
+                    phase != "preflight"
+                    or current_phase != "preflight"
+                    or selected_new_head == row["head_sha"]
+                ):
+                    mismatches.append(
+                        "the durable head can change only during preflight and must differ"
+                    )
                 if row["cancel_requested"]:
                     raise CoordinatorError(
                         f"land job {run_id} has a cancellation request; publication refused"
@@ -2318,8 +2343,14 @@ class CoordinatorBroker:
                     f"run {run_id!r} cannot advance land phase: " + "; ".join(mismatches)
                 )
             db.execute(
-                "UPDATE runs SET phase = ?, gate_exit_status = ? WHERE run_id = ?",
-                (phase, selected_gate_status, run_id),
+                "UPDATE runs SET phase = ?, gate_exit_status = ?, head_sha = ? "
+                "WHERE run_id = ?",
+                (
+                    phase,
+                    selected_gate_status,
+                    selected_new_head or row["head_sha"],
+                    run_id,
+                ),
             )
         self._touch()
 
@@ -4399,6 +4430,7 @@ class CoordinatorClient:
         head_sha: str | None = None,
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
+        synchronize_target: bool = True,
     ) -> str:
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
@@ -4415,6 +4447,7 @@ class CoordinatorClient:
                 head_sha=head_sha,
                 caller_pid=caller_pid,
                 environment=environment,
+                synchronize_target=synchronize_target,
                 owner=owner,
             )
         return self._catalogue().submit_land(
@@ -4430,6 +4463,7 @@ class CoordinatorClient:
             head_sha=head_sha,
             caller_pid=caller_pid,
             environment=environment,
+            synchronize_target=synchronize_target,
         )
 
     def _native_submit_land(
@@ -4447,6 +4481,7 @@ class CoordinatorClient:
         head_sha: str | None,
         caller_pid: int | None,
         environment: Mapping[str, str] | None,
+        synchronize_target: bool,
         owner: Mapping[str, Any],
     ) -> str:
         selected_command = _validate_command(command)
@@ -4458,6 +4493,8 @@ class CoordinatorClient:
             )
         if not isinstance(label, str) or not label.strip():
             raise CoordinatorError("label must be a non-empty string")
+        if not isinstance(synchronize_target, bool):
+            raise CoordinatorError("synchronize_target must be boolean")
         identity = discover_repository(checkout, repository=repository)
         selected_branch = (
             branch.strip()
@@ -4478,6 +4515,13 @@ class CoordinatorClient:
         ):
             raise CoordinatorError("caller_pid must be a positive integer")
         selected_environment = _validate_environment(environment)
+        if LAND_TARGET_SYNC_ENV in selected_environment:
+            raise CoordinatorError(
+                f"gate environment uses the reserved {LAND_TARGET_SYNC_ENV} name"
+            )
+        selected_environment[LAND_TARGET_SYNC_ENV] = (
+            "1" if synchronize_target else "0"
+        )
         if "_AGCOORD_LAND_PYTHON" in selected_environment:
             raise CoordinatorError(
                 "gate environment uses the reserved _AGCOORD_LAND_PYTHON name"
@@ -4799,6 +4843,7 @@ class CoordinatorClient:
         phase: str,
         gate_exit_status: int | None,
         worker_pid: int,
+        new_head_sha: str | None = None,
     ) -> None:
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
@@ -4822,6 +4867,13 @@ class CoordinatorClient:
             ]
             if gate_exit_status is not None:
                 arguments.extend(("--gate-exit-status", str(gate_exit_status)))
+            if new_head_sha is not None:
+                arguments.extend(
+                    (
+                        "--new-head",
+                        _validate_head_sha(new_head_sha, required=True) or "",
+                    )
+                )
             result = self._native_invoke("phase", arguments)
             if not isinstance(result, dict) or result.get("run_id") != run_id:
                 raise CoordinatorError("native broker returned an invalid land phase receipt")
@@ -4831,6 +4883,7 @@ class CoordinatorClient:
             phase=phase,
             gate_exit_status=gate_exit_status,
             worker_pid=worker_pid,
+            new_head_sha=new_head_sha,
         )
 
     def report_land_result(

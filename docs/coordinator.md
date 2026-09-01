@@ -806,12 +806,22 @@ repository barrier. Its command and environment are the gate, not a second queue
 its `gate_run_id` is null.
 
 The worker first validates local and forge identity, readiness, and the current target and
-source refs. A stale base is refused before the gate command can run. If preflight succeeds,
-the worker runs the gate once with the captured environment and combined transcript. A red
-gate records its actual shell status with `failure_reason=gate-failed` and never calls the
-publisher. A green gate transitions the same row directly to `publishing` while retaining
-the repository barrier and every resource allocation. No check, gate, or second landing in
-that lane can enter the gap because no separate job or gap exists.
+source refs. If the target advanced while an open, ready, same-repository request waited, the
+default GitHub adapter fetches that exact target commit and creates one ordinary `--no-ff` merge
+commit in the submitted checkout. It verifies the ordered parents `(old source, target)`, pushes
+the commit to the request branch with an exact `--force-with-lease`, and atomically replaces the
+row's durable head while it is still in `preflight`. Preflight is then repeated against the new
+head. This retry is bounded if the target keeps moving. `--no-target-sync` instead returns the
+original `stale-main` refusal without changing the source.
+
+A merge conflict is aborted before the gate, restores the exact clean source checkout, and
+reports the conflicting paths. A concurrent source update or rejected push also fails before
+the gate; the lease prevents overwriting another writer. Once preflight succeeds, the worker
+runs the gate once with the captured environment and combined transcript. A red gate records
+its actual shell status with `failure_reason=gate-failed` and never calls the publisher. A green
+gate transitions the same row directly to `publishing` while retaining the repository barrier
+and every resource allocation. No check, gate, or second landing in that lane can enter the gap
+because no separate job or gap exists.
 
 Publication repeats the exact validation after the gate. Let `M` be the target's observed
 remote commit and `H` the submitted head; `M` must be an ancestor of `H`. The forge-neutral
@@ -822,17 +832,19 @@ A real non-main target such as `release` uses the same contract; an absent repor
 a readiness refusal. GitHub support is an optional adapter and is not needed to install,
 import, or run checks in the core coordinator.
 
-If the target advances before or during the gate, the result is `stale-main`; if the source
-head advances, it is `head-changed`. `pr-not-ready`, `publish-failed`, and `merge-error`
-remain distinct handbacks. A failed publication leaves the remote target untouched. If the
-exact `H` is already an ancestor of the remote target, recovery/retry is idempotent success
-even if forge metadata still says open or an auto-delete removed the source reference.
+If the target advances after preflight or during the gate, the result is `stale-main`; a passed
+gate is never reused after either ref moves. If the source head advances, the result is
+`head-changed`. `pr-not-ready`, `publish-failed`, and `merge-error` remain distinct handbacks.
+A failed publication leaves the remote target untouched. If the exact `H` is already an
+ancestor of the remote target, recovery/retry is idempotent success even if forge metadata still
+says open or an auto-delete removed the source reference.
 
-AGCoord never fetches a replacement branch into the worktree, refreshes, rebases, amends, or
-mutates the ticket branch. A stale or changed-head refusal hands control back to the agent:
-update the branch explicitly, push, and submit a fresh `agc land` request so the new head
-is gated and published together. Do not substitute a separate full-plus-merge sequence or
-direct target update.
+The pre-gate merge is the only automatic worktree mutation: AGCoord never rebases, amends, or
+rewrites existing source commits, and it never moves the target without a green gate. A conflict
+or changed-head refusal hands control back to the agent. Resolve the branch or submit its new
+exact head in a fresh `agc land` request; use `--no-target-sync` when policy requires every stale
+target to be handled manually. Do not substitute a separate full-plus-merge sequence or direct
+target update.
 
 A land request is cancellable while queued, preflighting, or gating. Once its durable phase
 is `publishing`, cancellation is refused because killing a client during an authenticated

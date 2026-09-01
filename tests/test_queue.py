@@ -198,6 +198,7 @@ def _install_land_gh(tmp_path: Path) -> Path:
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -212,13 +213,22 @@ if arguments[:2] == ["pr", "view"]:
     preflight_release = os.environ.get("AGCOORD_TEST_PREFLIGHT_RELEASE")
     while preflight_release and not Path(preflight_release).exists():
         time.sleep(0.01)
+    head = os.environ["AGCOORD_TEST_HEAD"]
+    if os.environ.get("AGCOORD_TEST_DYNAMIC_HEAD") == "1":
+        observed = subprocess.run(
+            ["git", "ls-remote", "origin", f"refs/heads/{{os.environ['AGCOORD_TEST_BRANCH']}}"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        head = observed.split()[0]
     print(json.dumps({{
         "number": int(arguments[2]),
         "state": "OPEN",
         "isDraft": False,
         "baseRefName": os.environ.get("AGCOORD_TEST_BASE", "main"),
         "headRefName": os.environ["AGCOORD_TEST_BRANCH"],
-        "headRefOid": os.environ["AGCOORD_TEST_HEAD"],
+        "headRefOid": head,
         "isCrossRepository": False,
         "title": "Atomic land test",
         "headRepositoryOwner": {{"login": "pytest"}},
@@ -246,8 +256,13 @@ elif arguments[:2] == ["api", "graphql"]:
     mutation = payload["variables"]["input"]["clientMutationId"]
     print(json.dumps({{"data": {{"updateRefs": {{"clientMutationId": mutation}}}}}}))
 elif arguments[:1] == ["api"] and "/compare/" in arguments[1]:
+    merge_base = (
+        "0" * 40
+        if os.environ.get("AGCOORD_TEST_DYNAMIC_HEAD") == "1"
+        else os.environ["AGCOORD_TEST_HEAD"]
+    )
     print(json.dumps({{
-        "merge_base_commit": {{"sha": os.environ["AGCOORD_TEST_HEAD"]}},
+        "merge_base_commit": {{"sha": merge_base}},
     }}))
 else:
     print(f"unexpected gh arguments: {{arguments!r}}", file=sys.stderr)
@@ -270,6 +285,7 @@ def _land_environment(
     publish_release: Path | None = None,
     preflight_entered: Path | None = None,
     preflight_release: Path | None = None,
+    dynamic_head: bool = False,
 ) -> dict[str, str]:
     environment = caller_environment()
     environment.update(
@@ -289,6 +305,8 @@ def _land_environment(
         environment["AGCOORD_TEST_PREFLIGHT_ENTERED"] = str(preflight_entered)
     if preflight_release is not None:
         environment["AGCOORD_TEST_PREFLIGHT_RELEASE"] = str(preflight_release)
+    if dynamic_head:
+        environment["AGCOORD_TEST_DYNAMIC_HEAD"] = "1"
     return environment
 
 
@@ -1512,6 +1530,174 @@ def test_land_submission_is_one_exact_head_publication_barrier(
     finally:
         release.touch()
         _row(client, blocker_id, "passed")
+
+
+def test_land_target_sync_updates_the_durable_head_before_the_gate(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, remote, branch, old_head = _publication_repository(
+        tmp_path / "repository"
+    )
+    target_checkout = tmp_path / "target-checkout"
+    subprocess.run(
+        [GIT, "clone", "--branch", "main", str(remote), str(target_checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(target_checkout, "config", "user.name", "AGCoord target test")
+    _git(target_checkout, "config", "user.email", "target@example.invalid")
+    (target_checkout / "target.txt").write_text("advanced\n", encoding="utf-8")
+    _git(target_checkout, "add", "target.txt")
+    _git(target_checkout, "commit", "-m", "advance target")
+    advanced_main = _head(target_checkout)
+    _git(target_checkout, "push", "origin", "main")
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    gate_report = tmp_path / "gate-report.json"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=old_head,
+        tag="target-sync",
+        event_log=events,
+        dynamic_head=True,
+    )
+    gate = _python(
+        """
+import json
+import os
+from pathlib import Path
+import subprocess
+
+from agcoord.queue import CoordinatorClient
+
+head = subprocess.run(
+    ["git", "rev-parse", "HEAD"],
+    check=True,
+    text=True,
+    capture_output=True,
+).stdout.strip()
+row = CoordinatorClient(
+    state_dir=os.environ["AGCOORD_STATE_DIR"],
+    checkout=Path.cwd(),
+    autostart=False,
+).status(os.environ["AGCOORD_RUN_ID"])
+Path(os.environ["AGCOORD_TEST_GATE_REPORT"]).write_text(
+    json.dumps({"checkout_head": head, "durable_head": row["head_sha"]}),
+    encoding="utf-8",
+)
+"""
+    )
+    environment["AGCOORD_TEST_GATE_REPORT"] = str(gate_report)
+
+    land_id = client.submit_land(
+        "github",
+        123,
+        gate,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+    )
+    receipt = _row(client, land_id, "passed")
+    observed = json.loads(gate_report.read_text(encoding="utf-8"))
+    merge_head = observed["checkout_head"]
+
+    assert merge_head != old_head
+    assert observed["durable_head"] == merge_head
+    assert receipt["head_sha"] == merge_head
+    assert _head(checkout) == merge_head
+    assert _git(
+        checkout,
+        "show",
+        "-s",
+        "--format=%P",
+        merge_head,
+    ).split() == [old_head, advanced_main]
+    remote_head = _git(
+        checkout,
+        "ls-remote",
+        "origin",
+        f"refs/heads/{branch}",
+    ).split()[0]
+    assert remote_head == merge_head
+    assert events.read_text(encoding="utf-8").splitlines() == [
+        "publish:target-sync"
+    ]
+
+
+def test_land_target_sync_opt_out_retains_the_stale_target_refusal(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, remote, branch, old_head = _publication_repository(
+        tmp_path / "repository"
+    )
+    target_checkout = tmp_path / "target-checkout"
+    subprocess.run(
+        [GIT, "clone", "--branch", "main", str(remote), str(target_checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(target_checkout, "config", "user.name", "AGCoord target test")
+    _git(target_checkout, "config", "user.email", "target@example.invalid")
+    (target_checkout / "target.txt").write_text("advanced\n", encoding="utf-8")
+    _git(target_checkout, "add", "target.txt")
+    _git(target_checkout, "commit", "-m", "advance target")
+    advanced_main = _head(target_checkout)
+    _git(target_checkout, "push", "origin", "main")
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    gate_marker = tmp_path / "gate-ran"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=old_head,
+        tag="target-sync-opt-out",
+        event_log=events,
+        dynamic_head=True,
+    )
+
+    land_id = client.submit_land(
+        "github",
+        123,
+        _python(
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            gate_marker,
+        ),
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        synchronize_target=False,
+    )
+    receipt = _row(client, land_id, "failed")
+
+    assert receipt["exit_status"] == 75
+    assert receipt["failure_reason"] == "stale-main"
+    assert receipt["head_sha"] == old_head
+    assert not gate_marker.exists()
+    assert not events.exists()
+    assert _head(checkout) == old_head
+    assert _git(
+        checkout,
+        "ls-remote",
+        "origin",
+        f"refs/heads/{branch}",
+    ).split()[0] == old_head
+    assert _git(
+        checkout,
+        "ls-remote",
+        "origin",
+        "refs/heads/main",
+    ).split()[0] == advanced_main
 
 
 def test_land_rejects_dirty_or_nested_requests_without_accepting_a_row(

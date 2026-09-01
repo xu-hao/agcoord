@@ -56,9 +56,12 @@
     {
       "id": "publication.one-atomic-land",
       "domain": "publication",
-      "description": "A land request holds one exact-head barrier through its gate and publication authority transition.",
+      "description": "A land request may durably synchronize its exact head during preflight, then holds one barrier through its gate and publication authority transition.",
       "tests": {
-        "python_reference": ["tests/test_queue.py::test_land_submission_is_one_exact_head_publication_barrier"],
+        "python_reference": [
+          "tests/test_queue.py::test_land_submission_is_one_exact_head_publication_barrier",
+          "tests/test_queue.py::test_land_target_sync_updates_the_durable_head_before_the_gate"
+        ],
         "rust_native": ["client_compatibility::atomic_land_keeps_gate_and_publication_inside_one_native_admission"]
       }
     },

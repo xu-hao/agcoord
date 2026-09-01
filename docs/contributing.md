@@ -142,10 +142,12 @@ Do not use a direct target-branch push, a forge merge command, a separate
 full-plus-merge sequence, or any equivalent path that separates the landing verdict
 from publication.
 
-A stale-target or changed-head refusal hands the work back to the contributor. Update
-the branch explicitly, push it, and submit a fresh `agc land` request. AGCoord does
-not refresh, rebase, or rewrite the worktree, and a moved reference invalidates the
-earlier gate result.
+By default, a stale target is merged mechanically into an otherwise unchanged
+same-repository request branch before the gate. The exact lease-protected push becomes the
+durable head that is gated; AGCoord does not rebase or rewrite existing commits. Pass
+`--no-target-sync` when the request requires a stale-target refusal instead. A merge conflict,
+concurrent source change, or target movement during the gate hands the work back to the
+contributor and never reuses the earlier verdict.
 
 Landing repository work does not authorize a package upload. Upload an AGCoord
 distribution to PyPI only when the user explicitly requests it; permission to implement,

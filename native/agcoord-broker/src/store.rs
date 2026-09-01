@@ -195,6 +195,7 @@ pub struct PhaseRequest {
     pub worker_start_token: String,
     pub checkout: PathBuf,
     pub head_sha: String,
+    pub new_head_sha: Option<String>,
     pub phase: String,
     pub gate_exit_status: Option<i64>,
 }
@@ -2264,6 +2265,16 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
         _ => None,
     };
     let selected_gate_status = request.gate_exit_status.or(run.gate_exit_status);
+    let new_head_valid = request.new_head_sha.as_ref().is_none_or(|head| {
+        head.len() == 40
+            && head
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && head != &request.head_sha
+            && run.phase == "preflight"
+            && request.phase == "preflight"
+            && selected_gate_status.is_none()
+    });
     let valid = order(&run.phase)
         .is_some_and(|current| order(&request.phase).is_some_and(|next| next >= current))
         && request
@@ -2273,7 +2284,8 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
             && request.gate_exit_status.is_some()
             && run.gate_exit_status != request.gate_exit_status)
         && !(request.phase == "preflight" && selected_gate_status.is_some())
-        && !(request.phase == "publishing" && selected_gate_status != Some(0));
+        && !(request.phase == "publishing" && selected_gate_status != Some(0))
+        && new_head_valid;
     if !valid {
         return Err(AppError::new(
             "broker-land-phase-invalid",
@@ -2282,8 +2294,14 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
     }
     connection
         .execute(
-            "UPDATE runs SET phase = ?1, gate_exit_status = ?2 WHERE run_id = ?3",
-            params![request.phase, selected_gate_status, request.run_id,],
+            "UPDATE runs SET phase = ?1, gate_exit_status = ?2, head_sha = ?3
+             WHERE run_id = ?4",
+            params![
+                request.phase,
+                selected_gate_status,
+                request.new_head_sha.as_ref().unwrap_or(&request.head_sha),
+                request.run_id,
+            ],
         )
         .map_err(map_database_error)?;
     connection
