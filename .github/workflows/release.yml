@@ -27,7 +27,8 @@ jobs:
       - run: cargo fetch --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --frozen --workspace --all-targets -- -D warnings
-      - run: cargo test --frozen --workspace
+      - name: Run versioned Python/native conformance gate
+        run: ./scripts/check-conformance
       - run: ./scripts/build-native-broker
       - run: ./scripts/audit-native-broker dist/native/agcoord-broker-x86_64-unknown-linux-musl
       - run: ./scripts/check-native-licenses dist/native/agcoord-broker-x86_64-unknown-linux-musl
