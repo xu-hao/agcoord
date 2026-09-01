@@ -5,7 +5,7 @@ use crate::platform::{
 };
 use crate::store::{
     Paths, RunRecord, allocations, blocked_by, connect, initialize_native, load_run, load_runs,
-    map_database_error, now,
+    maintain_child_cpu_leases, map_database_error, now, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
 use crate::{cgroup, project_quota, resources};
@@ -15,7 +15,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -54,6 +54,60 @@ pub struct Broker {
 }
 
 impl Broker {
+    fn worker_command(&self, run: &RunRecord) -> Result<Vec<String>> {
+        if run.kind != "land" {
+            return Ok(run.command.clone());
+        }
+        let python = run
+            .environment
+            .get("_AGCOORD_LAND_PYTHON")
+            .filter(|path| Path::new(path).is_absolute())
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-worker-start-failed",
+                    "land worker Python is missing or no longer an absolute file",
+                )
+            })?;
+        let adapter = run.publication_adapter.as_deref().ok_or_else(|| {
+            AppError::new("broker-row-invalid", "land run has no publication adapter")
+        })?;
+        let request = run.publication_request.as_ref().ok_or_else(|| {
+            AppError::new("broker-row-invalid", "land run has no publication request")
+        })?;
+        let head = run
+            .head_sha
+            .as_deref()
+            .ok_or_else(|| AppError::new("broker-row-invalid", "land run has no exact head"))?;
+        let mut command = vec![
+            python.clone(),
+            "-m".to_owned(),
+            "agcoord.land".to_owned(),
+            "--run-id".to_owned(),
+            run.run_id.clone(),
+            "--state-dir".to_owned(),
+            self.paths.state_dir.to_string_lossy().into_owned(),
+        ];
+        command.extend([
+            "--checkout".to_owned(),
+            run.checkout.to_string_lossy().into_owned(),
+            "--branch".to_owned(),
+            run.branch.clone(),
+            "--head-sha".to_owned(),
+            head.to_owned(),
+            "--adapter".to_owned(),
+            adapter.to_owned(),
+            "--request-json".to_owned(),
+            serde_json::to_string(request).map_err(|error| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!("cannot encode land publication request: {error}"),
+                )
+            })?,
+            "--".to_owned(),
+        ]);
+        command.extend(run.command.clone());
+        Ok(command)
+    }
     pub fn start(options: ServeOptions) -> Result<Self> {
         if options.capacities.is_empty()
             || options.capacities.values().any(|units| *units == 0)
@@ -141,6 +195,8 @@ impl Broker {
         }
         let connection = initialize_native(&paths, &options.capacities)?;
         let runs = load_runs(&connection)?;
+        validate_child_cpu_leases(&connection)?;
+        maintain_child_cpu_leases(&connection)?;
         if cgroup_backend.is_none()
             && runs
                 .iter()
@@ -341,6 +397,7 @@ impl Broker {
 
     fn pump_once(&mut self) -> Result<()> {
         let connection = connect(&self.paths)?;
+        maintain_child_cpu_leases(&connection)?;
         let runs = load_runs(&connection)?;
         let active: Vec<_> = runs
             .iter()
@@ -351,6 +408,7 @@ impl Broker {
         for run in active {
             self.observe(&connection, &run)?;
         }
+        maintain_child_cpu_leases(&connection)?;
         drop(connection);
 
         loop {
@@ -432,14 +490,19 @@ impl Broker {
                 self.finish_and_cleanup_resources(connection, &refreshed)?;
             }
             let run = load_run(connection, &run.run_id)?;
+            let observed_exit = if run.kind == "land" {
+                run.reported_exit_status.unwrap_or(exit_status)
+            } else {
+                exit_status
+            };
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
                 ("cancelled", 130, None)
-            } else if exit_status == 0 {
+            } else if observed_exit == 0 {
                 ("passed", 0, None)
             } else if Self::has_resource_observation(&run, "memory-oom") {
-                ("failed", exit_status, Some("memory-oom"))
+                ("failed", observed_exit, Some("memory-oom"))
             } else {
-                ("failed", exit_status, None)
+                ("failed", observed_exit, None)
             };
             self.finish_run(connection, &run, status, selected_exit, failure_reason)?;
             self.crash("terminal-commit");
@@ -476,6 +539,10 @@ impl Broker {
         let run = load_run(connection, &run.run_id)?;
         let (status, exit_status, failure_reason) = if run.cancel_requested {
             ("cancelled", 130, None)
+        } else if run.kind == "land" && run.reported_exit_status == Some(0) {
+            ("passed", 0, None)
+        } else if let ("land", Some(exit_status)) = (run.kind.as_str(), run.reported_exit_status) {
+            ("failed", exit_status, None)
         } else {
             ("interrupted", 125, Some("worker-result-lost"))
         };
@@ -1766,8 +1833,9 @@ impl Broker {
             environment.insert("TMP".to_owned(), target.clone());
             environment.insert("TEMP".to_owned(), target);
         }
+        let worker_command = self.worker_command(&current)?;
         let mut pending = match PendingWorker::spawn(
-            &current.command,
+            &worker_command,
             &environment,
             &current.checkout,
             &output,

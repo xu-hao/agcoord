@@ -27,9 +27,11 @@ different stable repository and worktree identities.
 The state directory, spool, lock, broker diagnostics, run logs, and transient sidecars are
 owner-only. An ownership lock elects exactly one broker. Simultaneous first clients either
 join that owner or fail without an accepted row; they never create two supervisors for the
-same spool. The first ordinary client starts a detached owner on demand, so there is no
-separate daemon-install command. Closing the submitting terminal does not cancel accepted
-work.
+same spool. The first ordinary client starts the explicitly selected native executable as a
+detached owner on demand, so there is no separate daemon-install command. Closing the
+submitting terminal does not cancel accepted work. Concurrent first clients converge on the
+same ownership lock; a loser joins the exact compatible owner instead of starting a second
+supervisor.
 
 The broker may exit after the queue is empty and idle. Durable history and logs remain, and a
 later client starts a replacement owner against the same spool. An unclean restart observes
@@ -60,13 +62,14 @@ the entire machine:
   identifiable in migrated history but are not the normal public landing workflow.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
-directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`, and
-`database_timeout`; invalid JSON, a top-level value that is not an object, an unknown key, a
-section that is not an object, or an empty `cgroup_root` is refused when the broker loads its
-configuration. When present, `cgroup_io` contains exactly one nonempty `paths` list of unique
-absolute strings. `database_timeout` is a positive finite number of seconds no greater than
-`2147483.647` (SQLite's millisecond limit) and defaults to `10`. An absent file is the default
-configuration, and capacity then defaults to `jobs=2`.
+directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
+`database_timeout`, and `native_broker`; invalid JSON, a top-level value that is not an object,
+an unknown key, a section that is not an object, or an empty `cgroup_root` is refused when the
+client or broker loads its configuration. When present, `cgroup_io` contains exactly one
+nonempty `paths` list of unique absolute strings. `database_timeout` is a positive finite number
+of seconds no greater than `2147483.647` (SQLite's millisecond limit) and defaults to `10`. An
+absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
+defaults capacity to `jobs=2`.
 
 ```json
 {
@@ -75,9 +78,21 @@ configuration, and capacity then defaults to `jobs=2`.
     "cpu": {"kind": "cpu", "unit": "logical-cpu", "mode": "required", "backend": "cgroup-v2"}
   },
   "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service",
-  "database_timeout": 30
+  "database_timeout": 30,
+  "native_broker": {
+    "path": "/usr/libexec/agcoord/agcoord-broker",
+    "allow_development": false
+  }
 }
 ```
+
+`native_broker.path` must be absolute. The default/release policy requires a root-owned,
+non-writable-by-group-or-others x86_64 Linux artifact with the supported protocol, version,
+implementation, and SHA-256 build identity; host packaging separately audits its static ELF
+contract. Development from a checkout is explicit: select the absolute regular executable and
+set `allow_development` to `true`. That permits only a current-user- or root-owned supported GNU
+or musl development build; it does not weaken file, identity, protocol, or live-owner matching
+checks. Clients never search `PATH` and never fall back to the Python broker.
 
 No environment variable configures capacity, bindings, the delegated cgroup root, or block-I/O
 paths or the database timeout; `AGCOORD_STATE_DIR` selects which state directory, and therefore
@@ -942,10 +957,12 @@ not reinterpreted as typed or enforced resources. Protocol 3 migrates by adding 
 child-CPU-lease catalogue; terminal run history remains unchanged and no lease is invented for
 old work.
 
-During the protocol-5 native-owner rollout, its separate migration first produces and verifies
+Protocol-5 migration first produces and verifies
 a normalized protocol-4 rollback backup. An explicit rollback restores that baseline, replays
 terminal native history, and writes `invalid_gate_through_sequence`. Protocol-4 merge submission
 then ignores all full-gate receipts through that sequence, including an explicitly named one;
-run a new exact-head full gate before any legacy merge workflow. The installed `agc` continues
-to own protocol-4 migration until native client selection is enabled, so installing or building
-the native artifact alone never performs this transition.
+run a new exact-head full gate before any legacy merge workflow. The installed `agc migrate`
+selects and verifies the configured native executable, requires the old owner and queue to be
+idle, and invokes that executable's migration command. Ordinary client commands refuse a live
+protocol-4 owner or an idle older spool and name this procedure; installing or building the
+native artifact alone never performs the transition.

@@ -166,25 +166,63 @@ pub fn prepare_private_directory(path: &Path) -> Result<()> {
     })
 }
 
-fn process_identity(pid: u32) -> Option<(String, u32, String)> {
+fn process_identity(pid: u32) -> Option<(String, u32, u32, String)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let closing = stat.rfind(')')?;
     let fields: Vec<_> = stat.get(closing + 2..)?.split_whitespace().collect();
     Some((
         fields.first()?.to_string(),
+        fields.get(1)?.parse().ok()?,
         fields.get(2)?.parse().ok()?,
         fields.get(19)?.to_string(),
     ))
 }
 
 pub fn process_start_token(pid: u32) -> Option<String> {
-    process_identity(pid).map(|(_state, _process_group, token)| token)
+    process_identity(pid).map(|(_state, _parent, _process_group, token)| token)
+}
+
+pub fn same_process(pid: u32, token: &str) -> bool {
+    process_identity(pid).is_some_and(|(state, _parent, _process_group, observed)| {
+        !matches!(state.as_str(), "Z" | "X") && observed == token
+    })
+}
+
+pub fn is_descendant_process(
+    pid: u32,
+    token: &str,
+    ancestor_pid: u32,
+    ancestor_token: &str,
+) -> bool {
+    let mut current_pid = pid;
+    let mut expected_token = token.to_owned();
+    let mut visited = std::collections::BTreeSet::new();
+    while current_pid > 0 && visited.insert(current_pid) {
+        let Some((state, parent_pid, _process_group, observed)) = process_identity(current_pid)
+        else {
+            return false;
+        };
+        if matches!(state.as_str(), "Z" | "X") || observed != expected_token {
+            return false;
+        }
+        if current_pid == ancestor_pid {
+            return observed == ancestor_token;
+        }
+        let Some((_parent_state, _grandparent, _parent_group, parent_token)) =
+            process_identity(parent_pid)
+        else {
+            return false;
+        };
+        current_pid = parent_pid;
+        expected_token = parent_token;
+    }
+    false
 }
 
 pub fn same_worker_process(pid: Option<u32>, token: Option<&str>) -> bool {
     match (pid, token) {
         (Some(pid), Some(token)) => {
-            process_identity(pid).is_some_and(|(state, process_group, observed)| {
+            process_identity(pid).is_some_and(|(state, _parent, process_group, observed)| {
                 !matches!(state.as_str(), "Z" | "X") && process_group == pid && observed == token
             })
         }
@@ -195,7 +233,7 @@ pub fn same_worker_process(pid: Option<u32>, token: Option<&str>) -> bool {
 pub fn worker_identity_conflicts(pid: Option<u32>, token: Option<&str>) -> bool {
     match (pid, token) {
         (Some(pid), Some(token)) => {
-            process_identity(pid).is_some_and(|(_state, process_group, observed)| {
+            process_identity(pid).is_some_and(|(_state, _parent, process_group, observed)| {
                 process_group != pid || observed != token
             })
         }

@@ -142,6 +142,7 @@ def fake_client(monkeypatch):
         "cancel": [],
         "log": [],
         "clear": [],
+        "migrate": [],
         "follow": [],
     }
 
@@ -213,6 +214,10 @@ def fake_client(monkeypatch):
         def clear(self):
             observations["clear"].append(True)
             return {"cleared": 3}
+
+        def migrate(self):
+            observations["migrate"].append(True)
+            return {"changed": True, "from_protocol": 4, "to_protocol": 5}
 
     def fake_follow(client, run_id, *, out):
         observations["follow"].append((client, run_id))
@@ -401,19 +406,11 @@ def test_public_full_refuses_a_dirty_checkout_before_accepting_a_receipt(
 
     try:
         with pytest.raises(CoordinatorError, match="clean|dirty|receipt"):
-            cli.run(
-                _args(
-                    "--state-dir",
-                    str(state_dir),
-                    "full",
-                    "--checkout",
-                    str(checkout),
-                    "--resource",
-                    "cpu=1",
-                    "--",
-                    "true",
-                ),
-                out=StringIO(),
+            client.submit(
+                ["true"],
+                checkout=str(checkout),
+                kind="full",
+                resources={"cpu": 1},
             )
         snapshot = client.snapshot()
         assert snapshot["active"] == []
@@ -499,20 +496,20 @@ def test_tui_constructs_the_client_lazily(fake_client, monkeypatch):
     assert len(fake_client["constructed"]) == 1
 
 
-def test_migration_is_explicit_and_starts_no_client(fake_client, monkeypatch, tmp_path: Path):
+def test_migration_is_explicit_and_never_autostarts_a_broker(fake_client, tmp_path: Path):
     fake_client["constructed"].clear()
-    calls: list[Path] = []
-
-    def fake_migrate(*, state_dir):
-        calls.append(Path(state_dir))
-        return {"changed": True, "from_protocol": 1, "to_protocol": PROTOCOL}
-
-    monkeypatch.setattr(cli, "migrate_queue", fake_migrate)
     output = StringIO()
     state_dir = tmp_path / "legacy"
 
     assert cli.run(_args("--state-dir", str(state_dir), "migrate"), out=output) == 0
-    assert calls == [state_dir]
-    assert fake_client["constructed"] == []
-    assert f"protocol 1" in output.getvalue()
-    assert str(PROTOCOL) in output.getvalue()
+    assert fake_client["migrate"] == [True]
+    assert fake_client["constructed"] == [
+        {
+            "state_dir": str(state_dir),
+            "checkout": Path.cwd(),
+            "autostart": False,
+            "thread": threading.get_ident(),
+        }
+    ]
+    assert "protocol 4" in output.getvalue()
+    assert "to 5" in output.getvalue()

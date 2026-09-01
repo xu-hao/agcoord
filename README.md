@@ -13,11 +13,17 @@ core package is forge-neutral; GitHub support is an optional adapter.
 
 ## Install and start
 
-Install the published package in a tool environment:
+Install the published Python client in a tool environment and the matching host package, which
+places the native broker at `/usr/libexec/agcoord/agcoord-broker`:
 
 ```bash
 python -m pip install agcoord
 ```
+
+The client refuses to search `PATH` or fall back to the old Python broker. Source developers may
+select an absolute current-user-owned development build with the documented
+[`native_broker` configuration](docs/native_broker.md#executable-discovery); release installs
+require the root-owned static artifact.
 
 The base package installs the supported Textual 8 release line (`textual>=8.2,<9`) for the
 terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
@@ -34,9 +40,10 @@ idle spool, and back up the state directory when its history matters. Move capac
 binding, and cgroup-root values from `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`, and
 `AGCOORD_CGROUP_ROOT` into that state directory's single `config.json`; those three environment
 variables and the old comma-separated capacity syntax are no longer accepted. After installing
-0.2.0, run `agc migrate` once for the idle default spool (or
-`agc --state-dir /path/to/state migrate`), then use `agc list` to start the new broker. Migration
-preserves historical meaning and never reinterprets legacy resource names as enforced limits.
+the native-capable release and its host artifact, run `agc migrate` once for the idle default
+spool (or `agc --state-dir /path/to/state migrate`), then use `agc list` to start the new broker.
+Migration preserves historical meaning and never reinterprets legacy resource names as enforced
+limits.
 
 There is no separate service-install step. The first command starts the detached broker on
 demand; later shells and repositories join the same user-scoped coordinator:
