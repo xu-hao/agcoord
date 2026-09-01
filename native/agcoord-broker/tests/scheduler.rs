@@ -2,7 +2,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -2163,11 +2163,19 @@ fn project_quota_cleanup_refuses_a_replaced_tree_without_removing_it() {
     let target = PathBuf::from(
         String::from_utf8(wait_for_nonempty_file(&entered, Duration::from_secs(5))).unwrap(),
     );
-    fs::remove_dir_all(&target).unwrap();
-    fs::create_dir(&target).unwrap();
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
-    let replacement = target.join("replacement");
+    let original_identity = fs::metadata(&target).unwrap().ino();
+    let replacement_tree = target.with_extension("replacement");
+    fs::create_dir(&replacement_tree).unwrap();
+    fs::set_permissions(&replacement_tree, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_ne!(
+        fs::metadata(&replacement_tree).unwrap().ino(),
+        original_identity
+    );
+    let replacement = replacement_tree.join("replacement");
     fs::write(&replacement, "must survive").unwrap();
+    fs::remove_dir_all(&target).unwrap();
+    fs::rename(&replacement_tree, &target).unwrap();
+    let replacement = target.join("replacement");
     fs::write(&release, "release").unwrap();
     let passed = wait_status(&state, submission.run_id, "passed");
     assert!(target.is_dir());
