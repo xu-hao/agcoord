@@ -14,7 +14,6 @@ from .queue import (
     CoordinatorClient,
     CoordinatorError,
     follow,
-    migrate_queue,
     parse_resource_claims,
     wait,
 )
@@ -155,7 +154,11 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
     )
 
     if args.command == "migrate":
-        result = migrate_queue(state_dir=args.state_dir)
+        result = CoordinatorClient(
+            state_dir=args.state_dir,
+            checkout=checkout,
+            autostart=False,
+        ).migrate()
         if emit:
             emit(result)
         elif result["changed"]:

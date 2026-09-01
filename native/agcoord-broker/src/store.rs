@@ -1,6 +1,7 @@
 use crate::error::{AppError, Result};
 use crate::platform::{
-    OwnerLock, live_owner_metadata, prepare_private_directory, same_worker_process, sync_file,
+    OwnerLock, is_descendant_process, live_owner_metadata, prepare_private_directory, same_process,
+    same_worker_process, sync_file,
 };
 use crate::resources::{
     BackendState, Binding, initial_receipt, parse_backend_state, parse_bindings,
@@ -9,7 +10,8 @@ use crate::resources::{
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,6 +20,7 @@ pub const PROTOCOL: u64 = 5;
 pub const SCHEMA_FINGERPRINT: &str = "agcoord-spool-v5";
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const RECENT_LIMIT: usize = 50;
+const MAX_LOG_BYTES: usize = 64 * 1024;
 
 const RUNS_SCHEMA: &str = r#"
 CREATE TABLE runs (
@@ -178,6 +181,9 @@ pub struct SubmitRequest {
     pub head_sha: Option<String>,
     pub resources: BTreeMap<String, u64>,
     pub gate_run_id: Option<String>,
+    pub publication_adapter: Option<String>,
+    pub publication_request: Option<Value>,
+    pub caller_pid: u32,
     pub command: Vec<String>,
     pub environment: BTreeMap<String, String>,
 }
@@ -191,6 +197,58 @@ pub struct PhaseRequest {
     pub head_sha: String,
     pub phase: String,
     pub gate_exit_status: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdmissionRequest {
+    pub run_id: String,
+    pub kind: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LandResultRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub exit_status: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChildLeaseRequest {
+    pub lease_id: String,
+    pub run_id: String,
+    pub requested: u64,
+    pub minimum: u64,
+    pub owner_pid: u32,
+    pub owner_start_token: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChildLeaseOwnerRequest {
+    pub lease_id: String,
+    pub owner_pid: u32,
+    pub owner_start_token: String,
+}
+
+#[derive(Clone, Debug)]
+struct ChildLeaseRecord {
+    sequence: i64,
+    lease_id: String,
+    run_id: String,
+    status: String,
+    requested: u64,
+    minimum: u64,
+    granted: u64,
+    owner_pid: u32,
+    owner_start_token: String,
+    bypass_count: u64,
+    created_at: String,
+    acquired_at: Option<String>,
+    finished_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +276,7 @@ pub struct RunRecord {
     pub publication_request: Option<Value>,
     pub failure_reason: Option<String>,
     pub gate_exit_status: Option<i64>,
+    pub reported_exit_status: Option<i64>,
     pub caller_pid: i64,
     pub command: Vec<String>,
     pub environment: BTreeMap<String, String>,
@@ -289,6 +348,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
         "cgroup_root",
         "cgroup_io",
         "database_timeout",
+        "native_broker",
     ];
     if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(AppError::new(
@@ -315,6 +375,44 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             "broker-config-invalid",
             "broker configuration cgroup_root must be a non-empty string",
         ));
+    }
+    if let Some(native) = object.get("native_broker") {
+        let native = native.as_object().ok_or_else(|| {
+            AppError::new(
+                "broker-config-invalid",
+                "broker configuration native_broker must be a JSON object",
+            )
+        })?;
+        if native
+            .keys()
+            .any(|key| !matches!(key.as_str(), "path" | "allow_development"))
+        {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                "broker configuration native_broker has an unknown key",
+            ));
+        }
+        let selected = native
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty() && !path.contains('\0'))
+            .map(Path::new)
+            .filter(|path| path.is_absolute());
+        if selected.is_none() {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                "broker configuration native_broker path must be absolute",
+            ));
+        }
+        if native
+            .get("allow_development")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                "broker configuration native_broker allow_development must be boolean",
+            ));
+        }
     }
     if let Some(io) = object.get("cgroup_io")
         && !io.is_null()
@@ -893,6 +991,9 @@ fn run_from_row(row: &Row<'_>) -> Result<RunRecord> {
         publication_request,
         failure_reason: row.get("failure_reason").map_err(map_database_error)?,
         gate_exit_status: row.get("gate_exit_status").map_err(map_database_error)?,
+        reported_exit_status: row
+            .get("reported_exit_status")
+            .map_err(map_database_error)?,
         caller_pid: row.get("caller_pid").map_err(map_database_error)?,
         command,
         environment,
@@ -1153,6 +1254,572 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
     ))
 }
 
+pub fn log(paths: &Paths, run_id: &str, offset: u64, limit: usize) -> Result<Value> {
+    if limit == 0 || limit > MAX_LOG_BYTES {
+        return Err(AppError::new(
+            "broker-log-range-invalid",
+            format!("gate log limit must be between 1 and {MAX_LOG_BYTES}"),
+        ));
+    }
+    let connection = open_protocol5(paths)?;
+    load_run(&connection, run_id)?;
+    let path = paths.logs.join(format!("{run_id}.log"));
+    let size = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(AppError::new(
+                "broker-log-read-failed",
+                format!("cannot inspect gate log for {run_id}: {error}"),
+            ));
+        }
+    };
+    if offset > size {
+        return Err(AppError::new(
+            "broker-log-range-invalid",
+            format!("gate log offset {offset} is past its {size}-byte end"),
+        ));
+    }
+    let mut data = Vec::new();
+    if size > 0 {
+        let mut file = File::open(&path).map_err(|error| {
+            AppError::new(
+                "broker-log-read-failed",
+                format!("cannot open gate log for {run_id}: {error}"),
+            )
+        })?;
+        file.seek(SeekFrom::Start(offset)).map_err(|error| {
+            AppError::new(
+                "broker-log-read-failed",
+                format!("cannot seek gate log for {run_id}: {error}"),
+            )
+        })?;
+        file.take(limit as u64)
+            .read_to_end(&mut data)
+            .map_err(|error| {
+                AppError::new(
+                    "broker-log-read-failed",
+                    format!("cannot read gate log for {run_id}: {error}"),
+                )
+            })?;
+    }
+    let next_offset = offset + data.len() as u64;
+    Ok(json!({
+        "run_id": run_id,
+        "offset": offset,
+        "next_offset": next_offset,
+        "text": String::from_utf8_lossy(&data),
+        "eof": next_offset >= size,
+    }))
+}
+
+fn child_lease_from_row(row: &Row<'_>) -> Result<ChildLeaseRecord> {
+    let lease_id: String = row.get("lease_id").map_err(map_database_error)?;
+    let positive = |value: i64, subject: &str| {
+        u64::try_from(value)
+            .ok()
+            .filter(|selected| *selected > 0)
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-lease-row-invalid",
+                    format!("child CPU lease {lease_id} has invalid {subject}"),
+                )
+            })
+    };
+    let non_negative = |value: i64, subject: &str| {
+        u64::try_from(value).map_err(|_| {
+            AppError::new(
+                "broker-lease-row-invalid",
+                format!("child CPU lease {lease_id} has invalid {subject}"),
+            )
+        })
+    };
+    let owner_pid_value: i64 = row.get("owner_pid").map_err(map_database_error)?;
+    let owner_pid = u32::try_from(owner_pid_value)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            AppError::new(
+                "broker-lease-row-invalid",
+                format!("child CPU lease {lease_id} has invalid owner PID"),
+            )
+        })?;
+    let record = ChildLeaseRecord {
+        sequence: row.get("sequence").map_err(map_database_error)?,
+        lease_id: lease_id.clone(),
+        run_id: row.get("run_id").map_err(map_database_error)?,
+        status: row.get("status").map_err(map_database_error)?,
+        requested: positive(row.get("requested").map_err(map_database_error)?, "request")?,
+        minimum: positive(row.get("minimum").map_err(map_database_error)?, "minimum")?,
+        granted: non_negative(row.get("granted").map_err(map_database_error)?, "grant")?,
+        owner_pid,
+        owner_start_token: row.get("owner_start_token").map_err(map_database_error)?,
+        bypass_count: non_negative(
+            row.get("bypass_count").map_err(map_database_error)?,
+            "bypass count",
+        )?,
+        created_at: row.get("created_at").map_err(map_database_error)?,
+        acquired_at: row.get("acquired_at").map_err(map_database_error)?,
+        finished_at: row.get("finished_at").map_err(map_database_error)?,
+    };
+    let coherent = record.sequence > 0
+        && identifier_valid(&record.lease_id)
+        && identifier_valid(&record.run_id)
+        && !record.owner_start_token.is_empty()
+        && record.minimum <= record.requested
+        && record.granted <= record.requested
+        && record.bypass_count <= 1
+        && match record.status.as_str() {
+            "waiting" => {
+                record.granted == 0 && record.acquired_at.is_none() && record.finished_at.is_none()
+            }
+            "active" => {
+                record.granted >= record.minimum
+                    && record.acquired_at.is_some()
+                    && record.finished_at.is_none()
+            }
+            "released" => record.finished_at.is_some(),
+            "cancelled" => record.finished_at.is_some(),
+            _ => false,
+        };
+    if !coherent {
+        return Err(AppError::new(
+            "broker-lease-row-invalid",
+            format!(
+                "child CPU lease {} is structurally invalid",
+                record.lease_id
+            ),
+        ));
+    }
+    Ok(record)
+}
+
+fn load_child_leases(connection: &Connection) -> Result<Vec<ChildLeaseRecord>> {
+    let mut statement = connection
+        .prepare("SELECT * FROM child_cpu_leases ORDER BY sequence")
+        .map_err(map_database_error)?;
+    let mut rows = statement.query([]).map_err(map_database_error)?;
+    let mut selected = Vec::new();
+    while let Some(row) = rows.next().map_err(map_database_error)? {
+        selected.push(child_lease_from_row(row)?);
+    }
+    Ok(selected)
+}
+
+fn load_live_child_leases(connection: &Connection) -> Result<Vec<ChildLeaseRecord>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT * FROM child_cpu_leases
+             WHERE status IN ('waiting', 'active') ORDER BY sequence",
+        )
+        .map_err(map_database_error)?;
+    let mut rows = statement.query([]).map_err(map_database_error)?;
+    let mut selected = Vec::new();
+    while let Some(row) = rows.next().map_err(map_database_error)? {
+        selected.push(child_lease_from_row(row)?);
+    }
+    Ok(selected)
+}
+
+fn load_child_lease(connection: &Connection, lease_id: &str) -> Result<ChildLeaseRecord> {
+    let mut statement = connection
+        .prepare("SELECT * FROM child_cpu_leases WHERE lease_id = ?1")
+        .map_err(map_database_error)?;
+    let mut rows = statement
+        .query(params![lease_id])
+        .map_err(map_database_error)?;
+    let row = rows.next().map_err(map_database_error)?.ok_or_else(|| {
+        AppError::new(
+            "broker-lease-unknown",
+            format!("unknown child CPU lease {lease_id:?}"),
+        )
+    })?;
+    child_lease_from_row(row)
+}
+
+fn child_lease_position(connection: &Connection, lease: &ChildLeaseRecord) -> Result<Option<u64>> {
+    if lease.status != "waiting" {
+        return Ok(None);
+    }
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM child_cpu_leases
+             WHERE run_id = ?1 AND status = 'waiting' AND sequence <= ?2",
+            params![lease.run_id, lease.sequence],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    u64::try_from(count).map(Some).map_err(|_| {
+        AppError::new(
+            "broker-lease-row-invalid",
+            "child CPU lease queue position is invalid",
+        )
+    })
+}
+
+fn public_child_lease(lease: &ChildLeaseRecord, position: Option<u64>) -> Value {
+    json!({
+        "lease_id": lease.lease_id,
+        "run_id": lease.run_id,
+        "status": lease.status,
+        "requested": lease.requested,
+        "minimum": lease.minimum,
+        "granted": lease.granted,
+        "full": lease.granted > 0 && lease.granted == lease.requested,
+        "owner_pid": lease.owner_pid,
+        "created_at": lease.created_at,
+        "acquired_at": lease.acquired_at,
+        "finished_at": lease.finished_at,
+        "position": position,
+    })
+}
+
+pub fn validate_child_cpu_leases(connection: &Connection) -> Result<()> {
+    let leases = load_child_leases(connection)?;
+    let mut active_by_run: BTreeMap<String, u64> = BTreeMap::new();
+    for lease in &leases {
+        let parent = load_run(connection, &lease.run_id)?;
+        let budget = parent.resources.get("cpu").copied().ok_or_else(|| {
+            AppError::new(
+                "broker-lease-row-invalid",
+                format!(
+                    "child CPU lease {} has a parent without a CPU budget",
+                    lease.lease_id
+                ),
+            )
+        })?;
+        if lease.minimum > budget {
+            return Err(AppError::new(
+                "broker-lease-row-invalid",
+                format!(
+                    "child CPU lease {} exceeds its parent budget",
+                    lease.lease_id
+                ),
+            ));
+        }
+        if lease.status == "active" {
+            let used = active_by_run.entry(lease.run_id.clone()).or_default();
+            *used = used.checked_add(lease.granted).ok_or_else(|| {
+                AppError::new(
+                    "broker-lease-row-invalid",
+                    "child CPU lease allocation overflowed",
+                )
+            })?;
+            if *used > budget {
+                return Err(AppError::new(
+                    "broker-lease-row-invalid",
+                    format!(
+                        "active child CPU leases exceed parent {} budget",
+                        lease.run_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn request_child_cpu_lease(paths: &Paths, request: &ChildLeaseRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    if !identifier_valid(&request.lease_id)
+        || !identifier_valid(&request.run_id)
+        || request.requested == 0
+        || request.requested > i64::MAX as u64
+        || request.minimum == 0
+        || request.minimum > request.requested
+        || request.owner_start_token.is_empty()
+    {
+        return Err(AppError::new(
+            "broker-lease-request-invalid",
+            "child CPU lease request is invalid",
+        ));
+    }
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let parent = load_run(&connection, &request.run_id)?;
+    let admitted = parent.status == "running"
+        && !parent.cancel_requested
+        && parent.worker_pid.is_some()
+        && parent.worker_start_token.is_some()
+        && same_worker_process(parent.worker_pid, parent.worker_start_token.as_deref())
+        && same_process(request.owner_pid, &request.owner_start_token)
+        && is_descendant_process(
+            request.owner_pid,
+            &request.owner_start_token,
+            parent.worker_pid.unwrap(),
+            parent.worker_start_token.as_deref().unwrap(),
+        );
+    if !admitted {
+        return Err(AppError::new(
+            "broker-lease-parent-invalid",
+            format!(
+                "caller is not a live descendant of admitted run {}",
+                request.run_id
+            ),
+        ));
+    }
+    let budget = parent.resources.get("cpu").copied().ok_or_else(|| {
+        AppError::new(
+            "broker-lease-budget-missing",
+            format!("parent run {} has no 'cpu' resource budget", request.run_id),
+        )
+    })?;
+    if request.minimum > budget {
+        return Err(AppError::new(
+            "broker-lease-budget-exceeded",
+            format!(
+                "child CPU lease minimum {} exceeds parent budget {budget}",
+                request.minimum
+            ),
+        ));
+    }
+    connection
+        .execute(
+            "INSERT INTO child_cpu_leases (
+                lease_id, run_id, status, requested, minimum, owner_pid,
+                owner_start_token, created_at
+             ) VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7)",
+            params![
+                request.lease_id,
+                request.run_id,
+                request.requested as i64,
+                request.minimum as i64,
+                i64::from(request.owner_pid),
+                request.owner_start_token,
+                now(&connection)?,
+            ],
+        )
+        .map_err(|error| {
+            if matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
+                AppError::new(
+                    "broker-lease-exists",
+                    format!("child CPU lease {} already exists", request.lease_id),
+                )
+            } else {
+                map_database_error(error)
+            }
+        })?;
+    set_metadata(&connection, "last_activity", &now(&connection)?)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    let lease = load_child_lease(&connection, &request.lease_id)?;
+    let position = child_lease_position(&connection, &lease)?;
+    Ok(public_child_lease(&lease, position))
+}
+
+pub fn child_cpu_lease_status(paths: &Paths, lease_id: &str) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    let lease = load_child_lease(&connection, lease_id)?;
+    let position = child_lease_position(&connection, &lease)?;
+    Ok(public_child_lease(&lease, position))
+}
+
+pub fn child_cpu_leases(
+    paths: &Paths,
+    run_id: Option<&str>,
+    include_terminal: bool,
+) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    if let Some(run_id) = run_id {
+        load_run(&connection, run_id)?;
+    }
+    let leases = load_child_leases(&connection)?;
+    let mut waiting_positions: BTreeMap<String, u64> = BTreeMap::new();
+    let selected = leases
+        .iter()
+        .filter(|lease| run_id.is_none_or(|selected| lease.run_id == selected))
+        .filter(|lease| include_terminal || matches!(lease.status.as_str(), "waiting" | "active"))
+        .map(|lease| {
+            let position = if lease.status == "waiting" {
+                let value = waiting_positions.entry(lease.run_id.clone()).or_default();
+                *value += 1;
+                Some(*value)
+            } else {
+                None
+            };
+            public_child_lease(lease, position)
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Array(selected))
+}
+
+pub fn finish_child_cpu_lease(
+    paths: &Paths,
+    request: &ChildLeaseOwnerRequest,
+    status: &str,
+) -> Result<Value> {
+    if !matches!(status, "released" | "cancelled") {
+        return Err(AppError::new(
+            "broker-lease-request-invalid",
+            "child CPU lease terminal status is invalid",
+        ));
+    }
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let lease = load_child_lease(&connection, &request.lease_id)?;
+    if lease.owner_pid != request.owner_pid
+        || lease.owner_start_token != request.owner_start_token
+        || !same_process(request.owner_pid, &request.owner_start_token)
+    {
+        return Err(AppError::new(
+            "broker-lease-owner-mismatch",
+            format!("caller does not own child CPU lease {}", request.lease_id),
+        ));
+    }
+    if matches!(lease.status.as_str(), "waiting" | "active") {
+        connection
+            .execute(
+                "UPDATE child_cpu_leases SET status = ?1, finished_at = ?2
+                 WHERE lease_id = ?3 AND status IN ('waiting', 'active')",
+                params![status, now(&connection)?, request.lease_id],
+            )
+            .map_err(map_database_error)?;
+    }
+    set_metadata(&connection, "last_activity", &now(&connection)?)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    let lease = load_child_lease(&connection, &request.lease_id)?;
+    Ok(public_child_lease(&lease, None))
+}
+
+pub fn maintain_child_cpu_leases(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let result = (|| {
+        let timestamp = now(connection)?;
+        let leases = load_live_child_leases(connection)?;
+        for lease in &leases {
+            let parent = load_run(connection, &lease.run_id)?;
+            let valid = parent.status == "running"
+                && !parent.cancel_requested
+                && parent.worker_pid.is_some()
+                && parent.worker_start_token.is_some()
+                && same_worker_process(parent.worker_pid, parent.worker_start_token.as_deref())
+                && same_process(lease.owner_pid, &lease.owner_start_token)
+                && is_descendant_process(
+                    lease.owner_pid,
+                    &lease.owner_start_token,
+                    parent.worker_pid.unwrap(),
+                    parent.worker_start_token.as_deref().unwrap(),
+                );
+            if !valid {
+                connection
+                    .execute(
+                        "UPDATE child_cpu_leases SET status = 'cancelled', finished_at = ?1
+                         WHERE lease_id = ?2 AND status IN ('waiting', 'active')",
+                        params![timestamp, lease.lease_id],
+                    )
+                    .map_err(map_database_error)?;
+            }
+        }
+
+        let leases = load_live_child_leases(connection)?;
+        let run_ids = leases
+            .iter()
+            .filter(|lease| matches!(lease.status.as_str(), "waiting" | "active"))
+            .map(|lease| lease.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        for run_id in run_ids {
+            let parent = load_run(connection, &run_id)?;
+            if parent.status != "running" || parent.cancel_requested {
+                continue;
+            }
+            let budget = parent.resources.get("cpu").copied().ok_or_else(|| {
+                AppError::new(
+                    "broker-lease-row-invalid",
+                    format!("parent run {run_id} has live child leases without a CPU budget"),
+                )
+            })?;
+            let active = load_live_child_leases(connection)?
+                .into_iter()
+                .filter(|lease| lease.run_id == run_id && lease.status == "active")
+                .collect::<Vec<_>>();
+            let used = active.iter().try_fold(0_u64, |total, lease| {
+                total.checked_add(lease.granted).ok_or_else(|| {
+                    AppError::new(
+                        "broker-lease-row-invalid",
+                        "child CPU lease allocation overflowed",
+                    )
+                })
+            })?;
+            if used > budget {
+                return Err(AppError::new(
+                    "broker-lease-row-invalid",
+                    format!("child CPU leases for {run_id} exceed the parent budget"),
+                ));
+            }
+            let mut available = budget - used;
+            let mut waiting = load_live_child_leases(connection)?
+                .into_iter()
+                .filter(|lease| lease.run_id == run_id && lease.status == "waiting")
+                .collect::<Vec<_>>();
+            while available > 0 && !waiting.is_empty() {
+                let selected_index = if waiting[0].minimum <= available {
+                    Some(0)
+                } else if waiting[0].bypass_count >= 1 {
+                    None
+                } else {
+                    waiting
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .find(|(_index, lease)| lease.minimum <= available)
+                        .map(|(index, _lease)| index)
+                };
+                let Some(selected_index) = selected_index else {
+                    break;
+                };
+                if selected_index > 0 {
+                    connection
+                        .execute(
+                            "UPDATE child_cpu_leases SET bypass_count = bypass_count + 1
+                             WHERE lease_id = ?1",
+                            params![waiting[0].lease_id],
+                        )
+                        .map_err(map_database_error)?;
+                    waiting[0].bypass_count += 1;
+                }
+                let selected = waiting.remove(selected_index);
+                let granted = selected.requested.min(available);
+                if granted < selected.minimum {
+                    return Err(AppError::new(
+                        "broker-lease-row-invalid",
+                        "child CPU lease scheduler selected an impossible grant",
+                    ));
+                }
+                connection
+                    .execute(
+                        "UPDATE child_cpu_leases SET status = 'active', granted = ?1,
+                         acquired_at = ?2 WHERE lease_id = ?3 AND status = 'waiting'",
+                        params![granted as i64, timestamp, selected.lease_id],
+                    )
+                    .map_err(map_database_error)?;
+                available -= granted;
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(map_database_error),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn identifier_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
@@ -1210,6 +1877,38 @@ fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
             "submission command or environment is invalid",
         ));
     }
+    let publication_valid = match request.kind.as_str() {
+        "merge" | "land" => {
+            request.publication_adapter.as_deref() == Some("github")
+                && request
+                    .publication_request
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .is_some_and(|number| number > 0 && number <= i64::MAX as u64)
+        }
+        _ => request.publication_adapter.is_none() && request.publication_request.is_none(),
+    };
+    if !publication_valid {
+        return Err(AppError::new(
+            "broker-submission-invalid",
+            "publication metadata does not match the run kind",
+        ));
+    }
+    if request.kind != "merge" && request.gate_run_id.is_some() {
+        return Err(AppError::new(
+            "broker-submission-invalid",
+            "only a merge submission may name a full-gate receipt",
+        ));
+    }
+    if request.kind == "land" {
+        let worker = request.environment.get("_AGCOORD_LAND_PYTHON");
+        if worker.is_none_or(|path| !Path::new(path).is_absolute() || !Path::new(path).is_file()) {
+            return Err(AppError::new(
+                "broker-submission-invalid",
+                "land submission requires an absolute existing Python worker",
+            ));
+        }
+    }
     if !request.checkout.is_absolute() || !request.checkout.is_dir() {
         return Err(AppError::new(
             "broker-submission-invalid",
@@ -1266,14 +1965,8 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
             format!("run {} already exists", request.run_id),
         ));
     }
+    let mut selected_gate_run_id = request.gate_run_id.clone();
     if request.kind == "merge" {
-        let gate_run_id = request.gate_run_id.as_deref().ok_or_else(|| {
-            AppError::new(
-                "broker-gate-required",
-                "merge submission requires an exact full-gate receipt",
-            )
-        })?;
-        let gate = load_run(&connection, gate_run_id)?;
         let floor: i64 = metadata(&connection, "native_gate_floor")?
             .ok_or_else(|| {
                 AppError::new(
@@ -1288,6 +1981,32 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
                     "native gate generation metadata is invalid",
                 )
             })?;
+        if selected_gate_run_id.is_none() {
+            selected_gate_run_id = connection
+                .query_row(
+                    "SELECT run_id FROM runs
+                     WHERE kind = 'full' AND status = 'passed' AND exit_status = 0
+                       AND repository_id = ?1 AND branch = ?2 AND head_sha = ?3
+                       AND sequence >= ?4
+                     ORDER BY sequence DESC LIMIT 1",
+                    params![
+                        request.repository_id,
+                        request.branch,
+                        request.head_sha,
+                        floor,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(map_database_error)?;
+        }
+        let gate_run_id = selected_gate_run_id.as_deref().ok_or_else(|| {
+            AppError::new(
+                "broker-gate-required",
+                "no passed full-gate receipt matches this repository, branch, and head",
+            )
+        })?;
+        let gate = load_run(&connection, gate_run_id)?;
         if gate.sequence < floor {
             return Err(AppError::new(
                 "stale-gate-verdict",
@@ -1316,10 +2035,11 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
                 run_id, status, kind, phase, label, agent, repository_id, repository,
                 worktree_id, checkout, branch, head_sha, barrier, resources_json,
                 resource_contract_json, resource_receipt_json, resource_state_json,
-                gate_run_id, caller_pid, command_json, environment_json, created_at
+                gate_run_id, publication_adapter, publication_request, caller_pid,
+                command_json, environment_json, created_at
              ) VALUES (
                 ?1, 'queued', ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, '{}', ?15, ?16, ?17, ?18, ?19
+                ?11, ?12, ?13, ?14, '{}', ?15, ?16, ?17, ?18, ?19, ?20, ?21
              )",
             params![
                 request.run_id,
@@ -1336,8 +2056,13 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
                 serde_json::to_string(&request.resources).unwrap(),
                 serde_json::to_string(&contract).unwrap(),
                 serde_json::to_string(&receipt).unwrap(),
-                request.gate_run_id,
-                i64::from(std::process::id()),
+                selected_gate_run_id,
+                request.publication_adapter,
+                request
+                    .publication_request
+                    .as_ref()
+                    .map(|value| serde_json::to_string(value).unwrap()),
+                i64::from(request.caller_pid),
                 serde_json::to_string(&request.command).unwrap(),
                 serde_json::to_string(&request.environment).unwrap(),
                 timestamp,
@@ -1398,6 +2123,97 @@ pub fn cancel(paths: &Paths, run_id: &str, crash_after_commit: bool) -> Result<V
         std::process::exit(86);
     }
     status(paths, run_id)
+}
+
+pub fn clear(paths: &Paths) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let live: Vec<String> = {
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id FROM runs WHERE status IN ('queued', 'running') ORDER BY sequence",
+            )
+            .map_err(map_database_error)?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(map_database_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_database_error)?
+    };
+    if !live.is_empty() {
+        return Err(AppError::new(
+            "broker-clear-live-work",
+            format!(
+                "cannot clear history while work is queued or running: {}",
+                live.join(", ")
+            ),
+        ));
+    }
+    let terminal: Vec<String> = {
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id FROM runs WHERE status IN
+                 ('passed', 'failed', 'cancelled', 'interrupted') ORDER BY sequence",
+            )
+            .map_err(map_database_error)?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(map_database_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_database_error)?
+    };
+    for run_id in &terminal {
+        let path = paths.logs.join(format!("{run_id}.log"));
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(AppError::new(
+                "broker-clear-failed",
+                format!("cannot remove gate log for {run_id}: {error}"),
+            ));
+        }
+    }
+    connection
+        .execute(
+            "DELETE FROM runs WHERE status IN
+             ('passed', 'failed', 'cancelled', 'interrupted')",
+            [],
+        )
+        .map_err(map_database_error)?;
+    set_metadata(&connection, "last_activity", &now(&connection)?)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({"cleared": terminal.len()}))
+}
+
+pub fn verify_admission(paths: &Paths, request: &AdmissionRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    if !matches!(request.kind.as_str(), "full" | "merge" | "land") {
+        return Err(AppError::new(
+            "broker-admission-invalid",
+            "broker admission kind must be full, merge, or land",
+        ));
+    }
+    let connection = open_protocol5(paths)?;
+    let run = load_run(&connection, &request.run_id)?;
+    let matches = run.status == "running"
+        && run.kind == request.kind
+        && run.checkout == request.checkout
+        && run.head_sha.as_deref() == Some(&request.head_sha)
+        && run.worker_pid == Some(request.worker_pid)
+        && run.worker_start_token.as_deref() == Some(&request.worker_start_token)
+        && same_worker_process(Some(request.worker_pid), Some(&request.worker_start_token));
+    if !matches {
+        return Err(AppError::new(
+            "broker-admission-mismatch",
+            format!("run {:?} has no exact broker admission", request.run_id),
+        ));
+    }
+    Ok(json!({"verified": true}))
 }
 
 pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value> {
@@ -1463,6 +2279,48 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
     status(paths, &request.run_id)
+}
+
+pub fn report_land_result(paths: &Paths, request: &LandResultRequest) -> Result<Value> {
+    if !(0..=255).contains(&request.exit_status) {
+        return Err(AppError::new(
+            "broker-land-result-invalid",
+            "land result must be an exit status from 0 to 255",
+        ));
+    }
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let run = load_run(&connection, &request.run_id)?;
+    let identity_matches = run.worker_pid == Some(request.worker_pid)
+        && run.worker_start_token.as_deref() == Some(&request.worker_start_token)
+        && same_worker_process(Some(request.worker_pid), Some(&request.worker_start_token));
+    let phase_valid = (run.phase == "gating" && run.gate_exit_status.is_some())
+        || (run.phase == "publishing" && run.gate_exit_status == Some(0))
+        || run.phase == "preflight";
+    if run.kind != "land"
+        || run.status != "running"
+        || !identity_matches
+        || run.reported_exit_status.is_some()
+        || !phase_valid
+    {
+        return Err(AppError::new(
+            "broker-land-result-invalid",
+            "land result does not match one unreported admitted worker",
+        ));
+    }
+    connection
+        .execute(
+            "UPDATE runs SET reported_exit_status = ?1 WHERE run_id = ?2",
+            params![request.exit_status, request.run_id],
+        )
+        .map_err(map_database_error)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({"reported": true}))
 }
 
 pub fn is_terminal(status: &str) -> bool {

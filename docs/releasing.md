@@ -52,9 +52,12 @@ host toolchain builds. `AGCOORD_MUSL_CC=cc` is an explicit local compatibility e
 an audited x86_64 compiler when `musl-gcc` cannot be installed; release CI never uses it.
 
 Building the artifact does not activate it. Host packaging installs the verified executable at
-`/usr/libexec/agcoord/agcoord-broker`, and a development configuration may select another
-absolute path. Protocol-5 clients verify `identity --json`, file ownership, and policy before
-startup; they never search `PATH` or silently fall back to the Python broker.
+`/usr/libexec/agcoord/agcoord-broker`, and a development configuration may explicitly select
+another absolute path with `native_broker.allow_development=true`. Python clients verify the
+regular-file mode and ownership plus the exact `identity --json` version, protocol,
+implementation, build, and target before startup and commands. They never search `PATH`, accept
+a symlink, or silently fall back to the Python broker. The Python wheel deliberately contains
+no copied interpreter or native executable.
 
 ## Dependency posture
 

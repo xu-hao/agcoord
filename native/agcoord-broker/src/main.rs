@@ -15,7 +15,10 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
-use store::{PROTOCOL, Paths, PhaseRequest, SubmitRequest};
+use store::{
+    AdmissionRequest, ChildLeaseOwnerRequest, ChildLeaseRequest, LandResultRequest, PROTOCOL,
+    Paths, PhaseRequest, SubmitRequest,
+};
 use worker::WorkerFault;
 
 const NAME: &str = "agcoord-broker";
@@ -26,9 +29,35 @@ const TARGET: &str = env!("AGCOORD_TARGET");
 
 fn print_help() {
     println!(
-        "{NAME} — native AGCoord scheduler and enforcement owner\n\n\
-         Usage:\n  {NAME} --version\n  {NAME} identity --json\n  {NAME} serve --state-dir PATH [--capacity NAME=UNITS]\n  {NAME} submit --state-dir PATH [OPTIONS] -- COMMAND...\n  {NAME} snapshot|status|cancel|phase --state-dir PATH [OPTIONS]\n  {NAME} migrate|rollback --state-dir PATH\n\n\
-         Commands:\n  identity --json  Report the exact build and durable protocol identity\n  serve            Own and schedule one protocol-5 durable spool\n  submit           Append one validated immutable run\n  snapshot         Read the live queue snapshot\n  status            Read one durable run\n  cancel            Request durable cancellation\n  phase             Commit an identity-verified land phase transition\n  migrate           Explicitly migrate an idle protocol-4 spool\n  rollback          Explicitly return an idle migrated spool to protocol 4"
+        concat!(
+            "{NAME} — native AGCoord scheduler and enforcement owner\n\n",
+            "Usage:\n",
+            "  {NAME} --version\n",
+            "  {NAME} identity --json\n",
+            "  {NAME} serve --state-dir PATH [--capacity NAME=UNITS]\n",
+            "  {NAME} submit --state-dir PATH [OPTIONS] -- COMMAND...\n",
+            "  {NAME} snapshot|status|log|cancel|clear --state-dir PATH [OPTIONS]\n",
+            "  {NAME} verify|phase|report --state-dir PATH [OPTIONS]\n",
+            "  {NAME} lease-request|lease-status|lease-list --state-dir PATH [OPTIONS]\n",
+            "  {NAME} lease-release|lease-cancel --state-dir PATH [OPTIONS]\n",
+            "  {NAME} migrate|rollback --state-dir PATH\n\n",
+            "Commands:\n",
+            "  identity --json  Report the exact build and durable protocol identity\n",
+            "  serve            Own and schedule one protocol-5 durable spool\n",
+            "  submit           Append one validated immutable run\n",
+            "  snapshot         Read the live queue snapshot\n",
+            "  status           Read one durable run\n",
+            "  log              Read one bounded run-log page\n",
+            "  cancel           Request durable cancellation\n",
+            "  clear            Remove terminal history while the queue is idle\n",
+            "  verify           Verify an admitted publication worker identity\n",
+            "  phase            Commit an identity-verified land phase transition\n",
+            "  report           Durably report a land publication result\n",
+            "  lease-*          Manage authenticated child CPU leases\n",
+            "  migrate          Explicitly migrate an idle protocol-4 spool\n",
+            "  rollback         Explicitly return an idle migrated spool to protocol 4"
+        ),
+        NAME = NAME
     );
 }
 
@@ -128,6 +157,48 @@ fn parse_run_selector(arguments: &[String], allow_crash: bool) -> Result<(Paths,
         Paths::new(&state_dir).configured()?,
         run_id.ok_or_else(|| AppError::usage("--run-id is required"))?,
         crash_after_commit,
+    ))
+}
+
+fn parse_log(arguments: &[String]) -> Result<(Paths, String, u64, usize)> {
+    let mut state_dir = None;
+    let mut run_id = None;
+    let mut offset = 0_u64;
+    let mut limit = 64 * 1024_usize;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir" | "--run-id" | "--offset" | "--limit" => {
+                option_value(arguments, &mut index, &option)?
+            }
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--run-id" => run_id = Some(value),
+            "--offset" => {
+                offset = value
+                    .parse()
+                    .map_err(|_| AppError::usage("--offset must be a non-negative integer"))?;
+            }
+            "--limit" => {
+                limit = value
+                    .parse()
+                    .ok()
+                    .filter(|selected| *selected > 0 && *selected <= 64 * 1024)
+                    .ok_or_else(|| AppError::usage("--limit must be an integer from 1 to 65536"))?;
+            }
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        run_id.ok_or_else(|| AppError::usage("--run-id is required"))?,
+        offset,
+        limit,
     ))
 }
 
@@ -252,16 +323,31 @@ fn parse_submit(arguments: &[String]) -> Result<(Paths, SubmitRequest)> {
     let mut head_sha = None;
     let mut resources = BTreeMap::new();
     let mut gate_run_id = None;
+    let mut publication_adapter = None;
+    let mut publication_request = None;
+    let mut caller_pid = None;
     let mut environment = BTreeMap::new();
     let mut index = 0;
     while index < options.len() {
         let option = options[index].clone();
         let value = match option.as_str() {
-            "--state-dir" | "--run-id" | "--kind" | "--label" | "--agent" | "--repository-id"
-            | "--repository" | "--worktree-id" | "--checkout" | "--branch" | "--head"
-            | "--resource" | "--gate-run-id" | "--env" => {
-                option_value(options, &mut index, &option)?
-            }
+            "--state-dir"
+            | "--run-id"
+            | "--kind"
+            | "--label"
+            | "--agent"
+            | "--repository-id"
+            | "--repository"
+            | "--worktree-id"
+            | "--checkout"
+            | "--branch"
+            | "--head"
+            | "--resource"
+            | "--gate-run-id"
+            | "--publication-adapter"
+            | "--publication-request-json"
+            | "--caller-pid"
+            | "--env" => option_value(options, &mut index, &option)?,
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
         };
         match option.as_str() {
@@ -277,6 +363,23 @@ fn parse_submit(arguments: &[String]) -> Result<(Paths, SubmitRequest)> {
             "--branch" => branch = Some(value),
             "--head" => head_sha = Some(value),
             "--gate-run-id" => gate_run_id = Some(value),
+            "--publication-adapter" => publication_adapter = Some(value),
+            "--publication-request-json" => {
+                publication_request = Some(serde_json::from_str(&value).map_err(|_| {
+                    AppError::usage("--publication-request-json must be valid JSON")
+                })?);
+            }
+            "--caller-pid" => {
+                caller_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| {
+                            AppError::usage("--caller-pid must be a positive integer")
+                        })?,
+                );
+            }
             "--resource" => insert_mapping(&mut resources, &value, "resource")?,
             "--env" => {
                 let (name, selected) = value
@@ -310,6 +413,9 @@ fn parse_submit(arguments: &[String]) -> Result<(Paths, SubmitRequest)> {
             head_sha,
             resources,
             gate_run_id,
+            publication_adapter,
+            publication_request,
+            caller_pid: caller_pid.ok_or_else(|| AppError::usage("--caller-pid is required"))?,
             command,
             environment,
         },
@@ -385,6 +491,296 @@ fn parse_phase(arguments: &[String]) -> Result<(Paths, PhaseRequest)> {
     ))
 }
 
+fn parse_admission(arguments: &[String]) -> Result<(Paths, AdmissionRequest)> {
+    let mut state_dir = None;
+    let mut run_id = None;
+    let mut kind = None;
+    let mut worker_pid = None;
+    let mut worker_start_token = None;
+    let mut checkout = None;
+    let mut head_sha = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir"
+            | "--run-id"
+            | "--kind"
+            | "--worker-pid"
+            | "--worker-start-token"
+            | "--checkout"
+            | "--head" => option_value(arguments, &mut index, &option)?,
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--run-id" => run_id = Some(value),
+            "--kind" => kind = Some(value),
+            "--worker-pid" => {
+                worker_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| {
+                            AppError::usage("--worker-pid must be a positive integer")
+                        })?,
+                );
+            }
+            "--worker-start-token" => worker_start_token = Some(value),
+            "--checkout" => checkout = Some(PathBuf::from(value)),
+            "--head" => head_sha = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        AdmissionRequest {
+            run_id: run_id.ok_or_else(|| AppError::usage("--run-id is required"))?,
+            kind: kind.ok_or_else(|| AppError::usage("--kind is required"))?,
+            worker_pid: worker_pid.ok_or_else(|| AppError::usage("--worker-pid is required"))?,
+            worker_start_token: worker_start_token
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::usage("--worker-start-token is required"))?,
+            checkout: checkout.ok_or_else(|| AppError::usage("--checkout is required"))?,
+            head_sha: head_sha.ok_or_else(|| AppError::usage("--head is required"))?,
+        },
+    ))
+}
+
+fn parse_land_result(arguments: &[String]) -> Result<(Paths, LandResultRequest)> {
+    let mut state_dir = None;
+    let mut run_id = None;
+    let mut worker_pid = None;
+    let mut worker_start_token = None;
+    let mut exit_status = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir"
+            | "--run-id"
+            | "--worker-pid"
+            | "--worker-start-token"
+            | "--exit-status" => option_value(arguments, &mut index, &option)?,
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--run-id" => run_id = Some(value),
+            "--worker-pid" => {
+                worker_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| {
+                            AppError::usage("--worker-pid must be a positive integer")
+                        })?,
+                );
+            }
+            "--worker-start-token" => worker_start_token = Some(value),
+            "--exit-status" => {
+                exit_status = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| AppError::usage("--exit-status must be an integer"))?,
+                );
+            }
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        LandResultRequest {
+            run_id: run_id.ok_or_else(|| AppError::usage("--run-id is required"))?,
+            worker_pid: worker_pid.ok_or_else(|| AppError::usage("--worker-pid is required"))?,
+            worker_start_token: worker_start_token
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::usage("--worker-start-token is required"))?,
+            exit_status: exit_status.ok_or_else(|| AppError::usage("--exit-status is required"))?,
+        },
+    ))
+}
+
+fn parse_child_lease_request(arguments: &[String]) -> Result<(Paths, ChildLeaseRequest)> {
+    let mut state_dir = None;
+    let mut lease_id = None;
+    let mut run_id = None;
+    let mut requested = None;
+    let mut minimum = None;
+    let mut owner_pid = None;
+    let mut owner_start_token = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir"
+            | "--lease-id"
+            | "--run-id"
+            | "--requested"
+            | "--minimum"
+            | "--owner-pid"
+            | "--owner-start-token" => option_value(arguments, &mut index, &option)?,
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--lease-id" => lease_id = Some(value),
+            "--run-id" => run_id = Some(value),
+            "--requested" => {
+                requested = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|units| *units > 0 && *units <= i64::MAX as u64)
+                        .ok_or_else(|| AppError::usage("--requested must be a positive integer"))?,
+                );
+            }
+            "--minimum" => {
+                minimum = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|units| *units > 0 && *units <= i64::MAX as u64)
+                        .ok_or_else(|| AppError::usage("--minimum must be a positive integer"))?,
+                );
+            }
+            "--owner-pid" => {
+                owner_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| AppError::usage("--owner-pid must be a positive integer"))?,
+                );
+            }
+            "--owner-start-token" => owner_start_token = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        ChildLeaseRequest {
+            lease_id: lease_id.ok_or_else(|| AppError::usage("--lease-id is required"))?,
+            run_id: run_id.ok_or_else(|| AppError::usage("--run-id is required"))?,
+            requested: requested.ok_or_else(|| AppError::usage("--requested is required"))?,
+            minimum: minimum.ok_or_else(|| AppError::usage("--minimum is required"))?,
+            owner_pid: owner_pid.ok_or_else(|| AppError::usage("--owner-pid is required"))?,
+            owner_start_token: owner_start_token
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::usage("--owner-start-token is required"))?,
+        },
+    ))
+}
+
+fn parse_child_lease_owner(arguments: &[String]) -> Result<(Paths, ChildLeaseOwnerRequest)> {
+    let mut state_dir = None;
+    let mut lease_id = None;
+    let mut owner_pid = None;
+    let mut owner_start_token = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir" | "--lease-id" | "--owner-pid" | "--owner-start-token" => {
+                option_value(arguments, &mut index, &option)?
+            }
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--lease-id" => lease_id = Some(value),
+            "--owner-pid" => {
+                owner_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| AppError::usage("--owner-pid must be a positive integer"))?,
+                );
+            }
+            "--owner-start-token" => owner_start_token = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        ChildLeaseOwnerRequest {
+            lease_id: lease_id.ok_or_else(|| AppError::usage("--lease-id is required"))?,
+            owner_pid: owner_pid.ok_or_else(|| AppError::usage("--owner-pid is required"))?,
+            owner_start_token: owner_start_token
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::usage("--owner-start-token is required"))?,
+        },
+    ))
+}
+
+fn parse_child_lease_id(arguments: &[String]) -> Result<(Paths, String)> {
+    let mut state_dir = None;
+    let mut lease_id = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--state-dir",
+                )?));
+            }
+            "--lease-id" => {
+                lease_id = Some(option_value(arguments, &mut index, "--lease-id")?);
+            }
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        lease_id.ok_or_else(|| AppError::usage("--lease-id is required"))?,
+    ))
+}
+
+fn parse_child_lease_list(arguments: &[String]) -> Result<(Paths, Option<String>, bool)> {
+    let mut state_dir = None;
+    let mut run_id = None;
+    let mut include_terminal = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--state-dir",
+                )?));
+            }
+            "--run-id" => {
+                run_id = Some(option_value(arguments, &mut index, "--run-id")?);
+            }
+            "--include-terminal" => include_terminal = true,
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        run_id,
+        include_terminal,
+    ))
+}
+
 fn emit_json(value: &Value) -> Result<()> {
     println!(
         "{}",
@@ -421,13 +817,59 @@ fn run_command(arguments: &[String]) -> Result<()> {
             let (paths, run_id, _) = parse_run_selector(rest, false)?;
             emit_json(&store::status(&paths, &run_id)?)
         }
+        [command, rest @ ..] if command == "log" => {
+            let (paths, run_id, offset, limit) = parse_log(rest)?;
+            emit_json(&store::log(&paths, &run_id, offset, limit)?)
+        }
         [command, rest @ ..] if command == "cancel" => {
             let (paths, run_id, crash_after) = parse_run_selector(rest, true)?;
             emit_json(&store::cancel(&paths, &run_id, crash_after)?)
         }
+        [command, rest @ ..] if command == "clear" => {
+            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
+            emit_json(&store::clear(&paths)?)
+        }
+        [command, rest @ ..] if command == "verify" => {
+            let (paths, request) = parse_admission(rest)?;
+            emit_json(&store::verify_admission(&paths, &request)?)
+        }
         [command, rest @ ..] if command == "phase" => {
             let (paths, request) = parse_phase(rest)?;
             emit_json(&store::advance_land_phase(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "report" => {
+            let (paths, request) = parse_land_result(rest)?;
+            emit_json(&store::report_land_result(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "lease-request" => {
+            let (paths, request) = parse_child_lease_request(rest)?;
+            emit_json(&store::request_child_cpu_lease(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "lease-status" => {
+            let (paths, lease_id) = parse_child_lease_id(rest)?;
+            emit_json(&store::child_cpu_lease_status(&paths, &lease_id)?)
+        }
+        [command, rest @ ..] if command == "lease-list" => {
+            let (paths, run_id, include_terminal) = parse_child_lease_list(rest)?;
+            emit_json(&store::child_cpu_leases(
+                &paths,
+                run_id.as_deref(),
+                include_terminal,
+            )?)
+        }
+        [command, rest @ ..] if command == "lease-release" => {
+            let (paths, request) = parse_child_lease_owner(rest)?;
+            emit_json(&store::finish_child_cpu_lease(
+                &paths, &request, "released",
+            )?)
+        }
+        [command, rest @ ..] if command == "lease-cancel" => {
+            let (paths, request) = parse_child_lease_owner(rest)?;
+            emit_json(&store::finish_child_cpu_lease(
+                &paths,
+                &request,
+                "cancelled",
+            )?)
         }
         [command, rest @ ..] if command == "migrate" => {
             emit_json(&store::migrate(&parse_state_only(rest)?)?)
