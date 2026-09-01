@@ -159,7 +159,9 @@ impl SetupCode {
     }
 
     fn from_resource_error(code: &str) -> Self {
-        if code.starts_with("namespace-cgroup2-mount-failed-errno-") {
+        if code.starts_with("namespace-cgroup2-mount-failed-errno-")
+            || code.starts_with("namespace-cgroup2-bind-failed-errno-")
+        {
             return Self::NamespaceMountFailed;
         }
         match code {
@@ -1274,9 +1276,14 @@ mod tests {
 
     #[test]
     fn cgroup_mount_errno_remains_a_stable_worker_mount_failure() {
-        assert_eq!(
-            SetupCode::from_resource_error("namespace-cgroup2-mount-failed-errno-13"),
-            SetupCode::NamespaceMountFailed,
-        );
+        for code in [
+            "namespace-cgroup2-mount-failed-errno-13",
+            "namespace-cgroup2-bind-failed-errno-13",
+        ] {
+            assert_eq!(
+                SetupCode::from_resource_error(code),
+                SetupCode::NamespaceMountFailed,
+            );
+        }
     }
 }

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import pytest
 
+from agcoord import cgroup as cgroup_module
 from agcoord.cgroup import (
     CGROUP_ISOLATE_ENV,
     CgroupIdentity,
@@ -37,6 +38,54 @@ LIFECYCLE_BINDING = {
         "unit": "admission-unit",
     }
 }
+
+
+def test_namespace_cgroup_mount_falls_back_to_its_attached_leaf_on_ebusy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def call_libc(name: str, *arguments: object) -> None:
+        calls.append((name, arguments))
+        if len(calls) == 1:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+    monkeypatch.setattr(cgroup_module, "_call_libc", call_libc)
+    mount = cgroup_module.CgroupMount(
+        path=Path("/sys/fs/cgroup"),
+        root=Path("/user.slice"),
+        options=frozenset({"rw", "nsdelegate"}),
+    )
+
+    cgroup_module._mount_isolated_cgroup_view(
+        mount,
+        Path("/user.slice/runner.scope/agcoord-leaf"),
+    )
+
+    assert calls == [
+        (
+            "mount",
+            (
+                b"none",
+                b"/sys/fs/cgroup",
+                b"cgroup2",
+                cgroup_module._MS_NOSUID
+                | cgroup_module._MS_NODEV
+                | cgroup_module._MS_NOEXEC,
+                None,
+            ),
+        ),
+        (
+            "mount",
+            (
+                b"/sys/fs/cgroup/runner.scope/agcoord-leaf",
+                b"/sys/fs/cgroup",
+                None,
+                cgroup_module._MS_BIND,
+                None,
+            ),
+        ),
+    ]
 
 
 def _process_identity(pid: int) -> tuple[int, str] | None:
