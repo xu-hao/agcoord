@@ -59,6 +59,12 @@ together with the raw native executable. The archive's manifest binds the execut
 service unit, and AppArmor policy; see the [native host runbook](native_host.md) for supported
 hosts, activation, and rollback.
 
+The client/owner/state combinations admitted for release are fixed in the
+[native compatibility matrix](native_migration.md#compatibility-matrix). Python and native
+versions must be the same stable 0.3.x version, the native artifact and host manifest must report
+the same protocol-5 identity, and the running owner must match the exact configured build. No
+release workflow admits a live Python/Rust mixed-owner state.
+
 Building the artifact does not activate it. Host packaging installs the verified executable at
 `/usr/libexec/agcoord/agcoord-broker`, and a development configuration may explicitly select
 another absolute path with `native_broker.allow_development=true`. Python clients verify the
@@ -80,53 +86,82 @@ interface and must be smoke-tested from the built wheel.
 
 ## Release checklist
 
-1. Start from a clean release commit and select the version once in package metadata.
-   Update the matching section in [the changelog](../CHANGELOG.md) with the release date and
-   user-visible changes.
-2. Run `./scripts/check-conformance`, which validates the version-1 behavior manifest and
-   collected Python/native selectors before running both complete suites. The tag workflow uses
-   the same checker and cannot build a native release after declared coverage disappears. The
-   manifest includes generic multi-repository scheduling, one-row
-   exact-head gate-and-publication behavior, recovery/cancellation boundaries, the optional
-   GitHub adapter, child CPU lease contention and recovery, and real terminal UI coverage. A
-   standalone `agc full` may validate a release candidate, but repository changes must land
-   with `agc land` so the verdict and publication cannot be separated.
-   Run the deterministic cgroup lifecycle suite on every host; when an exclusive delegated v2
-   subtree is available, also set `AGCOORD_TEST_CGROUP_ROOT` and require the opt-in kernel tests
-   to prove namespace-root protection, aggregate CPU throttling, PID exhaustion, terminal
-   metrics, and complete cleanup. On an init-namespace-root host, set
-   `AGCOORD_TEST_CGROUP_IO=1` for the test-owned loop-device bandwidth and IOPS checks.
-3. Build both Python artifacts with `python -m build` and validate them with
-   `python -m twine check dist/*`. Build and audit the native artifact with the commands above;
-   build and validate the native host package, and retain its executable, host bundle, helper
-   tools, checksums, provenance, and reviewed license inventory together. On a supported Ubuntu
-   runner, install the bundle through the staged runbook and require its real `cpu=1` enforced
-   receipt without disabling the global user-namespace restriction.
-4. Create a fresh virtual environment outside the checkout. Install the wheel, with each
-   supported optional extra in at least one smoke environment, and exercise both
-   `python -m agcoord --help` and `agc --help`. Verify that no `agcoord` console executable
-   is installed. For the `xdist` extra, verify pytest discovers the `agcoord-xdist` entry point,
-   plain pytest remains serial, and an admitted `-n auto` run starts its leased worker count.
-5. In that clean environment, start a temporary explicit state directory, run a check, read
-   its log, clear terminal history, and verify that importing the core does not require a
-   forge executable or credentials.
-6. Record both artifact hashes, then upload those exact files directly to production PyPI
-   with `python -m twine upload --repository pypi <wheel> <sdist>`. Twine reads the existing
-   `pypi` login from `~/.pypirc`; keep that file owner-only, use a project-scoped API token,
-   and never place the token in a repository, command line, or long-lived shell variable.
-7. Read the production PyPI JSON metadata for the new version. Require exactly the expected
-   wheel and source archive, compare their SHA-256 values with the local records, and install
-   `agcoord==<version>` from `https://pypi.org/simple/` into another clean environment.
-8. Tag the exact source commit as `v<version>` and push only that tag. The tag workflow
-   independently rebuilds and smoke-tests the tagged source without publishing it. Require
-   that workflow to pass, then create the GitHub release and attach the same local wheel and
-   source archive that production PyPI accepted.
+1. Start from one clean release commit. Set the same stable version in
+   `src/agcoord/__init__.py`, the Cargo workspace, and `Cargo.lock`; development suffixes are
+   release refusals. Add a dated matching section to [the changelog](../CHANGELOG.md).
+2. Land that exact commit through `agc land` with `./scripts/check-conformance`. The checker
+   validates the version-1 manifest and collected Python/native selectors before running both
+   complete suites serially at their process boundary. It includes generic scheduling, atomic
+   publication, real TUI behavior, resources/receipts, migration/rollback rehearsal, malformed
+   state, contention, cancellation, and crash-recovery safety properties. Missing declared
+   coverage closes the gate.
+3. On every host, run the deterministic cgroup lifecycle suite. On an exclusive delegated v2
+   host, set `AGCOORD_TEST_CGROUP_ROOT` and require the opt-in namespace, CPU, PID, metrics, and
+   cleanup tests. On an init-namespace-root host, also set `AGCOORD_TEST_CGROUP_IO=1` for owned
+   loop-device bandwidth and IOPS tests. These do not replace the supported-Ubuntu host proof.
+4. Build into three initially absent directories and audit the inputs:
 
-The release workflow should fail closed if conformance coverage is missing, artifact versions
-differ, files are dirty, a tag does not match the declared version, or the wheel exposes a
-package name other than `agcoord` or a console command other than `agc`. Publishing remains an
-explicit maintainer action through Twine; GitHub Actions has no package-index credentials or
-deployment job. Releases
-never migrate a user's live spool implicitly; protocol changes require the explicit
-`agc migrate` runbook in
-[the coordinator guide](coordinator.md#migrations).
+   ```bash
+   umask 022
+   python -m build --outdir dist/python
+   python -m twine check dist/python/*
+   ./scripts/build-native-broker dist/native
+   ./scripts/audit-native-broker \
+     dist/native/agcoord-broker-x86_64-unknown-linux-musl
+   ./scripts/check-native-licenses \
+     dist/native/agcoord-broker-x86_64-unknown-linux-musl
+   ./scripts/check-native-reproducible
+   ./scripts/build-native-host-package \
+     dist/native/agcoord-broker-x86_64-unknown-linux-musl dist/host
+   ```
+
+5. From that still-clean source commit, assemble the candidate through the single artifact
+   boundary:
+
+   ```bash
+   ./scripts/verify-release-candidate \
+     --python-dir dist/python \
+     --native-dir dist/native \
+     --host-dir dist/host \
+     --output-dir dist/release
+   (cd dist/release && sha256sum --check SHA256SUMS)
+   ```
+
+   The verifier requires exactly two Python files, five native files, and eight host files. It
+   rejects symlinks, extras, missing helpers, unsafe archive paths/modes, dirty source, unstable
+   or unequal versions, a wrong wheel name/entry point, a copied broker in the wheel, changed
+   sidecars, non-static ELF, unreviewed dependencies, and differing raw/host identities. It then
+   installs the wheel with `xdist` and the sdist into separate fresh environments outside the
+   checkout, verifies `agc`/module entry points and the pytest plugin, and runs the complete
+   protocol-4 backup/migrate/rollback/remigrate rehearsal against the exact release ELF. Only
+   after those checks pass does it create `release-manifest.json` and aggregate `SHA256SUMS`.
+   GitHub's zipped workflow-artifact transport normalizes file modes, so the workflow restores
+   `0755` on only the fixed broker and three fixed helper names before running this verifier;
+   content sidecars and the host archive's internal modes remain independently checked.
+6. Install the host bundle on the supported Ubuntu configuration through the staged runbook.
+   Keep `kernel.apparmor_restrict_unprivileged_userns=1`, start the ordinary unprivileged managed
+   service, and retain the shipped `cpu=1` receipt proving its AppArmor transition, cgroup
+   namespace root, exact CPU control, and durable applied/peak evidence. Rehearse the operator
+   backup and rollback steps in the [migration runbook](native_migration.md) before making the
+   native owner the default for an existing spool.
+7. A PyPI upload is a separate, explicit maintainer action. Only after the user explicitly asks
+   for it, upload the exact wheel and sdist already named in `release-manifest.json` with Twine.
+   Twine reads an owner-only `~/.pypirc` and a project-scoped token; never put credentials in the
+   repository, command line, workflow, or long-lived environment. No permission to implement,
+   land, tag, or create a GitHub release implies PyPI authorization.
+8. Read production PyPI JSON for the uploaded version, require exactly that wheel and sdist,
+   compare their hashes to `SHA256SUMS`, and install `agcoord==<version>` from the production
+   simple index into one more clean environment. If no PyPI upload was authorized, skip this
+   step and state that the release is not on PyPI; never substitute TestPyPI evidence.
+9. Tag the exact release commit as `v<version>`. The tag workflow independently rebuilds the
+   Python, native, and host inputs, reruns conformance and the candidate verifier with the tag
+   check enabled, and uploads one credential-free workflow artifact. After it passes and the
+   supported-host receipt is retained, create the GitHub release and attach every file from the
+   verified release bundle. If PyPI was authorized, the attached wheel and sdist must be the
+   exact files production PyPI accepted.
+
+The release workflow contains no package-index credentials, upload step, service activation, or
+implicit spool migration. It fails closed on a dirty/mistagged source, missing conformance,
+artifact or identity mismatch, failed clean install, failed rollback rehearsal, or incomplete
+checksum set. Release automation owns only temporary state and never opens the user's default
+spool.

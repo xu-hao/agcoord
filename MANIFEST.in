@@ -10,4 +10,5 @@ recursive-include native *.rs *.toml *.tsv
 recursive-include packaging *
 include scripts/*native*
 include scripts/check-conformance
+include scripts/verify-release-candidate
 recursive-include tests *.py
