@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add a strict version-1 Python/native conformance manifest and executable release gate covering
+  commands, repositories, atomic publication, the real TUI, protocols, resources and receipts,
+  migrations, contention, cancellation, crash recovery, malformed-input corpora, and the core
+  no-duplicate/no-stale/no-unrelated-kill/no-unverified-enforcement safety properties.
 - Route the Python CLI, client, TUI, atomic publication worker, and pytest-xdist child leases
   through the protocol-5 Rust broker. Native selection now verifies one explicit executable and
   exact live-owner identity, concurrent autostart elects one owner, protocol-4 state requires an
