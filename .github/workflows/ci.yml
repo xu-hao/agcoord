@@ -37,9 +37,155 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: agcoord-native-host-x86_64-linux
+          if-no-files-found: error
+          path: dist/
+
+  native-host-enforcement:
+    name: native-host enforcement (ubuntu-24.04)
+    needs: native-broker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e .
+      - name: Install supported-host prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends apparmor jq
+      - uses: actions/download-artifact@v4
+        with:
+          name: agcoord-native-host-x86_64-linux
+          path: dist
+      - name: Verify the transported host bundle
+        run: |
+          set -euo pipefail
+          chmod 0755 \
+            dist/native/agcoord-broker-x86_64-unknown-linux-musl \
+            dist/host/check-native-host-package \
+            dist/host/install-native-host \
+            dist/host/test-native-host-enforcement
+          cd dist/host
+          sha256sum --check check-native-host-package.sha256
+          sha256sum --check install-native-host.sha256
+          sha256sum --check test-native-host-enforcement.sha256
+          ./check-native-host-package agcoord-native-host-x86_64-linux.tar.gz
+      - name: Prepare a disposable managed-service state
+        run: |
+          set -euo pipefail
+          uid=$(id -u)
+          runtime=/run/user/$uid
+          export XDG_RUNTIME_DIR=$runtime
+          export DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus
+          if ! systemctl --user show-environment >/dev/null 2>&1; then
+            sudo systemctl start "user-runtime-dir@$uid.service"
+            sudo systemctl start "user@$uid.service"
+            echo AGCOORD_CI_STARTED_USER_MANAGER=1 >>"$GITHUB_ENV"
+          fi
+          systemctl --user show-environment >/dev/null
+          echo "XDG_RUNTIME_DIR=$runtime" >>"$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >>"$GITHUB_ENV"
+
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          test "$(cat /sys/module/apparmor/parameters/enabled)" = Y
+          findmnt -no OPTIONS /sys/fs/cgroup | tr , '\n' | grep -qx nsdelegate
+          user_cgroup=$(sudo systemctl show "user@$uid.service" --property ControlGroup --value)
+          test -n "$user_cgroup"
+          cgroup_root="/sys/fs/cgroup$user_cgroup/app.slice/agcoord-broker.service"
+          state=$HOME/.local/state/agcoord
+          install -d -m 0700 "$state"
+          jq -n --arg cgroup_root "$cgroup_root" --arg broker /usr/libexec/agcoord/agcoord-broker '
+            {
+              capacities: {jobs: 2, cpu: 2},
+              bindings: {
+                cpu: {
+                  kind: "cpu",
+                  unit: "logical-cpu",
+                  mode: "required",
+                  backend: "cgroup-v2"
+                }
+              },
+              cgroup_root: $cgroup_root,
+              native_broker: {
+                path: $broker,
+                allow_development: false,
+                managed_service: true
+              }
+            }
+          ' >"$state/config.json"
+          chmod 0600 "$state/config.json"
+      - name: Activate the audited host boundary after an empty drain
+        run: |
+          set -euo pipefail
+          sudo dist/host/install-native-host stage \
+            dist/host/agcoord-native-host-x86_64-linux.tar.gz
+          sudo dist/host/install-native-host activate "$HOME/.local/state/agcoord"
+          systemctl --user daemon-reload
+          systemctl --user start agcoord-broker.service
+          for attempt in {1..50}; do
+            if agc list >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.2
+          done
+          systemctl --user --no-pager status agcoord-broker.service
+          agc list
+      - name: Retain the real enforced CPU receipt
+        run: |
+          set -euo pipefail
+          agc --json run --label "native host enforcement" --resource cpu=1 \
+            -- dist/host/test-native-host-enforcement >native-host-receipt.json
+          jq -e '
+            .status == "passed"
+            and .resource_receipt.requested.cpu == 1
+            and .resource_receipt.applied.cpu == 1
+            and .resource_receipt.peak.cpu == 1
+          ' native-host-receipt.json
+          {
+            cat /etc/os-release
+            uname -a
+            systemctl --version
+            findmnt /sys/fs/cgroup
+            cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          } >native-host-platform.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-host-enforcement-receipt
+          if-no-files-found: error
           path: |
-            dist/native/*
-            dist/host/*
+            native-host-receipt.json
+            native-host-platform.txt
+      - name: Stop and remove the disposable host boundary
+        if: always()
+        run: |
+          set -euo pipefail
+          uid=$(id -u)
+          systemctl --user stop agcoord-broker.service 2>/dev/null || true
+          systemctl --user disable agcoord-broker.service 2>/dev/null || true
+          sudo apparmor_parser --remove \
+            /etc/apparmor.d/usr.libexec.agcoord.agcoord-broker 2>/dev/null || true
+          sudo rm -f \
+            /etc/apparmor.d/usr.libexec.agcoord.agcoord-broker \
+            /usr/lib/systemd/user/agcoord-broker.service \
+            /usr/libexec/agcoord/agcoord-broker \
+            /usr/libexec/agcoord/agcoord-broker.sha256 \
+            /usr/share/doc/agcoord/AGCOORD_LICENSE \
+            /usr/share/doc/agcoord/THIRD_PARTY_LICENSES.tsv \
+            /usr/share/doc/agcoord/native-host-manifest.json
+          sudo rmdir /usr/libexec/agcoord /usr/share/doc/agcoord 2>/dev/null || true
+          sudo rm -rf \
+            /var/lib/agcoord/native-host-active \
+            /var/lib/agcoord/native-host-pending
+          sudo rmdir /var/lib/agcoord 2>/dev/null || true
+          rm -rf "$HOME/.local/state/agcoord"
+          systemctl --user daemon-reload 2>/dev/null || true
+          if [[ ${AGCOORD_CI_STARTED_USER_MANAGER:-0} == 1 ]]; then
+            sudo systemctl stop "user@$uid.service" 2>/dev/null || true
+            sudo systemctl stop "user-runtime-dir@$uid.service" 2>/dev/null || true
+          fi
 
   test:
     runs-on: ubuntu-latest
