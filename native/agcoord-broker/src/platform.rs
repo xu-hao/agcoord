@@ -4,6 +4,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub struct OwnerLock {
     file: File,
@@ -11,6 +13,10 @@ pub struct OwnerLock {
 
 impl OwnerLock {
     pub fn acquire(state_dir: &Path) -> Result<Self> {
+        Self::acquire_with_retry(state_dir, Duration::ZERO)
+    }
+
+    pub fn acquire_with_retry(state_dir: &Path, retry_for: Duration) -> Result<Self> {
         let path = state_dir.join("broker.lock");
         let file = OpenOptions::new()
             .read(true)
@@ -32,12 +38,20 @@ impl OwnerLock {
                     format!("cannot protect broker ownership file: {error}"),
                 )
             })?;
-        // SAFETY: flock receives a live descriptor owned by `file`; the descriptor remains
-        // open for the lifetime of this guard and no pointer crosses the FFI boundary.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
+        let deadline = Instant::now() + retry_for;
+        loop {
+            // SAFETY: flock receives a live descriptor owned by `file`; the descriptor remains
+            // open for the lifetime of this guard and no pointer crosses the FFI boundary.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                break;
+            }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                if Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 return Err(AppError::new(
                     "broker-already-owned",
                     "another native or Python broker already owns this state directory",

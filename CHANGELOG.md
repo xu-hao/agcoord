@@ -11,6 +11,8 @@ versioning; dates use ISO 8601.
   cgroup, controllers, global namespace restriction, and setup profile, while admitted broker
   calls and arbitrary submitted commands remain namespace-restricted. A real-host probe proves
   an enforced CPU receipt without weakening Ubuntu's global policy.
+- Retry native broker startup through a bounded transient ownership-lock collision while
+  preserving the stable refusal for a genuinely live owner.
 - Publish a native broker's live owner identity only after its termination handlers are ready,
   and require crash-recovery startup checks to observe the exact replacement PID rather than
   accepting stale metadata retained in the locked ownership file.
