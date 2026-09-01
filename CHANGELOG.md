@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add the verified native host bundle, long-lived delegated systemd user service, and
+  three-domain AppArmor boundary. Staged installation and upgrade refuse live work and never
+  restart implicitly; managed startup verifies the fixed root-owned release identity, service
+  cgroup, controllers, global namespace restriction, and setup profile, while admitted broker
+  calls and arbitrary submitted commands remain namespace-restricted. A real-host probe proves an enforced
+  CPU receipt without weakening Ubuntu's global policy.
 - Route the Python CLI, client, TUI, atomic publication worker, and pytest-xdist child leases
   through the protocol-5 Rust broker. Native selection now verifies one explicit executable and
   exact live-owner identity, concurrent autostart elects one owner, protocol-4 state requires an

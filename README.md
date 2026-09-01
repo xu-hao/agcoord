@@ -24,6 +24,9 @@ The client refuses to search `PATH` or fall back to the old Python broker. Sourc
 select an absolute current-user-owned development build with the documented
 [`native_broker` configuration](docs/native_broker.md#executable-discovery); release installs
 require the root-owned static artifact.
+Production installation and upgrades use the staged package, long-lived user service, and
+AppArmor policy in the [native host runbook](docs/native_host.md); activation never restarts a
+broker while queued or running work remains.
 
 The base package installs the supported Textual 8 release line (`textual>=8.2,<9`) for the
 terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
@@ -45,8 +48,9 @@ spool (or `agc --state-dir /path/to/state migrate`), then use `agc list` to star
 Migration preserves historical meaning and never reinterprets legacy resource names as enforced
 limits.
 
-There is no separate service-install step. The first command starts the detached broker on
-demand; later shells and repositories join the same user-scoped coordinator:
+With the production host package configured, the first command asks systemd to start the
+long-lived user service; later shells and repositories join the same user-scoped coordinator.
+Explicit development binaries retain detached on-demand startup:
 
 ```bash
 agc list

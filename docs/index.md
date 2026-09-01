@@ -14,6 +14,8 @@ procedure is in [the contributor workflow](contributing.md).
   TUI.
 - [Native broker architecture](native_broker.md) — single-executable scope, trust model,
   durable protocol, worker boundary, compatibility, and migration requirements.
+- [Native host deployment](native_host.md) — supported host, package verification, managed
+  service, AppArmor boundary, enforced-host proof, upgrades, recovery, and rollback.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
   publication, optional adapters, and release posture.
 - [Session handoff format](session_handoff_format.md) — closing changed work with concise

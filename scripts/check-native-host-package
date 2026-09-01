@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+package=${1:?usage: check-native-host-package PACKAGE}
+package=$(readlink -f "$package")
+checksum="$package.sha256"
+if [[ ! -f "$package" ]] || [[ ! -f "$checksum" ]]; then
+    printf 'host package or checksum is missing\n' >&2
+    exit 2
+fi
+(
+    cd "$(dirname -- "$package")"
+    sha256sum --check "$(basename -- "$checksum")"
+)
+
+expected=$(printf '%s\n' \
+    ./ \
+    ./etc/ \
+    ./etc/apparmor.d/ \
+    ./etc/apparmor.d/usr.libexec.agcoord.agcoord-broker \
+    ./usr/ \
+    ./usr/lib/ \
+    ./usr/lib/systemd/ \
+    ./usr/lib/systemd/user/ \
+    ./usr/lib/systemd/user/agcoord-broker.service \
+    ./usr/libexec/ \
+    ./usr/libexec/agcoord/ \
+    ./usr/libexec/agcoord/agcoord-broker \
+    ./usr/libexec/agcoord/agcoord-broker.sha256 \
+    ./usr/share/ \
+    ./usr/share/doc/ \
+    ./usr/share/doc/agcoord/ \
+    ./usr/share/doc/agcoord/AGCOORD_LICENSE \
+    ./usr/share/doc/agcoord/THIRD_PARTY_LICENSES.tsv \
+    ./usr/share/doc/agcoord/native-host-manifest.json)
+observed=$(tar -tzf "$package")
+if [[ "$observed" != "$expected" ]]; then
+    printf 'host package has an unexpected path set\n' >&2
+    exit 1
+fi
+if tar --numeric-owner -tvzf "$package" | awk '$2 != "0/0" { exit 1 }'; then
+    :
+else
+    printf 'host package contains a non-root archive owner\n' >&2
+    exit 1
+fi
+
+temporary=$(mktemp -d)
+trap 'rm -rf -- "$temporary"' EXIT
+tar -xzf "$package" --no-same-owner -C "$temporary"
+binary="$temporary/usr/libexec/agcoord/agcoord-broker"
+sidecar="$temporary/usr/libexec/agcoord/agcoord-broker.sha256"
+unit="$temporary/usr/lib/systemd/user/agcoord-broker.service"
+profile="$temporary/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker"
+manifest="$temporary/usr/share/doc/agcoord/native-host-manifest.json"
+for path in "$binary" "$sidecar" "$unit" "$profile" "$manifest"; do
+    if [[ ! -f "$path" ]] || [[ -L "$path" ]]; then
+        printf 'host package contains an invalid regular file: %s\n' "$path" >&2
+        exit 1
+    fi
+done
+if [[ $(stat -c '%a' "$binary") != 755 ]] \
+    || [[ $(stat -c '%a' "$sidecar") != 644 ]] \
+    || [[ $(stat -c '%a' "$unit") != 644 ]] \
+    || [[ $(stat -c '%a' "$profile") != 644 ]] \
+    || [[ $(stat -c '%a' "$manifest") != 644 ]]; then
+    printf 'host package contains an invalid file mode\n' >&2
+    exit 1
+fi
+(
+    cd "$(dirname -- "$binary")"
+    sha256sum --check "$(basename -- "$sidecar")"
+)
+
+identity=$(env -i "$binary" identity --json)
+binary_sha=$(sha256sum "$binary" | awk '{print $1}')
+unit_sha=$(sha256sum "$unit" | awk '{print $1}')
+profile_sha=$(sha256sum "$profile" | awk '{print $1}')
+if ! jq -e \
+    --arg binary "$binary_sha" \
+    --arg profile "$profile_sha" \
+    --arg unit "$unit_sha" \
+    --argjson identity "$identity" \
+    '.format == 1
+     and (.development | type == "boolean")
+     and .identity == $identity
+     and .files["/usr/libexec/agcoord/agcoord-broker"] == $binary
+     and .files["/usr/lib/systemd/user/agcoord-broker.service"] == $unit
+     and .files["/etc/apparmor.d/usr.libexec.agcoord.agcoord-broker"] == $profile' \
+    "$manifest" >/dev/null; then
+    printf 'host package manifest does not match its files or identity\n' >&2
+    exit 1
+fi
+
+if command -v apparmor_parser >/dev/null 2>&1; then
+    profile_names=$(apparmor_parser --skip-kernel-load --skip-cache --names "$profile" | LC_ALL=C sort)
+    expected_profiles=$(printf '%s\n' agcoord-admitted agcoord-broker agcoord-broker-client)
+    if [[ "$profile_names" != "$expected_profiles" ]]; then
+        printf 'host package has an unexpected AppArmor profile set\n' >&2
+        exit 1
+    fi
+fi
+if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd_errors="$temporary/systemd-errors"
+    if systemd-analyze security --offline=yes "$unit" >/dev/null 2>"$systemd_errors"; then
+        if grep -q 'Unknown key' "$systemd_errors"; then
+            cat "$systemd_errors" >&2
+            exit 1
+        fi
+    elif ! grep -q 'SO_PASSCRED failed' "$systemd_errors"; then
+        cat "$systemd_errors" >&2
+        exit 1
+    fi
+fi
+printf 'native host package passed: %s\n' "$package"

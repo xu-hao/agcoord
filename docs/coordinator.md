@@ -27,14 +27,16 @@ different stable repository and worktree identities.
 The state directory, spool, lock, broker diagnostics, run logs, and transient sidecars are
 owner-only. An ownership lock elects exactly one broker. Simultaneous first clients either
 join that owner or fail without an accepted row; they never create two supervisors for the
-same spool. The first ordinary client starts the explicitly selected native executable as a
-detached owner on demand, so there is no separate daemon-install command. Closing the
-submitting terminal does not cancel accepted work. Concurrent first clients converge on the
-same ownership lock; a loser joins the exact compatible owner instead of starting a second
-supervisor.
+same spool. An unmanaged development configuration lets the first ordinary client start the
+explicitly selected native executable as a detached owner on demand. A production managed
+configuration instead asks systemd to start the installed long-lived user service; clients
+never spawn that broker directly. Closing the submitting terminal does not cancel accepted
+work. Concurrent first clients converge on the same ownership lock; a loser joins the exact
+compatible owner instead of starting a second supervisor.
 
-The broker may exit after the queue is empty and idle. Durable history and logs remain, and a
-later client starts a replacement owner against the same spool. An unclean restart observes
+An unmanaged broker may exit after the queue is empty and idle; the managed user service does
+not. Durable history and logs remain, and a later unmanaged client or systemd starts a
+replacement owner against the same spool. An unclean restart observes
 the recorded process identity before classifying a live job; it never reruns an already
 spawned command merely because the old broker disappeared. An exception that ends the broker
 does not request cancellation or signal live process groups: ownership is released so a
@@ -77,11 +79,12 @@ defaults capacity to `jobs=2`.
   "bindings": {
     "cpu": {"kind": "cpu", "unit": "logical-cpu", "mode": "required", "backend": "cgroup-v2"}
   },
-  "cgroup_root": "/sys/fs/cgroup/user.slice/example.slice/agcoord.service",
+  "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/agcoord-broker.service",
   "database_timeout": 30,
   "native_broker": {
     "path": "/usr/libexec/agcoord/agcoord-broker",
-    "allow_development": false
+    "allow_development": false,
+    "managed_service": true
   }
 }
 ```
@@ -92,7 +95,9 @@ implementation, and SHA-256 build identity; host packaging separately audits its
 contract. Development from a checkout is explicit: select the absolute regular executable and
 set `allow_development` to `true`. That permits only a current-user- or root-owned supported GNU
 or musl development build; it does not weaken file, identity, protocol, or live-owner matching
-checks. Clients never search `PATH` and never fall back to the Python broker.
+checks. `managed_service=true` is valid only for the installed service's default state directory
+and makes autostart call the fixed user unit instead of spawning the binary. Clients never
+search `PATH` and never fall back to the Python broker.
 
 No environment variable configures capacity, bindings, the delegated cgroup root, or block-I/O
 paths or the database timeout; `AGCOORD_STATE_DIR` selects which state directory, and therefore
@@ -250,6 +255,8 @@ policy. The Rust executable provides the narrow broker-specific target, but it d
 AppArmor by itself: use the native backend only after the documented host package and broker
 profile are installed and verified. Otherwise keep the cgroup backend disabled unless the
 administrator deliberately accepts a broader account-level user-namespace opt-in.
+The supported service, AppArmor policy, preflight, installation, and real enforced-receipt
+procedure are defined by the [native host runbook](native_host.md).
 
 For each run, AGCoord creates an owner-specific, collision-safe leaf and records device/inode
 identities plus a random ownership token in the private spool. The existing launcher stays

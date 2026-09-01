@@ -6,5 +6,6 @@ include LICENSE
 include rust-toolchain.toml
 recursive-include docs *.md *.png
 recursive-include native *.rs *.toml *.tsv
+recursive-include packaging *
 include scripts/*native*
 recursive-include tests *.py
