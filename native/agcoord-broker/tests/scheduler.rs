@@ -2,6 +2,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -74,15 +75,15 @@ impl RunningBroker {
         command.args(options);
         let mut child = command
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("start native broker");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "native broker exited early"
-            );
+            if let Some(status) = child.try_wait().unwrap() {
+                let stderr = child_stderr(&mut child);
+                panic!("native broker exited early with {status}: {stderr}");
+            }
             if snapshot(state_dir).is_some() {
                 break;
             }
@@ -156,21 +157,31 @@ fn start_crashing_broker(state_dir: &Path, crash_after: &str) -> Child {
             crash_after,
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "crash broker exited early"
-        );
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = child_stderr(&mut child);
+            panic!("crash broker exited early with {status}: {stderr}");
+        }
         if snapshot(state_dir).is_some() {
             return child;
         }
         assert!(Instant::now() < deadline, "crash broker did not start");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn child_stderr(child: &mut Child) -> String {
+    let Some(mut pipe) = child.stderr.take() else {
+        return "<stderr was not captured>".to_owned();
+    };
+    let mut stderr = String::new();
+    pipe.read_to_string(&mut stderr)
+        .expect("read native broker stderr");
+    stderr
 }
 
 impl Drop for RunningBroker {
@@ -224,6 +235,27 @@ fn run(arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("run native broker command")
+}
+
+fn run_after_transient_database_busy(arguments: &[&str], timeout: Duration) -> (Output, usize) {
+    let deadline = Instant::now() + timeout;
+    let mut database_busy_refusals = 0;
+    loop {
+        let result = run(arguments);
+        let database_busy = serde_json::from_slice::<Value>(&result.stderr)
+            .ok()
+            .is_some_and(|error| error["code"] == "broker-database-busy");
+        if !database_busy {
+            return (result, database_busy_refusals);
+        }
+        database_busy_refusals += 1;
+        assert!(
+            Instant::now() < deadline,
+            "database remained busy while checking dead land worker identity: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn json_output(arguments: &[&str]) -> Value {
@@ -5602,6 +5634,8 @@ fn a_dead_land_worker_identity_cannot_advance_publication() {
     let temporary = TestDirectory::new("dead-land-worker");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("config.json"), r#"{"database_timeout":0.05}"#).unwrap();
     fs::create_dir(&checkout).unwrap();
     let entered = temporary.path().join("entered");
     let release = temporary.path().join("release");
@@ -5639,25 +5673,39 @@ fn a_dead_land_worker_identity_cannot_advance_publication() {
     wait_for(Duration::from_secs(5), || {
         process_state(worker_pid).is_none_or(|state| state == "Z")
     });
+    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let unlocker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        locker.execute_batch("ROLLBACK").unwrap();
+    });
 
     let worker_pid = worker_pid.to_string();
-    let refused = run(&[
-        "phase",
-        "--state-dir",
-        state_argument(&state),
-        "--run-id",
-        "dead-land-worker",
-        "--worker-pid",
-        &worker_pid,
-        "--worker-start-token",
-        &worker_token,
-        "--checkout",
-        row["checkout"].as_str().unwrap(),
-        "--head",
-        row["head_sha"].as_str().unwrap(),
-        "--phase",
-        "gating",
-    ]);
+    let (refused, database_busy_refusals) = run_after_transient_database_busy(
+        &[
+            "phase",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "dead-land-worker",
+            "--worker-pid",
+            &worker_pid,
+            "--worker-start-token",
+            &worker_token,
+            "--checkout",
+            row["checkout"].as_str().unwrap(),
+            "--head",
+            row["head_sha"].as_str().unwrap(),
+            "--phase",
+            "gating",
+        ],
+        Duration::from_secs(5),
+    );
+    unlocker.join().unwrap();
+    assert!(
+        database_busy_refusals > 0,
+        "the dead-worker phase probe did not exercise transient database contention"
+    );
     assert!(!refused.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
