@@ -62,6 +62,22 @@ fn repository_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn packaged_service_arguments(state: &Path) -> Vec<String> {
+    let unit =
+        fs::read_to_string(repository_root().join("packaging/systemd/agcoord-broker.service"))
+            .unwrap();
+    let command = unit
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .expect("packaged service has an ExecStart");
+    let fields = command.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields[0], "/usr/libexec/agcoord/agcoord-broker");
+    fields[1..]
+        .iter()
+        .map(|argument| argument.replace("%S/agcoord", state.to_str().unwrap()))
+        .collect()
+}
+
 struct HostFixture {
     _temporary: TestDirectory,
     root: PathBuf,
@@ -310,17 +326,15 @@ fn maintenance_holder_creates_the_owner_lock_and_excludes_a_broker_until_release
 #[test]
 fn managed_service_uses_configured_capacity_and_has_no_idle_shutdown() {
     let fixture = HostFixture::new();
+    let mut arguments = packaged_service_arguments(&fixture.state);
+    arguments.extend([
+        "--host-fixture-root".to_owned(),
+        fixture.root.to_string_lossy().into_owned(),
+        "--host-executable".to_owned(),
+        fixture.executable.to_string_lossy().into_owned(),
+    ]);
     let mut broker = Command::new(BROKER)
-        .args([
-            "serve",
-            "--state-dir",
-            fixture.state.to_str().unwrap(),
-            "--host-managed",
-            "--host-fixture-root",
-            fixture.root.to_str().unwrap(),
-            "--host-executable",
-            fixture.executable.to_str().unwrap(),
-        ])
+        .args(arguments)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

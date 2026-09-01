@@ -6,7 +6,7 @@ ConditionFileIsExecutable=/usr/libexec/agcoord/agcoord-broker
 [Service]
 Type=simple
 Slice=app.slice
-ExecStart=/usr/libexec/agcoord/agcoord-broker serve --state-dir=%S/agcoord --host-managed
+ExecStart=/usr/libexec/agcoord/agcoord-broker serve --state-dir %S/agcoord --host-managed
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=infinity
