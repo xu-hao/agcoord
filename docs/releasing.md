@@ -75,7 +75,10 @@ interface and must be smoke-tested from the built wheel.
 1. Start from a clean release commit and select the version once in package metadata.
    Update the matching section in [the changelog](../CHANGELOG.md) with the release date and
    user-visible changes.
-2. Run the complete test suite, including generic multi-repository scheduling, one-row
+2. Run `./scripts/check-conformance`, which validates the version-1 behavior manifest and
+   collected Python/native selectors before running both complete suites. The tag workflow uses
+   the same checker and cannot build a native release after declared coverage disappears. The
+   manifest includes generic multi-repository scheduling, one-row
    exact-head gate-and-publication behavior, recovery/cancellation boundaries, the optional
    GitHub adapter, child CPU lease contention and recovery, and real terminal UI coverage. A
    standalone `agc full` may validate a release candidate, but repository changes must land
@@ -108,10 +111,11 @@ interface and must be smoke-tested from the built wheel.
    that workflow to pass, then create the GitHub release and attach the same local wheel and
    source archive that production PyPI accepted.
 
-The release workflow should fail closed if artifact versions differ, files are dirty, a tag
-does not match the declared version, or the wheel exposes a package name other than `agcoord`
-or a console command other than `agc`. Publishing remains an explicit maintainer action
-through Twine; GitHub Actions has no package-index credentials or deployment job. Releases
+The release workflow should fail closed if conformance coverage is missing, artifact versions
+differ, files are dirty, a tag does not match the declared version, or the wheel exposes a
+package name other than `agcoord` or a console command other than `agc`. Publishing remains an
+explicit maintainer action through Twine; GitHub Actions has no package-index credentials or
+deployment job. Releases
 never migrate a user's live spool implicitly; protocol changes require the explicit
 `agc migrate` runbook in
 [the coordinator guide](coordinator.md#migrations).

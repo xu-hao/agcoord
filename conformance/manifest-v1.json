@@ -1,0 +1,277 @@
+{
+  "manifest_version": 1,
+  "protocols": {
+    "python_reference": 4,
+    "rust_native": 5
+  },
+  "required_domains": [
+    "commands",
+    "repositories",
+    "publication",
+    "tui",
+    "protocol",
+    "resources",
+    "receipts",
+    "migrations",
+    "contention",
+    "cancellation",
+    "recovery",
+    "crash_database",
+    "crash_launcher",
+    "crash_cgroup",
+    "crash_publication",
+    "crash_cleanup",
+    "crash_replacement",
+    "fuzz_clients",
+    "fuzz_state",
+    "no_duplicate_execution",
+    "no_stale_publication",
+    "no_unrelated_kill",
+    "no_unverified_enforcement"
+  ],
+  "execution": {
+    "rust_build_jobs": 4,
+    "python_test_workers": 1,
+    "rust_test_threads": 1
+  },
+  "behaviors": [
+    {
+      "id": "commands.strict-public-records",
+      "domain": "commands",
+      "description": "Public submit, snapshot, list, status, and log records retain their strict JSON contract.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_submit_and_snapshot_have_the_strict_generic_schema"],
+        "rust_native": ["client_compatibility::python_public_commands_keep_the_protocol_five_json_contract"]
+      }
+    },
+    {
+      "id": "repositories.lanes-and-capacity",
+      "domain": "repositories",
+      "description": "Repository lanes preserve barriers while unrelated repositories may share available capacity.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_resources_allow_cross_repo_overlap_but_full_is_a_lane_barrier"],
+        "rust_native": ["scheduler::repository_barriers_and_machine_capacity_preserve_order"]
+      }
+    },
+    {
+      "id": "publication.one-atomic-land",
+      "domain": "publication",
+      "description": "A land request holds one exact-head barrier through its gate and publication authority transition.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_land_submission_is_one_exact_head_publication_barrier"],
+        "rust_native": ["client_compatibility::atomic_land_keeps_gate_and_publication_inside_one_native_admission"]
+      }
+    },
+    {
+      "id": "tui.real-snapshot-refresh",
+      "domain": "tui",
+      "description": "The real Textual application renders public queue identity and refreshes a live native snapshot.",
+      "tests": {
+        "python_reference": ["tests/test_tui.py::test_queue_order_and_detail_keep_repository_resource_and_publication_identity"],
+        "rust_native": ["client_compatibility::real_textual_refresh_renders_a_protocol_five_snapshot"]
+      }
+    },
+    {
+      "id": "protocol.explicit-version-boundary",
+      "domain": "protocol",
+      "description": "Legacy state is never treated as current state or silently credited with enforcement evidence.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_legacy_history_requires_explicit_migration_without_inventing_enforcement"],
+        "rust_native": ["scheduler::every_legacy_protocol_migrates_through_protocol_four_without_inventing_evidence"]
+      }
+    },
+    {
+      "id": "resources.typed-lifecycle",
+      "domain": "resources",
+      "description": "Typed resources prepare before release, measure terminal use, and clean only owned state.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_backend_lifecycle_applies_and_measures_a_typed_resource"],
+        "rust_native": ["scheduler::typed_cgroup_fixture_applies_controls_before_release_and_cleans_owned_leaf"]
+      }
+    },
+    {
+      "id": "receipts.verified-terminal-evidence",
+      "domain": "receipts",
+      "description": "Receipts retain sanitized applied, peak, and event evidence exactly once.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_backend_observations_are_sanitized_and_recorded_once"],
+        "rust_native": ["scheduler::cgroup_fixture_reports_conservative_compute_and_memory_peaks_and_events"]
+      }
+    },
+    {
+      "id": "migrations.rollback-freshness",
+      "domain": "migrations",
+      "description": "Migration and rollback preserve history while invalidating stale pre-rollback gates.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_rollback_cutoff_prevents_reusing_any_pre_rollback_gate"],
+        "rust_native": ["scheduler::migration_and_rollback_preserve_history_and_reject_stale_gates"]
+      }
+    },
+    {
+      "id": "contention.owner-and-timeout",
+      "domain": "contention",
+      "description": "Database contention honors the configured timeout without replacing or cancelling the live owner.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_wal_writer_contention_does_not_stop_or_cancel_the_live_broker"],
+        "rust_native": ["scheduler::transient_database_contention_keeps_the_same_owner_and_honors_timeout"]
+      }
+    },
+    {
+      "id": "cancellation.complete-process-tree",
+      "domain": "cancellation",
+      "description": "Cancellation drains the complete owned process tree before publishing a terminal result.",
+      "tests": {
+        "python_reference": ["tests/test_cgroup.py::test_double_forked_descendant_cannot_survive_cgroup_cancellation"],
+        "rust_native": ["scheduler::cancellation_drains_the_complete_owned_process_group_before_terminal_state"]
+      }
+    },
+    {
+      "id": "recovery.adopt-without-duplicate",
+      "domain": "recovery",
+      "description": "A replacement owner adopts live work and its enforcement handle without duplicate execution.",
+      "tests": {
+        "python_reference": ["tests/test_cgroup.py::test_replacement_broker_adopts_live_cgroup_without_duplicate_work"],
+        "rust_native": ["scheduler::replacement_adopts_a_live_worker_without_duplicate_execution"]
+      }
+    },
+    {
+      "id": "crash.database-transactions",
+      "domain": "crash_database",
+      "description": "Ownership and admission transaction crashes recover without orphaning or duplicating work.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_replacement_broker_preserves_a_full_worker_after_the_owner_crashes"],
+        "rust_native": ["scheduler::ownership_and_admission_commit_crashes_recover_without_duplicate_work"]
+      }
+    },
+    {
+      "id": "crash.launcher-release",
+      "domain": "crash_launcher",
+      "description": "Launcher setup and final release crashes never expose user code before durable ownership.",
+      "tests": {
+        "python_reference": ["tests/test_cgroup.py::test_blocked_launcher_joins_owned_leaf_before_command_and_descendant_start"],
+        "rust_native": ["scheduler::setup_and_final_release_crashes_preserve_exactly_once_execution"]
+      }
+    },
+    {
+      "id": "crash.cgroup-attachment",
+      "domain": "crash_cgroup",
+      "description": "A durable cgroup handle survives replacement and cleanup targets only the recorded leaf.",
+      "tests": {
+        "python_reference": ["tests/test_cgroup.py::test_durable_handle_recovers_an_empty_leaf_and_partial_cleanup"],
+        "rust_native": ["scheduler::replacement_recovers_a_live_cgroup_worker_and_cleans_its_durable_leaf"]
+      }
+    },
+    {
+      "id": "crash.publication-authority",
+      "domain": "crash_publication",
+      "description": "Owner replacement cannot rerun a gate or advance publication with a dead or stale worker identity.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_replacement_broker_finishes_one_recovered_land_without_rerunning_gate"],
+        "rust_native": ["scheduler::a_dead_land_worker_identity_cannot_advance_publication"]
+      }
+    },
+    {
+      "id": "crash.terminal-cleanup",
+      "domain": "crash_cleanup",
+      "description": "Terminal cleanup is durable, retryable, and reclaims only test-owned trees.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_terminal_cleanup_reclaims_worker_created_mode_zero_trees"],
+        "rust_native": ["scheduler::worker_identity_and_terminal_commit_crashes_recover_durably"]
+      }
+    },
+    {
+      "id": "crash.replacement-owner",
+      "domain": "crash_replacement",
+      "description": "A replacement owner preserves the one live worker and one allocation until terminal recovery.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_replacement_broker_preserves_a_full_worker_after_the_owner_crashes"],
+        "rust_native": ["scheduler::replacement_adopts_a_live_worker_without_duplicate_execution"]
+      }
+    },
+    {
+      "id": "fuzz.clients-invalid-corpus",
+      "domain": "fuzz_clients",
+      "description": "A property corpus of invalid resource and client values is refused without accepting a row.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_impossible_or_nonpositive_resource_requests_are_never_queued"],
+        "rust_native": ["scheduler::cgroup_fixture_refuses_impossible_and_ambiguous_resource_contracts_stably"]
+      }
+    },
+    {
+      "id": "fuzz.stored-state-corpus",
+      "domain": "fuzz_state",
+      "description": "Malformed schema, rows, receipts, resource state, and NUL-bearing values fail without rewriting stored bytes.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_malformed_configuration_file_is_rejected_when_the_broker_loads"],
+        "rust_native": [
+          "scheduler::corrupt_schema_or_row_fails_stably_without_rewriting_state",
+          "scheduler::corrupt_resource_contract_or_state_fails_before_owner_mutation",
+          "scheduler::stored_nul_values_are_rejected_before_worker_syscalls"
+        ]
+      }
+    },
+    {
+      "id": "safety.no-duplicate-execution",
+      "domain": "no_duplicate_execution",
+      "description": "Crash recovery never executes the admitted command more than once.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_replacement_broker_preserves_a_full_worker_after_the_owner_crashes"],
+        "rust_native": ["scheduler::ownership_and_admission_commit_crashes_recover_without_duplicate_work"]
+      }
+    },
+    {
+      "id": "safety.no-stale-publication",
+      "domain": "no_stale_publication",
+      "description": "Remote movement or dead publication identity refuses without mutating a forge reference.",
+      "tests": {
+        "python_reference": ["tests/test_merge.py::test_land_remote_movement_during_gate_is_a_typed_refusal_without_publication"],
+        "rust_native": ["scheduler::a_dead_land_worker_identity_cannot_advance_publication"]
+      }
+    },
+    {
+      "id": "safety.no-unrelated-kill",
+      "domain": "no_unrelated_kill",
+      "description": "Changed kernel or process identity is refused without killing or removing the replacement.",
+      "tests": {
+        "python_reference": ["tests/test_cgroup.py::test_cleanup_refuses_a_reused_foreign_leaf_without_removing_it"],
+        "rust_native": ["scheduler::stale_worker_identity_never_signals_an_unrelated_reused_process_group"]
+      }
+    },
+    {
+      "id": "safety.no-unverified-enforcement",
+      "domain": "no_unverified_enforcement",
+      "description": "Required enforcement refuses before user code when the backend cannot prove application.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_required_unavailable_resource_backend_refuses_before_user_code"],
+        "rust_native": ["scheduler::required_cgroup_binding_refuses_before_user_code_when_delegation_is_unavailable"]
+      }
+    }
+  ],
+  "intentional_differences": [
+    {
+      "id": "owner.production-eligibility",
+      "description": "The Python protocol-4 owner remains a reference fixture; installed clients require the audited protocol-5 Rust owner.",
+      "python_reference": "The reference broker is exercised directly by conformance tests and is never an automatic production fallback.",
+      "rust_native": "The release executable publishes protocol, implementation, version, build, target, and SQLite identity.",
+      "rationale": "Removing interpreter and environment ambiguity requires one production owner while retaining an executable reference oracle.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_first_client_refuses_a_missing_native_broker_without_python_fallback"],
+        "rust_native": ["identity::reports_exact_version_and_protocol_identity"]
+      }
+    },
+    {
+      "id": "resources.deterministic-kernel-seams",
+      "description": "Default conformance uses owned deterministic kernel seams; real cgroup and project-quota tests remain explicit host opt-ins.",
+      "python_reference": "Python tests inject test-owned cgroup and quota systems behind the public broker boundary.",
+      "rust_native": "Native tests select explicit fixture roots, while identically named real tests activate only with dedicated host variables.",
+      "rationale": "The ordinary gate must be safe on undelegated hosts without weakening the separate enforced-host proof.",
+      "tests": {
+        "python_reference": ["tests/test_cgroup_compute.py::test_cpu_and_pid_limits_apply_before_user_code_and_report_terminal_usage"],
+        "rust_native": [
+          "scheduler::typed_cgroup_fixture_applies_controls_before_release_and_cleans_owned_leaf",
+          "scheduler::real_cgroup_cpu_and_pid_limits_cover_the_complete_process_tree"
+        ]
+      }
+    }
+  ]
+}
