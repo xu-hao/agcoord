@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -73,11 +74,15 @@ impl RunningBroker {
             command.arg("--capacity").arg(format!("{name}={units}"));
         }
         command.args(options);
-        let mut child = command
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .expect("start native broker");
+        Self::wait_until_ready(state_dir, child)
+    }
+
+    fn wait_until_ready(state_dir: &Path, mut child: Child) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -949,6 +954,7 @@ fn ownership_and_protocol_refusals_are_stable_and_non_mutating() {
     let state = temporary.path().join("state");
     let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
 
+    let started = Instant::now();
     let contender = run(&[
         "serve",
         "--state-dir",
@@ -961,6 +967,7 @@ fn ownership_and_protocol_refusals_are_stable_and_non_mutating() {
         serde_json::from_slice::<Value>(&contender.stderr).unwrap()["code"],
         "broker-already-owned"
     );
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(broker.terminate().success());
 
     let database = state.join("queue.sqlite3");
@@ -993,6 +1000,51 @@ fn ownership_and_protocol_refusals_are_stable_and_non_mutating() {
         .unwrap(),
         "99"
     );
+}
+
+#[test]
+fn broker_start_retries_a_transient_owner_lock_probe() {
+    let temporary = TestDirectory::new("transient-owner-lock");
+    let state = temporary.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state.join("broker.lock"))
+        .unwrap();
+    // SAFETY: flock receives a live descriptor owned by `lock`, which remains open until the
+    // transient probe is explicitly released below.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let mut child = Command::new(BROKER)
+        .args([
+            "serve",
+            "--state-dir",
+            state_argument(&state),
+            "--capacity",
+            "jobs=1",
+            "--idle-timeout",
+            "30",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(75));
+    if let Some(status) = child.try_wait().unwrap() {
+        let stderr = child_stderr(&mut child);
+        panic!("broker did not tolerate the transient probe: {status}: {stderr}");
+    }
+
+    // SAFETY: this releases only the probe lock acquired on the same live descriptor above.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let mut broker = RunningBroker::wait_until_ready(&state, child);
+    assert!(broker.terminate().success());
 }
 
 #[test]
