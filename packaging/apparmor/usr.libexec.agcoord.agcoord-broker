@@ -1,0 +1,38 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# The fixed broker process and its pre-exec launcher inherit this domain. It grants only the
+# user-namespace operation that Ubuntu's global restriction removes from unconfined processes.
+profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(default_allow,attach_disconnected,mediate_deleted) {
+  allow userns create,
+  deny ptrace,
+
+  # A Python client inside admitted work may execute safe broker client verbs, but that new
+  # process enters a domain without namespace permission. Every submitted command enters the
+  # admitted domain before any of its own code runs.
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-broker-client,
+  /** px -> agcoord-admitted,
+}
+
+# Calls from admitted work transition here instead of reattaching to the setup profile.
+profile agcoord-broker-client flags=(default_allow,attach_disconnected,mediate_deleted) {
+  deny userns,
+  deny change_profile -> agcoord-broker,
+  deny /proc/@{pid}/attr/{current,exec} w,
+  deny /proc/self/attr/{current,exec} w,
+  deny /proc/thread-self/attr/{current,exec} w,
+
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-broker-client,
+  /** px -> agcoord-admitted,
+}
+
+profile agcoord-admitted flags=(default_allow,attach_disconnected,mediate_deleted) {
+  deny userns,
+  deny change_profile -> agcoord-broker,
+  deny /proc/@{pid}/attr/{current,exec} w,
+  deny /proc/self/attr/{current,exec} w,
+  deny /proc/thread-self/attr/{current,exec} w,
+
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-broker-client,
+  /** ix,
+}

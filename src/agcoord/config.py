@@ -42,6 +42,7 @@ class NativeBrokerConfig:
 
     path: str
     allow_development: bool
+    managed_service: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ def load_broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
             native_broker=NativeBrokerConfig(
                 path=DEFAULT_NATIVE_BROKER_PATH,
                 allow_development=False,
+                managed_service=False,
             ),
         )
     except OSError as exc:
@@ -132,12 +134,13 @@ def _native_broker_section(
         return NativeBrokerConfig(
             path=DEFAULT_NATIVE_BROKER_PATH,
             allow_development=False,
+            managed_service=False,
         )
     if not isinstance(value, dict):
         raise BrokerConfigError(
             f"broker configuration {source} section 'native_broker' must be a JSON object"
         )
-    unknown = sorted(set(value) - {"path", "allow_development"})
+    unknown = sorted(set(value) - {"path", "allow_development", "managed_service"})
     if unknown:
         raise BrokerConfigError(
             f"broker configuration {source} native_broker has unknown keys: "
@@ -158,9 +161,15 @@ def _native_broker_section(
         raise BrokerConfigError(
             f"broker configuration {source} native_broker allow_development must be boolean"
         )
+    managed_service = value.get("managed_service", False)
+    if not isinstance(managed_service, bool):
+        raise BrokerConfigError(
+            f"broker configuration {source} native_broker managed_service must be boolean"
+        )
     return NativeBrokerConfig(
         path=path,
         allow_development=allow_development,
+        managed_service=managed_service,
     )
 
 

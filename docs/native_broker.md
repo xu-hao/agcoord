@@ -94,7 +94,7 @@ unrelated processes and cgroups, host filesystems, and credentials omitted from 
 | Malformed submitted or stored data | Refuse or interrupt only the owning row; never pass unchecked data to a syscall. |
 | PID reuse or forged worker identity | Match PID, start token, process group, and private inherited channel. |
 | Direct internal-worker invocation | No public worker subcommand; setup requires broker-created inherited descriptors and token. |
-| Command execs the broker binary | The admitted-command AppArmor profile denies execution of the setup executable. |
+| Command execs the broker binary | From admitted work it enters the restricted client profile and cannot regain the setup domain. The public setup binary exposes no arbitrary worker mode. |
 | Broker crash before worker release | Pipe EOF keeps the blocked launcher from executing user code. |
 | Broker crash after release | A replacement adopts only identity-verified live state and never executes the command again. |
 | Changed head or target during landing | Refuse publication and discard the prior verdict. |
@@ -156,7 +156,8 @@ binary may instead be owned by the current user and report `development` only wh
 {
   "native_broker": {
     "path": "/absolute/path/to/target/debug/agcoord-broker",
-    "allow_development": true
+    "allow_development": true,
+    "managed_service": false
   }
 }
 ```
@@ -353,11 +354,15 @@ roots the visible cgroup hierarchy at its leaf, provisions optional tmpfs, drops
 permitted, inheritable and ambient capabilities, sets `no_new_privs`, reports verified setup,
 and waits for the final release. It then `execve`s the submitted command.
 
-The AppArmor setup profile attaches only to the root-owned native binary. Its exec transition
-moves submitted commands into an admitted-command profile that denies user-namespace creation,
-administrative capabilities, and execution of the broker binary. The broker performs no other
-exec after startup. A failure to verify the loaded profile or transition makes required work
-unavailable.
+The setup-only `agcoord-broker` AppArmor profile attaches to the immutable root-owned executable,
+not to a user-editable service directive. Its public command parser exposes no worker mode or
+arbitrary setup-domain exec path. The authenticated worker exec transition moves submitted
+commands into `agcoord-admitted`; an admitted command that invokes the broker transitions to
+`agcoord-broker-client` instead of regaining setup permission. Both restricted domains deny
+user-namespace creation and changing back to the setup domain, and arbitrary interpreters
+inherit the admitted restriction. A failure to verify the loaded setup profile, service cgroup,
+global restriction, or backend namespace probe makes required work unavailable.
+The complete package and transition contract is in [the native host runbook](native_host.md).
 
 ## Compatibility and migration
 
