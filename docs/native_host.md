@@ -80,7 +80,8 @@ Other refusals distinguish `namespace-propagation-mount-failed`,
 `namespace-cgroup2-mount-failed-errno-N`, and `namespace-cgroup2-bind-failed-errno-N`, where `N` is
 the retained Linux error number. A later worker-side refusal is normalized to the stable
 `namespace-mount-failed` setup code. Inspect the kernel journal alongside that receipt to
-distinguish a kernel namespace refusal from an AppArmor denial.
+distinguish a kernel namespace refusal from an AppArmor denial. Controller metrics accept the
+kernel's dotted field names, including Linux 6.17's `core_sched.force_idle_usec` CPU statistic.
 
 ## First install
 

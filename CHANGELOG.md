@@ -14,7 +14,8 @@ versioning; dates use ISO 8601.
   an enforced CPU receipt without weakening Ubuntu's global policy and retains broker and kernel
   diagnostics, including the failing cgroup2 mount's Linux error number, when namespace setup
   fails. Namespace isolation falls back to a leaf-only bind mount when Linux reports that the
-  namespace-rooted cgroup2 view collides with the inherited mountpoint.
+  namespace-rooted cgroup2 view collides with the inherited mountpoint, and native metric parsing
+  accepts dotted cgroup fields emitted by Linux 6.17 and later.
 - Retry native broker startup through a bounded transient ownership-lock collision while
   preserving the stable refusal for a genuinely live owner.
 - Publish a native broker's live owner identity only after its termination handlers are ready,
