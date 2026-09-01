@@ -163,7 +163,9 @@ impl SetupCode {
             "namespace-delegation-unavailable" => Self::NamespaceDelegationUnavailable,
             "namespace-isolation-unavailable" => Self::NamespaceIsolationUnavailable,
             "namespace-mapping-failed" => Self::NamespaceMappingFailed,
-            "namespace-mount-failed" => Self::NamespaceMountFailed,
+            "namespace-mount-failed"
+            | "namespace-propagation-mount-failed"
+            | "namespace-cgroup2-mount-failed" => Self::NamespaceMountFailed,
             "namespace-verification-failed" => Self::NamespaceVerificationFailed,
             "controller-files-exposed" => Self::ControllerFilesExposed,
             "tmpfs-namespace-required" => Self::TmpfsNamespaceRequired,
