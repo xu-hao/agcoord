@@ -26,7 +26,8 @@ profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(enforce,attach
   /** px -> agcoord-admitted,
 }
 
-# Calls from admitted work stack this restriction instead of reattaching to the setup profile.
+# Calls from admitted work retain that profile and stack this restriction instead of reattaching
+# to the setup profile.
 profile agcoord-broker-client flags=(enforce,attach_disconnected,mediate_deleted) {
   allow capability,
   allow network,
@@ -68,6 +69,6 @@ profile agcoord-admitted flags=(enforce,attach_disconnected,mediate_deleted) {
   deny /proc/self/attr/{current,exec} w,
   deny /proc/thread-self/attr/{current,exec} w,
 
-  /usr/libexec/agcoord/agcoord-broker px -> &agcoord-broker-client,
+  /usr/libexec/agcoord/agcoord-broker px -> @{profile_name}//&agcoord-broker-client,
   /** ix,
 }
