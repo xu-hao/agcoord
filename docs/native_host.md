@@ -72,9 +72,10 @@ On every managed start, the broker fails before acquiring the spool unless all o
 The cgroup backend then performs its destructive probe, including user-, cgroup-, and mount-
 namespace creation and controller-file protection. An unavailable required binding refuses the
 run before user code; it is never silently treated as admission-only.
-For `namespace-mount-failed`, inspect the user-service journal: the native broker records whether
-the propagation change or cgroup2 mount failed together with the operating-system error. Inspect
-the kernel journal alongside it to distinguish a kernel namespace refusal from an AppArmor denial.
+The capability refusal distinguishes `namespace-propagation-mount-failed` from
+`namespace-cgroup2-mount-failed`; a later worker-side refusal is normalized to the stable
+`namespace-mount-failed` setup code. Inspect the kernel journal alongside the receipt to
+distinguish a kernel namespace refusal from an AppArmor denial.
 
 ## First install
 

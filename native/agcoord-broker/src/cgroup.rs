@@ -927,11 +927,7 @@ pub fn isolate_current_cgroup() -> CgroupResult<()> {
         )
     } != 0
     {
-        eprintln!(
-            "native cgroup namespace propagation mount failed: {}",
-            io::Error::last_os_error()
-        );
-        return Err(CgroupError::new("namespace-mount-failed"));
+        return Err(CgroupError::new("namespace-propagation-mount-failed"));
     }
     let source = CString::new("none").unwrap();
     let filesystem = CString::new("cgroup2").unwrap();
@@ -949,12 +945,7 @@ pub fn isolate_current_cgroup() -> CgroupResult<()> {
             )
         } != 0
         {
-            eprintln!(
-                "native cgroup2 namespace mount at {} failed: {}",
-                mount.path.display(),
-                io::Error::last_os_error()
-            );
-            return Err(CgroupError::new("namespace-mount-failed"));
+            return Err(CgroupError::new("namespace-cgroup2-mount-failed"));
         }
     }
     let cgroups = fs::read_to_string("/proc/self/cgroup")
