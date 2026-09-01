@@ -23,8 +23,11 @@ installer rechecks the package before staging and rechecks the installed binary'
 identity after activation. A production activation also requires a release musl identity and
 installs every live file as root-owned.
 
-The Python wheel intentionally contains no broker executable. Configuration, the spool,
-systemd unit, and AppArmor policy remain external to the one-file native runtime.
+The Python wheel intentionally contains no broker executable. “One executable” describes the
+statically linked Rust runtime, not a one-file installation: configuration, durable state,
+systemd supervision, AppArmor policy, checksums, provenance, and the Python clients remain
+external and independently auditable. The exact boundary and compatibility matrix are in the
+[migration runbook](native_migration.md#what-one-executable-means).
 
 ## Configuration
 
@@ -76,9 +79,11 @@ run before user code; it is never silently treated as admission-only.
 ## First install
 
 Download all host artifacts into one owner-only directory. Verify the three helper sidecars,
-then let the checker validate the package:
+restore the helpers' declared executable mode (ordinary HTTP and workflow-artifact downloads do
+not carry a POSIX mode), then let the checker validate the package:
 
 ```bash
+chmod 0755 check-native-host-package install-native-host test-native-host-enforcement
 sha256sum --check check-native-host-package.sha256
 sha256sum --check install-native-host.sha256
 sha256sum --check test-native-host-enforcement.sha256
@@ -105,8 +110,9 @@ native maintenance holder creates `broker.lock` as that directory's owner with m
 keeps it locked through final identity verification. Existing locks with a wrong owner, mode,
 type, or link count are refused rather than repaired by a root shell.
 
-For a fresh state directory, start the service. For an older spool, first run the explicit
-`agc migrate` procedure in [the coordinator guide](coordinator.md#migrations), then start it:
+For a fresh state directory, start the service. For an older spool, first complete the backup
+and rollback rehearsal and run the explicit transition in the
+[native migration runbook](native_migration.md), then start it:
 
 ```bash
 agc migrate                 # omit for a fresh or already protocol-5 spool
@@ -166,4 +172,7 @@ binary is still installed, then change the client/configuration according to the
 That rollback restores
 the verified protocol-4 baseline, replays terminal native history, and invalidates every old
 gate receipt through the recorded cutoff. Preserve the state directory and its rollback backup;
-a fresh exact-head gate is required before legacy publication.
+a fresh exact-head gate is required before legacy publication. Follow the complete
+[rollback procedure](native_migration.md#roll-back-during-the-retained-window), including the
+configuration change and retirement criteria; do not treat this abbreviated host-package
+sequence as a live-spool runbook.

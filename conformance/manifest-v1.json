@@ -104,7 +104,10 @@
       "description": "Migration and rollback preserve history while invalidating stale pre-rollback gates.",
       "tests": {
         "python_reference": ["tests/test_queue.py::test_rollback_cutoff_prevents_reusing_any_pre_rollback_gate"],
-        "rust_native": ["scheduler::migration_and_rollback_preserve_history_and_reject_stale_gates"]
+        "rust_native": [
+          "client_compatibility::migration_runbook_rehearses_backup_rollback_and_final_native_ownership",
+          "scheduler::migration_and_rollback_preserve_history_and_reject_stale_gates"
+        ]
       }
     },
     {

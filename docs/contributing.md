@@ -112,6 +112,15 @@ It uses four Rust build jobs, then one pytest worker and one Rust test thread so
 tests retain exclusive ownership of every broker and child they create. Do not replace it in a
 native release path with an unversioned `cargo test` invocation.
 
+The final release-artifact boundary is `scripts/verify-release-candidate`. It accepts only the
+two clean Python distributions, the exact five-file native artifact set, and the exact
+eight-file host artifact set produced from one clean versioned commit. It re-audits every
+identity and sidecar, installs the wheel and sdist into fresh environments, runs the migration
+and rollback rehearsal against the installed wheel, and only then writes an aggregate manifest
+and `SHA256SUMS`. The CI and tag workflows download the independently built inputs and run this
+same verifier; missing coverage or any artifact is a closed gate, not a manual checklist waiver.
+The verifier owns temporary state and never targets the default coordinator.
+
 In a fresh AGCoord development environment, direct package installation and focused
 tests are allowed only long enough to make `agc run` available. Bootstrap is never
 an exception for a direct full gate or publication.

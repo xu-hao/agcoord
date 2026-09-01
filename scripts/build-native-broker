@@ -58,6 +58,7 @@ install -m 0644 LICENSE "$output_directory/AGCOORD_LICENSE"
 install -m 0644 native/THIRD_PARTY_LICENSES.tsv "$output_directory/THIRD_PARTY_LICENSES.tsv"
 artifact_sha256=$(sha256sum "$artifact" | awk '{print $1}')
 printf '%s  %s\n' "$artifact_sha256" "$artifact_name" >"$artifact.sha256"
+chmod 0644 "$artifact.sha256"
 
 identity=$(env -i "$artifact" identity --json)
 if ! jq -e \
@@ -96,5 +97,6 @@ jq -n \
         source_sha256: $source_sha256,
         target: $target
     }' >"$artifact.provenance.json"
+chmod 0644 "$artifact.provenance.json"
 
 printf '%s\n' "$artifact"

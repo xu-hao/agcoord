@@ -18,6 +18,8 @@ procedure is in [the contributor workflow](contributing.md).
   service, AppArmor boundary, enforced-host proof, upgrades, recovery, and rollback.
 - [Cross-implementation conformance](conformance.md) — versioned Python/native behavior,
   failure-injection coverage, intentional differences, and the executable release gate.
+- [Native migration and rollback](native_migration.md) — compatibility matrix, drain,
+  backup rehearsal, explicit transition, mixed-version refusal, rollback, and retirement.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
   publication, optional adapters, and release posture.
 - [Session handoff format](session_handoff_format.md) — closing changed work with concise
