@@ -24,7 +24,7 @@ NATIVE_PROTOCOL = 5
 NATIVE_IMPLEMENTATION = "rust-native"
 MAX_NATIVE_JSON_BYTES = 1024 * 1024
 _RELEASE_BUILD = re.compile(r"^sha256:[0-9a-f]{64}$")
-_SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.3\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+_SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.4\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 _SUPPORTED_RELEASE_TARGET = "x86_64-unknown-linux-musl"
 _SUPPORTED_DEVELOPMENT_TARGETS = frozenset(
     {_SUPPORTED_RELEASE_TARGET, "x86_64-unknown-linux-gnu"}
