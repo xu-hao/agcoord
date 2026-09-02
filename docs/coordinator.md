@@ -160,6 +160,15 @@ allocation is held until the complete worker process group is gone. A request th
 fit is rejected rather than left queued forever. Scheduling does not infer resource use from
 labels or commands.
 
+Admission greedily packs the complete declared resource vectors rather than assigning fixed
+per-job shares. On each pass the scheduler takes one repository-lane head, rotates fairly among
+repositories, admits the first head whose every requested resource fits the currently free
+capacities, and repeats until no head fits. Thus an eight-CPU host can overlap requests for six
+and two CPUs, or four requests for two CPUs, without a preselected “two jobs at four CPUs each”
+partition. `jobs` remains an independent concurrency ceiling and does not replace CPU, memory,
+temporary-storage, or disk claims. Greedy backfill can delay a large request while smaller
+requests continue to fit; it does not reserve future capacity for that request.
+
 Capacity and enforcement are separate contracts. An unbound name is always a generic
 `admission-unit`, even when it is spelled `cpu`, `memory`, or `disk`: AGCoord schedules it but
 does not claim to have constrained or measured the process. Bind selected capacity names before

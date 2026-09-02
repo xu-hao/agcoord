@@ -26,6 +26,7 @@ PUBLIC_COMMANDS = {
     "drain",
     "resume",
     "clear",
+    "host",
 }
 
 
