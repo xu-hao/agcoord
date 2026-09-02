@@ -17,11 +17,14 @@ individual sidecars. The tar archive contains only these root-owned host files:
 - the exact native identity and file-digest manifest, AGCoord license, and reviewed Rust
   dependency inventory under `/usr/share/doc/agcoord/`.
 
-The checker rejects a changed package checksum, unexpected path, symlink, non-root archive
-owner, unsafe mode, changed embedded file, mismatched identity, or invalid AppArmor policy. The
-installer rechecks the package before staging and rechecks the installed binary's digest and
-identity after activation. A production activation also requires a release musl identity and
-installs every live file as root-owned.
+The builder normalizes its creation umask to `022`, so archive directory modes and bytes do not
+depend on the invoking shell. The checker rejects a changed package checksum, unexpected path,
+symlink, non-root archive owner, unsafe mode, changed embedded file, mismatched identity, or
+invalid AppArmor policy. It preserves the archived permissions in its test-owned extraction, so
+it validates the artifact's modes independently of the caller's umask, including the broker's
+restrictive admitted worker umask. The installer rechecks the package before staging and rechecks
+the installed binary's digest and identity after activation. A production activation also
+requires a release musl identity and installs every live file as root-owned.
 
 The Python wheel intentionally contains no broker executable. “One executable” describes the
 statically linked Rust runtime, not a one-file installation: configuration, durable state,
@@ -165,8 +168,10 @@ the service stopped and the marker in place; rerunning `drain` reports the same 
 Run the shipped probe as an ordinary coordinated job with exactly one CPU unit; do not invoke
 it from a nested coordinator. It proves the admitted AppArmor transition, user-namespace
 denial, cgroup namespace root, exact `cpu.max`, release owner identity, and the restricted
-profile reached when admitted work invokes the broker. The final assertion proves that the durable public
-receipt records the enforced allocation:
+profile reached when admitted work invokes the broker. It also calls the installed Python
+client's operation-specific callback by showing the exact admitted run while it is live; this
+guards the complete `agc`-to-native path used by land reporting and pytest-xdist child leases.
+The final assertion proves that the durable public receipt records the enforced allocation:
 
 ```bash
 agc --json run --label "native host enforcement" --resource cpu=1 \
@@ -175,9 +180,13 @@ jq -e '
   .status == "passed"
   and .resource_receipt.requested.cpu == 1
   and .resource_receipt.applied.cpu == 1
-  and .resource_receipt.peak.cpu == 1
+  and .resource_receipt.peak.cpu >= 1
 ' native-host-receipt.json
 ```
+
+The requested and applied values prove the exact configured CPU limit. The nonzero peak proves
+that usage was measured; it is a conservative ceiling of sampled usage concurrency and may exceed
+the quota when short parallel bursts are rounded upward.
 
 The setup-only `agcoord-broker` profile attaches only to the fixed root-owned executable; it is
 not selected by the user-editable systemd unit. The public binary has no internal-worker or
@@ -190,6 +199,14 @@ admitted confinement; this adds restrictions without requesting a replacement do
 All three profiles use explicit enforce mode and broad enumerated host permissions;
 `default_allow` is not accepted because Ubuntu 24.04 implements it as an unconfined profile that
 does not apply these denials.
+
+Within the admitted user namespace, `stat(2)` reports the host-root-owned installed binary with
+the overflow UID because host root is intentionally absent from the one-entry identity map. The
+Python client does not weaken its ordinary root-ownership policy or whitelist that UID. Only its
+admitted callback selector accepts this view, and only after checking the fixed installed path,
+managed release configuration, exact UID/GID maps, denied `setgroups`, and the native restricted
+profile preflight. The selector exposes own-run status, authenticated child leases, and land
+verification/phase/result reporting; it does not turn `agc` into a nested submission mechanism.
 
 ## Upgrade, recovery, and rollback
 

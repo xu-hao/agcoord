@@ -179,6 +179,29 @@ The selected executable and a live owner must have the same supported version an
 identity. A missing, stale, malformed, or incompatible executable produces an actionable
 refusal without accepting work or replacing the live owner.
 
+Managed admitted workers retain a deliberately narrow callback surface for their own run:
+admission verification, land phase/result reporting, own-run status, and authenticated child
+CPU leases. A user namespace cannot represent the installed file's host-root owner, so Linux
+reports that owner as the overflow UID inside the worker. The callback selector never treats an
+overflow UID as ownership evidence by itself. It accepts only the fixed host-package path in
+managed release mode, with exact one-entry UID and GID identity maps, denied `setgroups`, the
+configured overflow UID, and an exact `host-client-preflight` receipt from the stacked enforced
+`agcoord-admitted`/`agcoord-broker-client` profiles. It then applies the normal executable mode,
+identity, target, build, and live-owner checks.
+
+This is an operation-specific callback path, not general client re-entry. The Python land worker
+and pytest-xdist adapter call it explicitly; `agc show` selects it only when asked for the exact
+`AGCOORD_RUN_ID` in the matching `AGCOORD_STATE_DIR`. Ordinary snapshot, submission,
+cancellation, history, migration, and unrelated-run status paths continue to use normal
+root-owner selection. An absent or forged admission environment, arbitrary overflow-owned path,
+inexact namespace map, or failed confinement attestation is refused before a callback command
+runs.
+
+Publication workers retain the submitting Python entry-point exactly, including a virtual
+environment's `bin/python` symlink. Resolving that entry-point to the base interpreter would drop
+the virtual environment's installed client and could run a stale AGCoord version at the admitted
+callback boundary.
+
 ### Implemented scheduler and state boundary
 
 The native executable implements the protocol-5 owner lock, SQLite spool initialization,

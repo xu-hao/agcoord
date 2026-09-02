@@ -737,6 +737,13 @@ row. Repository wrappers should verify immediately before protected gate work an
 refusal as a failed gate. The verifier remains an internal seam for wrappers, not a second
 submission or user-facing workflow.
 
+On a managed native host, these verifier calls and the other run-scoped operations below use an
+explicit admitted callback path. The path accepts only the exact current run and state context,
+the fixed installed release, the worker's exact one-entry user-namespace maps, and the restricted
+native client-profile attestation. `agc show "$AGCOORD_RUN_ID"` uses the same path for the exact
+parent row. Other CLI reads and every submission retain ordinary client selection, so a gate
+script remains a standalone command and never needs to invoke a nested coordinator.
+
 ### Child CPU leases for parallel tools
 
 A job that declares `--resource cpu=N` owns one finite worker-token budget for its entire

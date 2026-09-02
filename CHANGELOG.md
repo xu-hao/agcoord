@@ -5,6 +5,18 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.3.2 — 2026-09-02
+
+- Allow the installed Python client to perform only its authenticated run-scoped callbacks from
+  a managed admitted user namespace, where Linux represents the fixed host-root-owned broker
+  with the overflow UID. Selection still rejects arbitrary overflow-owned paths and requires
+  exact namespace maps plus the restricted AppArmor preflight; general nested client operations
+  retain the ordinary root-owner policy. Publication workers now preserve a virtual environment's
+  Python entry-point instead of resolving it to a potentially stale base installation.
+- Normalize host-package creation modes and preserve archived modes during verification, so
+  package bytes are independent of the invoking umask and the atomic release gate validates the
+  artifact correctly under a restrictive worker umask.
+
 ## 0.3.1 — 2026-09-02
 
 - Add durable `agc drain` and exact-token `agc resume` maintenance operations. Drain atomically

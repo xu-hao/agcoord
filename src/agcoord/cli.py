@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -11,6 +12,7 @@ from typing import Iterable, TextIO
 
 from . import __version__
 from .queue import (
+    RUN_ID_ENV,
     CoordinatorClient,
     CoordinatorError,
     follow,
@@ -259,7 +261,11 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             )
         return 0
     if args.command == "show":
-        row = client.status(args.run_id)
+        row = (
+            client.admitted_run_status(args.run_id)
+            if os.environ.get(RUN_ID_ENV) == args.run_id
+            else client.status(args.run_id)
+        )
         print(json.dumps(row, indent=2, sort_keys=True), file=out)
         return 0
     if args.command == "cancel":

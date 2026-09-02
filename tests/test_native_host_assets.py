@@ -115,3 +115,6 @@ def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
     assert "cat native-host-receipt.json" in workflow
     assert 'agc log "$run_id"' in workflow
     assert "sudo journalctl --dmesg --no-pager" in workflow
+    assert ".resource_receipt.applied.cpu == 1" in workflow
+    assert ".resource_receipt.peak.cpu >= 1" in workflow
+    assert ".resource_receipt.peak.cpu == 1" not in workflow
