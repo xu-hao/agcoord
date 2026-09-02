@@ -49,6 +49,19 @@ The base package installs the supported Textual 8 release line (`textual>=8.2,<9
 terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
 after its real-TUI behavior is validated.
 
+### Upgrading to 0.4.0
+
+Version 0.4.0 removes the implicit unbounded scratch directory. A run that declares neither a
+complete tmpfs policy nor a complete project-quota policy now receives no AGCoord-provided
+temporary directory, and its inherited `TMPDIR`, `TMP`, and `TEMP` values are removed. Before
+upgrading, audit admitted commands that relied on a private temporary directory and give each
+one an explicit tmpfs or project-quota declaration; the
+[native migration runbook](docs/native_migration.md) records that audit step. The host
+transition itself is unchanged: install the matching 0.4.0 client, then run `agc host upgrade`
+with the verified 0.4.0 bundle.
+
+If upgrading from 0.2.x or earlier, first apply the 0.3 native-owner transition below.
+
 ### Upgrading to 0.3.0
 
 Version 0.3.0 replaces the production Python queue owner with the fixed, statically linked Rust

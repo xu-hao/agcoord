@@ -1113,15 +1113,28 @@ fn a_stale_selected_binary_cannot_replace_or_command_the_live_owner() {
     let (guard, original_owner) = owner_guard(&state).expect("native owner disappeared");
 
     let stale = temporary.path().join("stale-broker");
+    let stale_identity = format!(
+        concat!(
+            r#"{{"name":"agcoord-broker","version":"{}","protocol":5,"#,
+            r#""implementation":"rust-native","#,
+            r#""build":"sha256:{}","target":"x86_64-unknown-linux-musl","sqlite":"3"}}"#,
+        ),
+        env!("CARGO_PKG_VERSION"),
+        "0".repeat(64),
+    );
     fs::write(
         &stale,
-        r#"#!/bin/sh
-if [ "$1" = identity ] && [ "$2" = --json ]; then
-  printf '%s\n' '{"name":"agcoord-broker","version":"0.3.0","protocol":5,"implementation":"rust-native","build":"sha256:0000000000000000000000000000000000000000000000000000000000000000","target":"x86_64-unknown-linux-musl","sqlite":"3"}'
-  exit 0
-fi
-exit 97
-"#,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = identity ] && [ \"$2\" = --json ]; then\n",
+                "  printf '%s\\n' '{}'\n",
+                "  exit 0\n",
+                "fi\n",
+                "exit 97\n",
+            ),
+            stale_identity,
+        ),
     )
     .unwrap();
     fs::set_permissions(&stale, fs::Permissions::from_mode(0o755)).unwrap();

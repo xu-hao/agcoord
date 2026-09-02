@@ -1053,6 +1053,6 @@ and verifies the configured native executable, requires no owner or live row, an
 production drain across its schema transaction. Ordinary client commands refuse a live
 protocol-4 owner or an older spool that has not completed this procedure; installing or building
 the native artifact alone never performs the transition. The canonical runbook also defines the
-0.3 compatibility matrix, whole-spool backup, capability proof, rollback, Python production-path
+0.4 compatibility matrix, whole-spool backup, capability proof, rollback, Python production-path
 retirement, and safe actions for every migration refusal; this section defines only the durable
 protocol semantics.
