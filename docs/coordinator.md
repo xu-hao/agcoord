@@ -7,9 +7,9 @@ do not launch a job merely because they inserted a row.
 
 The public Python surface uses `CoordinatorBroker` and `CoordinatorClient`. The public CLI is
 installed as `agc`; `python -m agcoord` remains an equivalent module entry point. Both expose
-`run`, `full`, `list`, `show`, `log`, `cancel`, `tui`, `land`, `migrate`, and `clear`. Worker
-and broker verbs used to detach or validate an admitted process are internal interfaces, not
-alternate user workflows.
+`run`, `full`, `list`, `show`, `log`, `cancel`, `tui`, `land`, `drain`, `resume`, `migrate`,
+and `clear`. Worker and broker verbs used to detach or validate an admitted process are
+internal interfaces, not alternate user workflows.
 
 ## Machine state and ownership
 
@@ -49,6 +49,44 @@ an unclean owner loss, a replacement preserves the live worker's lane and resour
 reruns its gate, waits for the exact process group to disappear, reclaims scratch, and then
 exposes the reported passed or typed-failed result. If the worker disappears before it can
 report a result, `interrupted` is the only safe terminal classification.
+
+## Durable maintenance drain
+
+Maintenance closes the submission race before waiting for an idle spool:
+
+```bash
+agc --json drain --reason "native host upgrade" >drain-receipt.json
+drain_id=$(jq -r '.drain_id' drain-receipt.json)
+# Perform owner-locked maintenance while the coordinator remains drained.
+agc resume "$drain_id"
+```
+
+`drain` takes an immediate SQLite write transaction that creates a durable `draining` marker
+and submission guards. The transaction is the linearization point: every competing submission
+commits completely before the guard or is refused completely after it. Native clients receive
+the stable `broker-draining` code; a direct or older SQLite writer receives
+`agcoord-maintenance-draining`. With `--json`, `agc` writes the native-style `code` and `message`
+refusal object to standard error. Repeating `drain` while a marker exists returns the original
+receipt instead of replacing its identity or reason.
+
+Queued and running rows remain owned work. The broker admits or recovers them, preserves
+resource and repository-lane ownership, and lets them reach a durable terminal result. A land
+whose authoritative publication transition has committed remains authoritative. `list`,
+`show`, `log`, the TUI, and named cancellation remain available while draining; new `run`,
+`full`, and `land` submissions and `clear` are refused. A replacement owner may start only to
+recover live rows while the state is `draining`. Once no live row remains, the owner commits
+`drained` and yields its ownership lock even when configured as a managed service; a drained
+spool cannot autostart an ordinary owner. A legacy protocol-4 owner that predates this command
+is asked to stop only after its live count reaches zero, and only through a pidfd for the PID
+the kernel reports as the current ownership-lock holder.
+
+The receipt contains exactly `state`, `drain_id`, `reason`, `started_at`, `protocol`, `live`,
+and `broker_pid`. The marker and its SQLite guards survive client exit, broker crash, host
+activation, migration, and rollback. `resume` requires the exact `drain-…` identifier, zero
+queued or running rows, and exclusive owner-lock acquisition. It removes the marker and guards
+in one transaction and returns the spool to `open`; a wrong or stale identifier cannot reopen
+submissions. Migration and rollback preserve the current marker across the protocol boundary
+and never resurrect a marker already removed by a successful resume.
 
 ## Repository lanes and resources
 
@@ -958,18 +996,21 @@ files.
 
 Protocol migration is explicit and out of band. Normal broker or client initialization fails
 closed on an older spool and names the required command; it never mutates schema on a hot
-path. Production upgrades must first drain, copy the whole owner-locked spool, and prove the
-installed binary's rollback against a disposable copy by following the
-[native migration runbook](native_migration.md). With no live old owner or jobs, run:
+path. Production upgrades must first install a durable drain, retain its exact receipt, copy
+the whole owner-locked spool, and prove the installed binary's rollback against a disposable
+copy by following the [native migration runbook](native_migration.md). Once the receipt says
+`drained`, run:
 
 ```bash
 agc migrate
 # or, for an intentionally isolated spool
 agc --state-dir /path/to/state migrate
+agc resume drain-0123456789ab
 ```
 
-After migration,
-`agc list` starts or joins a broker using the new protocol. Migration preserves only
+Migration leaves the maintenance marker installed, so no new owner or submission can race the
+remaining operator steps. Resume with the exact retained ID only after maintenance is complete;
+the next `agc list` then starts or joins a broker using the new protocol. Migration preserves only
 facts represented by the old schema; it never upgrades a legacy label into an exact-head
 receipt, fuses separate full and merge rows into a land, or invents a gate phase/status that
 the legacy row did not record. Protocol-1 and protocol-2 resource maps migrate as generic
@@ -980,13 +1021,14 @@ old work.
 
 Protocol-5 migration first produces and verifies
 a normalized protocol-4 rollback backup. An explicit rollback restores that baseline, replays
-terminal native history, and writes `invalid_gate_through_sequence`. Protocol-4 merge submission
-then ignores all full-gate receipts through that sequence, including an explicitly named one;
-run a new exact-head full gate before any legacy merge workflow. The installed `agc migrate`
-selects and verifies the configured native executable, requires the old owner and queue to be
-idle, and invokes that executable's migration command. Ordinary client commands refuse a live
-protocol-4 owner or an idle older spool and name this procedure; installing or building the
-native artifact alone never performs the transition. The canonical runbook also defines the
+terminal native history, writes `invalid_gate_through_sequence`, and retains the current drain
+marker rather than restoring a stale marker from the baseline. Protocol-4 merge submission then
+ignores all full-gate receipts through that sequence, including an explicitly named one; run a
+new exact-head full gate before any legacy merge workflow. The installed `agc migrate` selects
+and verifies the configured native executable, requires no owner or live row, and preserves the
+production drain across its schema transaction. Ordinary client commands refuse a live
+protocol-4 owner or an older spool that has not completed this procedure; installing or building
+the native artifact alone never performs the transition. The canonical runbook also defines the
 0.3 compatibility matrix, whole-spool backup, capability proof, rollback, Python production-path
 retirement, and safe actions for every migration refusal; this section defines only the durable
 protocol semantics.

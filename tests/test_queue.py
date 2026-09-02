@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import pytest
@@ -77,6 +78,7 @@ SNAPSHOT_KEYS = {
     "allocations",
     "resource_bindings",
     "resource_capabilities",
+    "maintenance",
     "active",
     "queued",
     "recent",
@@ -2492,6 +2494,330 @@ def test_first_client_refuses_a_missing_native_broker_without_python_fallback(
 
     assert not (state_dir / "broker.lock").exists()
     assert not (state_dir / "queue.sqlite3").exists()
+
+
+def test_drain_rejects_legacy_inserts_and_preserves_existing_work_until_resume(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    running = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 1},
+        idle_timeout=None,
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+
+    try:
+        run_id = _submit(
+            client,
+            _blocking_command(entered, release, "drain survivor"),
+            repository,
+        )
+        wait_for(entered.exists, "the pre-drain job did not start")
+        cancelled_id = _submit(
+            client,
+            _python("raise AssertionError('cancelled work ran')"),
+            repository,
+        )
+        assert client.status(cancelled_id)["status"] == "queued"
+
+        receipt = client.drain(reason="native host upgrade", wait=False)
+        assert receipt == {
+            "state": "draining",
+            "drain_id": receipt["drain_id"],
+            "reason": "native host upgrade",
+            "started_at": receipt["started_at"],
+            "protocol": PROTOCOL,
+            "live": 2,
+            "broker_pid": os.getpid(),
+        }
+        assert receipt["drain_id"].startswith("drain-")
+
+        with pytest.raises(CoordinatorError, match="draining|drain") as refused:
+            _submit(client, _python("print('must not run')"), repository)
+        assert refused.value.code == "broker-draining"
+
+        with sqlite3.connect(state_dir / "queue.sqlite3") as legacy:
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="agcoord-maintenance-draining",
+            ):
+                legacy.execute(
+                    "INSERT INTO runs(run_id) VALUES ('check-legacy-race')"
+                )
+
+        cancelled = client.cancel(cancelled_id)
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["exit_status"] == 130
+        release.touch()
+        assert _row(client, run_id, "passed")["exit_status"] == 0
+        wait_for(
+            lambda: not running.thread.is_alive(),
+            "the drained broker did not yield ownership",
+        )
+
+        drained = client.drain_status()
+        assert drained["state"] == "drained"
+        assert drained["drain_id"] == receipt["drain_id"]
+        assert drained["live"] == 0
+        assert drained["broker_pid"] is None
+        with pytest.raises(
+            CoordinatorError,
+            match="draining|drained|drain",
+        ) as refused:
+            _submit(client, _python("print('still must not run')"), repository)
+        assert refused.value.code == "broker-draining"
+
+        with pytest.raises(CoordinatorError, match="drain ID|identifier|mismatch"):
+            client.resume("drain-ffffffffffff")
+        assert client.resume(receipt["drain_id"]) == {
+            "state": "open",
+            "drain_id": receipt["drain_id"],
+            "resumed": True,
+        }
+
+        replacement = RunningCoordinator(
+            state_dir,
+            capacities={"jobs": 1},
+            idle_timeout=None,
+        )
+        replacement_client = replacement.start()
+        try:
+            resumed_id = _submit(
+                replacement_client,
+                _python("print('resumed')"),
+                repository,
+            )
+            assert _row(replacement_client, resumed_id, "passed")["exit_status"] == 0
+            assert replacement_client.snapshot()["maintenance"] is None
+        finally:
+            replacement.stop()
+    finally:
+        release.touch()
+        running.stop()
+
+
+def test_drain_safely_yields_an_idle_legacy_owner_without_an_idle_timeout(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    initialized = CoordinatorBroker(state_dir, idle_timeout=None)
+    initialized.close()
+    ready = tmp_path / "legacy-owner-ready"
+    script = """
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+lock_path = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+metadata = (
+    f"pid={os.getpid()}\\n"
+    "protocol=4\\n"
+    f"capacities={json.dumps({'jobs': 1}, separators=(',', ':'))}\\n"
+    "resource_bindings={}\\n"
+    "resource_capabilities={}\\n"
+    "started_at=2026-09-02T00:00:00+00:00\\n"
+)
+os.ftruncate(descriptor, 0)
+os.write(descriptor, metadata.encode())
+os.fsync(descriptor)
+ready.touch()
+while True:
+    time.sleep(1)
+"""
+    legacy = subprocess.Popen(
+        [sys.executable, "-c", script, str(state_dir / "broker.lock"), str(ready)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for(ready.exists, "the legacy owner did not acquire its lock")
+        client = CoordinatorClient(state_dir=state_dir, autostart=False)
+        receipt = client.drain(reason="legacy owner handoff", poll_interval=0.02)
+        assert receipt["state"] == "drained"
+        assert receipt["live"] == 0
+        assert receipt["broker_pid"] is None
+        assert legacy.wait(timeout=5) == -signal.SIGTERM
+        assert client.resume(receipt["drain_id"])["state"] == "open"
+    finally:
+        if legacy.poll() is None:
+            legacy.terminate()
+            legacy.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "started_at",
+    [
+        "2026-13-02T03:30:00+00:00",
+        "2026-09-02T03:30:00+01:00",
+    ],
+)
+def test_drain_status_fails_closed_for_an_invalid_durable_start_time(
+    tmp_path: Path,
+    started_at: str,
+):
+    state_dir = tmp_path / "state"
+    CoordinatorBroker(state_dir, idle_timeout=None).close()
+    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    receipt = client.drain(reason="marker validation")
+
+    with sqlite3.connect(state_dir / "queue.sqlite3") as database:
+        database.execute(
+            "UPDATE coordinator_meta SET value = ? "
+            "WHERE key = 'maintenance_started_at'",
+            (started_at,),
+        )
+
+    with pytest.raises(CoordinatorError, match="start time is invalid"):
+        client.drain_status()
+    assert receipt["state"] == "drained"
+
+
+def test_drain_preserves_an_authoritative_land_publication(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    running = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 1},
+        idle_timeout=None,
+    )
+    client = running.start()
+    checkout, _remote, branch, head = _publication_repository(
+        tmp_path / "repository"
+    )
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    publish_entered = tmp_path / "publish-entered"
+    publish_release = tmp_path / "publish-release"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head,
+        tag="drain-survivor",
+        event_log=events,
+        publish_entered=publish_entered,
+        publish_release=publish_release,
+    )
+
+    try:
+        land_id = client.submit_land(
+            "github",
+            123,
+            _land_gate_command(events, "drain-survivor"),
+            checkout=str(checkout),
+            resources={"jobs": 1},
+            caller_pid=os.getpid(),
+            environment=environment,
+        )
+        wait_for(publish_entered.exists, "land never entered authoritative publication")
+        assert client.status(land_id)["phase"] == "publishing"
+
+        receipt = client.drain(reason="publish-safe maintenance", wait=False)
+        assert receipt["state"] == "draining"
+        assert receipt["live"] == 1
+        with pytest.raises(CoordinatorError, match="authoritative|cannot be cancelled"):
+            client.cancel(land_id)
+        with pytest.raises(CoordinatorError, match="draining|drain"):
+            _submit(client, _python("print('must not run')"), checkout)
+
+        publish_release.touch()
+        row = _row(client, land_id, "passed")
+        assert row["phase"] == "complete"
+        assert row["gate_exit_status"] == 0
+        wait_for(
+            lambda: not running.thread.is_alive(),
+            "broker did not yield after the land publication completed",
+        )
+        drained = client.drain_status()
+        assert drained["state"] == "drained"
+        assert drained["drain_id"] == receipt["drain_id"]
+        assert events.read_text(encoding="utf-8") == (
+            "gate:drain-survivor\npublish:drain-survivor\n"
+        )
+    finally:
+        publish_release.touch()
+        running.stop()
+
+
+def test_drain_and_concurrent_submissions_have_one_atomic_order(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    running = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 4},
+        idle_timeout=None,
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    contestants = 16
+    start = threading.Barrier(contestants + 1)
+    accepted: list[str] = []
+    refused: list[str] = []
+    unexpected: list[BaseException] = []
+    lock = threading.Lock()
+
+    def submit(index: int) -> None:
+        contender = CoordinatorClient(state_dir=state_dir, autostart=False)
+        start.wait()
+        try:
+            run_id = _submit(
+                contender,
+                _python(f"print('race {index}')"),
+                repository,
+            )
+        except CoordinatorError as exc:
+            with lock:
+                refused.append(str(exc))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            with lock:
+                unexpected.append(exc)
+        else:
+            with lock:
+                accepted.append(run_id)
+
+    threads = [threading.Thread(target=submit, args=(index,)) for index in range(contestants)]
+    receipt: dict[str, object] | None = None
+    try:
+        for thread in threads:
+            thread.start()
+        start.wait()
+        receipt = client.drain(reason="linearization test", wait=False)
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert unexpected == []
+        assert len(accepted) + len(refused) == contestants
+        assert all("drain" in error for error in refused), refused
+        for run_id in accepted:
+            assert _row(client, run_id, "passed")["exit_status"] == 0
+        wait_for(
+            lambda: not running.thread.is_alive(),
+            "broker did not finish the pre-drain side of the submission race",
+        )
+        drained = client.drain_status()
+        assert drained["state"] == "drained"
+        assert drained["drain_id"] == receipt["drain_id"]
+        rows = client.snapshot()["recent"]
+        assert {row["run_id"] for row in rows} == set(accepted)
+    finally:
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=2)
+        if receipt is not None and not running.thread.is_alive():
+            try:
+                client.resume(receipt["drain_id"])
+            except CoordinatorError:
+                pass
+        running.stop()
 
 
 @pytest.mark.parametrize("kind", ["check", "full"])

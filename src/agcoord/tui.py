@@ -663,8 +663,17 @@ def build_app(
                 f"{name} {snapshot['allocations'].get(name, 0)}/{capacity}"
                 for name, capacity in snapshot["capacities"].items()
             )
+            maintenance = snapshot.get("maintenance")
+            maintenance_status = ""
+            if maintenance is not None:
+                maintenance_status = (
+                    f"{maintenance['state']} {maintenance['drain_id']} · "
+                    f"{maintenance['reason']} · "
+                )
+            broker = snapshot["broker_pid"]
             self._message = (
-                f"broker {snapshot['broker_pid']} · {allocation} · "
+                f"{maintenance_status}broker {broker if broker is not None else 'none'} · "
+                f"{allocation} · "
                 f"read {snapshot['captured_at']}"
             )
             self.query_one("#gate-status", Static).update(self._message)

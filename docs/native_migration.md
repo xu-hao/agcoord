@@ -1,9 +1,9 @@
 # Native broker migration and rollback
 
-This runbook moves one idle AGCoord state directory from the Python reference owner (durable
-protocol 1 through 4) to the Rust owner (protocol 5), proves the rollback path before changing
-the live spool, and defines when the old production path may be removed. It complements the
-[native host deployment runbook](native_host.md), which owns package installation, systemd,
+This runbook durably drains one AGCoord state directory, moves it from the Python reference
+owner (protocol 1 through 4) to the Rust owner (protocol 5), proves the rollback path before
+changing the live spool, and defines when the old production path may be removed. It complements
+the [native host deployment runbook](native_host.md), which owns package installation, systemd,
 AppArmor, delegated cgroups, and the enforced-host proof.
 
 ## Compatibility matrix
@@ -11,8 +11,10 @@ AppArmor, delegated cgroups, and the enforced-host proof.
 | Client or owner | State | Supported operation |
 | --- | --- | --- |
 | AGCoord 0.3.x Python client | Protocol 5, exact selected 0.3.x Rust identity | Normal CLI, TUI, adapter, and xdist operation |
-| AGCoord 0.3.x Python client | Idle protocol 1–4 | `agc migrate` only; ordinary commands refuse |
-| AGCoord 0.3.x Python client | Live protocol-4 Python owner | Refuse until the old owner and every job stop |
+| AGCoord 0.3.x Python client | Protocol 1–3 | `agc migrate` only; ordinary commands refuse |
+| AGCoord 0.3.x Python client | Open protocol 4 | `agc drain` or explicit migration; ordinary submissions never start the legacy owner |
+| AGCoord 0.3.x Python client | Draining/drained protocol 4 or 5 | Observe, explicitly cancel, migrate/rollback while fully drained, or resume with the exact drain ID |
+| AGCoord 0.3.x Python client | Live protocol-4 Python owner | Install a durable drain; accepted work finishes before the old owner yields |
 | Protocol-4 Python reference owner | Protocol 4 | Rollback inspection and compatibility testing only; never automatic 0.3 startup |
 | Protocol-4 Python reference owner | Protocol 5 | Refuse; run the installed Rust `rollback` command while idle first |
 | Rust 0.3.x broker | Protocol 1–4 | Explicit idle migration only; `serve` refuses |
@@ -48,9 +50,10 @@ service may start.
 ## Drain and retain a protocol-4 baseline
 
 Keep the old client environment and the downloaded old package until the rollback window closes.
-Before installing the new Python client, use that old client to list the exact state directory
-and wait until both its active and queued arrays are empty. Do not infer idleness from process
-names or restart the owner to apply a new configuration.
+Install the matching 0.3 client in a separate environment, but do not change the live broker
+configuration yet. Use that client against the exact state directory to install the durable
+submission guard and wait for the accepted queue to finish. Do not infer idleness from process
+names or repeatedly race an idle-timeout window.
 
 Set explicit paths in one owner-only administrative shell:
 
@@ -58,12 +61,18 @@ Set explicit paths in one owner-only administrative shell:
 state=${XDG_STATE_HOME:-$HOME/.local/state}/agcoord
 backup_parent=$HOME/agcoord-migration-backups
 install -d -m 0700 "$backup_parent"
+agc --json --state-dir "$state" drain --reason "protocol 5 migration" \
+  >drain-receipt.json
+drain_id=$(jq -er 'select(.state == "drained" and .live == 0) | .drain_id' \
+  drain-receipt.json)
 ```
 
 Stage and validate the native host bundle as described in the host runbook. Staging is safe
-while jobs run; activation is not. Once the old queue is empty, wait for its on-demand owner to
-exit. Acquire the same ownership lock non-blockingly while copying the whole directory, including
-the database, WAL, SHM, configuration, logs, and lock metadata:
+while jobs run; activation is not. `drain` atomically rejects every later submission, allows
+already queued/running rows to reach their normal result, commits `drained`, and makes the old
+owner yield even if it has no idle timeout. Acquire the same ownership lock non-blockingly while
+copying the whole directory, including the database, WAL, SHM, configuration, logs, lock
+metadata, durable drain keys, and SQLite guards:
 
 ```bash
 backup="$backup_parent/protocol4-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -74,9 +83,10 @@ find "$backup" -xdev -type f -print0 | sort -z | xargs -0 sha256sum \
   >"$backup_parent/$(basename "$backup").sha256"
 ```
 
-A failed `flock` means an owner still holds the spool; return to draining. Never copy only
-`queue.sqlite3`, copy while the owner lock is held elsewhere, or edit protocol metadata with
-SQLite. Keep the backup and checksum manifest owner-only.
+A failed `flock` means an owner still holds the spool; inspect the retained drain receipt and
+wait for accepted work or explicitly cancel named rows. Never copy only `queue.sqlite3`, copy
+while the owner lock is held elsewhere, resume merely to make the copy succeed, or edit protocol
+metadata with SQLite. Keep the backup, drain receipt, and checksum manifest owner-only.
 
 ## Prove rollback before touching the live spool
 
@@ -104,19 +114,25 @@ from a clean wheel installation against the exact release ELF.
 
 ## Install and migrate the live spool
 
-With the live state still idle, activate the staged host package. Activation takes the spool
-lock, independently verifies no queued or running rows, installs the fixed files, and does not
-start or restart the service. Write the production `config.json` from the host runbook only
-after the old owner has stopped; an older client may reject the new `managed_service` field.
+With the live state still drained, activate the staged host package using the retained ID.
+Activation takes the spool lock, independently verifies the exact durable marker and zero live
+rows, installs the fixed files, and does not start or restart the service. Write the production
+`config.json` from the host runbook only after the old owner has stopped; an older client may
+reject the new `managed_service` field.
 
 Install the matching 0.3 Python client, then run the one explicit schema transition before
-starting the service:
+resuming or starting the service:
 
 ```bash
+sudo ./install-native-host activate "$state" --drain-id "$drain_id"
+systemctl --user daemon-reload
 agc --json --state-dir "$state" migrate | tee migration-receipt.json
 jq -e '.changed and .from_protocol <= 4 and .to_protocol == 5' \
   migration-receipt.json
-systemctl --user daemon-reload
+agc --json --state-dir "$state" list | jq -e --arg drain_id "$drain_id" \
+  '.protocol == 5 and .maintenance.state == "drained" and
+   .maintenance.drain_id == $drain_id'
+agc --state-dir "$state" resume "$drain_id"
 systemctl --user start agcoord-broker.service
 systemctl --user --no-pager status agcoord-broker.service
 agc --json list | jq -e '.protocol == 5'
@@ -124,8 +140,10 @@ agc --json list | jq -e '.protocol == 5'
 
 `agc migrate` selects and verifies the configured native executable, requires no owner lock or
 live rows, checkpoints WAL completely, writes and verifies a mode-`0600` rollback database, and
-then changes native ownership metadata atomically. Building or installing either distribution
-never migrates a spool implicitly.
+then changes native ownership metadata atomically. It preserves the exact drain marker and
+guards, so migration cannot reopen submissions. Exact-ID `resume` removes them only after all
+owner-locked maintenance succeeds. Building or installing either distribution never migrates
+a spool implicitly.
 
 On the supported Ubuntu host, run the shipped enforced-host proof from the host runbook. Require
 the service preflight and an ordinary `cpu=1` job to prove the fixed AppArmor domains, global
@@ -135,18 +153,29 @@ the host enforcement boundary works.
 
 ## Roll back during the retained window
 
-Rollback is an explicit operational decision. First stop new submissions, let every queued and
-running row finish (or cancel named rows under an explicit cancellation policy), and stop the
-native service. Keep the installed native binary in place until its rollback command succeeds:
+Rollback is an explicit operational decision. Install a durable drain with the current 0.3
+client, retain its exact ID, let every queued and running row finish (or cancel named rows under
+an explicit cancellation policy), and stop the native service. Keep the installed native binary
+in place until its rollback command succeeds:
 
 ```bash
+agc --json --state-dir "$state" drain --reason "protocol 4 rollback" \
+  >rollback-drain-receipt.json
+drain_id=$(jq -er 'select(.state == "drained" and .live == 0) | .drain_id' \
+  rollback-drain-receipt.json)
 systemctl --user stop agcoord-broker.service
 /usr/libexec/agcoord/agcoord-broker rollback --state-dir "$state"
+agc --json --state-dir "$state" list | jq -e --arg drain_id "$drain_id" \
+  '.protocol == 4 and .maintenance.state == "drained" and
+   .maintenance.drain_id == $drain_id'
+agc --state-dir "$state" resume "$drain_id"
 ```
 
 The receipt must report `5 -> 4`. Rollback restores the verified normalized protocol-4 baseline
-and replays terminal native rows and leases. It records a cutoff that makes every earlier full
-gate stale; the old workflow must run a new exact-head full gate before any publication.
+and replays terminal native rows and leases. It preserves the currently installed drain and
+does not resurrect a stale marker copied into the older baseline. It records a cutoff that makes
+every earlier full gate stale; the old workflow must run a new exact-head full gate before any
+publication.
 
 Restore the old client environment and a protocol-4-compatible `config.json` before starting the
 reference owner. Do not leave `managed_service`, the native executable selection, or new binding
@@ -172,8 +201,11 @@ and follow either a supported native upgrade or the rollback procedure above.
 
 | Refusal or symptom | Meaning and safe response |
 | --- | --- |
-| Live `legacy protocol-4` owner | Keep the new client from submitting; drain with the retained old client and wait for the owner lock to release. |
-| Idle `queue uses protocol 4` | Back up and rehearse rollback, then run exactly one `agc migrate`. |
+| Live `legacy protocol-4` owner | Use the matching 0.3 client to install a durable drain; accepted work finishes and the old owner then yields. |
+| Idle `queue uses protocol 4` | Install and retain a durable drain, back up and rehearse rollback, then run exactly one `agc migrate`. |
+| `broker-draining` or `agcoord-maintenance-draining` | Expected submission refusal: maintenance owns the admission boundary. Observe/cancel accepted rows or resume with the exact retained ID after maintenance. |
+| `broker-drain-id-mismatch` | The supplied token is not the active drain. Recover the owner-only receipt or inspect the visible maintenance status; never guess or delete the marker. |
+| `host-drain-required` or `host-drain-incomplete` | Activation saw no complete `drained` marker. Return to `agc drain`; zero rows alone is not sufficient. |
 | `broker-migration-live-runs` | Rows are still queued/running; inspect and drain or explicitly cancel them. |
 | `broker-migration-backup-failed` | WAL checkpoint or private backup verification failed; preserve state and resolve storage/lock health before retrying. |
 | `broker-migration-backup-invalid` on rollback | Do not rewrite metadata; retain the spool and operator backup and investigate the recorded internal backup. |

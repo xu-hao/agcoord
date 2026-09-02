@@ -139,6 +139,8 @@ interface and must be smoke-tested from the built wheel.
    `0755` on only the fixed broker and three fixed helper names before running this verifier;
    content sidecars and the host archive's internal modes remain independently checked.
 6. Install the host bundle on the supported Ubuntu configuration through the staged runbook.
+   For an existing spool, retain the exact durable drain receipt, require activation to match its
+   ID, preserve it through migration, and resume only after owner-locked maintenance completes.
    Keep `kernel.apparmor_restrict_unprivileged_userns=1`, start the ordinary unprivileged managed
    service, and retain the shipped `cpu=1` receipt proving its AppArmor transition, cgroup
    namespace root, exact CPU control, and durable applied/peak evidence. Rehearse the operator

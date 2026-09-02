@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add durable `agc drain` and exact-token `agc resume` maintenance operations. Drain atomically
+  refuses new submissions while admitted checks and authoritative lands finish, survives broker
+  replacement and protocol migration/rollback, remains visible through JSON and the TUI, and is
+  now required—with its exact receipt—before replacing host files for an existing spool.
+
 ## 0.3.0 — 2026-09-01
 
 - Make `land` mechanically merge an advanced target into an unchanged same-repository request

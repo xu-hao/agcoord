@@ -17,6 +17,11 @@ and replacement ownership. Its client and stored-state corpora cover malformed v
 safety properties prove no duplicate execution, stale publication, unrelated process kill, or
 unverified enforcement claim.
 
+Contention coverage includes durable maintenance draining: competing submissions linearize
+entirely before or after the guard, accepted work and authoritative publication complete, a
+crashed owner is replaced only to recover live work, migration preserves the marker, host
+activation requires its exact ID, and only exact-ID resume reopens submissions.
+
 Each behavior contains one or more pytest node IDs for the Python reference and Rust integration
 test selectors for the native owner. Selectors exercise clients, commands, repositories,
 subprocesses, the Textual application, and test-owned kernel seams; documentation or source-text

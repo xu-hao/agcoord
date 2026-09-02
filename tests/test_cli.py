@@ -109,6 +109,7 @@ def _snapshot() -> dict[str, object]:
                 "reason": "backend-unavailable",
             }
         },
+        "maintenance": None,
         "active": [_row("check-active", "running", "check", "unit tests")],
         "queued": [
             _row(
@@ -143,7 +144,10 @@ def fake_client(monkeypatch):
         "log": [],
         "clear": [],
         "migrate": [],
+        "drain": [],
+        "resume": [],
         "follow": [],
+        "snapshot": [_snapshot()],
     }
 
     class Client:
@@ -158,7 +162,7 @@ def fake_client(monkeypatch):
             )
 
         def snapshot(self):
-            return deepcopy(_snapshot())
+            return deepcopy(observations["snapshot"][0])
 
         def status(self, run_id):
             observations["status"].append(run_id)
@@ -219,6 +223,26 @@ def fake_client(monkeypatch):
             observations["migrate"].append(True)
             return {"changed": True, "from_protocol": 4, "to_protocol": 5}
 
+        def drain(self, *, reason="maintenance", wait=True):
+            observations["drain"].append({"reason": reason, "wait": wait})
+            return {
+                "state": "draining" if not wait else "drained",
+                "drain_id": "drain-0123456789ab",
+                "reason": reason,
+                "started_at": "2026-09-02T03:30:00+00:00",
+                "protocol": 4,
+                "live": 1 if not wait else 0,
+                "broker_pid": 4001 if not wait else None,
+            }
+
+        def resume(self, drain_id):
+            observations["resume"].append(drain_id)
+            return {
+                "state": "open",
+                "drain_id": drain_id,
+                "resumed": True,
+            }
+
     def fake_follow(client, run_id, *, out):
         observations["follow"].append((client, run_id))
         print("followed exact job", file=out)
@@ -240,6 +264,44 @@ def test_parser_and_submission_validation_use_agc_command_name(fake_client):
     assert parser.format_usage().startswith("usage: agc")
     with pytest.raises(CoordinatorError, match=r"^agc run needs a command after --$"):
         cli.run(parser.parse_args(["run"]), out=StringIO())
+
+
+def test_json_cli_keeps_the_machine_readable_drain_refusal(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+):
+    class RefusingClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            raise CoordinatorError(
+                "coordinator is draining; new submissions are refused",
+                code="broker-draining",
+            )
+
+    monkeypatch.setattr(cli, "CoordinatorClient", RefusingClient)
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "run",
+                "--checkout",
+                str(tmp_path),
+                "--",
+                "true",
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "code": "broker-draining",
+        "message": "coordinator is draining; new submissions are refused",
+    }
 
 
 @pytest.mark.parametrize("command", ["run", "full", "land"])
@@ -300,6 +362,27 @@ def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_
     assert cli.run(_args("clear"), out=cleared) == 0
     assert fake_client["clear"] == [True]
     assert "3" in cleared.getvalue()
+
+
+def test_human_list_shows_the_durable_maintenance_receipt(fake_client):
+    snapshot = fake_client["snapshot"][0]
+    snapshot["broker_pid"] = None
+    snapshot["maintenance"] = {
+        "state": "drained",
+        "drain_id": "drain-0123456789ab",
+        "reason": "native host upgrade",
+        "started_at": "2026-09-02T03:30:00+00:00",
+        "protocol": 4,
+        "live": 0,
+        "broker_pid": None,
+    }
+    output = StringIO()
+
+    assert cli.run(_args("list"), out=output) == 0
+    rendered = output.getvalue()
+    assert "drained as drain-0123456789ab" in rendered
+    assert "native host upgrade" in rendered
+    assert "0 live · broker none" in rendered
 
 
 @pytest.mark.parametrize("command_kind", ["run", "full"])
@@ -522,3 +605,55 @@ def test_migration_is_explicit_and_never_autostarts_a_broker(fake_client, tmp_pa
     ]
     assert "protocol 4" in output.getvalue()
     assert "to 5" in output.getvalue()
+
+
+def test_drain_and_resume_are_explicit_non_autostarting_cli_operations(
+    fake_client,
+    tmp_path: Path,
+):
+    fake_client["constructed"].clear()
+    state_dir = tmp_path / "state"
+
+    drained = StringIO()
+    assert cli.run(
+        _args(
+            "--state-dir",
+            str(state_dir),
+            "drain",
+            "--reason",
+            "native host upgrade",
+            "--no-wait",
+        ),
+        out=drained,
+    ) == 0
+    assert "drain-0123456789ab" in drained.getvalue()
+    assert "draining" in drained.getvalue()
+    assert fake_client["drain"] == [
+        {"reason": "native host upgrade", "wait": False}
+    ]
+
+    resumed = StringIO()
+    assert cli.run(
+        _args("--json", "resume", "drain-0123456789ab"),
+        out=resumed,
+    ) == 0
+    assert json.loads(resumed.getvalue()) == {
+        "drain_id": "drain-0123456789ab",
+        "resumed": True,
+        "state": "open",
+    }
+    assert fake_client["resume"] == ["drain-0123456789ab"]
+    assert fake_client["constructed"] == [
+        {
+            "state_dir": str(state_dir),
+            "checkout": Path.cwd(),
+            "autostart": False,
+            "thread": threading.get_ident(),
+        },
+        {
+            "state_dir": None,
+            "checkout": Path.cwd(),
+            "autostart": False,
+            "thread": threading.get_ident(),
+        },
+    ]

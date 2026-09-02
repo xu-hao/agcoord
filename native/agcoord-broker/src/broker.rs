@@ -6,7 +6,8 @@ use crate::platform::{
 };
 use crate::store::{
     Paths, RunRecord, allocations, blocked_by, connect, initialize_native, load_run, load_runs,
-    maintain_child_cpu_leases, map_database_error, now, validate_child_cpu_leases,
+    maintain_child_cpu_leases, maintenance_record, map_database_error, mark_maintenance_drained,
+    now, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
 use crate::{cgroup, project_quota, resources};
@@ -210,6 +211,28 @@ impl Broker {
         }
         let connection = initialize_native(&paths, &capacities)?;
         let runs = load_runs(&connection)?;
+        if let Some(maintenance) = maintenance_record(&connection)? {
+            let live = runs
+                .iter()
+                .filter(|run| matches!(run.status.as_str(), "queued" | "running"))
+                .count();
+            if maintenance.state == "drained" && live != 0 {
+                return Err(AppError::new(
+                    "broker-maintenance-invalid",
+                    "coordinator maintenance state is drained but live rows remain",
+                ));
+            }
+            if live == 0 {
+                mark_maintenance_drained(&connection)?;
+                return Err(AppError::new(
+                    "broker-drained",
+                    format!(
+                        "coordinator is drained as {}; resume it before starting a broker",
+                        maintenance.drain_id
+                    ),
+                ));
+            }
+        }
         validate_child_cpu_leases(&connection)?;
         maintain_child_cpu_leases(&connection)?;
         if cgroup_backend.is_none()
@@ -371,6 +394,10 @@ impl Broker {
                     |row| row.get(0),
                 )
                 .map_err(map_database_error)?;
+            if !has_live && maintenance_record(&connection)?.is_some() {
+                mark_maintenance_drained(&connection)?;
+                return Ok(());
+            }
             drop(connection);
             if has_live {
                 self.idle_since = None;

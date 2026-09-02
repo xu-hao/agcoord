@@ -70,7 +70,10 @@
       "domain": "tui",
       "description": "The real Textual application renders public queue identity and refreshes a live native snapshot.",
       "tests": {
-        "python_reference": ["tests/test_tui.py::test_queue_order_and_detail_keep_repository_resource_and_publication_identity"],
+        "python_reference": [
+          "tests/test_tui.py::test_queue_order_and_detail_keep_repository_resource_and_publication_identity",
+          "tests/test_tui.py::test_durable_maintenance_state_is_visible_without_a_broker"
+        ],
         "rust_native": ["client_compatibility::real_textual_refresh_renders_a_protocol_five_snapshot"]
       }
     },
@@ -109,6 +112,7 @@
         "python_reference": ["tests/test_queue.py::test_rollback_cutoff_prevents_reusing_any_pre_rollback_gate"],
         "rust_native": [
           "client_compatibility::migration_runbook_rehearses_backup_rollback_and_final_native_ownership",
+          "client_compatibility::protocol_four_drain_survives_native_migration_until_exact_resume",
           "scheduler::migration_and_rollback_preserve_history_and_reject_stale_gates"
         ]
       }
@@ -120,6 +124,25 @@
       "tests": {
         "python_reference": ["tests/test_queue.py::test_wal_writer_contention_does_not_stop_or_cancel_the_live_broker"],
         "rust_native": ["scheduler::transient_database_contention_keeps_the_same_owner_and_honors_timeout"]
+      }
+    },
+    {
+      "id": "contention.durable-maintenance-drain",
+      "domain": "contention",
+      "description": "Drain linearizes with submissions, preserves accepted work and authoritative publication, survives owner replacement, and resumes only by exact receipt.",
+      "tests": {
+        "python_reference": [
+          "tests/test_cli.py::test_human_list_shows_the_durable_maintenance_receipt",
+          "tests/test_cli.py::test_json_cli_keeps_the_machine_readable_drain_refusal",
+          "tests/test_queue.py::test_drain_rejects_legacy_inserts_and_preserves_existing_work_until_resume",
+          "tests/test_queue.py::test_drain_and_concurrent_submissions_have_one_atomic_order",
+          "tests/test_queue.py::test_drain_preserves_an_authoritative_land_publication",
+          "tests/test_queue.py::test_drain_safely_yields_an_idle_legacy_owner_without_an_idle_timeout"
+        ],
+        "rust_native": [
+          "client_compatibility::durable_drain_rejects_native_submissions_then_resumes_by_exact_id",
+          "client_compatibility::draining_native_spool_recovers_after_broker_crash"
+        ]
       }
     },
     {

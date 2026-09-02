@@ -96,6 +96,30 @@ def build_parser() -> argparse.ArgumentParser:
     state(commands.add_parser("clear", help="clear terminal history and logs while idle"))
     state(commands.add_parser("tui", help="open the machine queue terminal view"))
     state(commands.add_parser("migrate", help="explicitly migrate an idle spool"))
+    drain = state(
+        commands.add_parser(
+            "drain",
+            help="reject new submissions and let accepted work finish",
+        )
+    )
+    drain.add_argument(
+        "--reason",
+        default="maintenance",
+        help="operator-visible reason retained with the durable drain",
+    )
+    drain.add_argument(
+        "--no-wait",
+        dest="wait",
+        action="store_false",
+        help="return after installing the guard instead of waiting for ownership yield",
+    )
+    resume = state(
+        commands.add_parser(
+            "resume",
+            help="remove one exact drained maintenance guard",
+        )
+    )
+    resume.add_argument("drain_id", help="exact drain identifier returned by agc drain")
 
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
         command = state(commands.add_parser(name, help=help_text))
@@ -177,6 +201,32 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             print(f"AGCoord: protocol {result['to_protocol']} already current", file=out)
         return 0
 
+    if args.command in {"drain", "resume"}:
+        client = CoordinatorClient(
+            state_dir=args.state_dir,
+            checkout=checkout,
+            autostart=False,
+        )
+        result = (
+            client.drain(reason=args.reason, wait=args.wait)
+            if args.command == "drain"
+            else client.resume(args.drain_id)
+        )
+        if emit:
+            emit(result)
+        elif args.command == "drain":
+            print(
+                f"AGCoord: {result['drain_id']} is {result['state']} "
+                f"({result['live']} live); new submissions are refused",
+                file=out,
+            )
+        else:
+            print(
+                f"AGCoord: resumed {result['drain_id']}; submissions are open",
+                file=out,
+            )
+        return 0
+
     def client_factory() -> CoordinatorClient:
         return _client(args, checkout)
 
@@ -191,7 +241,22 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         if emit:
             emit(snapshot)
         else:
-            print(_table([*snapshot["active"], *snapshot["queued"], *snapshot["recent"]]), file=out)
+            maintenance = snapshot.get("maintenance")
+            if maintenance is not None:
+                broker_pid = maintenance["broker_pid"]
+                print(
+                    f"AGCoord: {maintenance['state']} as "
+                    f"{maintenance['drain_id']} · {maintenance['reason']} · "
+                    f"{maintenance['live']} live · broker "
+                    f"{broker_pid if broker_pid is not None else 'none'}",
+                    file=out,
+                )
+            print(
+                _table(
+                    [*snapshot["active"], *snapshot["queued"], *snapshot["recent"]]
+                ),
+                file=out,
+            )
         return 0
     if args.command == "show":
         row = client.status(args.run_id)
@@ -267,5 +332,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         return run(args)
     except CoordinatorError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        if args.json and exc.code is not None:
+            print(
+                json.dumps({"code": exc.code, "message": str(exc)}, sort_keys=True),
+                file=sys.stderr,
+            )
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 2
