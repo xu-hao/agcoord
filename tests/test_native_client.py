@@ -156,6 +156,42 @@ def test_selection_admits_this_release_line_and_refuses_the_previous_one(tmp_pat
         )
 
 
+def test_host_maintenance_selection_admits_the_outgoing_broker_line(tmp_path: Path):
+    outgoing = _identity_executable(tmp_path / "outgoing", version="0.3.2")
+    config = NativeBrokerConfig(path=str(outgoing), allow_development=True)
+
+    with pytest.raises(NativeClientError, match="version is unsupported"):
+        NativeBrokerCommand.select(config)
+
+    maintenance = NativeBrokerCommand.select_for_host_maintenance(config)
+    assert maintenance.identity.version == "0.3.2"
+    assert maintenance.identity.protocol == NATIVE_PROTOCOL
+    assert maintenance.identity.implementation == NATIVE_IMPLEMENTATION
+
+
+def test_host_maintenance_selection_keeps_every_other_trust_boundary(tmp_path: Path):
+    wrong_target = _identity_executable(
+        tmp_path / "wrong-target",
+        version="0.3.2",
+        target="aarch64-unknown-linux-gnu",
+    )
+    with pytest.raises(NativeClientError, match="target is unsupported"):
+        NativeBrokerCommand.select_for_host_maintenance(
+            NativeBrokerConfig(path=str(wrong_target), allow_development=True)
+        )
+
+    unversioned = _identity_executable(tmp_path / "unversioned", version="not-a-version")
+    with pytest.raises(NativeClientError, match="version is unsupported"):
+        NativeBrokerCommand.select_for_host_maintenance(
+            NativeBrokerConfig(path=str(unversioned), allow_development=True)
+        )
+
+    development = _identity_executable(tmp_path / "development", version="0.3.2")
+    with pytest.raises(NativeClientError, match="owned by root|development build"):
+        NativeBrokerCommand.select_for_host_maintenance(
+            NativeBrokerConfig(path=str(development), allow_development=False)
+        )
+
 def test_release_policy_rejects_a_user_owned_development_binary(tmp_path: Path):
     executable = _identity_executable(tmp_path / "broker")
     with pytest.raises(NativeClientError, match="owned by root|development build"):

@@ -4544,11 +4544,13 @@ class CoordinatorClient:
         checkout: str | os.PathLike[str] | None = None,
         autostart: bool = True,
         connect_timeout: float = 5.0,
+        host_maintenance: bool = False,
     ):
         if connect_timeout <= 0:
             raise ValueError("connect_timeout must be positive")
         self.paths = queue_paths(state_dir=state_dir, checkout=checkout)
         self.autostart = autostart
+        self.host_maintenance = host_maintenance
         self.connect_timeout = connect_timeout
         self._catalogue_instance: CoordinatorBroker | None = None
         self._native_command_instance: NativeBrokerCommand | None = None
@@ -4565,10 +4567,13 @@ class CoordinatorClient:
     def _native_command(self) -> NativeBrokerCommand:
         if self._native_command_instance is None:
             config = broker_config(self.paths.state_dir)
+            select = (
+                NativeBrokerCommand.select_for_host_maintenance
+                if self.host_maintenance
+                else NativeBrokerCommand.select
+            )
             try:
-                self._native_command_instance = NativeBrokerCommand.select(
-                    config.native_broker
-                )
+                self._native_command_instance = select(config.native_broker)
             except NativeClientError as exc:
                 raise CoordinatorError(str(exc)) from exc
         return self._native_command_instance

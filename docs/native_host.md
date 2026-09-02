@@ -254,7 +254,7 @@ agc host upgrade /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.ta
 ```
 
 The command verifies and stages the package while the current service remains available, drains
-accepted work to zero, retains the exact ID, refreshes `sudo` authorization, stops the service,
+accepted work to zero through the installed outgoing broker's own identity, retains the exact ID, refreshes `sudo` authorization, stops the service,
 activates only against that drain, reloads, resumes the same ID, restarts, verifies the installed
 identity, and runs the enforced-host proof. It refuses to run from an admitted job or against a
 nondefault, unsafe, fresh, or pre-protocol-5 spool. A failure before activation leaves the live

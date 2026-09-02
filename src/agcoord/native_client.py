@@ -25,6 +25,7 @@ NATIVE_IMPLEMENTATION = "rust-native"
 MAX_NATIVE_JSON_BYTES = 1024 * 1024
 _RELEASE_BUILD = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.4\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+_MAINTENANCE_NATIVE_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 _SUPPORTED_RELEASE_TARGET = "x86_64-unknown-linux-musl"
 _SUPPORTED_DEVELOPMENT_TARGETS = frozenset(
     {_SUPPORTED_RELEASE_TARGET, "x86_64-unknown-linux-gnu"}
@@ -64,6 +65,20 @@ class NativeBrokerCommand:
         return cls._select(configured, admitted_callback=False)
 
     @classmethod
+    def select_for_host_maintenance(
+        cls,
+        configured: NativeBrokerConfig,
+    ) -> "NativeBrokerCommand":
+        """Select the installed outgoing broker so one host upgrade can drain it.
+
+        A managed host upgrade must command the broker that is actually installed,
+        which is on the previous release line until activation replaces it. Every
+        other selection boundary still applies; only the client's own release-line
+        pin is widened, and the durable protocol must still match exactly.
+        """
+        return cls._select(configured, admitted_callback=False, host_maintenance=True)
+
+    @classmethod
     def select_for_admitted_callback(
         cls,
         configured: NativeBrokerConfig,
@@ -77,6 +92,7 @@ class NativeBrokerCommand:
         configured: NativeBrokerConfig,
         *,
         admitted_callback: bool,
+        host_maintenance: bool = False,
     ) -> "NativeBrokerCommand":
         path = Path(configured.path)
         _validate_host_platform()
@@ -123,7 +139,7 @@ class NativeBrokerCommand:
             raise NativeClientError(f"native broker executable is not executable: {path}")
         if callback_owner:
             _attest_admitted_callback(path)
-        identity = _read_identity(path)
+        identity = _read_identity(path, host_maintenance=host_maintenance)
         if identity.build == "development":
             if not configured.allow_development:
                 raise NativeClientError(
@@ -301,7 +317,7 @@ def _attest_admitted_callback(path: Path) -> None:
         )
 
 
-def _read_identity(path: Path) -> NativeBrokerIdentity:
+def _read_identity(path: Path, *, host_maintenance: bool = False) -> NativeBrokerIdentity:
     try:
         completed = subprocess.run(
             [str(path), "identity", "--json"],
@@ -341,7 +357,10 @@ def _read_identity(path: Path) -> NativeBrokerIdentity:
         )
     ):
         raise NativeClientError("native broker identity is incompatible with this client")
-    if not _SUPPORTED_NATIVE_VERSION.fullmatch(value["version"]):
+    admitted = (
+        _MAINTENANCE_NATIVE_VERSION if host_maintenance else _SUPPORTED_NATIVE_VERSION
+    )
+    if not admitted.fullmatch(value["version"]):
         raise NativeClientError(
             f"native broker version is unsupported by this client: {value['version']}"
         )
