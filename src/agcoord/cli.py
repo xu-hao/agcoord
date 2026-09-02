@@ -11,6 +11,7 @@ import time
 from typing import Iterable, TextIO
 
 from . import __version__
+from .native_host import install_native_host, upgrade_native_host
 from .queue import (
     RUN_ID_ENV,
     CoordinatorClient,
@@ -123,6 +124,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("drain_id", help="exact drain identifier returned by agc drain")
 
+    host = commands.add_parser("host", help="manage the installed native host")
+    host_commands = host.add_subparsers(dest="host_command", required=True)
+    host_install = state(
+        host_commands.add_parser(
+            "install",
+            help="install and prove a native host matching this agc client",
+        )
+    )
+    host_install.add_argument(
+        "package",
+        type=Path,
+        help="agcoord-native-host-x86_64-linux.tar.gz release package",
+    )
+    host_upgrade = state(
+        host_commands.add_parser(
+            "upgrade",
+            help="verify, activate, and prove one native-host release package",
+        )
+    )
+    host_upgrade.add_argument(
+        "package",
+        type=Path,
+        help="agcoord-native-host-x86_64-linux.tar.gz release package",
+    )
+
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
         command = state(commands.add_parser(name, help=help_text))
         command.add_argument("--label", default=name, help="short queue label")
@@ -184,6 +210,32 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         if args.json
         else None
     )
+
+    if args.command == "host" and args.host_command in {"install", "upgrade"}:
+        operation = (
+            install_native_host if args.host_command == "install" else upgrade_native_host
+        )
+        result = operation(
+            args.package.expanduser().resolve(),
+            state_dir=args.state_dir,
+            checkout=checkout,
+        )
+        if emit:
+            emit(result)
+        else:
+            if args.host_command == "upgrade":
+                summary = (
+                    f"upgraded native host to {result['version']}; "
+                    f"resumed {result['drain_id']}"
+                )
+            else:
+                summary = f"installed native host {result['version']}"
+            print(
+                f"AGCoord: {summary}; service {result['service']}; "
+                f"proof {result['proof_run_id']} passed",
+                file=out,
+            )
+        return 0
 
     if args.command == "migrate":
         result = CoordinatorClient(

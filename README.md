@@ -13,20 +13,37 @@ core package is forge-neutral; GitHub support is an optional adapter.
 
 ## Install and start
 
-Install the published Python client in a tool environment and the matching host package, which
-places the native broker at `/usr/libexec/agcoord/agcoord-broker`:
+Install the published Python client in a tool environment first, then install the exact matching
+native-host bundle. Replace `RELEASE_VERSION` with the version attached to the bundle and keep
+the package, all four sidecars, and all three helpers together in one owner-only directory:
 
 ```bash
-python -m pip install agcoord
+version=RELEASE_VERSION
+python -m pip install "agcoord==$version"
+chmod 0700 /path/to/native-host-bundle
+agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
 ```
+
+`agc host install` verifies the complete bundle, creates or validates the default managed
+configuration, performs the privileged activation, enables and starts the user service, checks
+the installed identity, and submits an enforced one-CPU proof. Upgrade in the same client-first
+order:
+
+```bash
+python -m pip install --upgrade "agcoord==$version"
+agc host upgrade /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
+```
+
+The low-level commands and failure recovery contract remain in the
+[native host runbook](docs/native_host.md).
 
 The client refuses to search `PATH` or fall back to the old Python broker. Source developers may
 select an absolute current-user-owned development build with the documented
 [`native_broker` configuration](docs/native_broker.md#executable-discovery); release installs
 require the root-owned static artifact.
 Production installation and upgrades use the staged package, long-lived user service, and
-AppArmor policy in the [native host runbook](docs/native_host.md); activation never restarts a
-broker while queued or running work remains.
+AppArmor policy; upgrade activation waits for a durable drain and never restarts a broker while
+queued or running work remains.
 
 The base package installs the supported Textual 8 release line (`textual>=8.2,<9`) for the
 terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
@@ -65,10 +82,13 @@ agc list
 agc tui
 ```
 
-State defaults to `${XDG_STATE_HOME:-~/.local/state}/agcoord`. Set
-`AGCOORD_STATE_DIR` or pass `--state-dir` to use a deliberate alternate spool.
-Machine capacity defaults to two concurrent job slots. One JSON file, `config.json` in the
-state directory, configures the broker that owns it:
+State defaults to `${XDG_STATE_HOME:-~/.local/state}/agcoord`. Set `AGCOORD_STATE_DIR` or pass
+`--state-dir` to use a deliberate alternate spool for an unmanaged coordinator; the fixed
+managed service and `agc host` operations accept only the default state. With no configuration,
+capacity defaults to two concurrent job slots. A fresh `agc host install` instead records the
+process's available CPU-affinity count as both `cpu` and `jobs` capacity and requires cgroup-v2
+CPU enforcement. One JSON file, `config.json` in the state directory, configures the broker that
+owns it:
 
 ```json
 {"capacities": {"jobs": 4, "cpu": 8, "browser": 1}, "database_timeout": 10}
