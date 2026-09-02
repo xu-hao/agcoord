@@ -13,6 +13,9 @@ versioning; dates use ISO 8601.
   exact namespace maps plus the restricted AppArmor preflight; general nested client operations
   retain the ordinary root-owner policy. Publication workers now preserve a virtual environment's
   Python entry-point instead of resolving it to a potentially stale base installation.
+- Normalize host-package creation modes and preserve archived modes during verification, so
+  package bytes are independent of the invoking umask and the atomic release gate validates the
+  artifact correctly under a restrictive worker umask.
 
 ## 0.3.1 — 2026-09-02
 
