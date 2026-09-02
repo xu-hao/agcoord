@@ -11,97 +11,66 @@ The coordinator is local infrastructure: one detached broker per OS user, a priv
 spool, per-job logs, and an optional terminal UI. It does not require a hosted service. The
 core package is forge-neutral; GitHub support is an optional adapter.
 
-## Install and start
+## Get started
 
-Install the published Python client in a tool environment first, then install the exact matching
-native-host bundle. Replace `RELEASE_VERSION` with the version attached to the bundle and keep
-the package, all four sidecars, and all three helpers together in one owner-only directory:
+AGCoord's production host runs on x86_64 Ubuntu with AppArmor ABI 4, unified cgroup v2 mounted
+read-write with `nsdelegate`, `kernel.apparmor_restrict_unprivileged_userns=1`, systemd 254 or
+newer, and Python 3.10 or newer. The broker itself is an ordinary unprivileged user service; no
+root daemon is installed. Full host requirements are in the
+[native host runbook](docs/native_host.md).
+
+### 1. Get the matching client and host bundle
+
+The Python client and the native host must be the same version. Install the client from PyPI and
+download that version's native-host bundle — the archive, all four `.sha256` sidecars, and the
+three helpers — from the matching `v<version>` GitHub release into one owner-only directory:
 
 ```bash
 version=RELEASE_VERSION
 python -m pip install "agcoord==$version"
 chmod 0700 /path/to/native-host-bundle
+```
+
+### 2. Install the native host
+
+```bash
 agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
 ```
 
 `agc host install` verifies the complete bundle, creates or validates the default managed
 configuration, performs the privileged activation, enables and starts the user service, checks
-the installed identity, and submits an enforced one-CPU proof. Upgrade in the same client-first
-order:
-
-```bash
-python -m pip install --upgrade "agcoord==$version"
-agc host upgrade /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
-```
-
-The low-level commands and failure recovery contract remain in the
+the installed identity, and submits an enforced one-CPU proof. It refuses an incomplete bundle, a
+mismatched client version, or a nondefault spool rather than activating a host it cannot prove.
+The low-level commands, upgrade path, and failure recovery contract are in the
 [native host runbook](docs/native_host.md).
 
-The client refuses to search `PATH` or fall back to the old Python broker. Source developers may
-select an absolute current-user-owned development build with the documented
-[`native_broker` configuration](docs/native_broker.md#executable-discovery); release installs
-require the root-owned static artifact.
-Production installation and upgrades use the staged package, long-lived user service, and
-AppArmor policy; upgrade activation waits for a durable drain and never restarts a broker while
-queued or running work remains.
+The client refuses to search `PATH` or fall back to the old Python broker. Release installs
+require the root-owned static artifact; source developers may instead select an absolute
+current-user-owned development build with the documented
+[`native_broker` configuration](docs/native_broker.md#executable-discovery).
 
-The base package installs the supported Textual 8 release line (`textual>=8.2,<9`) for the
-terminal UI. Textual 1 through 7 are not supported; a future Textual major is admitted only
-after its real-TUI behavior is validated.
-
-### Upgrading to 0.4.0
-
-Version 0.4.0 removes the implicit unbounded scratch directory. A run that declares neither a
-complete tmpfs policy nor a complete project-quota policy now receives no AGCoord-provided
-temporary directory, and its inherited `TMPDIR`, `TMP`, and `TEMP` values are removed. Before
-upgrading, audit admitted commands that relied on a private temporary directory and give each
-one an explicit tmpfs or project-quota declaration; the
-[native migration runbook](docs/native_migration.md) records that audit step. The host
-transition itself is unchanged: install the matching 0.4 client, then run `agc host upgrade`
-with the verified 0.4 bundle.
-
-If upgrading from 0.2.x or earlier, first apply the 0.3 native-owner transition below.
-
-### Upgrading to 0.3.0
-
-Version 0.3.0 replaces the production Python queue owner with the fixed, statically linked Rust
-broker and durable protocol 5. Keep the old client and state backup through a tested rollback
-window. Install the matching client, run `agc drain` to atomically close submissions while
-accepted work finishes, and retain its exact drain ID. Then install and activate the matching
-host bundle with that ID, rehearse migrate/rollback against a copy, migrate the guarded live
-spool explicitly, run `agc resume DRAIN_ID`, and start the managed service. The complete
-commands, compatibility matrix, refusal modes, and rollback procedure are in the
-[native migration runbook](docs/native_migration.md). Neither package installation nor service
-activation changes the spool implicitly.
-
-If upgrading directly from 0.1.x, first apply the 0.2 command and configuration changes below.
-
-Version 0.2.0 removes the `agcoord` console executable. Replace downstream shell commands,
-service units, and automation with `agc`; the PyPI project, Python import, stable state-directory
-name, and `python -m agcoord` entry point remain `agcoord`.
-
-Let every 0.1.x job finish and move capacity, resource
-binding, and cgroup-root values from `AGCOORD_CAPACITIES`, `AGCOORD_RESOURCE_BINDINGS`, and
-`AGCOORD_CGROUP_ROOT` into that state directory's single `config.json`; those three environment
-variables and the old comma-separated capacity syntax are no longer accepted. The 0.3 migration
-preserves historical meaning and never reinterprets legacy resource names as enforced limits.
-
-With the production host package configured, the first command asks systemd to start the
-long-lived user service; later shells and repositories join the same user-scoped coordinator.
-Explicit development binaries retain detached on-demand startup:
+### 3. Confirm the coordinator answers
 
 ```bash
 agc list
 agc tui
 ```
 
+With the production host package configured, the first command asks systemd to start the
+long-lived user service; later shells and repositories join the same user-scoped coordinator.
+Explicit development binaries retain detached on-demand startup. `agc tui` opens the terminal
+view and needs the supported Textual 8 release line (`textual>=8.2,<9`), which the base package
+installs. Textual 1 through 7 are not supported; a future Textual major is admitted only after
+its real-TUI behavior is validated.
+
+### 4. Set the capacities this machine really has
+
 State defaults to `${XDG_STATE_HOME:-~/.local/state}/agcoord`. Set `AGCOORD_STATE_DIR` or pass
-`--state-dir` to use a deliberate alternate spool for an unmanaged coordinator; the fixed
-managed service and `agc host` operations accept only the default state. With no configuration,
-capacity defaults to two concurrent job slots. A fresh `agc host install` instead records the
-process's available CPU-affinity count as both `cpu` and `jobs` capacity and requires cgroup-v2
-CPU enforcement. One JSON file, `config.json` in the state directory, configures the broker that
-owns it:
+`--state-dir` to use a deliberate alternate spool for an unmanaged coordinator; the fixed managed
+service and `agc host` operations accept only the default state. A fresh `agc host install`
+records the process's available CPU-affinity count as both `cpu` and `jobs` capacity and requires
+cgroup-v2 CPU enforcement; with no configuration at all, capacity defaults to two concurrent job
+slots. One JSON file, `config.json` in the state directory, configures the broker that owns it:
 
 ```json
 {"capacities": {"jobs": 4, "cpu": 8, "browser": 1}, "database_timeout": 10}
@@ -110,6 +79,18 @@ owns it:
 `database_timeout` is the optional positive SQLite lock-wait limit in seconds and defaults to
 10. Current-protocol spools use WAL mode automatically so ordinary readers do not block behind
 writers; transient broker-pump and idle-check contention is retried.
+
+### 5. Submit your first coordinated check
+
+```bash
+agc run --label "unit tests" --resource cpu=2 -- python -m pytest -q
+agc list
+agc log run-0123456789ab --follow
+```
+
+That is the whole loop: declare what the command consumes, let the coordinator admit it when the
+machine has room, and watch it from any terminal. [Run work](#run-work) below covers standalone
+full validation, atomic gate-and-publish landing, and job management.
 
 ## Run work
 
