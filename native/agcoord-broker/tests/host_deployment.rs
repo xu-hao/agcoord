@@ -375,6 +375,28 @@ fn managed_service_uses_configured_capacity_and_has_no_idle_shutdown() {
     assert!(broker.try_wait().unwrap().is_none());
     let _ = broker.kill();
     let _ = broker.wait();
+    let unmarked = Command::new(BROKER)
+        .args([
+            "host-drain-check",
+            "--state-dir",
+            fixture.state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(refusal(&unmarked)["code"], "host-drain-required");
+    let marked = Command::new(BROKER)
+        .args([
+            "drain",
+            "--state-dir",
+            fixture.state.to_str().unwrap(),
+            "--drain-id",
+            "drain-0123456789ab",
+            "--reason",
+            "host test",
+        ])
+        .output()
+        .unwrap();
+    assert!(marked.status.success());
     let drained = Command::new(BROKER)
         .args([
             "host-drain-check",
@@ -390,7 +412,15 @@ fn managed_service_uses_configured_capacity_and_has_no_idle_shutdown() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&drained.stdout).unwrap(),
-        serde_json::json!({"drained": true, "live": 0, "protocol": 5})
+        serde_json::json!({
+            "drained": true,
+            "state": "drained",
+            "drain_id": "drain-0123456789ab",
+            "reason": "host test",
+            "started_at": serde_json::from_slice::<Value>(&marked.stdout).unwrap()["started_at"],
+            "live": 0,
+            "protocol": 5,
+        })
     );
 
     let connection = rusqlite::Connection::open(fixture.state.join("queue.sqlite3")).unwrap();
@@ -541,6 +571,8 @@ fn host_installer_stages_without_live_changes_and_activates_only_after_drain() {
         .args([
             "activate",
             fixture.state.to_str().unwrap(),
+            "--drain-id",
+            "drain-000000000000",
             "--root",
             image.to_str().unwrap(),
         ])
@@ -553,12 +585,47 @@ fn host_installer_stages_without_live_changes_and_activates_only_after_drain() {
         "refused activation changed the live binary"
     );
 
-    broker.kill().unwrap();
-    broker.wait().unwrap();
+    let drained = Command::new(BROKER)
+        .args([
+            "drain",
+            "--state-dir",
+            fixture.state.to_str().unwrap(),
+            "--drain-id",
+            "drain-abcdef012345",
+            "--reason",
+            "installer test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        drained.status.success(),
+        "host drain failed: {}",
+        String::from_utf8_lossy(&drained.stderr)
+    );
+    assert!(broker.wait().unwrap().success());
+    let wrong_drain = Command::new(&installer)
+        .args([
+            "activate",
+            fixture.state.to_str().unwrap(),
+            "--drain-id",
+            "drain-ffffffffffff",
+            "--root",
+            image.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_drain.status.success());
+    assert!(String::from_utf8_lossy(&wrong_drain.stderr).contains("invalid readiness record"));
+    assert!(
+        !installed.exists(),
+        "wrong drain ID changed the live binary"
+    );
     let activated = Command::new(&installer)
         .args([
             "activate",
             fixture.state.to_str().unwrap(),
+            "--drain-id",
+            "drain-abcdef012345",
             "--root",
             image.to_str().unwrap(),
         ])

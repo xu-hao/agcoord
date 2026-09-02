@@ -23,6 +23,8 @@ PUBLIC_COMMANDS = {
     "tui",
     "land",
     "migrate",
+    "drain",
+    "resume",
     "clear",
 }
 

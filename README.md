@@ -36,10 +36,11 @@ after its real-TUI behavior is validated.
 
 Version 0.3.0 replaces the production Python queue owner with the fixed, statically linked Rust
 broker and durable protocol 5. Keep the old client and state backup through a tested rollback
-window; drain the protocol-4 owner, install and activate the matching host bundle without
-starting it, rehearse migrate/rollback against a copy, migrate the idle live spool explicitly,
-and then start the managed service. The complete commands, compatibility matrix, refusal modes,
-and rollback procedure are in the
+window. Install the matching client, run `agc drain` to atomically close submissions while
+accepted work finishes, and retain its exact drain ID. Then install and activate the matching
+host bundle with that ID, rehearse migrate/rollback against a copy, migrate the guarded live
+spool explicitly, run `agc resume DRAIN_ID`, and start the managed service. The complete
+commands, compatibility matrix, refusal modes, and rollback procedure are in the
 [native migration runbook](docs/native_migration.md). Neither package installation nor service
 activation changes the spool implicitly.
 
@@ -166,10 +167,17 @@ agc show land-0123456789ab
 agc log land-0123456789ab --follow
 agc cancel land-0123456789ab
 agc clear
+# For planned maintenance:
+agc drain --reason "native host upgrade"
+agc resume drain-0123456789ab
 ```
 
 `clear` removes terminal history and its logs only. It refuses while queued or running work
 exists and never removes the spool, broker ownership, or migration history.
+`drain` durably and atomically refuses new submissions without cancelling work already admitted.
+It waits for those rows—including an authoritative land publication—to become terminal and for
+the broker to yield ownership. `list`, `show`, `log`, the TUI, and explicit cancellation remain
+available. Save the returned `drain-…` ID: only `resume` with that exact ID reopens submissions.
 
 The full operating contract, recovery behavior, TUI keys, and resource model are in
 [the coordinator guide](docs/coordinator.md). Package maintainers should also read
