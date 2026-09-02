@@ -156,12 +156,14 @@ def _install_fakes(
     proof=None,
     drain_id: str = "drain-0123456789ab",
     installed_broker: Path | None = None,
+    ownership_after: int = 0,
 ):
     from agcoord import native_host
 
     timeline: list[tuple[str, object]] = []
     clients: list[object] = []
     real_run = subprocess.run
+    probes = {"count": 0}
     monkeypatch.delenv(RUN_ID_ENV, raising=False)
     monkeypatch.delenv(STATE_DIR_ENV, raising=False)
 
@@ -230,7 +232,19 @@ def _install_fakes(
             timeline.append(("resume", drain_id))
             return {"state": "open", "drain_id": drain_id, "resumed": True}
 
+        def _owned(self) -> bool:
+            return probes["count"] >= ownership_after
+
+        def ping(self):
+            probes["count"] += 1
+            timeline.append(("ping", probes["count"]))
+            if not self._owned():
+                raise CoordinatorError(f"no gate broker owns {self.state_dir}")
+            return {"protocol": 5}
+
         def submit(self, command, **metadata):
+            if not self._owned():
+                raise CoordinatorError(f"no gate broker owns {self.state_dir}")
             timeline.append(
                 ("proof-submit", {"command": list(command), "metadata": metadata})
             )
@@ -310,6 +324,7 @@ def test_upgrade_stages_before_drain_and_proves_the_restarted_host(
             "command",
             [str(native_host.INSTALLED_BROKER), "identity", "--json"],
         ),
+        ("ping", 1),
         (
             "proof-submit",
             {
@@ -384,6 +399,32 @@ def test_upgrade_drains_a_previous_minor_installed_broker(monkeypatch, tmp_path:
     assert ("drain-selected", "0.3.2") in timeline
     assert clients[0].host_maintenance is True
     assert clients[1].host_maintenance is False
+
+def test_upgrade_waits_for_spool_ownership_after_starting_the_service(
+    monkeypatch,
+    tmp_path: Path,
+):
+    native_host, timeline, clients = _install_fakes(monkeypatch, ownership_after=2)
+    package = _release_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    _managed_state(state_dir, existing_spool=True)
+    monkeypatch.setattr(native_host, "MANAGED_STATE_DIR", state_dir.resolve())
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    result = native_host.upgrade_native_host(
+        package,
+        state_dir=state_dir,
+        checkout=checkout,
+    )
+
+    assert result["state"] == "complete"
+    assert result["proof_run_id"] == "check-native-host-proof"
+    probes = [entry for entry in timeline if entry[0] == "ping"]
+    assert len(probes) == 2
+    assert timeline.index(("ping", 2)) < next(
+        index for index, entry in enumerate(timeline) if entry[0] == "proof-submit"
+    )
 
 def test_activation_failure_leaves_the_exact_drain_and_service_stopped(
     monkeypatch,
@@ -532,6 +573,7 @@ def test_install_prepares_a_fresh_greedy_capacity_and_activates_without_a_drain(
             "command",
             [str(native_host.INSTALLED_BROKER), "identity", "--json"],
         ),
+        ("ping", 1),
         (
             "proof-submit",
             {
