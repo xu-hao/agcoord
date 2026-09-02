@@ -103,32 +103,62 @@ sudo ./install-native-host stage agcoord-native-host-x86_64-linux.tar.gz
 
 `stage` writes only `/var/lib/agcoord/native-host-pending/<package-sha256>` and an owner-only
 selection marker. It is safe while jobs run and does not change a live file, policy, unit, or
-service. Before activation, use `agc list` to require no queued or running row. If policy calls
-for cancellation instead, cancel each named row and wait until every result is terminal. Then:
+service. Install the matching Python client before changing the host files. For an existing
+spool, atomically close submissions and retain the exact durable drain receipt:
 
 ```bash
+state=${XDG_STATE_HOME:-$HOME/.local/state}/agcoord
+agc --json --state-dir "$state" drain --reason "native host activation" \
+  >native-host-drain.json
+drain_id=$(jq -er 'select(.state == "drained" and .live == 0) | .drain_id' \
+  native-host-drain.json)
 systemctl --user stop agcoord-broker.service
-sudo ./install-native-host activate "${XDG_STATE_HOME:-$HOME/.local/state}/agcoord"
+sudo ./install-native-host activate "$state" --drain-id "$drain_id"
 systemctl --user daemon-reload
 ```
 
-Activation takes the same exclusive spool ownership lock and independently counts live rows.
-It refuses if a broker still owns the lock or any queued/running row remains. It accepts an idle
-protocol-1-through-5 spool without changing it, installs and verifies the selected files, and
-deliberately does not start or restart the service. For a fresh owner-only state directory, the
-native maintenance holder creates `broker.lock` as that directory's owner with mode `0600` and
-keeps it locked through final identity verification. Existing locks with a wrong owner, mode,
-type, or link count are refused rather than repaired by a root shell.
+`drain` rejects every later submission at the database transaction boundary while accepted work
+finishes normally; it does not cancel those rows. The owner commits `drained` and yields its lock
+when the live count reaches zero. Activation then takes that same lock, validates the complete
+durable marker, independently confirms zero live rows, and requires `--drain-id` to match it
+exactly. It installs and verifies the selected files without starting or restarting the service.
+An unmarked, still-draining, mismatched-ID, live, or owned existing spool is refused.
+The holder's stable JSON codes are `host-drain-required`, `host-drain-incomplete`,
+`host-drain-live-work`, `host-drain-owner-live`, `host-drain-state-invalid`,
+`host-drain-lock-invalid`, and `host-drain-protocol-mismatch`. The installer additionally exits
+with status 2 before acquiring the lock when an existing spool has no syntactically valid
+`--drain-id` or a fresh spool is given one; a holder receipt that does not match the exact ID is
+an activation failure with status 1.
 
-For a fresh state directory, start the service. For an older spool, first complete the backup
-and rollback rehearsal and run the explicit transition in the
-[native migration runbook](native_migration.md), then start it:
+For a fresh owner-only state directory with no database, omit `--drain-id`. The native
+maintenance holder creates `broker.lock` as that directory's owner with mode `0600` and keeps it
+locked through final identity verification. A fresh spool rejects a drain ID. Existing locks
+with a wrong owner, mode, type, or link count are refused rather than repaired by a root shell.
+
+For a fresh state directory, activate without a token, reload, and start:
 
 ```bash
-agc migrate                 # omit for a fresh or already protocol-5 spool
+state=${XDG_STATE_HOME:-$HOME/.local/state}/agcoord
+sudo ./install-native-host activate "$state"
+systemctl --user daemon-reload
 systemctl --user start agcoord-broker.service
 agc list
 ```
+
+For an existing spool, first complete the backup and rollback rehearsal and follow the explicit
+transition in the [native migration runbook](native_migration.md). After activation and reload,
+keep the service stopped while completing the remaining steps:
+
+```bash
+agc migrate                 # omit for an already protocol-5 spool
+agc resume "$drain_id"
+systemctl --user start agcoord-broker.service
+agc list
+```
+
+Migration preserves the drain marker across protocol 4 to 5, and activation never removes it.
+Resume only after every owner-locked maintenance step has succeeded. If any step fails, leave
+the service stopped and the marker in place; rerunning `drain` reports the same ID.
 
 ## Enforced-host proof
 
@@ -164,10 +194,12 @@ does not apply these denials.
 ## Upgrade, recovery, and rollback
 
 For an upgrade, run `stage` while the current service remains available. Inspect the staged
-package digest, drain normally or apply an explicitly chosen cancellation policy, stop the user
-service, and run `activate`, `daemon-reload`, and `start` in that order. Never replace the live
-binary and ask systemd to restart while work remains. After start, inspect `systemctl --user
-status agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
+package digest, run `agc drain`, retain its exact ID, and stop the user service after the receipt
+says `drained`. Run `activate --drain-id ID`, `daemon-reload`, any required `migrate`, exact-ID
+`resume`, and `start` in that order. An explicitly chosen cancellation policy may shorten the drain,
+but cancellation never replaces its durable submission guard. Never replace the live binary and
+ask systemd to restart while work remains. After start, inspect `systemctl --user status
+agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
 
 `Restart=on-failure` recovers an unexpected broker exit without an idle shutdown. The durable
 spool remains the authority: the replacement adopts only identity-verified live workers and
@@ -177,11 +209,11 @@ stopped and repeat activation for the same selected package, which revalidates e
 file before start. Never delete or replace the state directory as host-package recovery.
 
 To roll back between protocol-compatible native packages, stage the previously retained bundle
-and use the identical drain, stop, activate, reload, and start sequence. Host activation never
-rewrites the spool. To return to the Python protocol-4 owner, first drain and stop the native
-service, run `/usr/libexec/agcoord/agcoord-broker rollback --state-dir PATH` while the current
-binary is still installed, then change the client/configuration according to the target release.
-That rollback restores
+and use the identical drain, stop, activate, reload, resume, and start sequence. Host activation
+never rewrites the spool. To return to the Python protocol-4 owner, first drain and stop the
+native service, run `/usr/libexec/agcoord/agcoord-broker rollback --state-dir PATH` while the
+current binary is still installed, then use the current client to `agc resume ID` before changing
+the client/configuration according to the target release. That rollback restores
 the verified protocol-4 baseline, replays terminal native history, and invalidates every old
 gate receipt through the recorded cutoff. Preserve the state directory and its rollback backup;
 a fresh exact-head gate is required before legacy publication. Follow the complete

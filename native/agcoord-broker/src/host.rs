@@ -1,6 +1,6 @@
 use crate::cgroup::sha256_prefix;
 use crate::error::{AppError, Result};
-use crate::store::PROTOCOL;
+use crate::store::{PROTOCOL, maintenance_record};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -703,7 +703,33 @@ fn drained_database(state_dir: &Path) -> Result<Value> {
             format!("{live} queued or running row(s) remain; drain or cancel them first"),
         ));
     }
-    Ok(json!({"drained": true, "live": live, "protocol": protocol}))
+    let maintenance = maintenance_record(&connection).map_err(|error| {
+        refusal(
+            "host-drain-state-invalid",
+            format!("durable maintenance state is invalid: {}", error.message),
+        )
+    })?;
+    let maintenance = maintenance.ok_or_else(|| {
+        refusal(
+            "host-drain-required",
+            "an existing spool requires 'agc drain' before host activation",
+        )
+    })?;
+    if maintenance.state != "drained" {
+        return Err(refusal(
+            "host-drain-incomplete",
+            "durable maintenance state is not drained",
+        ));
+    }
+    Ok(json!({
+        "drained": true,
+        "state": maintenance.state,
+        "drain_id": maintenance.drain_id,
+        "reason": maintenance.reason,
+        "started_at": maintenance.started_at,
+        "live": live,
+        "protocol": protocol,
+    }))
 }
 
 pub fn drain_check(state_dir: &Path) -> Result<Value> {

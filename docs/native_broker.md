@@ -127,6 +127,13 @@ migrated without reinterpretation. It adds these `coordinator_meta` values:
 }
 ```
 
+While maintenance is active, either protocol also carries the complete conditional key set
+`maintenance_state`, `maintenance_id`, `maintenance_reason`, and `maintenance_started_at`.
+The state is `draining` or `drained`, the ID is `drain-` plus 12 lowercase hexadecimal
+characters, and three named SQLite triggers guard run insertion and drained-owner activity.
+Missing keys or triggers invalidate the marker. Successful `resume` removes the complete set
+and its triggers atomically; absence of those keys means the coordinator is open.
+
 The owner lock is newline-delimited UTF-8 with unique keys. Clients reject missing, duplicate,
 unknown-version, invalid-JSON, or oversized metadata while the lock is held. A canonical native
 owner record is:
@@ -177,9 +184,9 @@ refusal without accepting work or replacing the live owner.
 The native executable implements the protocol-5 owner lock, SQLite spool initialization,
 submission validation, admission, repository barriers, queue-order-preserving round-robin
 selection, generic capacity accounting, cancellation, land-phase authority, history reads,
-worker observation, child leases, and explicit migration and rollback. The Python CLI, client,
-TUI, and pytest-xdist adapter use these native commands while retaining their public JSON and
-environment contracts.
+worker observation, child leases, durable drain/status/resume, and explicit migration and
+rollback. The Python CLI, client, TUI, and pytest-xdist adapter use these native commands while
+retaining their public JSON and environment contracts.
 
 `serve` validates the complete schema and every stored run before changing activity metadata,
 puts new and migrated databases in WAL mode, and uses `database_timeout` from the state
@@ -199,6 +206,14 @@ them. A running legacy merge or a land whose `publishing` transition committed r
 authoritative and is drained to a durable result. The identity-verified land-phase transaction
 and cancellation transaction both take the same immediate SQLite write lock, so exactly one
 wins their race.
+
+The maintenance `drain` operation is distinct from a process signal. It atomically installs the
+durable marker and submission trigger, then lets every accepted row follow its ordinary state
+machine without requesting cancellation. When the last live row becomes terminal, the owner
+commits `drained` and exits even in managed-service mode. If it crashes first, a replacement may
+start only while the marker is `draining` and live rows remain; it adopts or safely interrupts
+those rows and completes the handoff. A `drained` marker prevents activity writes and ordinary
+autostart until exact-ID `resume` holds the owner lock and removes every guard.
 
 ### Implemented worker boundary
 
@@ -337,6 +352,7 @@ The scheduler/state implementation freezes these refusal families:
 | Protocol and storage | `broker-protocol-mismatch`, `broker-protocol-unsupported`, `broker-schema-invalid`, `broker-row-invalid`, `broker-wal-unavailable`, `broker-database-busy`, `broker-database-error` |
 | Submission and admission | `broker-submission-invalid`, `broker-run-exists`, `broker-run-unknown`, `broker-run-terminal`, `broker-resource-unavailable`, `broker-active-state-invalid` |
 | Gate and land authority | `broker-gate-required`, `broker-gate-mismatch`, `stale-gate-verdict`, `broker-land-phase-invalid`, `broker-land-identity-mismatch`, `broker-land-cancelled`, `broker-publication-authoritative` |
+| Maintenance | `broker-draining`, `broker-drained`, `broker-not-draining`, `broker-maintenance-invalid`, `broker-drain-id-invalid`, `broker-drain-reason-invalid`, `broker-drain-id-mismatch`, `broker-drain-live-work`, `broker-resume-owner-live` |
 | Migration | `broker-migration-live-runs`, `broker-migration-row-invalid`, `broker-migration-state-changed`, `broker-migration-backup-failed`, `broker-migration-backup-invalid` |
 | Worker ownership | `broker-worker-start-failed`, `broker-worker-handshake-failed`, `broker-worker-identity-invalid`, `broker-worker-identity-mismatch`, `broker-worker-observation-failed`, `broker-worker-signal-failed`, `worker-privilege-drop-failed`, `worker-privilege-drop-unverified`, `worker-profile-transition-failed`, `worker-profile-transition-unverified`, `worker-descriptor-leak` |
 
@@ -390,6 +406,12 @@ explicit and requires:
 5. one atomic metadata transaction changing protocol and native-owner fingerprint; and
 6. a post-migration open by the exact native binary selected for startup.
 
+The production procedure establishes a durable drain before these steps. Migration preserves
+the exact current marker and guards across protocol 4 to 5, so it does not reopen submissions
+between schema transition and host startup. A later rollback likewise retains the current
+marker while restoring the verified baseline; it deliberately removes any maintenance marker
+found only in that older backup, so a previously resumed drain is never resurrected.
+
 Protocol 1 through 3 first use their already-defined migrations to protocol 4. Rollback is a
 separate explicit idle operation that restores the verified protocol-4 backup; neither client
 nor broker performs an implicit down-migration. A moved binary, changed build digest, target
@@ -410,12 +432,13 @@ cutoff, whether selected automatically or named explicitly, so publication requi
 gate after rollback.
 
 Python clients recognize protocol-4 history only to provide a controlled migration path. A
-default/autostart client never launches or joins the old Python owner: a live protocol-4 owner
-must finish and stop, and an idle protocol-1-through-4 spool requires `agc migrate`. The native
-broker refuses an old spool until that explicit migration succeeds, while the old Python
-`serve` entry point refuses protocol 5. Internal non-autostart compatibility access remains
-available only for migration tests and already admitted legacy workers; it is not a public
-startup fallback. Operators use the separately tested
+default/autostart client never launches or joins the old Python owner. The explicit drain path
+can guard a live protocol-4 spool and let its accepted work finish before the owner stops; an
+idle older spool otherwise requires `agc migrate`. The native broker refuses an old spool until
+that explicit migration succeeds, while the old Python `serve` entry point refuses protocol 5.
+Internal non-autostart compatibility access remains available only for migration tests,
+maintenance observation, and already admitted legacy workers; it is not a public startup
+fallback. Operators use the separately tested
 [native migration and rollback runbook](native_migration.md) for compatibility selection,
 whole-spool backup, rollback rehearsal, live transition, capability evidence, troubleshooting,
 and retirement of the old production path.

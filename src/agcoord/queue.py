@@ -9,6 +9,7 @@ module opens no network listener and has no dependency on a product repository.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
@@ -92,11 +93,33 @@ RUN_PHASES = frozenset({
 })
 _RESOURCE_NAME = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _SETUP_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_DRAIN_ID = re.compile(r"^drain-[0-9a-f]{12}$")
+_MAINTENANCE_TIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$"
+)
 _WORKER_LAUNCHER = "from agcoord.worker import launcher_main; launcher_main()\n"
+MAINTENANCE_REFUSAL = "agcoord-maintenance-draining"
+MAINTENANCE_STATES = frozenset({"draining", "drained"})
+MAINTENANCE_TRIGGER_NAMES = (
+    "agcoord_maintenance_reject_runs",
+    "agcoord_maintenance_reject_activity_insert",
+    "agcoord_maintenance_reject_activity_update",
+)
+MAINTENANCE_METADATA_KEYS = (
+    "maintenance_state",
+    "maintenance_id",
+    "maintenance_reason",
+    "maintenance_started_at",
+)
+MAX_MAINTENANCE_REASON = 256
 
 
 class CoordinatorError(RuntimeError):
     """A named local-coordinator refusal suitable for a terminal, not a traceback."""
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class _OwnerMetadataError(CoordinatorError):
@@ -457,7 +480,7 @@ def _spool_protocol(paths: CoordinatorPaths) -> int | None:
         return None
     try:
         uri = paths.database.resolve().as_uri() + "?mode=ro"
-        with sqlite3.connect(uri, uri=True) as database:
+        with closing(sqlite3.connect(uri, uri=True)) as database:
             row = database.execute(
                 "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
             ).fetchone()
@@ -475,6 +498,13 @@ def _spool_protocol(paths: CoordinatorPaths) -> int | None:
         raise CoordinatorError(
             f"gate queue database {paths.database} has invalid protocol metadata"
         ) from exc
+
+
+def _spool_initializing_error(error: CoordinatorError) -> bool:
+    detail = str(error)
+    return "no such table: coordinator_meta" in detail or (
+        "has no protocol metadata" in detail
+    )
 
 
 def _validate_resources(
@@ -600,6 +630,78 @@ def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
     return owner
 
 
+def _flock_holder_pid(path: Path) -> int | None:
+    """Return the kernel-reported PID holding one exclusive Linux flock."""
+    try:
+        details = path.stat()
+        lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise CoordinatorError(
+            f"cannot verify the gate broker ownership lock: {exc}"
+        ) from exc
+    expected = (os.major(details.st_dev), os.minor(details.st_dev), details.st_ino)
+    holders: set[int] = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6 or fields[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
+            continue
+        device = fields[5].split(":")
+        if len(device) != 3:
+            continue
+        try:
+            identity = (int(device[0], 16), int(device[1], 16), int(device[2]))
+            pid = int(fields[4])
+        except ValueError:
+            continue
+        if identity == expected and pid > 0:
+            holders.add(pid)
+    if len(holders) > 1:
+        raise CoordinatorError("gate broker ownership lock has multiple kernel holders")
+    return next(iter(holders), None)
+
+
+def _stop_verified_legacy_owner(
+    paths: CoordinatorPaths,
+    owner: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Signal only the exact process the kernel identifies as the legacy lock holder."""
+    pid = owner["pid"]
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return _read_broker_owner(paths)
+    except OSError as exc:
+        raise CoordinatorError(
+            f"cannot identify the drained legacy broker {pid}: {exc}"
+        ) from exc
+    try:
+        current = _read_broker_owner(paths)
+        if (
+            current is None
+            or current["protocol"] != PROTOCOL
+            or current["pid"] != pid
+        ):
+            return current
+        if _flock_holder_pid(paths.owner_lock) != pid:
+            refreshed = _read_broker_owner(paths)
+            if refreshed is None or refreshed["pid"] != pid:
+                return refreshed
+            raise CoordinatorError(
+                "cannot verify the drained legacy broker as the ownership-lock holder"
+            )
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return _read_broker_owner(paths)
+        except OSError as exc:
+            raise CoordinatorError(
+                f"cannot stop the drained legacy broker {pid}: {exc}"
+            ) from exc
+    finally:
+        os.close(pidfd)
+    return current
+
+
 def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
     """Read only the legacy protocol-4 owner used by the Python reference broker."""
     owner = _read_broker_owner(paths)
@@ -609,6 +711,373 @@ def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             f"Python reference broker needs {PROTOCOL}"
         )
     return owner
+
+
+def _maintenance_record(
+    db: sqlite3.Connection,
+) -> dict[str, str] | None:
+    """Read and strictly validate the durable maintenance marker."""
+    rows = db.execute(
+        "SELECT 'metadata', key, value FROM coordinator_meta "
+        "WHERE key IN (?, ?, ?, ?) "
+        "UNION ALL "
+        "SELECT 'trigger', name, NULL FROM sqlite_master WHERE type = 'trigger' "
+        "AND name IN (?, ?, ?)",
+        (*MAINTENANCE_METADATA_KEYS, *MAINTENANCE_TRIGGER_NAMES),
+    ).fetchall()
+    values = {
+        str(row[1]): str(row[2])
+        for row in rows
+        if row[0] == "metadata"
+    }
+    guards = {
+        str(row[1])
+        for row in rows
+        if row[0] == "trigger"
+    }
+    if not values:
+        if guards:
+            raise CoordinatorError(
+                "coordinator maintenance submission guards have no marker"
+            )
+        return None
+    if set(values) != set(MAINTENANCE_METADATA_KEYS):
+        raise CoordinatorError("coordinator maintenance metadata is incomplete")
+    if values["maintenance_state"] not in MAINTENANCE_STATES:
+        raise CoordinatorError("coordinator maintenance state is invalid")
+    if not _DRAIN_ID.fullmatch(values["maintenance_id"]):
+        raise CoordinatorError("coordinator maintenance drain ID is invalid")
+    reason = values["maintenance_reason"]
+    if not reason or len(reason) > MAX_MAINTENANCE_REASON or "\0" in reason:
+        raise CoordinatorError("coordinator maintenance reason is invalid")
+    started_at = values["maintenance_started_at"]
+    try:
+        parsed_start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CoordinatorError("coordinator maintenance start time is invalid") from exc
+    if (
+        not _MAINTENANCE_TIME.fullmatch(started_at)
+        or parsed_start.utcoffset() != timezone.utc.utcoffset(None)
+    ):
+        raise CoordinatorError("coordinator maintenance start time is invalid")
+    if guards != set(MAINTENANCE_TRIGGER_NAMES):
+        raise CoordinatorError(
+            "coordinator maintenance submission guards are missing"
+        )
+    return values
+
+
+def _install_maintenance_guards(db: sqlite3.Connection) -> None:
+    db.execute(
+        f"""
+        CREATE TRIGGER {MAINTENANCE_TRIGGER_NAMES[0]}
+        BEFORE INSERT ON runs
+        WHEN EXISTS (
+            SELECT 1 FROM coordinator_meta
+            WHERE key = 'maintenance_state'
+              AND value IN ('draining', 'drained')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, '{MAINTENANCE_REFUSAL}');
+        END
+        """
+    )
+    db.execute(
+        f"""
+        CREATE TRIGGER {MAINTENANCE_TRIGGER_NAMES[1]}
+        BEFORE INSERT ON coordinator_meta
+        WHEN NEW.key = 'last_activity'
+          AND EXISTS (
+              SELECT 1 FROM coordinator_meta
+              WHERE key = 'maintenance_state'
+                AND value = 'drained'
+          )
+        BEGIN
+            SELECT RAISE(ABORT, '{MAINTENANCE_REFUSAL}');
+        END
+        """
+    )
+    db.execute(
+        f"""
+        CREATE TRIGGER {MAINTENANCE_TRIGGER_NAMES[2]}
+        BEFORE UPDATE OF value ON coordinator_meta
+        WHEN OLD.key = 'last_activity'
+          AND EXISTS (
+              SELECT 1 FROM coordinator_meta
+              WHERE key = 'maintenance_state'
+                AND value = 'drained'
+          )
+        BEGIN
+            SELECT RAISE(ABORT, '{MAINTENANCE_REFUSAL}');
+        END
+        """
+    )
+
+
+def _remove_maintenance_guards(db: sqlite3.Connection) -> None:
+    for name in MAINTENANCE_TRIGGER_NAMES:
+        db.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def _maintenance_public(
+    record: Mapping[str, str],
+    *,
+    protocol: int,
+    live: int,
+    owner: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "state": record["maintenance_state"],
+        "drain_id": record["maintenance_id"],
+        "reason": record["maintenance_reason"],
+        "started_at": record["maintenance_started_at"],
+        "protocol": protocol,
+        "live": live,
+        "broker_pid": None if owner is None else owner["pid"],
+    }
+
+
+def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
+    expected = {
+        "state",
+        "drain_id",
+        "reason",
+        "started_at",
+        "protocol",
+        "live",
+        "broker_pid",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CoordinatorError("coordinator returned an invalid maintenance receipt")
+    if value["state"] not in MAINTENANCE_STATES:
+        raise CoordinatorError("coordinator returned an invalid maintenance state")
+    if not isinstance(value["drain_id"], str) or not _DRAIN_ID.fullmatch(
+        value["drain_id"]
+    ):
+        raise CoordinatorError("coordinator returned an invalid maintenance drain ID")
+    reason = value["reason"]
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > MAX_MAINTENANCE_REASON
+        or "\0" in reason
+    ):
+        raise CoordinatorError("coordinator returned an invalid maintenance reason")
+    started_at = value["started_at"]
+    try:
+        if (
+            not isinstance(started_at, str)
+            or not _MAINTENANCE_TIME.fullmatch(started_at)
+        ):
+            raise ValueError
+        parsed_start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if parsed_start.utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError
+    except ValueError as exc:
+        raise CoordinatorError(
+            "coordinator returned an invalid maintenance start time"
+        ) from exc
+    if value["protocol"] not in {PROTOCOL, NATIVE_PROTOCOL}:
+        raise CoordinatorError("coordinator returned an invalid maintenance protocol")
+    if (
+        not isinstance(value["live"], int)
+        or isinstance(value["live"], bool)
+        or value["live"] < 0
+    ):
+        raise CoordinatorError("coordinator returned an invalid maintenance live count")
+    broker_pid = value["broker_pid"]
+    if broker_pid is not None and (
+        not isinstance(broker_pid, int)
+        or isinstance(broker_pid, bool)
+        or broker_pid <= 0
+    ):
+        raise CoordinatorError("coordinator returned an invalid maintenance broker PID")
+    return value
+
+
+def _legacy_maintenance_status(
+    paths: CoordinatorPaths,
+    *,
+    transition: bool,
+) -> dict[str, Any]:
+    if not paths.database.is_file():
+        raise CoordinatorError(f"no gate queue database exists at {paths.database}")
+    configuration = broker_config(paths.state_dir)
+    timeout = (
+        DEFAULT_DATABASE_TIMEOUT
+        if configuration.database_timeout is None
+        else configuration.database_timeout
+    )
+    with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
+        db.row_factory = sqlite3.Row
+        record = _maintenance_record(db)
+        if record is None:
+            raise CoordinatorError("coordinator is not draining")
+        protocol_row = db.execute(
+            "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
+        ).fetchone()
+        try:
+            protocol = int(protocol_row["value"])
+        except (TypeError, ValueError) as exc:
+            raise CoordinatorError("coordinator protocol metadata is invalid") from exc
+        live = int(
+            db.execute(
+                "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')"
+            ).fetchone()[0]
+        )
+    owner = _read_broker_owner(paths)
+    if (
+        transition
+        and record["maintenance_state"] == "draining"
+        and live == 0
+        and owner is not None
+        and owner["protocol"] == PROTOCOL
+        and owner["pid"] != os.getpid()
+    ):
+        owner = _stop_verified_legacy_owner(paths, owner)
+    if (
+        transition
+        and record["maintenance_state"] == "draining"
+        and live == 0
+        and owner is None
+    ):
+        descriptor = os.open(paths.owner_lock, os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(descriptor, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                owner = _read_broker_owner(paths)
+            else:
+                with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
+                    db.row_factory = sqlite3.Row
+                    db.execute("BEGIN IMMEDIATE")
+                    current = _maintenance_record(db)
+                    current_live = int(
+                        db.execute(
+                            "SELECT COUNT(*) FROM runs "
+                            "WHERE status IN ('queued', 'running')"
+                        ).fetchone()[0]
+                    )
+                    if (
+                        current is not None
+                        and current["maintenance_state"] == "draining"
+                        and current_live == 0
+                    ):
+                        db.execute(
+                            "UPDATE coordinator_meta SET value = 'drained' "
+                            "WHERE key = 'maintenance_state'"
+                        )
+                        current = dict(current)
+                        current["maintenance_state"] = "drained"
+                    db.commit()
+                    if current is None:
+                        raise CoordinatorError("coordinator is not draining")
+                    record = current
+                    live = current_live
+                owner = None
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+    return _maintenance_public(record, protocol=protocol, live=live, owner=owner)
+
+
+def _legacy_begin_drain(
+    paths: CoordinatorPaths,
+    *,
+    drain_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    if not paths.database.is_file():
+        raise CoordinatorError(f"no gate queue database exists at {paths.database}")
+    configuration = broker_config(paths.state_dir)
+    timeout = (
+        DEFAULT_DATABASE_TIMEOUT
+        if configuration.database_timeout is None
+        else configuration.database_timeout
+    )
+    with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN IMMEDIATE")
+        protocol_row = db.execute(
+            "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
+        ).fetchone()
+        if protocol_row is None or protocol_row["value"] != str(PROTOCOL):
+            selected = None if protocol_row is None else protocol_row["value"]
+            raise CoordinatorError(
+                f"durable draining supports protocol {PROTOCOL} and {NATIVE_PROTOCOL}; "
+                f"state uses {selected!r}"
+            )
+        existing = _maintenance_record(db)
+        if existing is None:
+            started_at = _now()
+            db.execute(
+                "INSERT INTO coordinator_meta(key, value) VALUES ('last_activity', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(time.time()),),
+            )
+            _install_maintenance_guards(db)
+            for key, value in (
+                ("maintenance_state", "draining"),
+                ("maintenance_id", drain_id),
+                ("maintenance_reason", reason),
+                ("maintenance_started_at", started_at),
+            ):
+                db.execute(
+                    "INSERT INTO coordinator_meta(key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+        db.commit()
+    return _legacy_maintenance_status(paths, transition=True)
+
+
+def _legacy_resume(paths: CoordinatorPaths, drain_id: str) -> dict[str, Any]:
+    configuration = broker_config(paths.state_dir)
+    timeout = (
+        DEFAULT_DATABASE_TIMEOUT
+        if configuration.database_timeout is None
+        else configuration.database_timeout
+    )
+    descriptor = os.open(paths.owner_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(descriptor, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CoordinatorError(
+                "cannot resume while a broker or maintenance operation owns the queue"
+            ) from exc
+        with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            record = _maintenance_record(db)
+            if record is None:
+                raise CoordinatorError("coordinator is not draining")
+            if record["maintenance_id"] != drain_id:
+                raise CoordinatorError("maintenance drain ID does not match")
+            live = db.execute(
+                "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
+                "ORDER BY sequence"
+            ).fetchall()
+            if live:
+                raise CoordinatorError(
+                    "cannot resume while drained work remains live: "
+                    + ", ".join(str(row["run_id"]) for row in live)
+                )
+            _remove_maintenance_guards(db)
+            db.execute(
+                "DELETE FROM coordinator_meta WHERE key IN (?, ?, ?, ?)",
+                MAINTENANCE_METADATA_KEYS,
+            )
+            db.commit()
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    return {"state": "open", "drain_id": drain_id, "resumed": True}
 
 
 def _create_child_cpu_lease_table(db: sqlite3.Connection) -> None:
@@ -1180,6 +1649,28 @@ class CoordinatorBroker:
         try:
             self._prepare_worker_tmp_paths()
             self._remove_orphaned_worker_tmp()
+            with self._db_lock, self._connect() as db:
+                maintenance = _maintenance_record(db)
+                if maintenance is not None:
+                    live = int(
+                        db.execute(
+                            "SELECT COUNT(*) FROM runs "
+                            "WHERE status IN ('queued', 'running')"
+                        ).fetchone()[0]
+                    )
+                    if live == 0:
+                        db.execute(
+                            "UPDATE coordinator_meta SET value = 'drained' "
+                            "WHERE key = 'maintenance_state'"
+                        )
+                        raise CoordinatorError(
+                            f"coordinator is drained as {maintenance['maintenance_id']}; "
+                            "resume it before starting a broker"
+                        )
+                    if maintenance["maintenance_state"] == "drained":
+                        raise CoordinatorError(
+                            "coordinator maintenance state is drained but live rows remain"
+                        )
             self._touch()
             # Publish readable owner metadata last. Concurrent first clients already see
             # the flock and retry through this bounded preparation interval; none can
@@ -1329,6 +1820,8 @@ class CoordinatorBroker:
             return
         try:
             with self._db_lock, self._connect() as db:
+                if _maintenance_record(db) is not None:
+                    return
                 db.execute(
                     "INSERT INTO coordinator_meta(key, value) VALUES ('last_activity', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1401,17 +1894,18 @@ class CoordinatorBroker:
         selected_environment = _validate_environment(environment)
         run_id = f"{kind}-{uuid4().hex[:12]}"
         with self._db_lock, self._connect() as db:
-            db.execute(
-                """
-                INSERT INTO runs (
+            try:
+                db.execute(
+                    """
+                    INSERT INTO runs (
                     run_id, status, kind, phase, label, agent, repository_id, repository,
                     worktree_id, checkout, branch, head_sha, barrier, resources_json,
                     resource_contract_json, resource_receipt_json, resource_state_json,
                     caller_pid, command_json, environment_json, created_at
                 ) VALUES (?, 'queued', ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           '{}', ?, ?, ?, ?)
-                """,
-                (
+                    """,
+                    (
                     run_id,
                     kind,
                     label.strip(),
@@ -1430,8 +1924,15 @@ class CoordinatorBroker:
                     json.dumps(selected_command, separators=(",", ":")),
                     json.dumps(selected_environment, separators=(",", ":")),
                     _now(),
-                ),
-            )
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if MAINTENANCE_REFUSAL in str(exc):
+                    raise CoordinatorError(
+                        "coordinator is draining; new submissions are refused",
+                        code="broker-draining",
+                    ) from exc
+                raise
         self._touch()
         return run_id
 
@@ -1512,6 +2013,11 @@ class CoordinatorBroker:
         ]
         with self._db_lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if _maintenance_record(db) is not None:
+                raise CoordinatorError(
+                    "coordinator is draining; new submissions are refused",
+                    code="broker-draining",
+                )
             cutoff_row = db.execute(
                 "SELECT value FROM coordinator_meta "
                 "WHERE key = 'invalid_gate_through_sequence'"
@@ -1678,9 +2184,10 @@ class CoordinatorBroker:
         )
         run_id = f"land-{uuid4().hex[:12]}"
         with self._db_lock, self._connect() as db:
-            db.execute(
-                """
-                INSERT INTO runs (
+            try:
+                db.execute(
+                    """
+                    INSERT INTO runs (
                     run_id, status, kind, phase, label, agent, repository_id,
                     repository, worktree_id, checkout, branch, head_sha, barrier,
                     resources_json, resource_contract_json, resource_receipt_json,
@@ -1688,8 +2195,8 @@ class CoordinatorBroker:
                     caller_pid, command_json, environment_json, created_at
                 ) VALUES (?, 'queued', 'land', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 1,
                           ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?)
-                """,
-                (
+                    """,
+                    (
                     run_id,
                     label.strip(),
                     selected_agent,
@@ -1708,26 +2215,45 @@ class CoordinatorBroker:
                     json.dumps(selected_command, separators=(",", ":")),
                     json.dumps(selected_environment, separators=(",", ":")),
                     _now(),
-                ),
-            )
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if MAINTENANCE_REFUSAL in str(exc):
+                    raise CoordinatorError(
+                        "coordinator is draining; new submissions are refused",
+                        code="broker-draining",
+                    ) from exc
+                raise
         self._touch()
         return run_id
 
     def snapshot(self) -> dict[str, Any]:
         owner = _broker_owner(self.paths)
-        if owner is None:
-            raise CoordinatorError(
-                f"no gate broker owns {self.paths.state_dir}"
-            )
         with self._db_lock, self._connect() as db:
+            maintenance = _maintenance_record(db)
+            if owner is None and maintenance is None:
+                raise CoordinatorError(
+                    f"no gate broker owns {self.paths.state_dir}"
+                )
             rows = db.execute("SELECT * FROM runs ORDER BY sequence").fetchall()
         queued_rows = [row for row in rows if row["status"] == "queued"]
         active_rows = [row for row in rows if row["status"] == "running"]
         recent_rows = [row for row in rows if row["status"] in TERMINAL_STATUSES]
         recent_rows = list(reversed(recent_rows[-self.recent_limit:]))
+        capacities = owner["capacities"] if owner is not None else self.capacities
+        bindings = (
+            owner["resource_bindings"]
+            if owner is not None
+            else self.resource_bindings
+        )
+        capabilities = (
+            owner["resource_capabilities"]
+            if owner is not None
+            else {}
+        )
         used = self._allocations(active_rows)
         allocations = {
-            name: used.get(name, 0) for name in owner["capacities"]
+            name: used.get(name, 0) for name in capacities
         }
         queued = [
             self._public(
@@ -1735,19 +2261,29 @@ class CoordinatorBroker:
                 position=index,
                 active=active_rows,
                 queued=queued_rows,
-                capacities=owner["capacities"],
+                capacities=capacities,
             )
             for index, row in enumerate(queued_rows, start=1)
         ]
         self._touch()
         return {
             "protocol": PROTOCOL,
-            "broker_pid": owner["pid"],
+            "broker_pid": None if owner is None else owner["pid"],
             "captured_at": _now(),
-            "capacities": owner["capacities"],
+            "capacities": capacities,
             "allocations": allocations,
-            "resource_bindings": owner["resource_bindings"],
-            "resource_capabilities": owner["resource_capabilities"],
+            "resource_bindings": bindings,
+            "resource_capabilities": capabilities,
+            "maintenance": (
+                None
+                if maintenance is None
+                else _maintenance_public(
+                    maintenance,
+                    protocol=PROTOCOL,
+                    live=len(active_rows) + len(queued_rows),
+                    owner=owner,
+                )
+            ),
             "active": [self._public(row, position=None) for row in active_rows],
             "queued": queued,
             "recent": [self._public(row, position=None) for row in recent_rows],
@@ -1835,6 +2371,10 @@ class CoordinatorBroker:
         """Remove terminal history and logs without deleting live state or ownership."""
         with self._db_lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if _maintenance_record(db) is not None:
+                raise CoordinatorError(
+                    "cannot clear history while the coordinator is draining"
+                )
             live = db.execute(
                 "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
                 "ORDER BY sequence"
@@ -3898,10 +4438,9 @@ class CoordinatorBroker:
             db.execute("DELETE FROM runs WHERE run_id = ?", (row["run_id"],))
 
     def _should_idle_exit(self) -> bool:
-        if self.idle_timeout is None:
-            return False
         try:
             with self._db_lock, self._connect() as db:
+                maintenance = _maintenance_record(db)
                 activity = db.execute(
                     "SELECT value FROM coordinator_meta WHERE key = 'last_activity'"
                 ).fetchone()
@@ -3918,6 +4457,16 @@ class CoordinatorBroker:
             )
             return False
         if live:
+            return False
+        if maintenance is not None:
+            if maintenance["maintenance_state"] != "drained":
+                with self._db_lock, self._connect() as db:
+                    db.execute(
+                        "UPDATE coordinator_meta SET value = 'drained' "
+                        "WHERE key = 'maintenance_state'"
+                    )
+            return True
+        if self.idle_timeout is None:
             return False
         last_activity = float(activity["value"]) if activity is not None else 0.0
         return time.time() - last_activity >= self.idle_timeout
@@ -4054,15 +4603,77 @@ class CoordinatorClient:
                 arguments=arguments,
             )
         except NativeClientError as exc:
-            raise CoordinatorError(str(exc)) from exc
+            raise CoordinatorError(str(exc), code=exc.code) from exc
 
-    def _ensure_broker(self) -> dict[str, Any]:
+    def _maintenance_if_active(self) -> dict[str, Any] | None:
+        protocol = _spool_protocol(self.paths)
+        if protocol is None:
+            return None
+        configuration = broker_config(self.paths.state_dir)
+        timeout = (
+            DEFAULT_DATABASE_TIMEOUT
+            if configuration.database_timeout is None
+            else configuration.database_timeout
+        )
+        with closing(sqlite3.connect(self.paths.database, timeout=timeout)) as db:
+            db.row_factory = sqlite3.Row
+            if _maintenance_record(db) is None:
+                return None
+        if protocol == PROTOCOL:
+            try:
+                return _validated_maintenance_receipt(
+                    _legacy_maintenance_status(self.paths, transition=True)
+                )
+            except CoordinatorError as exc:
+                if str(exc) == "coordinator is not draining":
+                    return None
+                raise
+        if protocol == NATIVE_PROTOCOL:
+            try:
+                result = self._native_invoke("drain-status")
+            except CoordinatorError as exc:
+                cause = exc.__cause__
+                if (
+                    isinstance(cause, NativeClientError)
+                    and cause.code == "broker-not-draining"
+                ):
+                    return None
+                raise
+            if not isinstance(result, dict):
+                raise CoordinatorError(
+                    "native broker returned an invalid maintenance status"
+                )
+            return _validated_maintenance_receipt(result)
+        return None
+
+    def _recover_native_drain(
+        self,
+        maintenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Start only the owner needed to finish already accepted native work."""
+        if (
+            self.autostart
+            and maintenance["protocol"] == NATIVE_PROTOCOL
+            and maintenance["state"] == "draining"
+            and maintenance["live"] > 0
+            and maintenance["broker_pid"] is None
+        ):
+            self._start_broker()
+            refreshed = self._maintenance_if_active()
+            if refreshed is None:
+                raise CoordinatorError(
+                    "coordinator drain disappeared during native recovery"
+                )
+            return refreshed
+        return maintenance
+
+    def _ensure_broker(self, *, for_submission: bool = False) -> dict[str, Any]:
         deadline = time.monotonic() + self.connect_timeout
         last_metadata_error: _OwnerMetadataError | None = None
+        maintenance: dict[str, Any] | None = None
         while True:
             try:
                 owner = _read_broker_owner(self.paths)
-                break
             except _OwnerMetadataError as exc:
                 # flock ownership becomes visible a few instructions before its metadata
                 # write. Concurrent first clients wait through only that bounded interval;
@@ -4071,21 +4682,56 @@ class CoordinatorClient:
                 if time.monotonic() >= deadline:
                     raise CoordinatorError(str(exc)) from exc
                 time.sleep(0.01)
+                continue
+            if owner is not None:
+                break
+            try:
+                maintenance = self._maintenance_if_active()
+            except CoordinatorError as exc:
+                if _spool_initializing_error(exc) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
+                raise
+            break
         if owner is not None:
             if owner["protocol"] == NATIVE_PROTOCOL:
                 self._validate_native_owner(owner)
-            elif owner["protocol"] == PROTOCOL and self.autostart:
-                raise CoordinatorError(
-                    "a legacy protocol-4 Python broker still owns this state directory; "
-                    "let it finish and stop, then run 'agc migrate' before retrying"
-                )
-            elif owner["protocol"] != PROTOCOL:
+            if for_submission:
+                maintenance = self._maintenance_if_active()
+                if maintenance is not None:
+                    raise CoordinatorError(
+                        f"coordinator is {maintenance['state']} as "
+                        f"{maintenance['drain_id']}; new submissions are refused "
+                        "until resume",
+                        code="broker-draining",
+                    )
+            if owner["protocol"] == PROTOCOL:
+                if self.autostart:
+                    raise CoordinatorError(
+                        "a legacy protocol-4 Python broker still owns this state directory; "
+                        "let it finish and stop, then run 'agc migrate' before retrying"
+                    )
+            elif owner["protocol"] != NATIVE_PROTOCOL:
                 raise CoordinatorError(
                     f"gate coordinator protocol mismatch: broker has "
                     f"{owner['protocol']}; client supports {PROTOCOL} and "
                     f"{NATIVE_PROTOCOL}"
                 )
             return self._public_owner(owner)
+        if maintenance is not None:
+            if (
+                maintenance["protocol"] == NATIVE_PROTOCOL
+                and maintenance["state"] == "draining"
+                and maintenance["live"] > 0
+                and self.autostart
+            ):
+                self._start_broker()
+                return self.ping()
+            raise CoordinatorError(
+                f"coordinator is {maintenance['state']} as "
+                f"{maintenance['drain_id']}; new submissions are refused until resume",
+                code="broker-draining",
+            )
         if not self.autostart:
             if last_metadata_error is not None:
                 raise CoordinatorError(str(last_metadata_error))
@@ -4110,7 +4756,7 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
-        owner = self._ensure_broker()
+        owner = self._ensure_broker(for_submission=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_submit(
                 command,
@@ -4298,7 +4944,7 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
-        owner = self._ensure_broker()
+        owner = self._ensure_broker(for_submission=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_submit_merge(
                 adapter,
@@ -4432,7 +5078,7 @@ class CoordinatorClient:
         environment: Mapping[str, str] | None = None,
         synchronize_target: bool = True,
     ) -> str:
-        owner = self._ensure_broker()
+        owner = self._ensure_broker(for_submission=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_submit_land(
                 adapter,
@@ -4551,6 +5197,16 @@ class CoordinatorClient:
         return run_id
 
     def snapshot(self) -> dict[str, Any]:
+        maintenance = self._maintenance_if_active()
+        if maintenance is not None:
+            maintenance = self._recover_native_drain(maintenance)
+            if maintenance["protocol"] == PROTOCOL:
+                return self._catalogue().snapshot()
+            if maintenance["protocol"] == NATIVE_PROTOCOL:
+                result = self._native_invoke("snapshot")
+                if not isinstance(result, dict):
+                    raise CoordinatorError("native broker returned an invalid snapshot")
+                return result
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("snapshot")
@@ -4560,6 +5216,16 @@ class CoordinatorClient:
         return self._catalogue().snapshot()
 
     def status(self, run_id: str) -> dict[str, Any]:
+        maintenance = self._maintenance_if_active()
+        if maintenance is not None:
+            maintenance = self._recover_native_drain(maintenance)
+            if maintenance["protocol"] == PROTOCOL:
+                return self._catalogue().status(run_id)
+            if maintenance["protocol"] == NATIVE_PROTOCOL:
+                result = self._native_invoke("status", ("--run-id", run_id))
+                if not isinstance(result, dict):
+                    raise CoordinatorError("native broker returned an invalid run status")
+                return result
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("status", ("--run-id", run_id))
@@ -4569,6 +5235,18 @@ class CoordinatorClient:
         return self._catalogue().status(run_id)
 
     def cancel(self, run_id: str) -> dict[str, Any]:
+        maintenance = self._maintenance_if_active()
+        if maintenance is not None:
+            maintenance = self._recover_native_drain(maintenance)
+            if maintenance["protocol"] == PROTOCOL:
+                return self._catalogue().cancel(run_id)
+            if maintenance["protocol"] == NATIVE_PROTOCOL:
+                result = self._native_invoke("cancel", ("--run-id", run_id))
+                if not isinstance(result, dict):
+                    raise CoordinatorError(
+                        "native broker returned an invalid cancellation receipt"
+                    )
+                return result
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("cancel", ("--run-id", run_id))
@@ -4578,6 +5256,11 @@ class CoordinatorClient:
         return self._catalogue().cancel(run_id)
 
     def clear(self) -> dict[str, int]:
+        maintenance = self._maintenance_if_active()
+        if maintenance is not None:
+            raise CoordinatorError(
+                f"cannot clear history while the coordinator is {maintenance['state']}"
+            )
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("clear")
@@ -4599,6 +5282,100 @@ class CoordinatorClient:
         result = self._native_invoke("migrate")
         if not isinstance(result, dict):
             raise CoordinatorError("native broker returned an invalid migration receipt")
+        return result
+
+    def drain(
+        self,
+        *,
+        reason: str = "maintenance",
+        wait: bool = True,
+        poll_interval: float = 0.1,
+    ) -> dict[str, Any]:
+        """Atomically reject new submissions and optionally wait for ownership yield."""
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason.strip()) > MAX_MAINTENANCE_REASON
+            or "\0" in reason
+        ):
+            raise CoordinatorError(
+                f"maintenance reason must be 1 to {MAX_MAINTENANCE_REASON} characters"
+            )
+        if not isinstance(wait, bool):
+            raise CoordinatorError("maintenance wait must be boolean")
+        if poll_interval <= 0:
+            raise CoordinatorError("maintenance poll interval must be positive")
+        protocol = _spool_protocol(self.paths)
+        if protocol is None:
+            raise CoordinatorError(
+                f"no gate queue database exists at {self.paths.database}"
+            )
+        drain_id = f"drain-{uuid4().hex[:12]}"
+        if protocol == PROTOCOL:
+            result = _legacy_begin_drain(
+                self.paths,
+                drain_id=drain_id,
+                reason=reason.strip(),
+            )
+        elif protocol == NATIVE_PROTOCOL:
+            result = self._native_invoke(
+                "drain",
+                ("--drain-id", drain_id, "--reason", reason.strip()),
+            )
+        else:
+            raise CoordinatorError(
+                f"durable draining does not support queue protocol {protocol}"
+            )
+        result = _validated_maintenance_receipt(result)
+        if not wait:
+            return result
+        while result.get("state") != "drained":
+            result = self._recover_native_drain(result)
+            if result["state"] == "drained":
+                break
+            time.sleep(poll_interval)
+            result = self.drain_status()
+        return result
+
+    def drain_status(self) -> dict[str, Any]:
+        """Return the validated durable drain status without starting a broker."""
+        protocol = _spool_protocol(self.paths)
+        if protocol == PROTOCOL:
+            result = _legacy_maintenance_status(self.paths, transition=True)
+        elif protocol == NATIVE_PROTOCOL:
+            result = self._native_invoke("drain-status")
+        elif protocol is None:
+            raise CoordinatorError(
+                f"no gate queue database exists at {self.paths.database}"
+            )
+        else:
+            raise CoordinatorError(
+                f"durable draining does not support queue protocol {protocol}"
+            )
+        return _validated_maintenance_receipt(result)
+
+    def resume(self, drain_id: str) -> dict[str, Any]:
+        """Remove one exact drained guard while holding exclusive spool ownership."""
+        if not isinstance(drain_id, str) or not _DRAIN_ID.fullmatch(drain_id):
+            raise CoordinatorError("maintenance drain ID is invalid")
+        protocol = _spool_protocol(self.paths)
+        if protocol == PROTOCOL:
+            result = _legacy_resume(self.paths, drain_id)
+        elif protocol == NATIVE_PROTOCOL:
+            result = self._native_invoke(
+                "resume",
+                ("--drain-id", drain_id),
+            )
+        elif protocol is None:
+            raise CoordinatorError(
+                f"no gate queue database exists at {self.paths.database}"
+            )
+        else:
+            raise CoordinatorError(
+                f"durable draining does not support queue protocol {protocol}"
+            )
+        if result != {"state": "open", "drain_id": drain_id, "resumed": True}:
+            raise CoordinatorError("coordinator returned an invalid resume receipt")
         return result
 
     def acquire_child_cpu_lease(
@@ -4933,6 +5710,26 @@ class CoordinatorClient:
             raise CoordinatorError(
                 f"gate log limit must be between 1 and {MAX_LOG_BYTES}"
             )
+        maintenance = self._maintenance_if_active()
+        if maintenance is not None:
+            maintenance = self._recover_native_drain(maintenance)
+            if maintenance["protocol"] == PROTOCOL:
+                return self._catalogue().log(run_id, offset=offset, limit=limit)
+            if maintenance["protocol"] == NATIVE_PROTOCOL:
+                result = self._native_invoke(
+                    "log",
+                    (
+                        "--run-id",
+                        run_id,
+                        "--offset",
+                        str(offset),
+                        "--limit",
+                        str(limit),
+                    ),
+                )
+                if not isinstance(result, dict):
+                    raise CoordinatorError("native broker returned an invalid log page")
+                return result
         owner = self._ensure_broker()
         if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke(
@@ -4971,7 +5768,22 @@ class CoordinatorClient:
         return self._public_owner(owner)
 
     def _start_broker(self) -> None:
-        existing_protocol = _spool_protocol(self.paths)
+        try:
+            existing_protocol = _spool_protocol(self.paths)
+        except CoordinatorError as exc:
+            if not _spool_initializing_error(exc):
+                raise
+            deadline = time.monotonic() + self.connect_timeout
+            while True:
+                try:
+                    starting_owner = _read_broker_owner(self.paths)
+                except _OwnerMetadataError:
+                    starting_owner = None
+                if starting_owner is not None:
+                    return
+                if time.monotonic() >= deadline:
+                    raise exc
+                time.sleep(0.01)
         if existing_protocol is not None and existing_protocol != NATIVE_PROTOCOL:
             if 1 <= existing_protocol <= PROTOCOL:
                 raise CoordinatorError(
@@ -5075,6 +5887,23 @@ class CoordinatorClient:
                 return
             except CoordinatorError as exc:
                 last_error = exc
+                try:
+                    maintenance = self._maintenance_if_active()
+                except CoordinatorError as maintenance_error:
+                    if not _spool_initializing_error(maintenance_error):
+                        raise
+                    # The native process creates SQLite before its schema transaction
+                    # commits. Treat only that bounded partial-spool window like the
+                    # equally brief owner-metadata window handled by ping().
+                    last_error = maintenance_error
+                    time.sleep(0.05)
+                    continue
+                if (
+                    maintenance is not None
+                    and maintenance["state"] == "drained"
+                    and maintenance["live"] == 0
+                ):
+                    return
                 time.sleep(0.05)
         detail = f": {last_error}" if last_error else ""
         raise CoordinatorError(

@@ -109,6 +109,7 @@ def _snapshot() -> dict[str, object]:
         "allocations": {"jobs": 1, "cpu": 1, "browser": 1},
         "resource_bindings": {},
         "resource_capabilities": {},
+        "maintenance": None,
         "active": [_row("check-active", 1, "running")],
         "queued": [
             _row(
@@ -135,6 +136,31 @@ def _snapshot() -> dict[str, object]:
             )
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_durable_maintenance_state_is_visible_without_a_broker():
+    snapshot = _snapshot()
+    snapshot["broker_pid"] = None
+    snapshot["active"] = []
+    snapshot["queued"] = []
+    snapshot["maintenance"] = {
+        "state": "drained",
+        "drain_id": "drain-0123456789ab",
+        "reason": "native host upgrade",
+        "started_at": "2026-08-30T12:00:40+00:00",
+        "protocol": PROTOCOL,
+        "live": 0,
+        "broker_pid": None,
+    }
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await _settled(pilot)
+        screen = _screen_text(app)
+        assert "drained drain-0123456789ab" in screen
+        assert "native host upgrade" in screen
+        assert "broker none" in screen
 
 
 class FakeClient:

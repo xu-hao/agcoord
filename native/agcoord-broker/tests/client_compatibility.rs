@@ -39,6 +39,9 @@ struct BrokerGuard(u32);
 
 impl Drop for BrokerGuard {
     fn drop(&mut self) {
+        if !Path::new(&format!("/proc/{}", self.0)).exists() {
+            return;
+        }
         let _ = Command::new("/bin/kill")
             .args(["-TERM", &self.0.to_string()])
             .status();
@@ -52,6 +55,24 @@ impl Drop for BrokerGuard {
         let _ = Command::new("/bin/kill")
             .args(["-KILL", &self.0.to_string()])
             .status();
+    }
+}
+
+struct StateOwnerGuard(PathBuf);
+
+impl Drop for StateOwnerGuard {
+    fn drop(&mut self) {
+        if let Some((guard, _owner)) = owner_guard(&self.0) {
+            drop(guard);
+        }
+    }
+}
+
+struct ReleaseGuard(PathBuf);
+
+impl Drop for ReleaseGuard {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release\n");
     }
 }
 
@@ -737,6 +758,340 @@ fn concurrent_first_clients_converge_on_one_native_owner() {
 }
 
 #[test]
+fn durable_drain_rejects_native_submissions_then_resumes_by_exact_id() {
+    let temporary = TestDirectory::new("durable-drain");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let ready = temporary.path().join("ready");
+    let release = temporary.path().join("release");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+
+    let state_for_run = state.clone();
+    let checkout_for_run = checkout.clone();
+    let ready_for_run = ready.clone();
+    let release_for_run = release.clone();
+    let active = thread::spawn(move || {
+        python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state_for_run.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "--label".to_owned(),
+            "native drain survivor".to_owned(),
+            "--checkout".to_owned(),
+            checkout_for_run.to_string_lossy().into_owned(),
+            "--".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "touch \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.02; done".to_owned(),
+            "agcoord-drain".to_owned(),
+            ready_for_run.to_string_lossy().into_owned(),
+            release_for_run.to_string_lossy().into_owned(),
+        ])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready.exists(), "native pre-drain worker never became ready");
+
+    let caller_pid = std::process::id().to_string();
+    let queued = Command::new(&selected_broker)
+        .args([
+            "submit",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--run-id",
+            "check-native-drain-cancel",
+            "--kind",
+            "check",
+            "--label",
+            "native drain cancellation",
+            "--repository-id",
+            "repository",
+            "--repository",
+            checkout.to_str().unwrap(),
+            "--worktree-id",
+            "worktree",
+            "--checkout",
+            checkout.to_str().unwrap(),
+            "--branch",
+            "main",
+            "--resource",
+            "jobs=1",
+            "--caller-pid",
+            &caller_pid,
+            "--",
+            "/bin/false",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&queued, "queued native drain cancellation target");
+
+    let draining = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "drain".to_owned(),
+        "--reason".to_owned(),
+        "native host upgrade".to_owned(),
+        "--no-wait".to_owned(),
+    ]);
+    assert_success(&draining, "native drain request");
+    let draining = parse_json_output(&draining);
+    assert_eq!(draining["state"], "draining");
+    assert_eq!(draining["live"], 2);
+    assert_eq!(draining["reason"], "native host upgrade");
+    let drain_id = draining["drain_id"].as_str().unwrap().to_owned();
+
+    let cancelled = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "cancel".to_owned(),
+        "check-native-drain-cancel".to_owned(),
+    ]);
+    assert_success(&cancelled, "native cancellation during drain");
+    let cancelled = parse_json_output(&cancelled);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["exit_status"], 130);
+
+    let refused = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert!(!refused.status.success());
+    let refusal: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refusal["code"], "broker-draining");
+    assert!(refusal["message"].as_str().unwrap().contains("draining"));
+
+    let direct_refusal = Command::new(&selected_broker)
+        .args([
+            "submit",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--run-id",
+            "check-direct-drain",
+            "--kind",
+            "check",
+            "--label",
+            "direct drain refusal",
+            "--repository-id",
+            "repository",
+            "--repository",
+            checkout.to_str().unwrap(),
+            "--worktree-id",
+            "worktree",
+            "--checkout",
+            checkout.to_str().unwrap(),
+            "--branch",
+            "main",
+            "--resource",
+            "jobs=1",
+            "--caller-pid",
+            &caller_pid,
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!direct_refusal.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&direct_refusal.stderr).unwrap()["code"],
+        "broker-draining"
+    );
+
+    fs::write(&release, "release\n").unwrap();
+    let active = active.join().unwrap();
+    assert_success(&active, "native pre-drain worker");
+    assert_eq!(parse_json_output(&active)["status"], "passed");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let drained = loop {
+        let status = python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "drain".to_owned(),
+            "--no-wait".to_owned(),
+        ]);
+        assert_success(&status, "native drain status");
+        let status = parse_json_output(&status);
+        if status["state"] == "drained" {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native broker did not drain: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(drained["drain_id"], drain_id);
+    assert_eq!(drained["live"], 0);
+    assert!(drained["broker_pid"].is_null());
+
+    let wrong_resume = python_cli(&[
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        "drain-ffffffffffff".to_owned(),
+    ]);
+    assert!(!wrong_resume.status.success());
+    assert!(String::from_utf8_lossy(&wrong_resume.stderr).contains("does not match"));
+
+    let resumed = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        drain_id.clone(),
+    ]);
+    assert_success(&resumed, "native resume");
+    assert_eq!(
+        parse_json_output(&resumed),
+        json!({"state": "open", "drain_id": drain_id, "resumed": true})
+    );
+
+    let after = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert_success(&after, "post-resume native run");
+    assert_eq!(parse_json_output(&after)["status"], "passed");
+    let (_guard, _owner) = owner_guard(&state).expect("resumed broker disappeared");
+}
+
+#[test]
+fn draining_native_spool_recovers_after_broker_crash() {
+    let temporary = TestDirectory::new("drain-recovery");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let ready = temporary.path().join("ready");
+    let release = temporary.path().join("release");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+    let _cleanup = StateOwnerGuard(state.clone());
+    let _release_cleanup = ReleaseGuard(release.clone());
+
+    let state_for_run = state.clone();
+    let checkout_for_run = checkout.clone();
+    let ready_for_run = ready.clone();
+    let release_for_run = release.clone();
+    let active = thread::spawn(move || {
+        python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state_for_run.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "--label".to_owned(),
+            "native drain crash survivor".to_owned(),
+            "--checkout".to_owned(),
+            checkout_for_run.to_string_lossy().into_owned(),
+            "--".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "touch \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.02; done".to_owned(),
+            "agcoord-drain-recovery".to_owned(),
+            ready_for_run.to_string_lossy().into_owned(),
+            release_for_run.to_string_lossy().into_owned(),
+        ])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready.exists(), "native recovery worker never became ready");
+
+    let draining = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "drain".to_owned(),
+        "--no-wait".to_owned(),
+    ]);
+    assert_success(&draining, "native recovery drain");
+    let drain_id = parse_json_output(&draining)["drain_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let owner = fs::read_to_string(state.join("broker.lock")).unwrap();
+    let crashed_pid = owner
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .unwrap()
+        .to_owned();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", &crashed_pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{crashed_pid}")).exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{crashed_pid}")).exists(),
+        "crashed native broker remained live"
+    );
+
+    fs::write(&release, "release\n").unwrap();
+    let active = active.join().unwrap();
+    assert!(!active.status.success());
+    let recovered = parse_json_output(&active);
+    assert_eq!(recovered["status"], "interrupted");
+    assert_eq!(recovered["failure_reason"], "worker-result-lost");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let drained = loop {
+        let status = python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "drain".to_owned(),
+            "--no-wait".to_owned(),
+        ]);
+        assert_success(&status, "recovered drain status");
+        let status = parse_json_output(&status);
+        if status["state"] == "drained" {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement broker did not drain"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(drained["drain_id"], drain_id);
+    assert!(drained["broker_pid"].is_null());
+
+    let resumed = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        drain_id,
+    ]);
+    assert_success(&resumed, "recovered drain resume");
+}
+
+#[test]
 fn a_stale_selected_binary_cannot_replace_or_command_the_live_owner() {
     let temporary = TestDirectory::new("stale-binary");
     let state = temporary.path().join("state");
@@ -831,6 +1186,156 @@ fn python_migrate_routes_an_idle_protocol_four_spool_through_the_native_binary()
     assert_success(&check, "post-migration native check");
     assert_eq!(parse_json_output(&check)["status"], "passed");
     let (_guard, owner) = owner_guard(&state).expect("migrated spool has no native owner");
+    assert!(owner.contains("protocol=5\n"));
+}
+
+#[test]
+fn protocol_four_drain_survives_native_migration_until_exact_resume() {
+    let temporary = TestDirectory::new("drained-migrate");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+    let legacy = python_command(&[
+        "-c".to_owned(),
+        "import sys; from agcoord.queue import CoordinatorBroker; CoordinatorBroker(sys.argv[1], idle_timeout=None)".to_owned(),
+        state.to_string_lossy().into_owned(),
+    ]);
+    assert_success(&legacy, "protocol-four fixture");
+    let legacy_history = python_command(&[
+        "-c".to_owned(),
+        r#"
+import sys
+import threading
+import time
+from agcoord.queue import CoordinatorBroker
+
+broker = CoordinatorBroker(sys.argv[1], idle_timeout=None)
+thread = threading.Thread(target=broker.serve_forever)
+thread.start()
+assert broker.ready.wait(5)
+run_id = broker.submit(["/bin/true"], checkout=sys.argv[2])
+deadline = time.monotonic() + 5
+while broker.status(run_id)["status"] not in {"passed", "failed", "cancelled", "interrupted"}:
+    assert time.monotonic() < deadline
+    time.sleep(0.02)
+assert broker.status(run_id)["status"] == "passed"
+broker.close()
+thread.join(5)
+assert not thread.is_alive()
+"#
+        .to_owned(),
+        state.to_string_lossy().into_owned(),
+        checkout.to_string_lossy().into_owned(),
+    ]);
+    assert_success(&legacy_history, "protocol-four terminal history");
+
+    let drained = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "drain".to_owned(),
+        "--reason".to_owned(),
+        "native migration".to_owned(),
+    ]);
+    assert_success(&drained, "protocol-four drain");
+    let drained = parse_json_output(&drained);
+    assert_eq!(drained["state"], "drained");
+    assert_eq!(drained["protocol"], 4);
+    let drain_id = drained["drain_id"].as_str().unwrap().to_owned();
+
+    let migrated = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "migrate".to_owned(),
+    ]);
+    assert_success(&migrated, "drained native migration");
+    assert_eq!(
+        parse_json_output(&migrated),
+        json!({"changed": true, "from_protocol": 4, "to_protocol": 5})
+    );
+
+    let listed = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "list".to_owned(),
+    ]);
+    assert_success(&listed, "migrated drain observation");
+    let snapshot = parse_json_output(&listed);
+    assert_eq!(snapshot["protocol"], 5);
+    assert_eq!(snapshot["maintenance"]["state"], "drained");
+    assert_eq!(snapshot["maintenance"]["drain_id"], drain_id);
+    assert!(snapshot["broker_pid"].is_null());
+
+    let rolled_back = Command::new(&selected_broker)
+        .args(["rollback", "--state-dir", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_success(&rolled_back, "drained native rollback");
+    assert_eq!(
+        parse_json_output(&rolled_back),
+        json!({"changed": true, "from_protocol": 5, "to_protocol": 4})
+    );
+    let legacy_status = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "drain".to_owned(),
+        "--no-wait".to_owned(),
+    ]);
+    assert_success(&legacy_status, "rolled-back drain observation");
+    let legacy_status = parse_json_output(&legacy_status);
+    assert_eq!(legacy_status["protocol"], 4);
+    assert_eq!(legacy_status["drain_id"], drain_id);
+
+    let remigrated = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "migrate".to_owned(),
+    ]);
+    assert_success(&remigrated, "drained native remigration");
+    assert_eq!(
+        parse_json_output(&remigrated),
+        json!({"changed": true, "from_protocol": 4, "to_protocol": 5})
+    );
+
+    let refused = python_cli(&[
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("drained"));
+
+    let resumed = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        drain_id,
+    ]);
+    assert_success(&resumed, "post-migration resume");
+
+    let check = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert_success(&check, "post-resume native check");
+    let (_guard, owner) = owner_guard(&state).expect("resumed spool has no native owner");
     assert!(owner.contains("protocol=5\n"));
 }
 
