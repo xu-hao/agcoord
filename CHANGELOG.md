@@ -7,6 +7,9 @@ versioning; dates use ISO 8601.
 
 ## 0.4.0 — 2026-09-02
 
+- Move the client's supported native broker line to 0.4.x. A 0.4.0 Python client selects and
+  commands only a 0.4.x broker and refuses a retained 0.3.x executable, matching the release
+  compatibility matrix.
 - Stop granting implicit unbounded scratch to jobs that declare no scratch resources. The Python
   and native brokers now remove inherited `TMPDIR`, `TMP`, and `TEMP` values and create no per-run
   scratch directory unless the job requests a complete tmpfs or project-quota policy. A
