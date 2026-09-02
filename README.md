@@ -125,6 +125,11 @@ separate opt-in contracts. See
 [delegated cgroup setup](docs/coordinator.md#delegated-cgroup-v2-lifecycle) before enabling a
 required binding.
 
+Scratch is opt-in: a run that declares neither a complete tmpfs policy nor a complete
+project-quota policy receives no AGCoord-provided temporary directory, and inherited `TMPDIR`,
+`TMP`, and `TEMP` values are removed. Jobs that need accounted temporary storage must declare one
+of those providers explicitly.
+
 If a gate starts several worker-owning tools concurrently, admitted subprocesses can use
 the public Python [child CPU lease API](docs/coordinator.md#child-cpu-leases-for-parallel-tools)
 to divide the job's declared CPU budget fairly. Leases support exact or partial grants,

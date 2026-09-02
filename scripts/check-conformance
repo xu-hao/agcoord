@@ -15,7 +15,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MANIFEST = ROOT / "conformance" / "manifest-v1.json"
+DEFAULT_MANIFEST = ROOT / "conformance" / "manifest-v2.json"
 IMPLEMENTATIONS = ("python_reference", "rust_native")
 REQUIRED_DOMAINS = (
     "commands",
@@ -125,15 +125,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ConformanceError(f"conformance manifest {path} is invalid JSON: {exc}") from exc
     manifest = _object(document, "conformance manifest", MANIFEST_KEYS)
-    if manifest["manifest_version"] != 1:
-        raise ConformanceError("conformance manifest_version must be exactly 1")
+    if manifest["manifest_version"] != 2:
+        raise ConformanceError("conformance manifest_version must be exactly 2")
     if manifest["protocols"] != {"python_reference": 4, "rust_native": 5}:
         raise ConformanceError(
             "conformance protocols must identify Python reference 4 and Rust native 5"
         )
     if manifest["required_domains"] != list(REQUIRED_DOMAINS):
         raise ConformanceError(
-            "conformance required_domains must exactly match the version-1 contract"
+            "conformance required_domains must exactly match the version-2 contract"
         )
     if manifest["execution"] != {
         "rust_build_jobs": 4,
@@ -158,7 +158,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         behavior_ids.add(behavior_id)
         domain = _text(behavior["domain"], f"{subject}.domain")
         if domain not in REQUIRED_DOMAINS:
-            raise ConformanceError(f"{subject}.domain is not required by version 1")
+            raise ConformanceError(f"{subject}.domain is not required by version 2")
         covered_domains[domain] += 1
         _text(behavior["description"], f"{subject}.description")
         behavior["tests"] = _selectors(behavior["tests"], f"{subject}.tests")
@@ -327,7 +327,7 @@ def main() -> int:
         print(f"conformance refused: {exc}", file=sys.stderr)
         return 1
     print(
-        "conformance manifest v1 passed: "
+        "conformance manifest v2 passed: "
         f"{len(manifest['behaviors'])} behaviors, "
         f"{len(manifest['intentional_differences'])} intentional differences"
     )

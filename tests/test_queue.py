@@ -318,28 +318,17 @@ def _land_gate_command(
     *,
     entered: Path | None = None,
     release: Path | None = None,
-    temp_report: Path | None = None,
 ) -> list[str]:
     return _python(
         """
 from pathlib import Path
-import os
 import sys
-import tempfile
 import time
 
-event_log, tag, entered, release, temp_report = sys.argv[1:]
+event_log, tag, entered, release = sys.argv[1:]
 with Path(event_log).open("a", encoding="utf-8") as stream:
     stream.write(f"gate:{tag}\\n")
 print(f"gate transcript: {tag}", flush=True)
-if temp_report:
-    root = Path(tempfile.gettempdir())
-    Path(temp_report).write_text(str(root), encoding="utf-8")
-    protected = root / "protected" / "nested"
-    protected.mkdir(parents=True)
-    (protected / "payload").write_text("scratch", encoding="utf-8")
-    os.chmod(protected, 0)
-    os.chmod(protected.parent, 0)
 if entered:
     Path(entered).touch()
 while release and not Path(release).exists():
@@ -349,7 +338,6 @@ while release and not Path(release).exists():
         tag,
         entered or "",
         release or "",
-        temp_report or "",
     )
 
 
@@ -1742,7 +1730,7 @@ def test_land_rejects_dirty_or_nested_requests_without_accepting_a_row(
     assert snapshot["recent"] == []
 
 
-def test_land_holds_lane_resources_and_scratch_through_publication_fifo(
+def test_land_holds_lane_resources_through_publication_fifo(
     tmp_path: Path,
 ):
     running = RunningCoordinator(
@@ -1757,17 +1745,11 @@ def test_land_holds_lane_resources_and_scratch_through_publication_fifo(
     events = tmp_path / "events"
     first_publishing = tmp_path / "first-publishing"
     release_first = tmp_path / "release-first-publication"
-    scratch_report = tmp_path / "scratch-root"
-
     try:
         first_id = client.submit_land(
             "github",
             101,
-            _land_gate_command(
-                events,
-                "first",
-                temp_report=scratch_report,
-            ),
+            _land_gate_command(events, "first"),
             checkout=str(checkout),
             label="first atomic land",
             resources={"cpu": 1},
@@ -1802,14 +1784,12 @@ def test_land_holds_lane_resources_and_scratch_through_publication_fifo(
         wait_for(first_publishing.exists, "the first land never reached publication")
         first = client.status(first_id)
         second = client.status(second_id)
-        scratch_root = Path(scratch_report.read_text(encoding="utf-8"))
         assert first["status"] == "running"
         assert first["phase"] == "publishing"
         assert first["gate_exit_status"] == 0
         assert second["status"] == "queued"
         assert any(first_id in blocker for blocker in second["blocked_by"])
         assert client.snapshot()["allocations"] == {"jobs": 1, "cpu": 1}
-        assert scratch_root.exists()
         assert events.read_text(encoding="utf-8").splitlines() == [
             "gate:first",
             "publish:first",
@@ -1825,7 +1805,6 @@ def test_land_holds_lane_resources_and_scratch_through_publication_fifo(
 
         assert first["phase"] == second["phase"] == "complete"
         assert first["gate_exit_status"] == second["gate_exit_status"] == 0
-        assert not scratch_root.exists()
         assert events.read_text(encoding="utf-8").splitlines() == [
             "gate:first",
             "publish:first",
@@ -1958,7 +1937,6 @@ def test_replacement_broker_finishes_one_recovered_land_without_rerunning_gate(
     events = tmp_path / "events"
     gate_entered = tmp_path / "gate-entered"
     gate_release = tmp_path / "gate-release"
-    scratch_report = tmp_path / "scratch-root"
     owner = subprocess.Popen(
         _python(
             """
@@ -1994,7 +1972,6 @@ broker.serve_forever()
                 "recovered",
                 entered=gate_entered,
                 release=gate_release,
-                temp_report=scratch_report,
             ),
             checkout=str(checkout),
             resources={"jobs": 1},
@@ -2012,9 +1989,6 @@ broker.serve_forever()
         assert live["phase"] == "gating"
         worker_pid = live["worker_pid"]
         assert isinstance(worker_pid, int)
-        scratch_root = Path(scratch_report.read_text(encoding="utf-8"))
-        assert scratch_root.exists()
-
         os.kill(owner.pid, signal.SIGKILL)
         owner.wait(timeout=5)
         replacement = RunningCoordinator(state_dir, capacities={"jobs": 1})
@@ -2034,7 +2008,6 @@ broker.serve_forever()
             "gate:recovered",
             "publish:recovered",
         ]
-        assert not scratch_root.exists()
     finally:
         gate_release.touch()
         if owner.poll() is None:
@@ -2821,7 +2794,7 @@ def test_drain_and_concurrent_submissions_have_one_atomic_order(tmp_path: Path):
 
 
 @pytest.mark.parametrize("kind", ["check", "full"])
-def test_every_worker_uses_private_system_temp_until_terminal_reaping(
+def test_workers_without_scratch_do_not_receive_or_inherit_temp_paths(
     tmp_path: Path,
     kind: str,
 ):
@@ -2840,17 +2813,12 @@ def test_every_worker_uses_private_system_temp_until_terminal_reaping(
 import json
 import os
 from pathlib import Path
-import stat
 import sys
-import tempfile
 import time
 
 report, release = map(Path, sys.argv[1:])
-root = Path(tempfile.gettempdir())
 report.write_text(json.dumps({
-    "root": str(root),
-    "mode": stat.S_IMODE(root.stat().st_mode),
-    "variables": {name: os.environ[name] for name in ("TMPDIR", "TMP", "TEMP")},
+    "variables": {name: os.environ.get(name) for name in ("TMPDIR", "TMP", "TEMP")},
 }), encoding="utf-8")
 while not release.exists():
     time.sleep(0.01)
@@ -2866,57 +2834,67 @@ while not release.exists():
         )
         wait_for(report.exists, "the worker did not report its temporary root")
         observed = json.loads(report.read_text(encoding="utf-8"))
-        run_root = Path(observed["root"]).resolve()
-        system_temp = Path("/tmp").resolve()
-        assert run_root.is_relative_to(system_temp)
-        assert running.broker.paths.state_dir.resolve() not in (run_root, *run_root.parents)
-        assert run_root.name == run_id
-        assert observed["mode"] == 0o700
-        assert set(observed["variables"].values()) == {str(run_root)}
-        assert run_root.exists()
+        assert observed["variables"] == {"TMPDIR": None, "TMP": None, "TEMP": None}
+        assert not (running.broker.paths.worker_tmp / run_id).exists()
 
         release.touch()
         _row(client, run_id, "passed")
-        assert not run_root.exists()
     finally:
         release.touch()
         running.stop()
 
 
-def test_terminal_cleanup_reclaims_worker_created_mode_zero_trees(
-    coordinator,
-    tmp_path: Path,
-):
-    _broker, client = coordinator
-    repository = _repository(tmp_path / "repository")
-    report = tmp_path / "temp-root"
-    run_id = _submit(
-        client,
-        _python(
-            """
-from pathlib import Path
-import os
-import sys
-import tempfile
-
-report = Path(sys.argv[1])
-root = Path(tempfile.gettempdir())
-protected = root / "protected" / "nested"
-protected.mkdir(parents=True)
-(protected / "payload").write_bytes(b"x" * 1024)
-report.write_text(str(root), encoding="utf-8")
-os.chmod(protected, 0)
-os.chmod(protected.parent, 0)
-""",
-            report,
-        ),
-        repository,
+def test_land_without_scratch_does_not_receive_or_inherit_temp_paths(tmp_path: Path):
+    running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 1})
+    client = running.start()
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
     )
-    passed = _row(client, run_id, "passed")
-    run_root = Path(report.read_text(encoding="utf-8"))
+    bin_dir = _install_land_gh(tmp_path)
+    report = tmp_path / "land-temp-report.json"
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="no-scratch",
+        event_log=events,
+    )
+    environment.update(
+        {"TMPDIR": "/caller/tmp", "TMP": "/caller/tmp", "TEMP": "/caller/tmp"}
+    )
 
-    assert passed["status"] == "passed"
-    assert not run_root.exists()
+    try:
+        run_id = client.submit_land(
+            "github",
+            124,
+            _python(
+                """
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    name: os.environ.get(name) for name in ("TMPDIR", "TMP", "TEMP")
+}), encoding="utf-8")
+""",
+                report,
+            ),
+            checkout=str(checkout),
+            resources={"jobs": 1},
+            caller_pid=os.getpid(),
+            environment=environment,
+        )
+        _row(client, run_id, "passed")
+        assert json.loads(report.read_text(encoding="utf-8")) == {
+            "TMPDIR": None,
+            "TMP": None,
+            "TEMP": None,
+        }
+        assert not (running.broker.paths.worker_tmp / run_id).exists()
+    finally:
+        running.stop()
 
 
 def test_clear_refuses_live_work_then_removes_only_terminal_history_and_logs(
