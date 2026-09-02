@@ -17,11 +17,14 @@ individual sidecars. The tar archive contains only these root-owned host files:
 - the exact native identity and file-digest manifest, AGCoord license, and reviewed Rust
   dependency inventory under `/usr/share/doc/agcoord/`.
 
-The checker rejects a changed package checksum, unexpected path, symlink, non-root archive
-owner, unsafe mode, changed embedded file, mismatched identity, or invalid AppArmor policy. The
-installer rechecks the package before staging and rechecks the installed binary's digest and
-identity after activation. A production activation also requires a release musl identity and
-installs every live file as root-owned.
+The builder normalizes its creation umask to `022`, so archive directory modes and bytes do not
+depend on the invoking shell. The checker rejects a changed package checksum, unexpected path,
+symlink, non-root archive owner, unsafe mode, changed embedded file, mismatched identity, or
+invalid AppArmor policy. It preserves the archived permissions in its test-owned extraction, so
+it validates the artifact's modes independently of the caller's umask, including the broker's
+restrictive admitted worker umask. The installer rechecks the package before staging and rechecks
+the installed binary's digest and identity after activation. A production activation also
+requires a release musl identity and installs every live file as root-owned.
 
 The Python wheel intentionally contains no broker executable. “One executable” describes the
 statically linked Rust runtime, not a one-file installation: configuration, durable state,

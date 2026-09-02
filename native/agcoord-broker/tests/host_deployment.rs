@@ -455,7 +455,9 @@ fn host_bundle_is_reproducible_and_rejects_tampering() {
     let temporary = TestDirectory::new("package");
     let repository = repository_root();
     let output = temporary.path().join("dist");
-    let first = Command::new(repository.join("scripts/build-native-host-package"))
+    let first = Command::new("/bin/sh")
+        .args(["-c", "umask 077; exec \"$@\"", "agcoord-host-package-test"])
+        .arg(repository.join("scripts/build-native-host-package"))
         .args([BROKER, output.to_str().unwrap()])
         .env("AGCOORD_HOST_ALLOW_DEVELOPMENT", "1")
         .output()

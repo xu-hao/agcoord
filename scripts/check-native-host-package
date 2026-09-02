@@ -47,7 +47,7 @@ fi
 
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
-tar -xzf "$package" --no-same-owner -C "$temporary"
+tar -xzf "$package" --no-same-owner --same-permissions -C "$temporary"
 binary="$temporary/usr/libexec/agcoord/agcoord-broker"
 sidecar="$temporary/usr/libexec/agcoord/agcoord-broker.sha256"
 unit="$temporary/usr/lib/systemd/user/agcoord-broker.service"
