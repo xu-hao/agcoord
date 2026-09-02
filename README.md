@@ -57,8 +57,8 @@ temporary directory, and its inherited `TMPDIR`, `TMP`, and `TEMP` values are re
 upgrading, audit admitted commands that relied on a private temporary directory and give each
 one an explicit tmpfs or project-quota declaration; the
 [native migration runbook](docs/native_migration.md) records that audit step. The host
-transition itself is unchanged: install the matching 0.4.0 client, then run `agc host upgrade`
-with the verified 0.4.0 bundle.
+transition itself is unchanged: install the matching 0.4 client, then run `agc host upgrade`
+with the verified 0.4 bundle.
 
 If upgrading from 0.2.x or earlier, first apply the 0.3 native-owner transition below.
 
