@@ -242,6 +242,8 @@ struct ExecPlan {
     argument_pointers: Vec<*const libc::c_char>,
     _environment: Vec<CString>,
     environment_pointers: Vec<*const libc::c_char>,
+    _no_scratch_environment: Vec<CString>,
+    no_scratch_environment_pointers: Vec<*const libc::c_char>,
     checkout: CString,
     log_fd: RawFd,
     fault: Option<WorkerFault>,
@@ -269,8 +271,20 @@ impl ExecPlan {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let environment = environment
+        let environment_values = environment
             .iter()
+            .map(|(name, value)| {
+                CString::new(format!("{name}={value}").into_bytes()).map_err(|_| {
+                    AppError::new(
+                        "broker-worker-start-failed",
+                        "worker environment contains an invalid NUL byte",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let no_scratch_environment = environment
+            .iter()
+            .filter(|(name, _value)| !matches!(name.as_str(), "TMPDIR" | "TMP" | "TEMP"))
             .map(|(name, value)| {
                 CString::new(format!("{name}={value}").into_bytes()).map_err(|_| {
                     AppError::new(
@@ -288,15 +302,24 @@ impl ExecPlan {
         })?;
         let mut argument_pointers: Vec<_> = arguments.iter().map(|value| value.as_ptr()).collect();
         argument_pointers.push(ptr::null());
-        let mut environment_pointers: Vec<_> =
-            environment.iter().map(|value| value.as_ptr()).collect();
+        let mut environment_pointers: Vec<_> = environment_values
+            .iter()
+            .map(|value| value.as_ptr())
+            .collect();
         environment_pointers.push(ptr::null());
+        let mut no_scratch_environment_pointers: Vec<_> = no_scratch_environment
+            .iter()
+            .map(|value| value.as_ptr())
+            .collect();
+        no_scratch_environment_pointers.push(ptr::null());
         Ok(Self {
             executable,
             _arguments: arguments,
             argument_pointers,
-            _environment: environment,
+            _environment: environment_values,
             environment_pointers,
+            _no_scratch_environment: no_scratch_environment,
+            no_scratch_environment_pointers,
             checkout,
             log_fd: log.as_raw_fd(),
             fault,
@@ -818,7 +841,7 @@ fn cleanup_emulated_tmpfs(setup: &TmpfsSetup) {
     }
 }
 
-fn exec_plan(plan: &ExecPlan) -> ! {
+fn exec_plan(plan: &ExecPlan, scratch_available: bool) -> ! {
     close_all_except(&[]);
     if !descriptors_are_exactly(&[]) {
         unsafe { libc::_exit(125) }
@@ -829,10 +852,15 @@ fn exec_plan(plan: &ExecPlan) -> ! {
         if libc::chdir(plan.checkout.as_ptr()) != 0 {
             libc::_exit(127);
         }
+        let environment = if scratch_available {
+            &plan.environment_pointers
+        } else {
+            &plan.no_scratch_environment_pointers
+        };
         libc::execve(
             plan.executable.as_ptr(),
             plan.argument_pointers.as_ptr(),
-            plan.environment_pointers.as_ptr(),
+            environment.as_ptr(),
         );
         libc::_exit(127);
     }
@@ -845,7 +873,7 @@ fn supervise_tmpfs(plan: &ExecPlan, setup: &TmpfsSetup, baseline: TmpfsBaseline)
         unsafe { libc::_exit(125) }
     }
     if child == 0 {
-        exec_plan(plan);
+        exec_plan(plan, true);
     }
     let mut peak_bytes = 0;
     let mut peak_inodes = 0;
@@ -1043,14 +1071,14 @@ fn child_main(
         if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
             let _ = unmount_current_tmpfs(setup);
         }
-        exec_plan(plan);
+        exec_plan(plan, false);
     }
     if let (Some(setup), Some(baseline)) = (&plan.setup.tmpfs, tmpfs_baseline)
         && !setup.emulate
     {
         supervise_tmpfs(plan, setup, baseline);
     }
-    exec_plan(plan);
+    exec_plan(plan, true);
 }
 
 fn wait_status(status: libc::c_int) -> i64 {

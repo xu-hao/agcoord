@@ -10,7 +10,8 @@ import sys
 import pytest
 
 from agcoord import queue as queue_module
-from agcoord.cgroup import CgroupV2Backend
+from agcoord import worker as worker_module
+from agcoord.cgroup import CgroupIsolationError, CgroupV2Backend
 from agcoord.resources import ResourceMeasurement, ResourceRequest
 
 from conftest import RunningCoordinator, caller_environment, wait_for
@@ -79,8 +80,71 @@ continue_run = os.read(release_fd, 1) == b"1"
 os.close(release_fd)
 if not continue_run:
     raise SystemExit(125)
+for name in ("TMPDIR", "TMP", "TEMP"):
+    os.environ.pop(name, None)
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
+
+
+def test_best_effort_launcher_failure_removes_unavailable_scratch_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ExecReached(BaseException):
+        pass
+
+    target = tmp_path / "scratch"
+    report = tmp_path / "tmpfs-report.json"
+    release_read, release_write = os.pipe()
+    setup_read, setup_write = os.pipe()
+    observed: dict[str, str] = {}
+
+    def refuse_mount(_target: str, *, size: int, inodes: int):
+        assert size == 16 * MIB
+        assert inodes == 128
+        raise CgroupIsolationError(
+            "tmpfs-mount-unavailable",
+            "injected mount refusal",
+        )
+
+    def execute(_command: list[str], environment: dict[str, str]) -> None:
+        observed.update(environment)
+        raise ExecReached()
+
+    monkeypatch.setattr(worker_module, "isolate_current_cgroup", lambda: None)
+    monkeypatch.setattr(worker_module, "mount_current_tmpfs", refuse_mount)
+    monkeypatch.setattr(worker_module, "_exec", execute)
+    monkeypatch.setenv("_AGCOORD_CGROUP_ISOLATE", "1")
+    monkeypatch.setenv(
+        "_AGCOORD_TMPFS_SETUP",
+        json.dumps(
+            {
+                "version": 1,
+                "target": str(target),
+                "size": 16 * MIB,
+                "inodes": 128,
+                "report": str(report),
+                "token": "0" * 32,
+            }
+        ),
+    )
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(name, str(target))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agcoord-worker", str(release_read), str(setup_write), "command"],
+    )
+    os.write(release_write, b"11")
+    os.close(release_write)
+
+    try:
+        with pytest.raises(ExecReached):
+            worker_module.launcher_main()
+        assert os.read(setup_read, 64) == b"tmpfs-mount-unavailable"
+        assert all(name not in observed for name in ("TMPDIR", "TMP", "TEMP"))
+    finally:
+        os.close(setup_read)
 
 
 def test_tmpfs_policy_is_prepared_inside_the_hard_memory_envelope(tmp_path: Path):
@@ -205,11 +269,16 @@ import os
 from pathlib import Path
 
 target = Path(os.environ["TMPDIR"])
+protected = target / "protected" / "nested"
+protected.mkdir(parents=True)
+(protected / "payload").write_bytes(b"x" * 1024)
 Path(__import__("sys").argv[1]).write_text(json.dumps({
     "target": str(target),
     "variables": [os.environ[name] for name in ("TMPDIR", "TMP", "TEMP")],
     "setup_hidden": "_AGCOORD_TMPFS_SETUP" not in os.environ,
 }), encoding="utf-8")
+os.chmod(protected, 0)
+os.chmod(protected.parent, 0)
 """,
                 str(report),
             ],
@@ -258,7 +327,7 @@ Path(__import__("sys").argv[1]).write_text(json.dumps({
         ("best-effort", "passed", 0, True),
     ],
 )
-def test_mount_capability_failure_obeys_required_or_disk_fallback_mode(
+def test_mount_capability_failure_obeys_required_or_no_scratch_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
@@ -296,11 +365,16 @@ def test_mount_capability_failure_obeys_required_or_disk_fallback_mode(
     )
     client = running.start()
     repository = _repository(tmp_path / "repository")
-    marker = tmp_path / "user-code-ran"
+    report = tmp_path / "user-code.json"
 
     try:
         run_id = client.submit(
-            [sys.executable, "-c", "from pathlib import Path; Path(__import__('sys').argv[1]).touch()", str(marker)],
+            [
+                sys.executable,
+                "-c",
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}))",
+                str(report),
+            ],
             checkout=str(repository),
             resources={
                 "ram": 64 * MIB,
@@ -316,7 +390,13 @@ def test_mount_capability_failure_obeys_required_or_disk_fallback_mode(
         )
         assert finished["status"] == expected_status
         assert finished["exit_status"] == expected_exit
-        assert marker.exists() is ran
+        assert report.exists() is ran
+        if ran:
+            assert json.loads(report.read_text(encoding="utf-8")) == {
+                "TMPDIR": None,
+                "TMP": None,
+                "TEMP": None,
+            }
         tmpfs_events = [
             event
             for event in finished["resource_receipt"]["events"]

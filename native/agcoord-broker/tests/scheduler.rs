@@ -604,6 +604,52 @@ fn touch_command(path: &Path) -> Vec<String> {
     ]
 }
 
+#[test]
+fn workers_without_scratch_resources_do_not_inherit_caller_temp_paths() {
+    let temporary = TestDirectory::new("no-scratch-environment");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+
+    for kind in ["check", "full", "land"] {
+        let run_id = format!("{kind}-no-scratch");
+        let report = temporary.path().join(format!("{kind}-environment.json"));
+        let submission = Submission {
+            run_id: &run_id,
+            kind,
+            repository: "repo-no-scratch",
+            checkout: &checkout,
+            command: vec![
+                "/usr/bin/python3".to_owned(),
+                "-c".to_owned(),
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}), encoding='ascii')".to_owned(),
+                report.to_string_lossy().into_owned(),
+            ],
+            gate_run_id: None,
+        };
+        let result = submit_with_environment(
+            &state,
+            &submission,
+            &[
+                ("TMPDIR", "/caller/tmp"),
+                ("TMP", "/caller/tmp"),
+                ("TEMP", "/caller/tmp"),
+            ],
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        wait_status(&state, &run_id, "passed");
+        let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(observed, json!({"TMPDIR": null, "TMP": null, "TEMP": null}));
+    }
+
+    assert!(broker.terminate().success());
+}
+
 fn append_command(path: &Path, value: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),
@@ -1710,7 +1756,7 @@ fn project_quota_fixture_refuses_incomplete_misaligned_or_mixed_policies() {
 }
 
 #[test]
-fn unavailable_project_quota_obeys_required_or_best_effort_fallback() {
+fn unavailable_project_quota_obeys_required_or_best_effort_no_scratch() {
     let temporary = TestDirectory::new("project-quota-unavailable");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
@@ -1731,26 +1777,42 @@ fn unavailable_project_quota_obeys_required_or_best_effort_fallback() {
             snapshot(&state).unwrap()["resource_capabilities"]["project-quota"]["reason"],
             "quota-root-unavailable"
         );
-        let marker = temporary.path().join(format!("ran-{mode}"));
+        let report = temporary.path().join(format!("environment-{mode}.json"));
         let submission = Submission {
             run_id: mode,
             kind: "check",
             repository: "repo-a",
             checkout: &checkout,
-            command: touch_command(&marker),
+            command: vec![
+                "/usr/bin/python3".to_owned(),
+                "-c".to_owned(),
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}), encoding='ascii')".to_owned(),
+                report.to_string_lossy().into_owned(),
+            ],
             gate_run_id: None,
         };
         assert!(
-            submit_with_resources(
+            submit_with_resources_and_environment(
                 &state,
                 &submission,
                 &[("disk", 8 * 1024 * 1024), ("disk_inodes", 64)],
+                &[
+                    ("TMPDIR", "/caller/tmp"),
+                    ("TMP", "/caller/tmp"),
+                    ("TEMP", "/caller/tmp"),
+                ],
             )
             .status
             .success()
         );
         let finished = wait_status(&state, mode, expected_status);
-        assert_eq!(marker.exists(), ran);
+        assert_eq!(report.exists(), ran);
+        if ran {
+            assert_eq!(
+                serde_json::from_str::<Value>(&fs::read_to_string(&report).unwrap()).unwrap(),
+                json!({"TMPDIR": null, "TMP": null, "TEMP": null})
+            );
+        }
         assert_eq!(
             finished["resource_receipt"]["events"]
                 .as_array()
@@ -4129,7 +4191,7 @@ fn cgroup_fixture_provisions_private_tmpfs_and_retains_usage_receipt() {
 }
 
 #[test]
-fn cgroup_tmpfs_mount_failure_obeys_required_or_disk_fallback_mode() {
+fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
     let temporary = TestDirectory::new("cgroup-tmpfs-worker-failure");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
@@ -4140,7 +4202,7 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_disk_fallback_mode() {
     ] {
         let state = temporary.path().join(format!("state-{mode}"));
         let root = temporary.path().join(format!("delegated-{mode}"));
-        let marker = temporary.path().join(format!("user-code-{mode}"));
+        let report = temporary.path().join(format!("environment-{mode}.json"));
         fs::create_dir(&state).unwrap();
         fs::create_dir(&root).unwrap();
         fs::write(
@@ -4178,16 +4240,36 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_disk_fallback_mode() {
             kind: "check",
             repository: "repo-a",
             checkout: &checkout,
-            command: touch_command(&marker),
+            command: vec![
+                "/usr/bin/python3".to_owned(),
+                "-c".to_owned(),
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}), encoding='ascii')".to_owned(),
+                report.to_string_lossy().into_owned(),
+            ],
             gate_run_id: None,
         };
         assert!(
-            submit_with_resources(&state, &submission, &requested)
-                .status
-                .success()
+            submit_with_resources_and_environment(
+                &state,
+                &submission,
+                &requested,
+                &[
+                    ("TMPDIR", "/caller/tmp"),
+                    ("TMP", "/caller/tmp"),
+                    ("TEMP", "/caller/tmp"),
+                ],
+            )
+            .status
+            .success()
         );
         let finished = wait_status(&state, submission.run_id, expected_status);
-        assert_eq!(marker.exists(), user_code_runs);
+        assert_eq!(report.exists(), user_code_runs);
+        if user_code_runs {
+            assert_eq!(
+                serde_json::from_str::<Value>(&fs::read_to_string(&report).unwrap()).unwrap(),
+                json!({"TMPDIR": null, "TMP": null, "TEMP": null})
+            );
+        }
         assert_eq!(
             finished["failure_reason"],
             if mode == "required" {

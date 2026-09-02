@@ -1869,6 +1869,9 @@ impl Broker {
             "AGCOORD_STATE_DIR".to_owned(),
             self.paths.state_dir.to_string_lossy().into_owned(),
         );
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            environment.remove(name);
+        }
         if let Some(tmpfs) = &worker_setup.tmpfs {
             let target = tmpfs.target.to_string_lossy().into_owned();
             environment.insert("TMPDIR".to_owned(), target.clone());
