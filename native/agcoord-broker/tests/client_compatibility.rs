@@ -76,6 +76,11 @@ impl Drop for ReleaseGuard {
     }
 }
 
+fn nix_uid() -> u32 {
+    // Safe: getuid() cannot fail and touches no shared state.
+    unsafe { libc::getuid() }
+}
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1597,4 +1602,223 @@ def test_two():
         assert_eq!(leases[0]["full"], true);
     }
     let (_guard, _owner) = owner_guard(&state).expect("native owner disappeared");
+}
+
+#[test]
+fn a_full_row_leaves_one_exact_terminal_record() {
+    let temporary = TestDirectory::new("full-record");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+    let head = git_output(&checkout, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    let submitted = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "full".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--label".to_owned(),
+        "release gate".to_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    let (_guard, _owner) = owner_guard(&state).expect("full did not start a broker");
+    assert_success(&submitted, "full submission");
+    let row = parse_json_output(&submitted);
+    assert_eq!(row["kind"], "full");
+    assert_eq!(row["status"], "passed");
+
+    let listed = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "list".to_owned(),
+    ]);
+    assert_success(&listed, "list after full");
+    let snapshot = parse_json_output(&listed);
+    assert_eq!(snapshot["active"].as_array().unwrap().len(), 0);
+    assert_eq!(snapshot["queued"].as_array().unwrap().len(), 0);
+    let recent = snapshot["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1, "{recent:?}");
+    let record = &recent[0];
+    assert_eq!(record["kind"], "full");
+    assert_eq!(record["status"], "passed");
+    assert_eq!(record["head_sha"], head);
+    assert_eq!(record["checkout"], checkout.to_string_lossy().into_owned());
+    assert_eq!(record["command"], json!(["/bin/true"]));
+}
+
+#[test]
+fn an_undeclared_worker_scratch_root_is_absent_and_never_inherited() {
+    let temporary = TestDirectory::new("scratch-root");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("scratch.txt");
+    let inherited = temporary.path().join("caller-temp");
+    let selected_broker = installed_broker(&temporary);
+    fs::create_dir(&inherited).unwrap();
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+
+    let submitted = python_cli_with_env(
+        &[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "--checkout".to_owned(),
+            checkout.to_string_lossy().into_owned(),
+            "--".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            r#"printf 'tmpdir=[%s] tmp=[%s] temp=[%s]\n' "$TMPDIR" "$TMP" "$TEMP" >"$1""#
+                .to_owned(),
+            "agcoord-test".to_owned(),
+            report.to_string_lossy().into_owned(),
+        ],
+        &[
+            ("TMPDIR", inherited.to_str().unwrap()),
+            ("TMP", inherited.to_str().unwrap()),
+            ("TEMP", inherited.to_str().unwrap()),
+        ],
+    );
+    let (_guard, _owner) = owner_guard(&state).expect("run did not start a broker");
+    assert_success(&submitted, "undeclared scratch run");
+    let row = parse_json_output(&submitted);
+    let run_id = row["run_id"].as_str().unwrap().to_owned();
+
+    let observed = fs::read_to_string(&report).unwrap();
+    assert_eq!(
+        observed.trim(),
+        "tmpdir=[] tmp=[] temp=[]",
+        "a run that declared no scratch received a temporary directory"
+    );
+    let worker_root = PathBuf::from("/tmp").join(format!("agcoord-{}", nix_uid()));
+    assert!(
+        !worker_root.join(&run_id).exists(),
+        "an undeclared run left a scratch directory named after its run id"
+    );
+}
+
+#[test]
+fn a_dirty_checkout_is_refused_at_submission_without_a_row() {
+    let temporary = TestDirectory::new("dirty-refusal");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let marker = temporary.path().join("must-not-run.txt");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+    fs::write(checkout.join("untracked.txt"), "dirty\n").unwrap();
+
+    let refused = python_cli(&[
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "full".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "printf 'ran\\n' >\"$1\"".to_owned(),
+        "agcoord-test".to_owned(),
+        marker.to_string_lossy().into_owned(),
+    ]);
+    let owner = owner_guard(&state);
+
+    assert_eq!(refused.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&refused.stderr).to_lowercase();
+    assert!(
+        error.contains("dirty") || error.contains("clean"),
+        "refusal did not name the dirty checkout: {error}"
+    );
+    assert!(!marker.exists(), "the refused command still ran");
+
+    if let Some((_guard, _record)) = owner {
+        let listed = python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "list".to_owned(),
+        ]);
+        assert_success(&listed, "list after refusal");
+        let snapshot = parse_json_output(&listed);
+        assert_eq!(snapshot["active"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["queued"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["recent"].as_array().unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn an_admitted_worker_cannot_nest_another_coordinated_submission() {
+    let temporary = TestDirectory::new("no-nesting");
+    let state = temporary.path().join("state");
+    let other_state = temporary.path().join("other-state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("nested.txt");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 1}));
+    write_config(&other_state, &selected_broker, json!({"jobs": 1}));
+    let source = repository_root().join("src");
+
+    let submitted = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        concat!(
+            r#"PYTHONPATH="$1" python3 -m agcoord --state-dir "$2" run "#,
+            r#"--checkout "$3" -- /bin/true >"$4" 2>&1; printf 'exit=%s\n' "$?" >>"$4""#,
+        )
+        .to_owned(),
+        "agcoord-test".to_owned(),
+        source.to_string_lossy().into_owned(),
+        other_state.to_string_lossy().into_owned(),
+        checkout.to_string_lossy().into_owned(),
+        report.to_string_lossy().into_owned(),
+    ]);
+    let (_guard, _owner) = owner_guard(&state).expect("run did not start a broker");
+    assert_success(&submitted, "admitted worker run");
+
+    let nested = fs::read_to_string(&report).unwrap();
+    assert!(
+        !nested.contains("exit=0\n"),
+        "a nested coordinated submission succeeded: {nested}"
+    );
+    assert!(
+        nested.contains("a coordinated job cannot submit another coordinated job"),
+        "the refusal did not name the ownership rule: {nested}"
+    );
+    // The nesting rule is decided after selection, so the attempt may leave a broker
+    // owning the other spool. Own it here; the refusal must still accept no work.
+    let stray = owner_guard(&other_state);
+    if stray.is_some() {
+        let listed = python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            other_state.to_string_lossy().into_owned(),
+            "list".to_owned(),
+        ]);
+        assert_success(&listed, "list of the other state directory");
+        let snapshot = parse_json_output(&listed);
+        assert_eq!(snapshot["active"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["queued"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            snapshot["recent"].as_array().unwrap().len(),
+            0,
+            "the nested submission accepted a row in another state directory"
+        );
+    }
 }
