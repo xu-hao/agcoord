@@ -3,9 +3,11 @@
 Keep this file limited to repository-wide guardrails. Follow the canonical contracts and
 procedures listed in [docs/index.md](docs/index.md).
 
-- Track every code, test, documentation, packaging, or live-state change with a
-  descriptive issue. Pair every issue number with a sentence explaining the work it
-  tracks.
+- Track every code, test, documentation, or packaging change with a descriptive issue.
+  Pair every issue number with a sentence explaining the work it tracks. Do not file an
+  issue solely for machine-local installation, deployment, configuration, service
+  lifecycle, or other operator state; create one only when that work also requires a
+  repository change or the user explicitly requests an issue.
 - Develop and validate only in an issue-specific Git worktree branched from `main`.
   Preserve unrelated work and do not develop in the primary checkout.
 - Verify behavior at public boundaries. Start bug fixes with a failing behavioral test;
