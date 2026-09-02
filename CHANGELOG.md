@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add `agc host install` and `agc host upgrade` as verified one-command native-host operations
+  after the exact matching Python client is installed. They validate the complete release bundle,
+  enforce the managed default-spool boundary, orchestrate fresh activation or exact-ID draining,
+  verify the restarted identity, and retain an enforced CPU proof. Fresh managed installs create
+  CPU and job capacity from the process's available affinity so the existing greedy scheduler can
+  pack declared requests without a fixed two-way partition.
+
 ## 0.3.2 — 2026-09-02
 
 - Allow the installed Python client to perform only its authenticated run-scoped callbacks from
