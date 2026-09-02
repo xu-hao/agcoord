@@ -420,6 +420,91 @@ def test_admitted_callback_never_autostarts_a_missing_broker(
         client.admitted_run_status("land-callback")
 
 
+@pytest.mark.parametrize("operation", ["land", "merge"])
+def test_native_publication_preserves_a_virtualenv_python_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+):
+    from agcoord import queue
+
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch", "main", str(checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "AGCoord test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "config",
+            "user.email",
+            "agcoord@example.invalid",
+        ],
+        check=True,
+    )
+    (checkout / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", "tracked.txt"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    base_python = tmp_path / "base-python"
+    base_python.write_text("base\n", encoding="utf-8")
+    virtualenv_bin = tmp_path / "venv/bin"
+    virtualenv_bin.mkdir(parents=True)
+    virtualenv_python = virtualenv_bin / "python"
+    virtualenv_python.symlink_to(base_python)
+    monkeypatch.setattr(queue.sys, "executable", str(virtualenv_python))
+
+    client = CoordinatorClient(state_dir=tmp_path / "state", autostart=False)
+    owner = {"protocol": NATIVE_PROTOCOL, "capacities": {"jobs": 1}}
+    submitted: list[str] = []
+    monkeypatch.setattr(client, "_ensure_broker", lambda **_kwargs: owner)
+
+    def capture(command: str, arguments=()):
+        assert command == "submit"
+        submitted.extend(arguments)
+        run_id = submitted[submitted.index("--run-id") + 1]
+        return {"run_id": run_id}
+
+    monkeypatch.setattr(client, "_native_invoke", capture)
+    if operation == "land":
+        client.submit_land(
+            "github",
+            123,
+            ["/bin/true"],
+            checkout=str(checkout),
+            resources={"jobs": 1},
+            environment={},
+        )
+        assert f"_AGCOORD_LAND_PYTHON={virtualenv_python}" in submitted
+    else:
+        client.submit_merge(
+            "github",
+            123,
+            checkout=str(checkout),
+            resources={"jobs": 1},
+            environment={},
+        )
+        separator = submitted.index("--")
+        assert submitted[separator + 1] == str(virtualenv_python)
+
+
 def test_unsupported_platform_refusal_precedes_executable_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ):
