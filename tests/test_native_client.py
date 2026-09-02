@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agcoord import __version__
 from agcoord.config import (
     DEFAULT_NATIVE_BROKER_PATH,
     BrokerConfigError,
@@ -36,7 +37,7 @@ from conftest import RunningCoordinator
 def _identity_executable(
     path: Path,
     *,
-    version: str = "0.3.0",
+    version: str = "0.4.0",
     build: str = "development",
     target: str = "x86_64-unknown-linux-gnu",
 ) -> Path:
@@ -141,6 +142,20 @@ def test_explicit_development_selection_rejects_mutable_symlinked_and_wrong_targ
         )
 
 
+def test_selection_admits_this_release_line_and_refuses_the_previous_one(tmp_path: Path):
+    current = _identity_executable(tmp_path / "current", version=__version__)
+    selected = NativeBrokerCommand.select(
+        NativeBrokerConfig(path=str(current), allow_development=True)
+    )
+    assert selected.identity.version == __version__
+
+    previous = _identity_executable(tmp_path / "previous", version="0.3.2")
+    with pytest.raises(NativeClientError, match="version is unsupported"):
+        NativeBrokerCommand.select(
+            NativeBrokerConfig(path=str(previous), allow_development=True)
+        )
+
+
 def test_release_policy_rejects_a_user_owned_development_binary(tmp_path: Path):
     executable = _identity_executable(tmp_path / "broker")
     with pytest.raises(NativeClientError, match="owned by root|development build"):
@@ -163,7 +178,7 @@ def _mock_admitted_release(
     identity = json.dumps(
         {
             "name": "agcoord-broker",
-            "version": "0.3.1",
+            "version": "0.4.0",
             "protocol": 5,
             "implementation": "rust-native",
             "build": f"sha256:{'a' * 64}",
@@ -333,7 +348,7 @@ def test_client_routes_only_exact_admitted_status_through_the_callback_selector(
     build = f"sha256:{'a' * 64}"
     identity = NativeBrokerIdentity(
         name="agcoord-broker",
-        version="0.3.1",
+        version="0.4.0",
         protocol=NATIVE_PROTOCOL,
         implementation=NATIVE_IMPLEMENTATION,
         build=build,
