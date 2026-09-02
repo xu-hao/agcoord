@@ -13,6 +13,8 @@ import tarfile
 import pytest
 
 from agcoord import __version__
+from agcoord.config import NativeBrokerConfig
+from agcoord.native_client import NativeBrokerCommand, NativeClientError
 from agcoord.queue import CoordinatorError, RUN_ID_ENV, STATE_DIR_ENV
 
 
@@ -120,22 +122,53 @@ def _managed_state(state_dir: Path, *, existing_spool: bool) -> None:
         (state_dir / "queue.sqlite3").chmod(0o600)
 
 
+def _outgoing_broker(path: Path, *, version: str) -> Path:
+    """Write one real executable that reports an outgoing protocol-5 identity."""
+    identity = json.dumps(
+        {
+            "name": "agcoord-broker",
+            "version": version,
+            "protocol": 5,
+            "implementation": "rust-native",
+            "build": "development",
+            "target": "x86_64-unknown-linux-gnu",
+            "sqlite": "3.53.2",
+        },
+        separators=(",", ":"),
+    )
+    path.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = identity ] && [ "$2" = --json ]; then\n'
+        f"  printf '%s\\n' '{identity}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def _install_fakes(
     monkeypatch,
     *,
     activation_status: int = 0,
     proof=None,
     drain_id: str = "drain-0123456789ab",
+    installed_broker: Path | None = None,
 ):
     from agcoord import native_host
 
     timeline: list[tuple[str, object]] = []
     clients: list[object] = []
+    real_run = subprocess.run
     monkeypatch.delenv(RUN_ID_ENV, raising=False)
     monkeypatch.delenv(STATE_DIR_ENV, raising=False)
 
     def fake_run(arguments, **options):
         command = [str(value) for value in arguments]
+        if installed_broker is not None and command[:1] == [str(installed_broker)]:
+            return real_run(arguments, **options)
         timeline.append(("command", command))
         assert options["check"] is False
         assert options["text"] is True
@@ -151,14 +184,38 @@ def _install_fakes(
         return subprocess.CompletedProcess(command, 0, "ok\n", "")
 
     class Client:
-        def __init__(self, *, state_dir=None, checkout=None, autostart=True):
+        def __init__(
+            self,
+            *,
+            state_dir=None,
+            checkout=None,
+            autostart=True,
+            host_maintenance=False,
+        ):
             self.state_dir = state_dir
             self.checkout = checkout
             self.autostart = autostart
+            self.host_maintenance = host_maintenance
             clients.append(self)
 
         def drain(self, *, reason, wait):
             timeline.append(("drain", {"reason": reason, "wait": wait}))
+            if installed_broker is not None:
+                select = (
+                    NativeBrokerCommand.select_for_host_maintenance
+                    if self.host_maintenance
+                    else NativeBrokerCommand.select
+                )
+                try:
+                    command = select(
+                        NativeBrokerConfig(
+                            path=str(installed_broker),
+                            allow_development=True,
+                        )
+                    )
+                except NativeClientError as exc:
+                    raise CoordinatorError(str(exc)) from exc
+                timeline.append(("drain-selected", command.identity.version))
             return {
                 "state": "drained",
                 "drain_id": drain_id,
@@ -302,6 +359,31 @@ def test_upgrade_stages_before_drain_and_proves_the_restarted_host(
         "proof": _proof(),
     }
 
+
+def test_upgrade_drains_a_previous_minor_installed_broker(monkeypatch, tmp_path: Path):
+    outgoing = _outgoing_broker(tmp_path / "outgoing-broker", version="0.3.2")
+    native_host, timeline, clients = _install_fakes(
+        monkeypatch,
+        installed_broker=outgoing,
+    )
+    package = _release_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    _managed_state(state_dir, existing_spool=True)
+    monkeypatch.setattr(native_host, "MANAGED_STATE_DIR", state_dir.resolve())
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    result = native_host.upgrade_native_host(
+        package,
+        state_dir=state_dir,
+        checkout=checkout,
+    )
+
+    assert result["state"] == "complete"
+    assert result["version"] == __version__
+    assert ("drain-selected", "0.3.2") in timeline
+    assert clients[0].host_maintenance is True
+    assert clients[1].host_maintenance is False
 
 def test_activation_failure_leaves_the_exact_drain_and_service_stopped(
     monkeypatch,

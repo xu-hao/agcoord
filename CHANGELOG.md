@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Let one `agc host upgrade` cross a minor release boundary. The upgrade's drain now selects the
+  broker that is actually installed, which is still on the outgoing release line until activation,
+  instead of refusing it against the client's own supported line. Ordinary client commands keep
+  the strict release-line policy, and every other selection boundary is unchanged.
+
 ## 0.4.0 — 2026-09-02
 
 - Move the client's supported native broker line to 0.4.x. A 0.4.0 Python client selects and

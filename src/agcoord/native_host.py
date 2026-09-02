@@ -631,6 +631,7 @@ def upgrade_native_host(
         state_dir=paths.state_dir,
         checkout=checkout_path,
         autostart=False,
+        host_maintenance=True,
     )
     drain = _validate_drain(
         drain_client.drain(
