@@ -140,6 +140,7 @@ def fake_client(monkeypatch):
         "submitted": [],
         "landed": [],
         "status": [],
+        "admitted_status": [],
         "cancel": [],
         "log": [],
         "clear": [],
@@ -179,6 +180,10 @@ def fake_client(monkeypatch):
                     gate_exit_status=0,
                 )
             return _row(run_id, "running", "check", "selected job")
+
+        def admitted_run_status(self, run_id):
+            observations["admitted_status"].append(run_id)
+            return _row(run_id, "running", "land", "own admitted job")
 
         def cancel(self, run_id):
             observations["cancel"].append(run_id)
@@ -383,6 +388,23 @@ def test_human_list_shows_the_durable_maintenance_receipt(fake_client):
     assert "drained as drain-0123456789ab" in rendered
     assert "native host upgrade" in rendered
     assert "0 live · broker none" in rendered
+
+
+def test_show_uses_the_narrow_callback_only_for_its_exact_admitted_run(
+    fake_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AGCOORD_RUN_ID", "land-own")
+
+    own = StringIO()
+    assert cli.run(_args("show", "land-own"), out=own) == 0
+    assert json.loads(own.getvalue())["run_id"] == "land-own"
+    assert fake_client["admitted_status"] == ["land-own"]
+
+    other = StringIO()
+    assert cli.run(_args("show", "land-other"), out=other) == 0
+    assert json.loads(other.getvalue())["run_id"] == "land-other"
+    assert fake_client["status"][-1] == "land-other"
 
 
 @pytest.mark.parametrize("command_kind", ["run", "full"])
