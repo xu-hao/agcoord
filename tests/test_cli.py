@@ -420,11 +420,19 @@ def test_public_full_refuses_a_dirty_checkout_before_accepting_a_receipt(
         running.stop()
 
 
-@pytest.mark.parametrize("adapter_arguments", [(), ("--adapter", "github")])
+@pytest.mark.parametrize(
+    ("adapter_arguments", "synchronize_target"),
+    [
+        ((), True),
+        (("--adapter", "github"), True),
+        (("--no-target-sync",), False),
+    ],
+)
 def test_land_dispatches_gate_and_publication_as_one_followed_request(
     fake_client,
     tmp_path: Path,
     adapter_arguments: tuple[str, ...],
+    synchronize_target: bool,
 ):
     checkout = tmp_path / "checkout"
     subprocess.run(
@@ -474,6 +482,7 @@ def test_land_dispatches_gate_and_publication_as_one_followed_request(
     assert metadata["checkout"] == str(checkout.resolve())
     assert metadata["label"] == "gate and publish change 123"
     assert metadata["resources"] == {"network": 1}
+    assert metadata["synchronize_target"] is synchronize_target
     assert fake_client["follow"][-1][1] == "land-new"
     assert "land-new" in output.getvalue()
 

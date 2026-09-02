@@ -526,6 +526,7 @@ fn parse_phase(arguments: &[String]) -> Result<(Paths, PhaseRequest)> {
     let mut worker_start_token = None;
     let mut checkout = None;
     let mut head_sha = None;
+    let mut new_head_sha = None;
     let mut phase = None;
     let mut gate_exit_status = None;
     let mut index = 0;
@@ -538,6 +539,7 @@ fn parse_phase(arguments: &[String]) -> Result<(Paths, PhaseRequest)> {
             | "--worker-start-token"
             | "--checkout"
             | "--head"
+            | "--new-head"
             | "--phase"
             | "--gate-exit-status" => option_value(arguments, &mut index, &option)?,
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
@@ -559,6 +561,7 @@ fn parse_phase(arguments: &[String]) -> Result<(Paths, PhaseRequest)> {
             "--worker-start-token" => worker_start_token = Some(value),
             "--checkout" => checkout = Some(PathBuf::from(value)),
             "--head" => head_sha = Some(value),
+            "--new-head" => new_head_sha = Some(value),
             "--phase" => phase = Some(value),
             "--gate-exit-status" => {
                 gate_exit_status = Some(
@@ -582,6 +585,7 @@ fn parse_phase(arguments: &[String]) -> Result<(Paths, PhaseRequest)> {
                 .ok_or_else(|| AppError::usage("--worker-start-token is required"))?,
             checkout: checkout.ok_or_else(|| AppError::usage("--checkout is required"))?,
             head_sha: head_sha.ok_or_else(|| AppError::usage("--head is required"))?,
+            new_head_sha,
             phase: phase.ok_or_else(|| AppError::usage("--phase is required"))?,
             gate_exit_status,
         },

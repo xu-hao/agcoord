@@ -394,6 +394,7 @@ fn atomic_land_keeps_gate_and_publication_inside_one_native_admission() {
     let temporary = TestDirectory::new("land");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
+    let target_checkout = temporary.path().join("target-checkout");
     let remote = temporary.path().join("origin.git");
     let bin = temporary.path().join("bin");
     let events = temporary.path().join("events.txt");
@@ -416,6 +417,29 @@ fn atomic_land_keeps_gate_and_publication_inside_one_native_admission() {
     git(&checkout, &["commit", "-q", "-m", "candidate"]);
     git(&checkout, &["push", "-u", "origin", "feature/native-land"]);
     let head = git_output(&checkout, &["rev-parse", "HEAD"]);
+    git(
+        temporary.path(),
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            target_checkout.to_str().unwrap(),
+        ],
+    );
+    git(
+        &target_checkout,
+        &["config", "user.name", "AGCoord target test"],
+    );
+    git(
+        &target_checkout,
+        &["config", "user.email", "target@example.invalid"],
+    );
+    fs::write(target_checkout.join("target.txt"), "advanced\n").unwrap();
+    git(&target_checkout, &["add", "target.txt"]);
+    git(&target_checkout, &["commit", "-q", "-m", "advance target"]);
+    let advanced_main = git_output(&target_checkout, &["rev-parse", "HEAD"]);
+    git(&target_checkout, &["push", "origin", "main"]);
     write_config(&state, &selected_broker, json!({"jobs": 1}));
 
     let gh = bin.join("gh");
@@ -425,6 +449,7 @@ fn atomic_land_keeps_gate_and_publication_inside_one_native_admission() {
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 arguments = sys.argv[1:]
@@ -432,13 +457,19 @@ raw_input = sys.stdin.read()
 payload = json.loads(raw_input) if raw_input else None
 
 if arguments[:2] == ["pr", "view"]:
+    observed = subprocess.run(
+        ["git", "ls-remote", "origin", f"refs/heads/{os.environ['AGCOORD_TEST_BRANCH']}"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
     print(json.dumps({
         "number": int(arguments[2]),
         "state": "OPEN",
         "isDraft": False,
         "baseRefName": "main",
         "headRefName": os.environ["AGCOORD_TEST_BRANCH"],
-        "headRefOid": os.environ["AGCOORD_TEST_HEAD"],
+        "headRefOid": observed.split()[0],
         "isCrossRepository": False,
         "title": "Native atomic land",
         "headRepositoryOwner": {"login": "native-test"},
@@ -457,7 +488,7 @@ elif arguments[:2] == ["api", "graphql"]:
     mutation = payload["variables"]["input"]["clientMutationId"]
     print(json.dumps({"data": {"updateRefs": {"clientMutationId": mutation}}}))
 elif arguments[:1] == ["api"] and "/compare/" in arguments[1]:
-    print(json.dumps({"merge_base_commit": {"sha": os.environ["AGCOORD_TEST_HEAD"]}}))
+    print(json.dumps({"merge_base_commit": {"sha": "0" * 40}}))
 else:
     print(f"unexpected gh arguments: {arguments!r}", file=sys.stderr)
     raise SystemExit(93)
@@ -500,6 +531,28 @@ else:
     assert_eq!(row["kind"], "land");
     assert_eq!(row["phase"], "complete");
     assert_eq!(row["gate_exit_status"], 0);
+    let synchronized_head = row["head_sha"].as_str().unwrap();
+    assert_ne!(synchronized_head, head);
+    assert_eq!(
+        git_output(&checkout, &["rev-parse", "HEAD"]),
+        synchronized_head
+    );
+    assert_eq!(
+        git_output(&checkout, &["show", "-s", "--format=%P", synchronized_head])
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        vec![head.as_str(), advanced_main.as_str()]
+    );
+    assert_eq!(
+        git_output(
+            &checkout,
+            &["ls-remote", "origin", "refs/heads/feature/native-land"]
+        )
+        .split_whitespace()
+        .next()
+        .unwrap(),
+        synchronized_head
+    );
     assert_eq!(
         row["publication"],
         json!({"adapter": "github", "request": 123})
