@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import tarfile
+import time
 from typing import Any, Sequence
 
 from . import __version__
@@ -36,6 +37,8 @@ SUDO = Path("/usr/bin/sudo")
 SYSTEMCTL = Path("/usr/bin/systemctl")
 INSTALLED_BROKER = Path(DEFAULT_NATIVE_BROKER_PATH)
 SERVICE = "agcoord-broker.service"
+OWNERSHIP_TIMEOUT = 30.0
+OWNERSHIP_POLL_INTERVAL = 0.1
 PACKAGE_NAME = "agcoord-native-host-x86_64-linux.tar.gz"
 CHECKER_NAME = "check-native-host-package"
 INSTALLER_NAME = "install-native-host"
@@ -491,6 +494,32 @@ def _release_inputs(
     return selected, installer, probe, _expected_identity(selected)
 
 
+def _await_spool_ownership(
+    client: CoordinatorClient,
+    *,
+    operation: str,
+    state_dir: Path,
+) -> None:
+    """Wait for the restarted broker to own the spool before submitting the proof.
+
+    Starting the service and owning the state directory are separate events, so a
+    single probe can land in the gap and report a completed upgrade as a failure.
+    """
+    deadline = time.monotonic() + OWNERSHIP_TIMEOUT
+    while True:
+        try:
+            client.ping()
+            return
+        except CoordinatorError as exc:
+            if time.monotonic() >= deadline:
+                raise CoordinatorError(
+                    f"native-host {operation} started the service but no broker owned "
+                    f"{state_dir} within {OWNERSHIP_TIMEOUT:.0f}s: {exc}",
+                    code=f"native-host-{operation}-verification-failed",
+                ) from exc
+        time.sleep(OWNERSHIP_POLL_INTERVAL)
+
+
 def _verify_running_host(
     *,
     operation: str,
@@ -518,6 +547,11 @@ def _verify_running_host(
         state_dir=state_dir,
         checkout=checkout,
         autostart=False,
+    )
+    _await_spool_ownership(
+        proof_client,
+        operation=operation,
+        state_dir=state_dir,
     )
     proof_run_id = proof_client.submit(
         [str(probe)],
