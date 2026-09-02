@@ -1801,24 +1801,12 @@ fn an_admitted_worker_cannot_nest_another_coordinated_submission() {
         nested.contains("a coordinated job cannot submit another coordinated job"),
         "the refusal did not name the ownership rule: {nested}"
     );
-    // The nesting rule is decided after selection, so the attempt may leave a broker
-    // owning the other spool. Own it here; the refusal must still accept no work.
-    let stray = owner_guard(&other_state);
-    if stray.is_some() {
-        let listed = python_cli(&[
-            "--json".to_owned(),
-            "--state-dir".to_owned(),
-            other_state.to_string_lossy().into_owned(),
-            "list".to_owned(),
-        ]);
-        assert_success(&listed, "list of the other state directory");
-        let snapshot = parse_json_output(&listed);
-        assert_eq!(snapshot["active"].as_array().unwrap().len(), 0);
-        assert_eq!(snapshot["queued"].as_array().unwrap().len(), 0);
-        assert_eq!(
-            snapshot["recent"].as_array().unwrap().len(),
-            0,
-            "the nested submission accepted a row in another state directory"
-        );
-    }
+    assert!(
+        owner_guard(&other_state).is_none(),
+        "the nested submission started a second broker"
+    );
+    assert!(
+        !other_state.join("queue.sqlite3").exists(),
+        "the nested submission created a queue in another state directory"
+    );
 }

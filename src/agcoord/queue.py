@@ -4528,6 +4528,22 @@ class ChildCpuLease:
         self.release()
 
 
+@dataclass(frozen=True)
+class _PreparedSubmission:
+    """Caller-side facts a submission settles before any broker may be started."""
+
+    identity: RepositoryIdentity
+    branch: str
+    head_sha: str | None
+    caller_pid: int
+    environment: dict[str, str]
+
+    def exact_head(self) -> str:
+        if self.head_sha is None:
+            raise CoordinatorError("this submission requires an exact clean head")
+        return self.head_sha
+
+
 class CoordinatorClient:
     """Strict synchronous client over the user-only durable spool.
 
@@ -4842,20 +4858,33 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
+        selected_command = _validate_command(command)
+        if kind not in RUN_KINDS:
+            raise CoordinatorError(
+                "kind must be exactly 'check', 'full', 'merge', or 'land'"
+            )
+        if kind in {"merge", "land"}:
+            raise CoordinatorError(f"{kind} can only be submitted through submit_{kind}")
+        if not isinstance(label, str) or not label.strip():
+            raise CoordinatorError("label must be a non-empty string")
+        prepared = self._prepare_submission(
+            checkout=checkout,
+            repository=repository,
+            branch=branch,
+            head_sha=head_sha,
+            caller_pid=caller_pid,
+            environment=environment,
+            exact_head=kind == "full",
+        )
         owner = self._ensure_broker(for_submission=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_submit(
-                command,
-                checkout=checkout,
+                selected_command,
                 kind=kind,
-                label=label,
+                label=label.strip(),
                 resources=resources,
                 agent=agent,
-                repository=repository,
-                branch=branch,
-                head_sha=head_sha,
-                caller_pid=caller_pid,
-                environment=environment,
+                prepared=prepared,
                 owner=owner,
             )
         return self._catalogue().submit(
@@ -4872,31 +4901,24 @@ class CoordinatorClient:
             environment=environment,
         )
 
-    def _native_submit(
+    def _prepare_submission(
         self,
-        command: Sequence[str],
         *,
         checkout: str,
-        kind: str,
-        label: str,
-        resources: Mapping[str, int] | None,
-        agent: str | None,
         repository: str | None,
         branch: str | None,
         head_sha: str | None,
         caller_pid: int | None,
         environment: Mapping[str, str] | None,
-        owner: Mapping[str, Any],
-    ) -> str:
-        selected_command = _validate_command(command)
-        if kind not in RUN_KINDS:
-            raise CoordinatorError(
-                "kind must be exactly 'check', 'full', 'merge', or 'land'"
-            )
-        if kind in {"merge", "land"}:
-            raise CoordinatorError(f"{kind} can only be submitted through submit_{kind}")
-        if not isinstance(label, str) or not label.strip():
-            raise CoordinatorError("label must be a non-empty string")
+        exact_head: bool,
+    ) -> _PreparedSubmission:
+        """Decide every shared caller-side refusal before selection or autostart.
+
+        Repository discovery, the exact clean head, the caller PID, and the nesting
+        rule are properties of the caller, not of the target spool, so they are settled
+        here and only the owner's capacities remain to be checked once a broker exists.
+        The relative order of these refusals is unchanged.
+        """
         identity = discover_repository(checkout, repository=repository)
         selected_branch = (
             branch.strip()
@@ -4906,7 +4928,7 @@ class CoordinatorClient:
         if not selected_branch:
             raise CoordinatorError("branch must be a non-empty string")
         selected_head = _validate_head_sha(head_sha, required=False)
-        if kind == "full":
+        if exact_head:
             selected_head = selected_head or _git_head(identity.checkout)
             _assert_clean_head(identity.checkout, selected_head)
         selected_pid = os.getpid() if caller_pid is None else caller_pid
@@ -4916,39 +4938,39 @@ class CoordinatorClient:
             or selected_pid <= 0
         ):
             raise CoordinatorError("caller_pid must be a positive integer")
-        selected_resources = _validate_resources(resources, owner["capacities"])
-        selected_environment = _validate_environment(environment)
+        return _PreparedSubmission(
+            identity=identity,
+            branch=selected_branch,
+            head_sha=selected_head,
+            caller_pid=selected_pid,
+            environment=_validate_environment(environment),
+        )
+
+    def _native_submit(
+        self,
+        command: Sequence[str],
+        *,
+        kind: str,
+        label: str,
+        resources: Mapping[str, int] | None,
+        agent: str | None,
+        prepared: _PreparedSubmission,
+        owner: Mapping[str, Any],
+    ) -> str:
         run_id = f"{kind}-{uuid4().hex[:12]}"
-        arguments = [
-            "--run-id",
-            run_id,
-            "--kind",
-            kind,
-            "--label",
-            label.strip(),
-            "--agent",
-            _agent_identity(agent),
-            "--repository-id",
-            identity.repository_id,
-            "--repository",
-            identity.repository,
-            "--worktree-id",
-            identity.worktree_id,
-            "--checkout",
-            str(identity.checkout),
-            "--branch",
-            selected_branch,
-            "--caller-pid",
-            str(selected_pid),
-        ]
-        if selected_head is not None:
-            arguments.extend(("--head", selected_head))
-        for name, units in selected_resources.items():
-            arguments.extend(("--resource", f"{name}={units}"))
-        for name, value in selected_environment.items():
-            arguments.extend(("--env", f"{name}={value}"))
-        arguments.append("--")
-        arguments.extend(selected_command)
+        arguments = self._native_submission_arguments(
+            run_id=run_id,
+            kind=kind,
+            label=label,
+            identity=prepared.identity,
+            branch=prepared.branch,
+            head_sha=prepared.head_sha,
+            resources=_validate_resources(resources, owner["capacities"]),
+            agent=_agent_identity(agent),
+            caller_pid=prepared.caller_pid,
+            environment=prepared.environment,
+            command=command,
+        )
         result = self._native_invoke("submit", arguments)
         if not isinstance(result, dict) or result != {"run_id": run_id}:
             raise CoordinatorError("native broker returned an invalid submission receipt")
@@ -5030,20 +5052,34 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> str:
+        if adapter != "github":
+            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
+        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
+            raise CoordinatorError(
+                "the GitHub publication request must be a positive PR number"
+            )
+        if gate_run_id is not None and (
+            not isinstance(gate_run_id, str) or not gate_run_id
+        ):
+            raise CoordinatorError("gate_run_id must be a non-empty string")
+        prepared = self._prepare_submission(
+            checkout=checkout,
+            repository=repository,
+            branch=branch,
+            head_sha=head_sha,
+            caller_pid=caller_pid,
+            environment=environment,
+            exact_head=True,
+        )
         owner = self._ensure_broker(for_submission=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_submit_merge(
                 adapter,
                 request,
-                checkout=checkout,
                 gate_run_id=gate_run_id,
                 resources=resources,
                 agent=agent,
-                repository=repository,
-                branch=branch,
-                head_sha=head_sha,
-                caller_pid=caller_pid,
-                environment=environment,
+                prepared=prepared,
                 owner=owner,
             )
         return self._catalogue().submit_merge(
@@ -5064,49 +5100,14 @@ class CoordinatorClient:
     def _native_submit_merge(
         self,
         adapter: str,
-        request: object,
+        request: int,
         *,
-        checkout: str,
         gate_run_id: str | None,
         resources: Mapping[str, int] | None,
         agent: str | None,
-        repository: str | None,
-        branch: str | None,
-        head_sha: str | None,
-        caller_pid: int | None,
-        environment: Mapping[str, str] | None,
+        prepared: _PreparedSubmission,
         owner: Mapping[str, Any],
     ) -> str:
-        if adapter != "github":
-            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
-        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
-            raise CoordinatorError(
-                "the GitHub publication request must be a positive PR number"
-            )
-        if gate_run_id is not None and (
-            not isinstance(gate_run_id, str) or not gate_run_id
-        ):
-            raise CoordinatorError("gate_run_id must be a non-empty string")
-        identity = discover_repository(checkout, repository=repository)
-        selected_branch = (
-            branch.strip()
-            if isinstance(branch, str)
-            else _git_branch(identity.checkout)
-        )
-        if not selected_branch:
-            raise CoordinatorError("branch must be a non-empty string")
-        selected_head = (
-            _validate_head_sha(head_sha, required=False) or _git_head(identity.checkout)
-        )
-        _assert_clean_head(identity.checkout, selected_head)
-        selected_pid = os.getpid() if caller_pid is None else caller_pid
-        if (
-            not isinstance(selected_pid, int)
-            or isinstance(selected_pid, bool)
-            or selected_pid <= 0
-        ):
-            raise CoordinatorError("caller_pid must be a positive integer")
-        selected_environment = _validate_environment(environment)
         executable = str(Path(sys.executable).expanduser().absolute())
         if not Path(executable).is_file():
             raise CoordinatorError(f"merge worker Python does not exist: {executable}")
@@ -5120,24 +5121,24 @@ class CoordinatorClient:
             "--state-dir",
             str(self.paths.state_dir),
             "--checkout",
-            str(identity.checkout),
+            str(prepared.identity.checkout),
             "--branch",
-            selected_branch,
+            prepared.branch,
             "--head-sha",
-            selected_head,
+            prepared.exact_head(),
             str(request),
         ]
         arguments = self._native_submission_arguments(
             run_id=run_id,
             kind="merge",
             label=f"merge GitHub PR #{request}",
-            identity=identity,
-            branch=selected_branch,
-            head_sha=selected_head,
+            identity=prepared.identity,
+            branch=prepared.branch,
+            head_sha=prepared.exact_head(),
             resources=_validate_resources(resources, owner["capacities"]),
             agent=_agent_identity(agent),
-            caller_pid=selected_pid,
-            environment=selected_environment,
+            caller_pid=prepared.caller_pid,
+            environment=prepared.environment,
             publication=(adapter, request),
             gate_run_id=gate_run_id,
             command=worker,
@@ -5164,21 +5165,36 @@ class CoordinatorClient:
         environment: Mapping[str, str] | None = None,
         synchronize_target: bool = True,
     ) -> str:
+        selected_command = _validate_command(command)
+        if adapter != "github":
+            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
+        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
+            raise CoordinatorError(
+                "the GitHub publication request must be a positive PR number"
+            )
+        if not isinstance(label, str) or not label.strip():
+            raise CoordinatorError("label must be a non-empty string")
+        if not isinstance(synchronize_target, bool):
+            raise CoordinatorError("synchronize_target must be boolean")
+        prepared = self._prepare_submission(
+            checkout=checkout,
+            repository=repository,
+            branch=branch,
+            head_sha=head_sha,
+            caller_pid=caller_pid,
+            environment=environment,
+            exact_head=True,
+        )
         owner = self._ensure_broker(for_submission=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_submit_land(
                 adapter,
                 request,
-                command,
-                checkout=checkout,
-                label=label,
+                selected_command,
+                label=label.strip(),
                 resources=resources,
                 agent=agent,
-                repository=repository,
-                branch=branch,
-                head_sha=head_sha,
-                caller_pid=caller_pid,
-                environment=environment,
+                prepared=prepared,
                 synchronize_target=synchronize_target,
                 owner=owner,
             )
@@ -5201,52 +5217,17 @@ class CoordinatorClient:
     def _native_submit_land(
         self,
         adapter: str,
-        request: object,
+        request: int,
         command: Sequence[str],
         *,
-        checkout: str,
         label: str,
         resources: Mapping[str, int] | None,
         agent: str | None,
-        repository: str | None,
-        branch: str | None,
-        head_sha: str | None,
-        caller_pid: int | None,
-        environment: Mapping[str, str] | None,
+        prepared: _PreparedSubmission,
         synchronize_target: bool,
         owner: Mapping[str, Any],
     ) -> str:
-        selected_command = _validate_command(command)
-        if adapter != "github":
-            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
-        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
-            raise CoordinatorError(
-                "the GitHub publication request must be a positive PR number"
-            )
-        if not isinstance(label, str) or not label.strip():
-            raise CoordinatorError("label must be a non-empty string")
-        if not isinstance(synchronize_target, bool):
-            raise CoordinatorError("synchronize_target must be boolean")
-        identity = discover_repository(checkout, repository=repository)
-        selected_branch = (
-            branch.strip()
-            if isinstance(branch, str)
-            else _git_branch(identity.checkout)
-        )
-        if not selected_branch:
-            raise CoordinatorError("branch must be a non-empty string")
-        selected_head = (
-            _validate_head_sha(head_sha, required=False) or _git_head(identity.checkout)
-        )
-        _assert_clean_head(identity.checkout, selected_head)
-        selected_pid = os.getpid() if caller_pid is None else caller_pid
-        if (
-            not isinstance(selected_pid, int)
-            or isinstance(selected_pid, bool)
-            or selected_pid <= 0
-        ):
-            raise CoordinatorError("caller_pid must be a positive integer")
-        selected_environment = _validate_environment(environment)
+        selected_environment = dict(prepared.environment)
         if LAND_TARGET_SYNC_ENV in selected_environment:
             raise CoordinatorError(
                 f"gate environment uses the reserved {LAND_TARGET_SYNC_ENV} name"
@@ -5266,16 +5247,16 @@ class CoordinatorClient:
         arguments = self._native_submission_arguments(
             run_id=run_id,
             kind="land",
-            label=label.strip(),
-            identity=identity,
-            branch=selected_branch,
-            head_sha=selected_head,
+            label=label,
+            identity=prepared.identity,
+            branch=prepared.branch,
+            head_sha=prepared.exact_head(),
             resources=_validate_resources(resources, owner["capacities"]),
             agent=_agent_identity(agent),
-            caller_pid=selected_pid,
+            caller_pid=prepared.caller_pid,
             environment=selected_environment,
             publication=(adapter, request),
-            command=selected_command,
+            command=command,
         )
         result = self._native_invoke("submit", arguments)
         if not isinstance(result, dict) or result != {"run_id": run_id}:
