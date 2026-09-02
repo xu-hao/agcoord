@@ -165,8 +165,10 @@ the service stopped and the marker in place; rerunning `drain` reports the same 
 Run the shipped probe as an ordinary coordinated job with exactly one CPU unit; do not invoke
 it from a nested coordinator. It proves the admitted AppArmor transition, user-namespace
 denial, cgroup namespace root, exact `cpu.max`, release owner identity, and the restricted
-profile reached when admitted work invokes the broker. The final assertion proves that the durable public
-receipt records the enforced allocation:
+profile reached when admitted work invokes the broker. It also calls the installed Python
+client's operation-specific callback by showing the exact admitted run while it is live; this
+guards the complete `agc`-to-native path used by land reporting and pytest-xdist child leases.
+The final assertion proves that the durable public receipt records the enforced allocation:
 
 ```bash
 agc --json run --label "native host enforcement" --resource cpu=1 \
@@ -190,6 +192,14 @@ admitted confinement; this adds restrictions without requesting a replacement do
 All three profiles use explicit enforce mode and broad enumerated host permissions;
 `default_allow` is not accepted because Ubuntu 24.04 implements it as an unconfined profile that
 does not apply these denials.
+
+Within the admitted user namespace, `stat(2)` reports the host-root-owned installed binary with
+the overflow UID because host root is intentionally absent from the one-entry identity map. The
+Python client does not weaken its ordinary root-ownership policy or whitelist that UID. Only its
+admitted callback selector accepts this view, and only after checking the fixed installed path,
+managed release configuration, exact UID/GID maps, denied `setgroups`, and the native restricted
+profile preflight. The selector exposes own-run status, authenticated child leases, and land
+verification/phase/result reporting; it does not turn `agc` into a nested submission mechanism.
 
 ## Upgrade, recovery, and rollback
 

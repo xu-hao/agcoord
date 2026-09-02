@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+import stat
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,8 +17,18 @@ from agcoord.config import (
     NativeBrokerConfig,
     parse_broker_config,
 )
-from agcoord.native_client import NativeBrokerCommand, NativeClientError
-from agcoord.queue import CoordinatorBroker, CoordinatorClient, CoordinatorError
+from agcoord.native_client import (
+    NativeBrokerCommand,
+    NativeBrokerIdentity,
+    NativeClientError,
+)
+from agcoord.queue import (
+    NATIVE_IMPLEMENTATION,
+    NATIVE_PROTOCOL,
+    CoordinatorBroker,
+    CoordinatorClient,
+    CoordinatorError,
+)
 
 from conftest import RunningCoordinator
 
@@ -134,6 +147,277 @@ def test_release_policy_rejects_a_user_owned_development_binary(tmp_path: Path):
         NativeBrokerCommand.select(
             NativeBrokerConfig(path=str(executable), allow_development=False)
         )
+
+
+def _mock_admitted_release(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    executable: Path | None = None,
+    proc_overrides: dict[Path, str] | None = None,
+    callback_stdout: bytes | None = None,
+    callback_returncode: int = 0,
+    callback_stderr: bytes = b"",
+) -> tuple[NativeBrokerConfig, list[list[str]]]:
+    selected = Path(DEFAULT_NATIVE_BROKER_PATH) if executable is None else executable
+    details = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=65534)
+    identity = json.dumps(
+        {
+            "name": "agcoord-broker",
+            "version": "0.3.1",
+            "protocol": 5,
+            "implementation": "rust-native",
+            "build": f"sha256:{'a' * 64}",
+            "target": "x86_64-unknown-linux-musl",
+            "sqlite": "3.53.2",
+        },
+        separators=(",", ":"),
+    ).encode()
+    callback = callback_stdout
+    if callback is None:
+        callback = json.dumps(
+            {
+                "ready": True,
+                "profile": "agcoord-broker-client",
+                "user_namespace_denied": True,
+            },
+            separators=(",", ":"),
+        ).encode()
+    proc = {
+        Path("/proc/self/uid_map"): "1000 1000 1\n",
+        Path("/proc/self/gid_map"): "1000 1000 1\n",
+        Path("/proc/self/setgroups"): "deny\n",
+        Path("/proc/sys/kernel/overflowuid"): "65534\n",
+    }
+    proc.update(proc_overrides or {})
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(Path, "lstat", lambda _path: details)
+    monkeypatch.setattr(Path, "read_text", lambda path, **_kwargs: proc[path])
+    monkeypatch.setattr("agcoord.native_client.os.access", lambda *_args: True)
+    monkeypatch.setattr("agcoord.native_client.os.geteuid", lambda: 1000)
+    monkeypatch.setattr("agcoord.native_client.os.getegid", lambda: 1000)
+
+    def fake_run(arguments, **_kwargs):
+        calls.append(list(arguments))
+        if arguments == [str(selected), "identity", "--json"]:
+            return subprocess.CompletedProcess(arguments, 0, identity, b"")
+        if arguments == [str(selected), "host-client-preflight"]:
+            return subprocess.CompletedProcess(
+                arguments,
+                callback_returncode,
+                callback,
+                callback_stderr,
+            )
+        raise AssertionError(f"unexpected native command: {arguments!r}")
+
+    monkeypatch.setattr("agcoord.native_client.subprocess.run", fake_run)
+    return (
+        NativeBrokerConfig(
+            path=str(selected),
+            allow_development=False,
+            managed_service=True,
+        ),
+        calls,
+    )
+
+
+def test_admitted_callback_attests_the_fixed_release_when_host_root_is_unmapped(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    executable = Path(DEFAULT_NATIVE_BROKER_PATH)
+    configured, calls = _mock_admitted_release(monkeypatch)
+
+    with pytest.raises(NativeClientError, match="owned by root"):
+        NativeBrokerCommand.select(configured)
+
+    selected = NativeBrokerCommand.select_for_admitted_callback(configured)
+    assert selected.path == executable
+    assert selected.identity.build == f"sha256:{'a' * 64}"
+    assert calls == [
+        [str(executable), "host-client-preflight"],
+        [str(executable), "identity", "--json"],
+    ]
+
+
+def test_admitted_callback_never_trusts_an_arbitrary_overflow_owned_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    configured, calls = _mock_admitted_release(
+        monkeypatch,
+        executable=Path("/opt/agcoord/untrusted-broker"),
+    )
+
+    with pytest.raises(NativeClientError, match="owned by root"):
+        NativeBrokerCommand.select_for_admitted_callback(configured)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("proc_path", "value"),
+    [
+        (Path("/proc/self/uid_map"), "1000 0 1\n"),
+        (Path("/proc/self/gid_map"), "1000 0 1\n"),
+        (Path("/proc/self/setgroups"), "allow\n"),
+        (Path("/proc/sys/kernel/overflowuid"), "65533\n"),
+    ],
+)
+def test_admitted_callback_rejects_every_inexact_namespace_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    proc_path: Path,
+    value: str,
+):
+    configured, calls = _mock_admitted_release(
+        monkeypatch,
+        proc_overrides={proc_path: value},
+    )
+
+    with pytest.raises(NativeClientError, match="owned by root"):
+        NativeBrokerCommand.select_for_admitted_callback(configured)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "message"),
+    [
+        (0, b'{"ready":true}', b"", "incompatible JSON shape"),
+        (
+            1,
+            b"",
+            b'{"code":"host-client-profile-mismatch","message":"wrong profile"}\n',
+            "was refused.*host-client-profile-mismatch",
+        ),
+    ],
+)
+def test_admitted_callback_fails_closed_when_native_attestation_is_not_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: bytes,
+    stderr: bytes,
+    message: str,
+):
+    configured, calls = _mock_admitted_release(
+        monkeypatch,
+        callback_stdout=stdout,
+        callback_returncode=returncode,
+        callback_stderr=stderr,
+    )
+
+    with pytest.raises(NativeClientError, match=message):
+        NativeBrokerCommand.select_for_admitted_callback(configured)
+    assert calls == [
+        [DEFAULT_NATIVE_BROKER_PATH, "host-client-preflight"],
+    ]
+
+
+def test_client_routes_only_exact_admitted_status_through_the_callback_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from agcoord import queue
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "native_broker": {
+                    "path": DEFAULT_NATIVE_BROKER_PATH,
+                    "allow_development": False,
+                    "managed_service": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = "land-callback"
+    build = f"sha256:{'a' * 64}"
+    identity = NativeBrokerIdentity(
+        name="agcoord-broker",
+        version="0.3.1",
+        protocol=NATIVE_PROTOCOL,
+        implementation=NATIVE_IMPLEMENTATION,
+        build=build,
+        target="x86_64-unknown-linux-musl",
+        sqlite="3.53.2",
+    )
+    callback_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class CallbackCommand:
+        def __init__(self):
+            self.identity = identity
+
+        def invoke(self, command, *, state_dir, arguments=()):
+            assert Path(state_dir) == state_dir_path
+            callback_calls.append((command, tuple(arguments)))
+            return {"run_id": run_id, "status": "running"}
+
+    state_dir_path = state_dir.resolve()
+    owner = {
+        "protocol": NATIVE_PROTOCOL,
+        "pid": 4100,
+        "capacities": {"jobs": 1},
+        "resource_bindings": {},
+        "resource_capabilities": {},
+        "implementation": NATIVE_IMPLEMENTATION,
+        "version": identity.version,
+        "build": identity.build,
+    }
+    monkeypatch.setattr(queue, "_read_broker_owner", lambda _paths: owner)
+
+    def refuse_ordinary_selection(_cls, _configured):
+        raise NativeClientError("ordinary native selection was refused")
+
+    monkeypatch.setattr(
+        NativeBrokerCommand,
+        "select",
+        classmethod(refuse_ordinary_selection),
+    )
+    monkeypatch.setattr(
+        NativeBrokerCommand,
+        "select_for_admitted_callback",
+        classmethod(lambda _cls, _configured: CallbackCommand()),
+    )
+    monkeypatch.setenv("AGCOORD_RUN_ID", run_id)
+    monkeypatch.setenv("AGCOORD_STATE_DIR", str(state_dir_path))
+    client = CoordinatorClient(state_dir=state_dir_path, autostart=False)
+    monkeypatch.setattr(client, "_maintenance_if_active", lambda: None)
+
+    assert client.admitted_run_status(run_id) == {
+        "run_id": run_id,
+        "status": "running",
+    }
+    assert callback_calls == [("status", ("--run-id", run_id))]
+
+    with pytest.raises(CoordinatorError, match="callback run does not match"):
+        client.admitted_run_status("land-other")
+
+    with pytest.raises(CoordinatorError, match="ordinary native selection was refused"):
+        client.status(run_id)
+
+
+def test_admitted_callback_never_autostarts_a_missing_broker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from agcoord import queue
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("AGCOORD_RUN_ID", "land-callback")
+    monkeypatch.setenv("AGCOORD_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(queue, "_read_broker_owner", lambda _paths: None)
+    client = CoordinatorClient(
+        state_dir=state_dir,
+        autostart=True,
+        connect_timeout=0.01,
+    )
+    monkeypatch.setattr(
+        client,
+        "_start_broker",
+        lambda: pytest.fail("an admitted callback attempted to start a broker"),
+    )
+
+    with pytest.raises(CoordinatorError, match="no gate broker owns.*callback"):
+        client.admitted_run_status("land-callback")
 
 
 def test_unsupported_platform_refusal_precedes_executable_discovery(

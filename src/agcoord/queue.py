@@ -4544,6 +4544,7 @@ class CoordinatorClient:
         self.connect_timeout = connect_timeout
         self._catalogue_instance: CoordinatorBroker | None = None
         self._native_command_instance: NativeBrokerCommand | None = None
+        self._native_callback_command_instance: NativeBrokerCommand | None = None
 
     def _catalogue(self) -> CoordinatorBroker:
         if self._catalogue_instance is None:
@@ -4564,8 +4565,30 @@ class CoordinatorClient:
                 raise CoordinatorError(str(exc)) from exc
         return self._native_command_instance
 
-    def _validate_native_owner(self, owner: Mapping[str, Any]) -> None:
-        selected = self._native_command().identity
+    def _native_callback_command(self) -> NativeBrokerCommand:
+        if self._native_callback_command_instance is None:
+            config = broker_config(self.paths.state_dir)
+            try:
+                self._native_callback_command_instance = (
+                    NativeBrokerCommand.select(config.native_broker)
+                    if config.native_broker.allow_development
+                    else NativeBrokerCommand.select_for_admitted_callback(
+                        config.native_broker
+                    )
+                )
+            except NativeClientError as exc:
+                raise CoordinatorError(str(exc)) from exc
+        return self._native_callback_command_instance
+
+    def _validate_native_owner(
+        self,
+        owner: Mapping[str, Any],
+        *,
+        admitted_callback: bool = False,
+    ) -> None:
+        selected = (
+            self._native_callback_command() if admitted_callback else self._native_command()
+        ).identity
         if owner.get("implementation") != NATIVE_IMPLEMENTATION:
             raise CoordinatorError(
                 "live protocol-5 owner is not the native Rust broker"
@@ -4604,6 +4627,39 @@ class CoordinatorClient:
             )
         except NativeClientError as exc:
             raise CoordinatorError(str(exc), code=exc.code) from exc
+
+    def _native_callback_invoke(
+        self,
+        command: str,
+        arguments: Sequence[str] = (),
+    ) -> Any:
+        try:
+            return self._native_callback_command().invoke(
+                command,
+                state_dir=self.paths.state_dir,
+                arguments=arguments,
+            )
+        except NativeClientError as exc:
+            raise CoordinatorError(str(exc), code=exc.code) from exc
+
+    def _admitted_callback_run_id(self) -> str:
+        run_id = os.environ.get(RUN_ID_ENV)
+        if not run_id:
+            raise CoordinatorError(
+                "callbacks are available only inside an admitted AGCoord run"
+            )
+        state_marker = os.environ.get(STATE_DIR_ENV)
+        if not state_marker or _absolute(state_marker) != self.paths.state_dir:
+            raise CoordinatorError(
+                "callback state does not match the admitted AGCoord context"
+            )
+        return run_id
+
+    def _assert_admitted_callback(self, run_id: str) -> None:
+        if self._admitted_callback_run_id() != run_id:
+            raise CoordinatorError(
+                "callback run does not match the admitted AGCoord context"
+            )
 
     def _maintenance_if_active(self) -> dict[str, Any] | None:
         protocol = _spool_protocol(self.paths)
@@ -4667,7 +4723,12 @@ class CoordinatorClient:
             return refreshed
         return maintenance
 
-    def _ensure_broker(self, *, for_submission: bool = False) -> dict[str, Any]:
+    def _ensure_broker(
+        self,
+        *,
+        for_submission: bool = False,
+        admitted_callback: bool = False,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + self.connect_timeout
         last_metadata_error: _OwnerMetadataError | None = None
         maintenance: dict[str, Any] | None = None
@@ -4685,6 +4746,11 @@ class CoordinatorClient:
                 continue
             if owner is not None:
                 break
+            if admitted_callback:
+                if time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
+                break
             try:
                 maintenance = self._maintenance_if_active()
             except CoordinatorError as exc:
@@ -4695,7 +4761,10 @@ class CoordinatorClient:
             break
         if owner is not None:
             if owner["protocol"] == NATIVE_PROTOCOL:
-                self._validate_native_owner(owner)
+                self._validate_native_owner(
+                    owner,
+                    admitted_callback=admitted_callback,
+                )
             if for_submission:
                 maintenance = self._maintenance_if_active()
                 if maintenance is not None:
@@ -4731,6 +4800,10 @@ class CoordinatorClient:
                 f"coordinator is {maintenance['state']} as "
                 f"{maintenance['drain_id']}; new submissions are refused until resume",
                 code="broker-draining",
+            )
+        if admitted_callback:
+            raise CoordinatorError(
+                f"no gate broker owns {self.paths.state_dir} for the admitted callback"
             )
         if not self.autostart:
             if last_metadata_error is not None:
@@ -5216,6 +5289,30 @@ class CoordinatorClient:
         return self._catalogue().snapshot()
 
     def status(self, run_id: str) -> dict[str, Any]:
+        return self._status(run_id, admitted_callback=False)
+
+    def admitted_run_status(self, run_id: str) -> dict[str, Any]:
+        """Read only the exact parent run through the admitted callback boundary."""
+        self._assert_admitted_callback(run_id)
+        return self._status(run_id, admitted_callback=True)
+
+    def _status(
+        self,
+        run_id: str,
+        *,
+        admitted_callback: bool,
+    ) -> dict[str, Any]:
+        if admitted_callback:
+            owner = self._ensure_broker(admitted_callback=True)
+            if owner["protocol"] == NATIVE_PROTOCOL:
+                result = self._native_callback_invoke(
+                    "status",
+                    ("--run-id", run_id),
+                )
+                if not isinstance(result, dict) or result.get("run_id") != run_id:
+                    raise CoordinatorError("native broker returned an invalid run status")
+                return result
+            return self._catalogue().status(run_id)
         maintenance = self._maintenance_if_active()
         if maintenance is not None:
             maintenance = self._recover_native_drain(maintenance)
@@ -5396,23 +5493,14 @@ class CoordinatorClient:
             raise CoordinatorError("child CPU lease timeout must be non-negative or null")
         if poll_interval <= 0:
             raise CoordinatorError("child CPU lease poll interval must be positive")
-        marker = os.environ.get(RUN_ID_ENV)
+        marker = self._admitted_callback_run_id()
         selected_run = marker if run_id is None else run_id
-        if not selected_run:
-            raise CoordinatorError(
-                "child CPU leases are available only inside an admitted AGCoord run"
-            )
         if marker != selected_run:
             raise CoordinatorError(
                 "child CPU lease parent does not match the admitted run context"
             )
-        state_marker = os.environ.get(STATE_DIR_ENV)
-        if not state_marker or _absolute(state_marker) != self.paths.state_dir:
-            raise CoordinatorError(
-                "child CPU lease state does not match the admitted run context"
-            )
         selected_minimum = requested if minimum is None else minimum
-        owner = self._ensure_broker()
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             if (
                 not isinstance(requested, int)
@@ -5434,7 +5522,7 @@ class CoordinatorClient:
             if owner_token is None:
                 raise CoordinatorError("cannot identify child CPU lease owner process")
             lease_id = f"cpu-lease-{uuid4().hex[:12]}"
-            row = self._native_invoke(
+            row = self._native_callback_invoke(
                 "lease-request",
                 (
                     "--lease-id",
@@ -5492,16 +5580,24 @@ class CoordinatorClient:
         )
 
     def _child_cpu_lease_status(self, lease_id: str) -> dict[str, Any]:
-        owner = self._ensure_broker()
+        run_id = self._admitted_callback_run_id()
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
-            result = self._native_invoke(
+            result = self._native_callback_invoke(
                 "lease-status",
                 ("--lease-id", lease_id),
             )
-            if not isinstance(result, dict) or result.get("lease_id") != lease_id:
+            if (
+                not isinstance(result, dict)
+                or result.get("lease_id") != lease_id
+                or result.get("run_id") != run_id
+            ):
                 raise CoordinatorError("native broker returned an invalid child lease status")
             return result
-        return self._catalogue().child_cpu_lease_status(lease_id)
+        result = self._catalogue().child_cpu_lease_status(lease_id)
+        if result.get("run_id") != run_id:
+            raise CoordinatorError("child CPU lease does not belong to the admitted run")
+        return result
 
     def child_cpu_leases(
         self,
@@ -5530,13 +5626,15 @@ class CoordinatorClient:
         )
 
     def release_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
-        owner = self._ensure_broker()
+        self._admitted_callback_run_id()
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_finish_child_lease(lease_id, "lease-release")
         return self._catalogue().release_child_cpu_lease(lease_id)
 
     def cancel_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
-        owner = self._ensure_broker()
+        self._admitted_callback_run_id()
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             return self._native_finish_child_lease(lease_id, "lease-cancel")
         return self._catalogue().cancel_child_cpu_lease(lease_id)
@@ -5546,13 +5644,14 @@ class CoordinatorClient:
         lease_id: str,
         command: str,
     ) -> dict[str, Any]:
+        run_id = self._admitted_callback_run_id()
         if not isinstance(lease_id, str) or not lease_id:
             raise CoordinatorError("child CPU lease ID must be non-empty")
         owner_pid = os.getpid()
         owner_token = _process_start_token(owner_pid)
         if owner_token is None:
             raise CoordinatorError("cannot identify child CPU lease owner process")
-        result = self._native_invoke(
+        result = self._native_callback_invoke(
             command,
             (
                 "--lease-id",
@@ -5563,7 +5662,11 @@ class CoordinatorClient:
                 owner_token,
             ),
         )
-        if not isinstance(result, dict) or result.get("lease_id") != lease_id:
+        if (
+            not isinstance(result, dict)
+            or result.get("lease_id") != lease_id
+            or result.get("run_id") != run_id
+        ):
             raise CoordinatorError("native broker returned an invalid child lease receipt")
         return result
 
@@ -5576,7 +5679,8 @@ class CoordinatorClient:
         head_sha: str,
         worker_pid: int,
     ) -> None:
-        owner = self._ensure_broker()
+        self._assert_admitted_callback(run_id)
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             if kind not in {"full", "merge", "land"}:
                 raise CoordinatorError(
@@ -5585,7 +5689,7 @@ class CoordinatorClient:
             token = _process_start_token(worker_pid)
             if token is None:
                 raise CoordinatorError("cannot identify admitted worker process")
-            result = self._native_invoke(
+            result = self._native_callback_invoke(
                 "verify",
                 (
                     "--run-id",
@@ -5622,12 +5726,13 @@ class CoordinatorClient:
         worker_pid: int,
         new_head_sha: str | None = None,
     ) -> None:
-        owner = self._ensure_broker()
+        self._assert_admitted_callback(run_id)
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             token = _process_start_token(worker_pid)
             if token is None:
                 raise CoordinatorError("cannot identify admitted land worker process")
-            row = self.status(run_id)
+            row = self.admitted_run_status(run_id)
             arguments = [
                 "--run-id",
                 run_id,
@@ -5651,7 +5756,7 @@ class CoordinatorClient:
                         _validate_head_sha(new_head_sha, required=True) or "",
                     )
                 )
-            result = self._native_invoke("phase", arguments)
+            result = self._native_callback_invoke("phase", arguments)
             if not isinstance(result, dict) or result.get("run_id") != run_id:
                 raise CoordinatorError("native broker returned an invalid land phase receipt")
             return
@@ -5670,12 +5775,13 @@ class CoordinatorClient:
         exit_status: int,
         worker_pid: int,
     ) -> None:
-        owner = self._ensure_broker()
+        self._assert_admitted_callback(run_id)
+        owner = self._ensure_broker(admitted_callback=True)
         if owner["protocol"] == NATIVE_PROTOCOL:
             token = _process_start_token(worker_pid)
             if token is None:
                 raise CoordinatorError("cannot identify admitted land worker process")
-            result = self._native_invoke(
+            result = self._native_callback_invoke(
                 "report",
                 (
                     "--run-id",

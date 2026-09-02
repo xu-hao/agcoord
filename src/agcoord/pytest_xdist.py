@@ -47,7 +47,7 @@ def _client_and_budget() -> tuple[CoordinatorClient, int]:
     run_id = os.environ[RUN_ID_ENV]
     client = CoordinatorClient(state_dir=state_dir, autostart=False)
     try:
-        row = client.status(run_id)
+        row = client.admitted_run_status(run_id)
         budget = row["resources"].get("cpu")
     except (AttributeError, CoordinatorError, KeyError, TypeError) as exc:
         raise pytest.UsageError(

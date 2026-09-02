@@ -17,7 +17,7 @@ import stat
 import subprocess
 from typing import Any, Mapping, Sequence
 
-from .config import NativeBrokerConfig
+from .config import DEFAULT_NATIVE_BROKER_PATH, NativeBrokerConfig
 
 
 NATIVE_PROTOCOL = 5
@@ -61,6 +61,23 @@ class NativeBrokerCommand:
 
     @classmethod
     def select(cls, configured: NativeBrokerConfig) -> "NativeBrokerCommand":
+        return cls._select(configured, admitted_callback=False)
+
+    @classmethod
+    def select_for_admitted_callback(
+        cls,
+        configured: NativeBrokerConfig,
+    ) -> "NativeBrokerCommand":
+        """Select only the fixed release broker from its admitted callback domain."""
+        return cls._select(configured, admitted_callback=True)
+
+    @classmethod
+    def _select(
+        cls,
+        configured: NativeBrokerConfig,
+        *,
+        admitted_callback: bool,
+    ) -> "NativeBrokerCommand":
         path = Path(configured.path)
         _validate_host_platform()
         if not path.is_absolute():
@@ -85,13 +102,27 @@ class NativeBrokerCommand:
                 f"native broker executable must not be group- or world-writable: {path}"
             )
         allowed_owners = {0, os.geteuid()} if configured.allow_development else {0}
-        if details.st_uid not in allowed_owners:
+        callback_owner = False
+        if details.st_uid not in allowed_owners and admitted_callback:
+            callback_owner = _is_attested_callback_owner(
+                path,
+                configured=configured,
+                observed_uid=details.st_uid,
+            )
+        if details.st_uid not in allowed_owners and not callback_owner:
             owner = "root" if not configured.allow_development else "root or the current user"
             raise NativeClientError(
                 f"native broker executable must be owned by {owner}: {path}"
             )
+        if admitted_callback and not callback_owner:
+            raise NativeClientError(
+                "native broker admitted callbacks require the fixed installed release "
+                "from AGCoord's restricted user namespace"
+            )
         if details.st_mode & 0o111 == 0 or not os.access(path, os.X_OK):
             raise NativeClientError(f"native broker executable is not executable: {path}")
+        if callback_owner:
+            _attest_admitted_callback(path)
         identity = _read_identity(path)
         if identity.build == "development":
             if not configured.allow_development:
@@ -173,6 +204,100 @@ def _validate_host_platform() -> None:
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "AMD64"}:
         raise NativeClientError(
             "the native broker currently supports only Linux x86_64 hosts"
+        )
+
+
+def _read_proc_integer(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        return None
+    return value if 0 <= value < 2**32 - 1 else None
+
+
+def _one_entry_identity_map(path: Path, identity: int) -> bool:
+    try:
+        fields = path.read_text(encoding="ascii").split()
+    except (OSError, UnicodeError):
+        return False
+    return fields == [str(identity), str(identity), "1"]
+
+
+def _is_attested_callback_owner(
+    path: Path,
+    *,
+    configured: NativeBrokerConfig,
+    observed_uid: int,
+) -> bool:
+    """Recognize only AGCoord's narrow namespace view of host root.
+
+    An overflow UID is never ownership evidence by itself: every unmapped host owner has
+    that representation.  The fixed managed path, exact one-entry identity maps, denied
+    setgroups state, and native AppArmor attestation together establish the callback case.
+    """
+    if (
+        configured.allow_development
+        or not configured.managed_service
+        or path != Path(DEFAULT_NATIVE_BROKER_PATH)
+    ):
+        return False
+    effective_uid = os.geteuid()
+    effective_gid = os.getegid()
+    if effective_uid <= 0 or effective_gid <= 0:
+        return False
+    overflow_uid = _read_proc_integer(Path("/proc/sys/kernel/overflowuid"))
+    if overflow_uid is None or observed_uid != overflow_uid:
+        return False
+    if not _one_entry_identity_map(Path("/proc/self/uid_map"), effective_uid):
+        return False
+    if not _one_entry_identity_map(Path("/proc/self/gid_map"), effective_gid):
+        return False
+    try:
+        setgroups = Path("/proc/self/setgroups").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return False
+    return setgroups == "deny"
+
+
+def _attest_admitted_callback(path: Path) -> None:
+    try:
+        completed = subprocess.run(
+            [str(path), "host-client-preflight"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NativeClientError(
+            "cannot attest the native broker admitted callback"
+        ) from exc
+    if completed.returncode != 0:
+        refusal = _decode_refusal(completed.stderr)
+        code = refusal[0] if refusal is not None else "invalid-refusal"
+        raise NativeClientError(
+            f"native broker admitted callback attestation was refused ({code})"
+        )
+    if completed.stderr.strip():
+        raise NativeClientError(
+            "native broker admitted callback attestation wrote unexpected standard error"
+        )
+    value = _decode_json(
+        completed.stdout,
+        subject="native broker admitted callback attestation",
+    )
+    if value != {
+        "ready": True,
+        "profile": "agcoord-broker-client",
+        "user_namespace_denied": True,
+    }:
+        raise NativeClientError(
+            "native broker admitted callback attestation has an incompatible JSON shape"
         )
 
 
