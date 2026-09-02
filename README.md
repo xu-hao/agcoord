@@ -207,6 +207,7 @@ agc cancel land-0123456789ab
 agc clear
 # For planned maintenance:
 agc drain --reason "native host upgrade"
+agc migrate
 agc resume drain-0123456789ab
 ```
 
@@ -216,8 +217,14 @@ exists and never removes the spool, broker ownership, or migration history.
 It waits for those rows—including an authoritative land publication—to become terminal and for
 the broker to yield ownership. `list`, `show`, `log`, the TUI, and explicit cancellation remain
 available. Save the returned `drain-…` ID: only `resume` with that exact ID reopens submissions.
+`migrate` is the explicit, out-of-band protocol transition for an older spool; ordinary commands
+fail closed on one and name it rather than upgrading a schema on a hot path. Run it only while
+the retained receipt says `drained`, and follow the
+[native migration runbook](docs/native_migration.md) for the backup and rollback rehearsal it
+requires.
 
-The full operating contract, recovery behavior, TUI keys, and resource model are in
+Every canonical contract is listed in [the documentation index](docs/index.md). The full
+operating contract, recovery behavior, TUI keys, and resource model are in
 [the coordinator guide](docs/coordinator.md). Package maintainers should also read
 [the release guide](docs/releasing.md), and published user-facing changes are recorded in
 [the changelog](CHANGELOG.md). Contributors follow the repository workflow in
