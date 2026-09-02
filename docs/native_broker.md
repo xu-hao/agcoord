@@ -197,6 +197,11 @@ root-owner selection. An absent or forged admission environment, arbitrary overf
 inexact namespace map, or failed confinement attestation is refused before a callback command
 runs.
 
+Publication workers retain the submitting Python entry-point exactly, including a virtual
+environment's `bin/python` symlink. Resolving that entry-point to the base interpreter would drop
+the virtual environment's installed client and could run a stale AGCoord version at the admitted
+callback boundary.
+
 ### Implemented scheduler and state boundary
 
 The native executable implements the protocol-5 owner lock, SQLite spool initialization,

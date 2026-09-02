@@ -5094,7 +5094,7 @@ class CoordinatorClient:
         ):
             raise CoordinatorError("caller_pid must be a positive integer")
         selected_environment = _validate_environment(environment)
-        executable = str(Path(sys.executable).expanduser().resolve())
+        executable = str(Path(sys.executable).expanduser().absolute())
         if not Path(executable).is_file():
             raise CoordinatorError(f"merge worker Python does not exist: {executable}")
         run_id = f"merge-{uuid4().hex[:12]}"
@@ -5245,7 +5245,7 @@ class CoordinatorClient:
             raise CoordinatorError(
                 "gate environment uses the reserved _AGCOORD_LAND_PYTHON name"
             )
-        executable = str(Path(sys.executable).expanduser().resolve())
+        executable = str(Path(sys.executable).expanduser().absolute())
         if not Path(executable).is_file():
             raise CoordinatorError(f"land worker Python does not exist: {executable}")
         selected_environment["_AGCOORD_LAND_PYTHON"] = executable

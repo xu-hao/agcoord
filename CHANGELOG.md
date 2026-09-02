@@ -11,7 +11,8 @@ versioning; dates use ISO 8601.
   a managed admitted user namespace, where Linux represents the fixed host-root-owned broker
   with the overflow UID. Selection still rejects arbitrary overflow-owned paths and requires
   exact namespace maps plus the restricted AppArmor preflight; general nested client operations
-  retain the ordinary root-owner policy.
+  retain the ordinary root-owner policy. Publication workers now preserve a virtual environment's
+  Python entry-point instead of resolving it to a potentially stale base installation.
 
 ## 0.3.1 — 2026-09-02
 
