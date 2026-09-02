@@ -47,11 +47,13 @@ class Publisher:
         race_ref: str | None = None,
         race_sha: str | None = None,
         fail_update: bool = False,
+        branch: str = BRANCH,
     ):
         self.repository = repository
         self.race_ref = race_ref
         self.race_sha = race_sha
         self.fail_update = fail_update
+        self.branch = branch
         self.create_calls: list[dict[str, object]] = []
         self.created: list[dict[str, object]] = []
         self.update_calls: list[tuple[dict[str, object], ...]] = []
@@ -61,7 +63,7 @@ class Publisher:
     def _refs(self) -> tuple[str, str]:
         return (
             _remote_sha(self.repository, "refs/heads/main"),
-            _remote_sha(self.repository, f"refs/heads/{BRANCH}"),
+            _remote_sha(self.repository, f"refs/heads/{self.branch}"),
         )
 
     def create_merge_commit(
@@ -234,6 +236,105 @@ def _transfer_race_object(repository: Repository, sha: str, name: str) -> None:
     )
 
 
+def _advance_remote_main(
+    repository: Repository,
+    checkout: Path,
+    changes: dict[str, str],
+) -> str:
+    subprocess.run(
+        [GIT, "clone", "--branch", "main", str(repository.remote), str(checkout)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    _git(checkout, "config", "user.name", "AGCoord target test")
+    _git(checkout, "config", "user.email", "target@example.invalid")
+    for name, content in changes.items():
+        (checkout / name).write_text(content, encoding="utf-8")
+    _git(checkout, "add", *changes)
+    _git(checkout, "commit", "-m", "advance target")
+    _git(checkout, "push", "origin", "main")
+    return _sha(checkout, "HEAD")
+
+
+def _add_feature_checkout(
+    repository: Repository,
+    checkout: Path,
+    branch: str,
+) -> Repository:
+    subprocess.run(
+        [GIT, "clone", "--branch", "main", str(repository.remote), str(checkout)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    _git(checkout, "config", "user.name", "AGCoord queued land test")
+    _git(checkout, "config", "user.email", "queued-land@example.invalid")
+    main_sha = _sha(checkout, "HEAD")
+    _git(checkout, "switch", "-c", branch)
+    (checkout / "second.txt").write_text("second land\n", encoding="utf-8")
+    _git(checkout, "add", "second.txt")
+    _git(checkout, "commit", "-m", "second queued land")
+    head_sha = _sha(checkout, "HEAD")
+    _git(checkout, "push", "-u", "origin", branch)
+    return Repository(checkout, repository.remote, main_sha, head_sha)
+
+
+def _install_sync_push_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    remote: Path,
+    source_ref: str,
+    race_sha: str | None = None,
+    fail_push: bool = False,
+) -> None:
+    bin_dir = tmp_path / "sync-fault-bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / "git"
+    wrapper.write_text(
+        f"""#!{sys.executable}
+import os
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+sync_push = "push" in arguments and any(
+    argument.startswith("--force-with-lease=") for argument in arguments
+)
+if sync_push and os.environ.get("AGCOORD_TEST_RACE_SHA"):
+    subprocess.run(
+        [
+            os.environ["AGCOORD_TEST_REAL_GIT"],
+            "-C",
+            os.environ["AGCOORD_TEST_RACE_REMOTE"],
+            "update-ref",
+            os.environ["AGCOORD_TEST_RACE_REF"],
+            os.environ["AGCOORD_TEST_RACE_SHA"],
+        ],
+        check=True,
+    )
+if sync_push and os.environ.get("AGCOORD_TEST_FAIL_SYNC_PUSH") == "1":
+    print("injected synchronized-source push failure", file=sys.stderr)
+    raise SystemExit(88)
+os.execv(
+    os.environ["AGCOORD_TEST_REAL_GIT"],
+    [os.environ["AGCOORD_TEST_REAL_GIT"], *arguments],
+)
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("AGCOORD_TEST_REAL_GIT", GIT)
+    monkeypatch.setenv("AGCOORD_TEST_RACE_REMOTE", str(remote))
+    monkeypatch.setenv("AGCOORD_TEST_RACE_REF", source_ref)
+    if race_sha is not None:
+        monkeypatch.setenv("AGCOORD_TEST_RACE_SHA", race_sha)
+    if fail_push:
+        monkeypatch.setenv("AGCOORD_TEST_FAIL_SYNC_PUSH", "1")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+
 @pytest.fixture
 def repository(tmp_path: Path) -> Repository:
     remote = tmp_path / "origin.git"
@@ -322,24 +423,35 @@ def _land_execute(
     publisher: Publisher | None = None,
     *,
     environment: dict[str, str] | None = None,
+    synchronize_target: bool = True,
+    head_updates: list[tuple[str, str]] | None = None,
+    branch: str = BRANCH,
 ) -> tuple[int, str, str, list[tuple[str, int | None]]]:
     from agcoord.land import execute
 
     out = StringIO()
     err = StringIO()
     phases: list[tuple[str, int | None]] = []
+
+    def head_changed(old_head: str, new_head: str) -> None:
+        metadata_client.record["head_sha"] = new_head
+        if head_updates is not None:
+            head_updates.append((old_head, new_head))
+
     status = execute(
         PR_NUMBER,
         gate_command,
         checkout=str(repository.checkout),
-        branch=BRANCH,
+        branch=branch,
         head_sha=repository.head_sha,
         environment=environment or dict(os.environ),
         metadata_client=metadata_client,
-        publisher=publisher or Publisher(repository),
+        publisher=publisher or Publisher(repository, branch=branch),
         out=out,
         err=err,
         phase_changed=lambda phase, gate_status: phases.append((phase, gate_status)),
+        head_changed=head_changed,
+        synchronize_target=synchronize_target,
     )
     return status, out.getvalue(), err.getvalue(), phases
 
@@ -768,7 +880,7 @@ def test_merged_metadata_without_head_in_remote_main_is_not_success(
     assert _pushes(log) == []
 
 
-def test_land_rejects_a_stale_base_before_starting_the_gate(
+def test_land_opt_out_rejects_a_stale_base_before_starting_the_gate(
     repository: Repository,
     tmp_path: Path,
 ):
@@ -793,6 +905,7 @@ def test_land_rejects_a_stale_base_before_starting_the_gate(
         ],
         _metadata(repository),
         publisher,
+        synchronize_target=False,
     )
 
     assert status == 75
@@ -802,6 +915,296 @@ def test_land_rejects_a_stale_base_before_starting_the_gate(
     assert publisher.create_calls == []
     assert publisher.update_calls == []
     assert _remote_sha(repository, "refs/heads/main") == unrelated
+
+
+def test_land_merges_an_advanced_target_into_the_source_before_gating(
+    repository: Repository,
+    tmp_path: Path,
+):
+    advanced_main = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "first land\n"},
+    )
+    old_head = repository.head_sha
+    gate_marker = tmp_path / "gate-ran"
+    publisher = Publisher(repository)
+    head_updates: list[tuple[str, str]] = []
+
+    status, out, err, phases = _land_execute(
+        repository,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            str(gate_marker),
+        ],
+        _metadata(repository),
+        publisher,
+        head_updates=head_updates,
+    )
+
+    assert status == 0, err
+    assert gate_marker.exists()
+    assert phases == [
+        ("preflight", None),
+        ("gating", None),
+        ("publishing", 0),
+    ]
+    merge_head = _sha(repository.checkout, "HEAD")
+    assert head_updates == [(old_head, merge_head)]
+    assert _git(
+        repository.checkout,
+        "show",
+        "-s",
+        "--format=%P",
+        merge_head,
+    ).stdout.split() == [old_head, advanced_main]
+    assert _git(
+        repository.checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ).stdout == ""
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == merge_head
+    candidate = publisher.created[-1]["sha"]
+    assert isinstance(candidate, str)
+    assert _remote_sha(repository, "refs/heads/main") == candidate
+    assert publisher.created[-1]["parent_shas"] == (advanced_main, merge_head)
+    assert f"gate started for {merge_head}" in out
+
+
+def test_land_can_opt_out_of_target_synchronization(
+    repository: Repository,
+    tmp_path: Path,
+):
+    advanced_main = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "first land\n"},
+    )
+    gate_marker = tmp_path / "gate-ran"
+    publisher = Publisher(repository)
+    head_updates: list[tuple[str, str]] = []
+
+    status, _out, err, phases = _land_execute(
+        repository,
+        [sys.executable, "-c", "raise SystemExit('must not run')"],
+        _metadata(repository),
+        publisher,
+        synchronize_target=False,
+        head_updates=head_updates,
+    )
+
+    assert status == 75
+    assert "stale" in err.lower()
+    assert phases == [("preflight", None)]
+    assert not gate_marker.exists()
+    assert head_updates == []
+    assert _sha(repository.checkout, "HEAD") == repository.head_sha
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == repository.head_sha
+    assert _remote_sha(repository, "refs/heads/main") == advanced_main
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
+
+
+def test_land_conflict_is_reported_and_the_checkout_is_restored_before_the_gate(
+    repository: Repository,
+    tmp_path: Path,
+):
+    advanced_main = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"answer.txt": "advanced target\n"},
+    )
+    gate_marker = tmp_path / "gate-ran"
+    publisher = Publisher(repository)
+    head_updates: list[tuple[str, str]] = []
+
+    status, _out, err, phases = _land_execute(
+        repository,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            str(gate_marker),
+        ],
+        _metadata(repository),
+        publisher,
+        head_updates=head_updates,
+    )
+
+    assert status == 79
+    assert "conflict" in err.lower()
+    assert "answer.txt" in err
+    assert phases == [("preflight", None)]
+    assert not gate_marker.exists()
+    assert head_updates == []
+    assert _sha(repository.checkout, "HEAD") == repository.head_sha
+    assert _git(
+        repository.checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ).stdout == ""
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == repository.head_sha
+    assert _remote_sha(repository, "refs/heads/main") == advanced_main
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
+
+
+def test_two_queued_lands_mechanically_synchronize_the_second_request(
+    repository: Repository,
+    tmp_path: Path,
+):
+    second_branch = "feature/second-publication"
+    second = _add_feature_checkout(
+        repository,
+        tmp_path / "second-checkout",
+        second_branch,
+    )
+
+    first_publisher = Publisher(repository)
+    first_status, _out, first_err, _phases = _land_execute(
+        repository,
+        [sys.executable, "-c", "pass"],
+        _metadata(repository),
+        first_publisher,
+    )
+    assert first_status == 0, first_err
+    first_landed = _remote_sha(repository, "refs/heads/main")
+
+    second_publisher = Publisher(second, branch=second_branch)
+    head_updates: list[tuple[str, str]] = []
+    second_status, _out, second_err, phases = _land_execute(
+        second,
+        [sys.executable, "-c", "pass"],
+        _metadata(second, head_ref=second_branch),
+        second_publisher,
+        branch=second_branch,
+        head_updates=head_updates,
+    )
+
+    assert second_status == 0, second_err
+    assert phases == [
+        ("preflight", None),
+        ("gating", None),
+        ("publishing", 0),
+    ]
+    synchronized = _sha(second.checkout, "HEAD")
+    assert head_updates == [(second.head_sha, synchronized)]
+    assert _git(
+        second.checkout,
+        "show",
+        "-s",
+        "--format=%P",
+        synchronized,
+    ).stdout.split() == [second.head_sha, first_landed]
+    assert _remote_sha(second, f"refs/heads/{second_branch}") == synchronized
+    assert second_publisher.created[-1]["parent_shas"] == (
+        first_landed,
+        synchronized,
+    )
+
+
+def test_source_change_during_target_sync_fails_closed_before_the_gate(
+    repository: Repository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    advanced_main = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "first land\n"},
+    )
+    changed_source = _commit_object(repository, repository.head_sha, "source race")
+    _transfer_race_object(repository, changed_source, "source-race")
+    _install_sync_push_fault(
+        monkeypatch,
+        tmp_path,
+        remote=repository.remote,
+        source_ref=f"refs/heads/{BRANCH}",
+        race_sha=changed_source,
+    )
+    gate_marker = tmp_path / "gate-ran"
+    publisher = Publisher(repository)
+
+    status, _out, err, phases = _land_execute(
+        repository,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            str(gate_marker),
+        ],
+        _metadata(repository),
+        publisher,
+    )
+
+    assert status == 76
+    assert "source" in err.lower() and "changed" in err.lower()
+    assert phases == [("preflight", None)]
+    assert not gate_marker.exists()
+    assert _sha(repository.checkout, "HEAD") == repository.head_sha
+    assert _git(
+        repository.checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ).stdout == ""
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == changed_source
+    assert _remote_sha(repository, "refs/heads/main") == advanced_main
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
+
+
+def test_target_sync_push_failure_restores_the_checkout_and_never_gates(
+    repository: Repository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    advanced_main = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "first land\n"},
+    )
+    _install_sync_push_fault(
+        monkeypatch,
+        tmp_path,
+        remote=repository.remote,
+        source_ref=f"refs/heads/{BRANCH}",
+        fail_push=True,
+    )
+    gate_marker = tmp_path / "gate-ran"
+    publisher = Publisher(repository)
+
+    status, _out, err, phases = _land_execute(
+        repository,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            str(gate_marker),
+        ],
+        _metadata(repository),
+        publisher,
+    )
+
+    assert status == 78
+    assert "push" in err.lower()
+    assert phases == [("preflight", None)]
+    assert not gate_marker.exists()
+    assert _sha(repository.checkout, "HEAD") == repository.head_sha
+    assert _git(
+        repository.checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ).stdout == ""
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == repository.head_sha
+    assert _remote_sha(repository, "refs/heads/main") == advanced_main
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
 
 
 def test_land_red_gate_returns_its_status_and_never_publishes(

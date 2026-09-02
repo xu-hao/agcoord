@@ -1,9 +1,9 @@
-"""Publish one exact full-gated pull-request head through GitHub.
+"""Prepare and publish one exact pull-request head through GitHub.
 
-The worker never updates the ticket branch. It observes the local checkout and two remote
-refs, asks the forge to create a merge commit whose tree is exactly the gated head, then
-atomically compares and updates both refs. A changed base or head rejects the whole
-publication.
+Before gating, the worker can merge an advanced target into the same-repository ticket
+branch with a lease-protected push. Publication then observes the exact synchronized head,
+asks the forge to create a merge commit whose tree is exactly that gated head, and atomically
+compares and updates both refs. A changed source or post-gate target rejects publication.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Protocol, TextIO
+from io import StringIO
+from typing import Any, Callable, Protocol, TextIO
 from uuid import uuid4
 
 
@@ -262,6 +263,297 @@ def _is_ancestor(checkout: Path, ancestor: str, descendant: str) -> bool:
         return False
     detail = result.stderr.strip() or f"exit {result.returncode}"
     raise _MergeRefusal(EXIT_MERGE_ERROR, f"cannot compare merge ancestry: {detail}")
+
+
+def _copy_output(source: StringIO, destination: TextIO) -> None:
+    destination.write(source.getvalue())
+    destination.flush()
+
+
+def _restore_completed_merge(checkout: Path, old_head: str, merge_head: str) -> None:
+    current_head = _git(
+        checkout,
+        "rev-parse",
+        "HEAD",
+        operation="cannot inspect synchronized source head",
+    )
+    dirty = _git(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        operation="cannot inspect synchronized source checkout",
+    )
+    if current_head != merge_head or dirty:
+        raise _MergeRefusal(
+            EXIT_MERGE_ERROR,
+            "source changed while target synchronization was being restored; "
+            "the coordinator did not reset the checkout",
+        )
+    _git(
+        checkout,
+        "reset",
+        "--hard",
+        old_head,
+        operation="cannot restore source after target synchronization failed",
+    )
+    restored = _git(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        operation="cannot verify restored source checkout",
+    )
+    if restored:
+        raise _MergeRefusal(
+            EXIT_MERGE_ERROR,
+            "target synchronization failed and did not restore a clean checkout",
+        )
+
+
+def _synchronize_target(
+    pull_request: int,
+    *,
+    checkout: str,
+    branch: str,
+    head_sha: str,
+    metadata_client: PullRequestMetadataClient,
+    out: TextIO,
+    err: TextIO,
+) -> tuple[int, str]:
+    """Merge one observed target into the source and push it with an exact lease."""
+    expected_head = _sha(head_sha, field="submitted head")
+    try:
+        selected = Path(checkout).expanduser().resolve()
+        current_branch = _git(
+            selected,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+            operation="target synchronization requires the submitted branch",
+        )
+        current_head = _git(
+            selected,
+            "rev-parse",
+            "HEAD",
+            operation="cannot read source head before target synchronization",
+        )
+        dirty = _git(
+            selected,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            operation="cannot inspect source before target synchronization",
+        )
+        if current_branch != branch or current_head != expected_head or dirty:
+            raise _MergeRefusal(
+                EXIT_HEAD_CHANGED,
+                "source checkout changed before target synchronization",
+            )
+
+        try:
+            pr = _metadata(metadata_client.pull_request(pull_request), pull_request)
+        except _MergeRefusal:
+            raise
+        except Exception as exc:
+            raise _MergeRefusal(
+                EXIT_MERGE_ERROR,
+                f"cannot re-read pull request #{pull_request}: {exc}",
+            ) from exc
+        if (
+            pr["state"] != "OPEN"
+            or pr["is_draft"]
+            or not pr["same_repository"]
+            or pr["head_ref"] != branch
+        ):
+            raise _MergeRefusal(
+                EXIT_PR_NOT_READY,
+                "pull request is no longer an open, ready same-repository request",
+            )
+        if pr["head_sha"] != expected_head:
+            raise _MergeRefusal(
+                EXIT_HEAD_CHANGED,
+                f"pull-request head changed from submitted {expected_head} "
+                f"to {pr['head_sha']}",
+            )
+        base = str(pr["base_ref"])
+        refs = _remote_refs(selected, base, branch, require_head=True)
+        base_ref = f"refs/heads/{base}"
+        head_ref = f"refs/heads/{branch}"
+        base_sha = refs[base_ref]
+        if refs[head_ref] != expected_head:
+            raise _MergeRefusal(
+                EXIT_HEAD_CHANGED,
+                f"remote source changed from submitted {expected_head} to {refs[head_ref]}",
+            )
+        if _is_ancestor(selected, base_sha, expected_head):
+            return 0, expected_head
+
+        _git(
+            selected,
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            base_sha,
+            status=EXIT_STALE_MAIN,
+            operation=f"cannot fetch exact target {base} {base_sha}",
+        )
+        merge = _run(
+            [
+                "git",
+                "-C",
+                str(selected),
+                "merge",
+                "--no-ff",
+                "--no-gpg-sign",
+                "-m",
+                f"Merge {base} into {branch} for coordinated landing",
+                base_sha,
+            ],
+            checkout=selected,
+        )
+        if merge.returncode != 0:
+            conflicts = _run(
+                [
+                    "git",
+                    "-C",
+                    str(selected),
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=U",
+                    "-z",
+                ],
+                checkout=selected,
+            )
+            conflict_paths = sorted(
+                path for path in conflicts.stdout.split("\0") if path
+            )
+            aborted = _run(
+                ["git", "-C", str(selected), "merge", "--abort"],
+                checkout=selected,
+            )
+            restored_head = _run(
+                ["git", "-C", str(selected), "rev-parse", "HEAD"],
+                checkout=selected,
+            )
+            restored_status = _run(
+                [
+                    "git",
+                    "-C",
+                    str(selected),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                checkout=selected,
+            )
+            if (
+                aborted.returncode != 0
+                or restored_head.returncode != 0
+                or restored_head.stdout.strip() != expected_head
+                or restored_status.returncode != 0
+                or restored_status.stdout
+            ):
+                raise _MergeRefusal(
+                    EXIT_MERGE_ERROR,
+                    "target merge failed and the checkout could not be restored cleanly",
+                )
+            detail = merge.stderr.strip() or merge.stdout.strip() or "merge failed"
+            if conflict_paths:
+                raise _MergeRefusal(
+                    EXIT_MERGE_ERROR,
+                    "target merge conflicts in: "
+                    + ", ".join(repr(path) for path in conflict_paths),
+                )
+            raise _MergeRefusal(EXIT_MERGE_ERROR, f"target merge failed: {detail}")
+
+        merge_head = _sha(
+            _git(
+                selected,
+                "rev-parse",
+                "HEAD",
+                operation="cannot read synchronized source head",
+            ),
+            field="synchronized source head",
+        )
+        parents = _git(
+            selected,
+            "show",
+            "-s",
+            "--format=%P",
+            merge_head,
+            operation="cannot inspect synchronized source parents",
+        ).split()
+        synchronized_status = _git(
+            selected,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            operation="cannot inspect synchronized source checkout",
+        )
+        if parents != [expected_head, base_sha] or synchronized_status:
+            _restore_completed_merge(selected, expected_head, merge_head)
+            raise _MergeRefusal(
+                EXIT_MERGE_ERROR,
+                "target synchronization did not create one clean ordered merge commit",
+            )
+
+        before_push = _remote_refs(selected, base, branch, require_head=True)
+        if before_push[head_ref] != expected_head:
+            _restore_completed_merge(selected, expected_head, merge_head)
+            raise _MergeRefusal(
+                EXIT_HEAD_CHANGED,
+                f"remote source changed from submitted {expected_head} "
+                f"to {before_push[head_ref]}",
+            )
+        if before_push[base_ref] != base_sha:
+            _restore_completed_merge(selected, expected_head, merge_head)
+            raise _MergeRefusal(
+                EXIT_STALE_MAIN,
+                f"remote {base} advanced during target synchronization",
+            )
+
+        pushed = _run(
+            [
+                "git",
+                "-C",
+                str(selected),
+                "push",
+                f"--force-with-lease={head_ref}:{expected_head}",
+                "origin",
+                f"{merge_head}:{head_ref}",
+            ],
+            checkout=selected,
+        )
+        if pushed.returncode != 0:
+            after = _remote_refs(selected, base, branch, require_head=False)
+            if after.get(head_ref) != merge_head:
+                _restore_completed_merge(selected, expected_head, merge_head)
+                if after.get(head_ref) != expected_head:
+                    changed = after.get(head_ref, "deleted")
+                    raise _MergeRefusal(
+                        EXIT_HEAD_CHANGED,
+                        f"remote source changed from submitted {expected_head} to {changed}",
+                    )
+                detail = pushed.stderr.strip() or pushed.stdout.strip() or "push failed"
+                raise _MergeRefusal(
+                    EXIT_PUBLISH_FAILED,
+                    f"cannot push synchronized source branch: {detail}",
+                )
+        print(
+            f"Land coordinator: merged {base} {base_sha} into {branch}\n"
+            f"  previous head: {expected_head}\n"
+            f"  synchronized head: {merge_head}",
+            file=out,
+            flush=True,
+        )
+        return 0, merge_head
+    except _MergeRefusal as exc:
+        reason = FAILURE_REASONS[exc.status]
+        print(f"Merge coordinator: REFUSED ({reason}) — {exc}", file=err, flush=True)
+        return exc.status, expected_head
 
 
 def execute(
@@ -585,6 +877,80 @@ def preflight(
         )
         return 0
     return status
+
+
+def prepare(
+    pull_request: int,
+    *,
+    checkout: str,
+    branch: str,
+    head_sha: str,
+    metadata_client: PullRequestMetadataClient,
+    publisher: MergePublisher,
+    out: TextIO,
+    err: TextIO,
+    synchronize_target: bool = True,
+    head_changed: Callable[[str, str], None] | None = None,
+) -> tuple[int, str]:
+    """Reach one exact preflight head, synchronizing an advanced target by default."""
+    effective_head = _sha(head_sha, field="submitted head")
+    changed = head_changed or (lambda _old, _new: None)
+    for attempt in range(5):
+        captured_out = StringIO()
+        captured_err = StringIO()
+        status = preflight(
+            pull_request,
+            checkout=checkout,
+            branch=branch,
+            head_sha=effective_head,
+            metadata_client=metadata_client,
+            publisher=publisher,
+            out=captured_out,
+            err=captured_err,
+        )
+        if status == 0:
+            _copy_output(captured_out, out)
+            _copy_output(captured_err, err)
+            return 0, effective_head
+        if status != EXIT_STALE_MAIN or not synchronize_target:
+            _copy_output(captured_out, out)
+            _copy_output(captured_err, err)
+            return status, effective_head
+        if attempt == 4:
+            break
+
+        status, synchronized_head = _synchronize_target(
+            pull_request,
+            checkout=checkout,
+            branch=branch,
+            head_sha=effective_head,
+            metadata_client=metadata_client,
+            out=out,
+            err=err,
+        )
+        if status != 0:
+            return status, effective_head
+        if synchronized_head == effective_head:
+            continue
+        try:
+            changed(effective_head, synchronized_head)
+        except Exception as exc:
+            print(
+                "Merge coordinator: REFUSED (merge-error) — synchronized source was "
+                f"pushed but its durable head could not be updated: {exc}",
+                file=err,
+                flush=True,
+            )
+            return EXIT_MERGE_ERROR, effective_head
+        effective_head = synchronized_head
+
+    print(
+        "Merge coordinator: REFUSED (stale-main) — target kept advancing during "
+        "bounded source synchronization",
+        file=err,
+        flush=True,
+    )
+    return EXIT_STALE_MAIN, effective_head
 
 
 class GitHubMetadataClient:

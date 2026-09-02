@@ -1,7 +1,7 @@
 """Forge-neutral exact-head publication contract.
 
-Adapters provide strict metadata and atomic ref-publication implementations.  The core
-executor never refreshes or rewrites a submitted checkout.
+Adapters provide strict metadata and atomic ref-publication implementations. Preparation may
+merge an advanced target into the source; publication never rewrites the gated checkout.
 """
 
 from .github import (
@@ -14,6 +14,7 @@ from .github import (
     MergePublisher,
     PullRequestMetadataClient,
     execute,
+    prepare,
     preflight,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "MergePublisher",
     "PullRequestMetadataClient",
     "execute",
+    "prepare",
     "preflight",
 ]

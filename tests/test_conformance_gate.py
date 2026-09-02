@@ -46,10 +46,14 @@ def test_public_checker_lists_both_implementation_selector_sets():
     assert completed.returncode == 0, completed.stderr
     selectors = json.loads(completed.stdout)
     assert set(selectors) == {"python_reference", "rust_native"}
-    assert len(selectors["python_reference"]) == 23
+    assert len(selectors["python_reference"]) == 24
     assert len(selectors["rust_native"]) == 25
     assert (
         "tests/test_queue.py::test_submit_and_snapshot_have_the_strict_generic_schema"
+        in selectors["python_reference"]
+    )
+    assert (
+        "tests/test_queue.py::test_land_target_sync_updates_the_durable_head_before_the_gate"
         in selectors["python_reference"]
     )
     assert (

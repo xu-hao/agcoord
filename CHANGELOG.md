@@ -7,6 +7,10 @@ versioning; dates use ISO 8601.
 
 ## 0.3.0 — 2026-09-01
 
+- Make `land` mechanically merge an advanced target into an unchanged same-repository request
+  branch before gating by default. The lease-protected source update becomes the row's durable
+  exact head before the gate; conflicts and source races fail closed, and
+  `--no-target-sync` retains the explicit stale-target refusal.
 - Add a tested native migration and rollback runbook with a compatibility matrix, whole-spool
   backup rehearsal, mixed-owner refusals, capability verification, retirement criteria, and
   stable troubleshooting actions. A clean-install release verifier now binds the Python, native,
