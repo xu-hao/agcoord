@@ -116,7 +116,8 @@ job, an existing queue, a mismatched client/package version, or an unsafe or inc
 before activation. It verifies every sidecar, restores the helpers' executable modes, runs the
 package checker, creates or validates the owner-only state and configuration, stages and
 activates the package, reloads and enables the user service, checks its exact installed identity,
-and submits the shipped one-CPU enforcement proof. An existing safe configuration without a
+waits for the started broker to own the spool, and submits the shipped one-CPU enforcement
+proof. An existing safe configuration without a
 queue is preserved. Use `agc host upgrade`, not install, when a queue already exists.
 If activation succeeds but service verification or the enforcement proof fails, the command
 disables and stops the unproved fresh service before reporting recovery instructions.
@@ -254,10 +255,11 @@ agc host upgrade /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.ta
 ```
 
 The command verifies and stages the package while the current service remains available, drains
-accepted work to zero through the installed outgoing broker's own identity, retains the exact ID, refreshes `sudo` authorization, stops the service,
-activates only against that drain, reloads, resumes the same ID, restarts, verifies the installed
-identity, and runs the enforced-host proof. It refuses to run from an admitted job or against a
-nondefault, unsafe, fresh, or pre-protocol-5 spool. A failure before activation leaves the live
+accepted work to zero through the installed outgoing broker's own identity, retains the exact ID,
+refreshes `sudo` authorization, stops the service, activates only against that drain, reloads,
+resumes the same ID, restarts, verifies the installed identity, waits for the restarted broker to
+own the spool, and runs the enforced-host proof. It refuses to run from an admitted job or against
+a nondefault, unsafe, fresh, or pre-protocol-5 spool. A failure before activation leaves the live
 host unchanged; a failure after stop reports the exact drain ID and leaves the service stopped
 and coordinator drained unless the resume step had already succeeded.
 

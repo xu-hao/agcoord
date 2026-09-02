@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Stop reporting a completed `agc host install` or `agc host upgrade` as a failure. Starting the
+  managed service and owning the state directory are separate events, so verification now waits
+  for the restarted broker to own the spool before submitting the enforcement proof, and still
+  fails closed with the exact drain ID and service state if ownership never appears.
+
 ## 0.4.1 — 2026-09-02
 
 - Let one `agc host upgrade` cross a minor release boundary. The upgrade's drain now selects the
