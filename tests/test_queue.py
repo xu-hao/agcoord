@@ -2263,6 +2263,87 @@ def test_nested_coordinated_submission_is_rejected_without_a_row(
     assert snapshot["recent"] == []
 
 
+def _unreachable_native_state(state_dir: Path) -> None:
+    """Configure a spool whose only possible autostart is a distinct, observable refusal."""
+    state_dir.mkdir(mode=0o700)
+    config_path(state_dir).write_text(
+        json.dumps(
+            {
+                "capacities": {"jobs": 1},
+                "native_broker": {
+                    "path": str(state_dir / "missing-broker"),
+                    "allow_development": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path(state_dir).chmod(0o600)
+
+
+def _submit_through(client: CoordinatorClient, entry: str, repository: Path, environment):
+    command = _python("raise SystemExit('must not run')")
+    if entry == "submit":
+        return client.submit(
+            command,
+            checkout=str(repository),
+            kind="full",
+            environment=environment,
+        )
+    if entry == "submit_merge":
+        return client.submit_merge(
+            "github",
+            123,
+            checkout=str(repository),
+            environment=environment,
+        )
+    return client.submit_land(
+        "github",
+        123,
+        command,
+        checkout=str(repository),
+        environment=environment,
+    )
+
+
+@pytest.mark.parametrize("entry", ["submit", "submit_merge", "submit_land"])
+def test_nested_submission_is_refused_before_any_broker_can_start(
+    tmp_path: Path,
+    entry: str,
+):
+    state_dir = tmp_path / "state"
+    _unreachable_native_state(state_dir)
+    repository = _repository(tmp_path / "repository")
+    environment = caller_environment()
+    environment["AGCOORD_RUN_ID"] = "check-parent"
+    client = CoordinatorClient(state_dir=state_dir)
+
+    with pytest.raises(CoordinatorError, match="cannot submit another coordinated job"):
+        _submit_through(client, entry, repository, environment)
+
+    assert not (state_dir / "broker.lock").exists()
+    assert not (state_dir / "queue.sqlite3").exists()
+    assert not (state_dir / "missing-broker").exists()
+
+
+@pytest.mark.parametrize("entry", ["submit", "submit_merge", "submit_land"])
+def test_dirty_checkout_refusal_precedes_nesting_and_any_broker_start(
+    tmp_path: Path,
+    entry: str,
+):
+    state_dir = tmp_path / "state"
+    _unreachable_native_state(state_dir)
+    repository = _repository(tmp_path / "repository")
+    (repository / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+    environment = caller_environment()
+    environment["AGCOORD_RUN_ID"] = "check-parent"
+    client = CoordinatorClient(state_dir=state_dir)
+
+    with pytest.raises(CoordinatorError, match="checkout is dirty"):
+        _submit_through(client, entry, repository, environment)
+
+    assert not (state_dir / "broker.lock").exists()
+    assert not (state_dir / "queue.sqlite3").exists()
 @pytest.mark.parametrize("kind", ["check", "full"])
 def test_worker_receives_exact_immutable_admission_context(
     tmp_path: Path,

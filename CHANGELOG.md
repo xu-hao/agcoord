@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Decide every shared caller-side refusal before starting a broker. `agc run`, `agc full`, and
+  the land and merge submissions now settle repository discovery, the exact clean head, the
+  caller PID, and the no-nesting rule before selection or autostart, so a refused submission
+  can no longer leave a new owner and queue behind in the target state directory. Only the
+  owner's declared capacities are checked after a broker exists, and a dirty checkout is still
+  refused before a nested submission is.
+
 - Stop reporting a completed `agc host install` or `agc host upgrade` as a failure. Starting the
   managed service and owning the state directory are separate events, so verification now waits
   for the restarted broker to own the spool before submitting the enforcement proof, and still
