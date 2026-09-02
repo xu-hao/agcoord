@@ -161,7 +161,7 @@ jobs:
             .status == "passed"
             and .resource_receipt.requested.cpu == 1
             and .resource_receipt.applied.cpu == 1
-            and .resource_receipt.peak.cpu == 1
+            and .resource_receipt.peak.cpu >= 1
           ' native-host-receipt.json
           {
             cat /etc/os-release

@@ -177,9 +177,13 @@ jq -e '
   .status == "passed"
   and .resource_receipt.requested.cpu == 1
   and .resource_receipt.applied.cpu == 1
-  and .resource_receipt.peak.cpu == 1
+  and .resource_receipt.peak.cpu >= 1
 ' native-host-receipt.json
 ```
+
+The requested and applied values prove the exact configured CPU limit. The nonzero peak proves
+that usage was measured; it is a conservative ceiling of sampled usage concurrency and may exceed
+the quota when short parallel bursts are rounded upward.
 
 The setup-only `agcoord-broker` profile attaches only to the fixed root-owned executable; it is
 not selected by the user-editable systemd unit. The public binary has no internal-worker or
