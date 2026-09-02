@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.3.1 — 2026-09-02
+
 - Add durable `agc drain` and exact-token `agc resume` maintenance operations. Drain atomically
   refuses new submissions while admitted checks and authoritative lands finish, survives broker
   replacement and protocol migration/rollback, remains visible through JSON and the TUI, and is
