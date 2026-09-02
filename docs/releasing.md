@@ -61,7 +61,7 @@ hosts, activation, and rollback.
 
 The client/owner/state combinations admitted for release are fixed in the
 [native compatibility matrix](native_migration.md#compatibility-matrix). Python and native
-versions must be the same stable 0.3.x version, the native artifact and host manifest must report
+versions must be the same stable 0.4.x version, the native artifact and host manifest must report
 the same protocol-5 identity, and the running owner must match the exact configured build. No
 release workflow admits a live Python/Rust mixed-owner state.
 
@@ -90,7 +90,7 @@ interface and must be smoke-tested from the built wheel.
    `src/agcoord/__init__.py`, the Cargo workspace, and `Cargo.lock`; development suffixes are
    release refusals. Add a dated matching section to [the changelog](../CHANGELOG.md).
 2. Land that exact commit through `agc land` with `./scripts/check-conformance`. The checker
-   validates the version-1 manifest and collected Python/native selectors before running both
+   validates the version-2 manifest and collected Python/native selectors before running both
    complete suites serially at their process boundary. It includes generic scheduling, atomic
    publication, real TUI behavior, resources/receipts, migration/rollback rehearsal, malformed
    state, contention, cancellation, and crash-recovery safety properties. Missing declared

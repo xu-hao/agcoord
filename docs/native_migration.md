@@ -10,20 +10,20 @@ AppArmor, delegated cgroups, and the enforced-host proof.
 
 | Client or owner | State | Supported operation |
 | --- | --- | --- |
-| AGCoord 0.3.x Python client | Protocol 5, exact selected 0.3.x Rust identity | Normal CLI, TUI, adapter, and xdist operation |
-| AGCoord 0.3.x Python client | Protocol 1–3 | `agc migrate` only; ordinary commands refuse |
-| AGCoord 0.3.x Python client | Open protocol 4 | `agc drain` or explicit migration; ordinary submissions never start the legacy owner |
-| AGCoord 0.3.x Python client | Draining/drained protocol 4 or 5 | Observe, explicitly cancel, migrate/rollback while fully drained, or resume with the exact drain ID |
-| AGCoord 0.3.x Python client | Live protocol-4 Python owner | Install a durable drain; accepted work finishes before the old owner yields |
-| Protocol-4 Python reference owner | Protocol 4 | Rollback inspection and compatibility testing only; never automatic 0.3 startup |
+| AGCoord 0.4.x Python client | Protocol 5, exact selected 0.4.x Rust identity | Normal CLI, TUI, adapter, and xdist operation |
+| AGCoord 0.4.x Python client | Protocol 1–3 | `agc migrate` only; ordinary commands refuse |
+| AGCoord 0.4.x Python client | Open protocol 4 | `agc drain` or explicit migration; ordinary submissions never start the legacy owner |
+| AGCoord 0.4.x Python client | Draining/drained protocol 4 or 5 | Observe, explicitly cancel, migrate/rollback while fully drained, or resume with the exact drain ID |
+| AGCoord 0.4.x Python client | Live protocol-4 Python owner | Install a durable drain; accepted work finishes before the old owner yields |
+| Protocol-4 Python reference owner | Protocol 4 | Rollback inspection and compatibility testing only; never automatic 0.4 startup |
 | Protocol-4 Python reference owner | Protocol 5 | Refuse; run the installed Rust `rollback` command while idle first |
-| Rust 0.3.x broker | Protocol 1–4 | Explicit idle migration only; `serve` refuses |
-| Rust 0.3.x broker | Protocol 5 created by another build | Refuse until the configured executable and live owner identities match exactly |
+| Rust 0.4.x broker | Protocol 1–4 | Explicit idle migration only; `serve` refuses |
+| Rust 0.4.x broker | Protocol 5 created by another build | Refuse until the configured executable and live owner identities match exactly |
 
 Protocol 1 through 3 is normalized to protocol 4 before the native transition. Migration never
 invents resource enforcement, child leases, exact-head evidence, or publication authority that
 the older schema could not represent. There is no supported live mixed-owner mode and no
-configuration switch that makes the 0.3 client fall back to the Python broker.
+configuration switch that makes the 0.4 client fall back to the Python broker.
 
 Before deploying a build with the no-scratch default, audit admitted commands that relied on an
 implicit private temporary directory. Such jobs must request a complete tmpfs policy or a complete
@@ -34,7 +34,7 @@ checkout and host paths remain outside the resource contract.
 
 The supported production host is x86_64 Ubuntu with the requirements in the
 [host runbook](native_host.md). The release executable target is
-`x86_64-unknown-linux-musl`; a client and broker must both be on the 0.3 release line, and a
+`x86_64-unknown-linux-musl`; a client and broker must both be on the 0.4 release line, and a
 running owner must retain the exact selected version and build digest.
 
 ## What “one executable” means
@@ -57,7 +57,7 @@ service may start.
 ## Drain and retain a protocol-4 baseline
 
 Keep the old client environment and the downloaded old package until the rollback window closes.
-Install the matching 0.3 client in a separate environment, but do not change the live broker
+Install the matching 0.4 client in a separate environment, but do not change the live broker
 configuration yet. Use that client against the exact state directory to install the durable
 submission guard and wait for the accepted queue to finish. Do not infer idleness from process
 names or repeatedly race an idle-timeout window.
@@ -127,7 +127,7 @@ rows, installs the fixed files, and does not start or restart the service. Write
 `config.json` from the host runbook only after the old owner has stopped; an older client may
 reject the new `managed_service` field.
 
-Install the matching 0.3 Python client, then run the one explicit schema transition before
+Install the matching 0.4 Python client, then run the one explicit schema transition before
 resuming or starting the service:
 
 ```bash
@@ -160,7 +160,7 @@ the host enforcement boundary works.
 
 ## Roll back during the retained window
 
-Rollback is an explicit operational decision. Install a durable drain with the current 0.3
+Rollback is an explicit operational decision. Install a durable drain with the current 0.4
 client, retain its exact ID, let every queued and running row finish (or cancel named rows under
 an explicit cancellation policy), and stop the native service. Keep the installed native binary
 in place until its rollback command succeeds:
@@ -208,7 +208,7 @@ and follow either a supported native upgrade or the rollback procedure above.
 
 | Refusal or symptom | Meaning and safe response |
 | --- | --- |
-| Live `legacy protocol-4` owner | Use the matching 0.3 client to install a durable drain; accepted work finishes and the old owner then yields. |
+| Live `legacy protocol-4` owner | Use the matching 0.4 client to install a durable drain; accepted work finishes and the old owner then yields. |
 | Idle `queue uses protocol 4` | Install and retain a durable drain, back up and rehearse rollback, then run exactly one `agc migrate`. |
 | `broker-draining` or `agcoord-maintenance-draining` | Expected submission refusal: maintenance owns the admission boundary. Observe/cancel accepted rows or resume with the exact retained ID after maintenance. |
 | `broker-drain-id-mismatch` | The supplied token is not the active drain. Recover the owner-only receipt or inspect the visible maintenance status; never guess or delete the marker. |

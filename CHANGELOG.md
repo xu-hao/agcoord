@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.4.0 — 2026-09-02
+
 - Stop granting implicit unbounded scratch to jobs that declare no scratch resources. The Python
   and native brokers now remove inherited `TMPDIR`, `TMP`, and `TEMP` values and create no per-run
   scratch directory unless the job requests a complete tmpfs or project-quota policy. A
