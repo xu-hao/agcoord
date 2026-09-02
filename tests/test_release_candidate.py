@@ -1,4 +1,4 @@
-"""Public artifact-boundary tests for the native 0.3 release candidate."""
+"""Public artifact-boundary tests for the native 0.4 release candidate."""
 
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ def test_migration_cli_preserves_the_supplied_virtualenv_interpreter(
 
 
 def test_release_sources_declare_one_stable_version_and_ship_the_gate():
-    assert RELEASE["source_versions"]() == ("0.3.2", "0.3.2", "0.3.2")
+    assert RELEASE["source_versions"]() == ("0.4.0", "0.4.0", "0.4.0")
     assert SCRIPT.stat().st_mode & 0o111
     assert (ROOT / "scripts/rehearse-native-migration").stat().st_mode & 0o111
     manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
