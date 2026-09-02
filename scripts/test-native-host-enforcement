@@ -38,6 +38,11 @@ jq -e '
     and .profile == "agcoord-broker-client"
     and .user_namespace_denied == true
 ' <<<"$client" >/dev/null
+callback=$(agc --json show "$AGCOORD_RUN_ID")
+jq -e --arg run_id "$AGCOORD_RUN_ID" '
+    .run_id == $run_id
+    and .status == "running"
+' <<<"$callback" >/dev/null
 jq -e '
     .native_broker.path == "/usr/libexec/agcoord/agcoord-broker"
     and .native_broker.allow_development == false
