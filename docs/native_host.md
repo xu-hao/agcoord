@@ -64,6 +64,15 @@ Create the state directory as the broker user with mode `0700` and `config.json`
 `app.slice`, and `DelegateSubgroup=supervisor` make the configured service root deterministic
 and keep the broker process out of the inner node where it enables controllers.
 
+On a fresh `agc host install`, an absent configuration is created with `cpu` and `jobs` both set
+to the invoking process's available CPU-affinity count, plus the required cgroup-v2
+`cpu/logical-cpu` binding shown above. The scheduler greedily packs each job's complete declared
+resource vector against those totals; it does not divide the machine into a fixed number of
+equal CPU partitions. `jobs` remains a ceiling for submissions that omit other claims. To add
+memory, RAM-disk, persistent-disk, I/O, or project-defined capacities, create the owner-only
+configuration before first install; the command validates and preserves an existing safe
+configuration instead of overwriting it.
+
 On every managed start, the broker fails before acquiring the spool unless all of these match:
 
 - the running executable is the fixed, root-owned, non-writable release file and its installed
@@ -91,9 +100,33 @@ kernel's dotted field names, including Linux 6.17's `core_sched.force_idle_usec`
 
 ## First install
 
-Download all host artifacts into one owner-only directory. Verify the three helper sidecars,
-restore the helpers' declared executable mode (ordinary HTTP and workflow-artifact downloads do
-not carry a POSIX mode), then let the checker validate the package:
+Install the exact matching Python client first. Download the package, all four `.sha256`
+sidecars, and the three helpers into one owner-only directory, then run the public installation
+operation:
+
+```bash
+version=RELEASE_VERSION
+python -m pip install "agcoord==$version"
+chmod 0700 /path/to/native-host-bundle
+agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
+```
+
+The command refuses an ambient `AGCOORD_STATE_DIR`, any nondefault spool, an admitted AGCoord
+job, an existing queue, a mismatched client/package version, or an unsafe or incomplete bundle
+before activation. It verifies every sidecar, restores the helpers' executable modes, runs the
+package checker, creates or validates the owner-only state and configuration, stages and
+activates the package, reloads and enables the user service, checks its exact installed identity,
+and submits the shipped one-CPU enforcement proof. An existing safe configuration without a
+queue is preserved. Use `agc host upgrade`, not install, when a queue already exists.
+If activation succeeds but service verification or the enforcement proof fails, the command
+disables and stops the unproved fresh service before reporting recovery instructions.
+
+### Manual activation and recovery
+
+The following low-level sequence exposes the boundaries used by the public command and remains
+available for migration, rollback, and recovery. Verify the three helper sidecars, restore the
+helpers' declared executable mode (ordinary HTTP and workflow-artifact downloads do not carry a
+POSIX mode), then let the checker validate the package:
 
 ```bash
 chmod 0755 check-native-host-package install-native-host test-native-host-enforcement
@@ -210,13 +243,31 @@ verification/phase/result reporting; it does not turn `agc` into a nested submis
 
 ## Upgrade, recovery, and rollback
 
-For an upgrade, run `stage` while the current service remains available. Inspect the staged
-package digest, run `agc drain`, retain its exact ID, and stop the user service after the receipt
-says `drained`. Run `activate --drain-id ID`, `daemon-reload`, any required `migrate`, exact-ID
-`resume`, and `start` in that order. An explicitly chosen cancellation policy may shorten the drain,
-but cancellation never replaces its durable submission guard. Never replace the live binary and
-ask systemd to restart while work remains. After start, inspect `systemctl --user status
-agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
+For a protocol-5 upgrade, install the exact matching Python client first and invoke one public
+operation:
+
+```bash
+version=RELEASE_VERSION
+python -m pip install --upgrade "agcoord==$version"
+chmod 0700 /path/to/native-host-bundle
+agc host upgrade /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
+```
+
+The command verifies and stages the package while the current service remains available, drains
+accepted work to zero, retains the exact ID, refreshes `sudo` authorization, stops the service,
+activates only against that drain, reloads, resumes the same ID, restarts, verifies the installed
+identity, and runs the enforced-host proof. It refuses to run from an admitted job or against a
+nondefault, unsafe, fresh, or pre-protocol-5 spool. A failure before activation leaves the live
+host unchanged; a failure after stop reports the exact drain ID and leaves the service stopped
+and coordinator drained unless the resume step had already succeeded.
+
+For manual upgrade or recovery, run `stage` while the current service remains available. Inspect
+the staged package digest, run `agc drain`, retain its exact ID, and stop the user service after
+the receipt says `drained`. Run `activate --drain-id ID`, `daemon-reload`, any required `migrate`,
+exact-ID `resume`, and `start` in that order. An explicitly chosen cancellation policy may shorten
+the drain, but cancellation never replaces its durable submission guard. Never replace the live
+binary and ask systemd to restart while work remains. After start, inspect `systemctl --user
+status agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
 
 `Restart=on-failure` recovers an unexpected broker exit without an idle shutdown. The durable
 spool remains the authority: the replacement adopts only identity-verified live workers and

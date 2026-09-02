@@ -679,3 +679,97 @@ def test_drain_and_resume_are_explicit_non_autostarting_cli_operations(
             "thread": threading.get_ident(),
         },
     ]
+
+
+def test_native_host_upgrade_is_one_public_cli_operation(monkeypatch, tmp_path: Path):
+    package = tmp_path / "agcoord-native-host-x86_64-linux.tar.gz"
+    package.write_bytes(b"verified release package")
+    state_dir = tmp_path / "state"
+    observed: list[dict[str, object]] = []
+    result = {
+        "state": "complete",
+        "version": "0.3.2",
+        "drain_id": "drain-0123456789ab",
+        "service": "active",
+        "proof_run_id": "check-native-host-proof",
+    }
+
+    def fake_upgrade(package_path, *, state_dir, checkout):
+        observed.append(
+            {
+                "package": package_path,
+                "state_dir": state_dir,
+                "checkout": checkout,
+            }
+        )
+        return result
+
+    monkeypatch.setattr(cli, "upgrade_native_host", fake_upgrade, raising=False)
+    output = StringIO()
+
+    assert cli.run(
+        _args(
+            "--json",
+            "--state-dir",
+            str(state_dir),
+            "host",
+            "upgrade",
+            str(package),
+        ),
+        out=output,
+    ) == 0
+    assert json.loads(output.getvalue()) == result
+    assert observed == [
+        {
+            "package": package.resolve(),
+            "state_dir": str(state_dir),
+            "checkout": Path.cwd(),
+        }
+    ]
+
+
+def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: Path):
+    package = tmp_path / "agcoord-native-host-x86_64-linux.tar.gz"
+    package.write_bytes(b"verified release package")
+    state_dir = tmp_path / "state"
+    observed: list[dict[str, object]] = []
+    result = {
+        "state": "complete",
+        "operation": "install",
+        "version": "0.3.2",
+        "service": "active",
+        "proof_run_id": "check-native-host-proof",
+    }
+
+    def fake_install(package_path, *, state_dir, checkout):
+        observed.append(
+            {
+                "package": package_path,
+                "state_dir": state_dir,
+                "checkout": checkout,
+            }
+        )
+        return result
+
+    monkeypatch.setattr(cli, "install_native_host", fake_install, raising=False)
+    output = StringIO()
+
+    assert cli.run(
+        _args(
+            "--json",
+            "--state-dir",
+            str(state_dir),
+            "host",
+            "install",
+            str(package),
+        ),
+        out=output,
+    ) == 0
+    assert json.loads(output.getvalue()) == result
+    assert observed == [
+        {
+            "package": package.resolve(),
+            "state_dir": str(state_dir),
+            "checkout": Path.cwd(),
+        }
+    ]
