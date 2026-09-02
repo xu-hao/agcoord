@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.3.2 — 2026-09-02
+
 - Allow the installed Python client to perform only its authenticated run-scoped callbacks from
   a managed admitted user namespace, where Linux represents the fixed host-root-owned broker
   with the overflow UID. Selection still rejects arbitrary overflow-owned paths and requires
