@@ -368,9 +368,9 @@ uncontrolled services.
 
 ### Bounded tmpfs scratch
 
-The `cgroup-v2` backend can replace a run's ordinary private temporary directory with a bounded
-tmpfs. Bind one `tmpfs/bytes` name and one `inodes/inodes` name to that backend, and bind a
-required `memory/bytes` name in the same run:
+The `cgroup-v2` backend can provide a run with bounded in-memory scratch. Bind one `tmpfs/bytes`
+name and one `inodes/inodes` name to that backend, and bind a required `memory/bytes` name in the
+same run:
 
 ```json
 {
@@ -428,16 +428,16 @@ names or contents.
 A namespace-rooting failure always stops before user code with exit status 125 and
 `failure_reason=resource-enforcement-failed`; the launcher is never released with parent controls
 visible. A required tmpfs mount failure has the same outcome. If both tmpfs bindings are
-`best-effort`, a mount-specific failure is recorded as unapplied and the command continues in the
-ordinary owned directory; the verified namespace and hard memory control remain applied. With no
-tmpfs bindings, AGCoord preserves that existing directory behavior without claiming RAM backing
-or a byte/inode ceiling.
+`best-effort`, a mount-specific failure is recorded as unapplied and the command continues with
+`TMPDIR`, `TMP`, and `TEMP` absent; the verified namespace and hard memory control remain applied.
+AGCoord does not substitute an unbounded disk directory for the unavailable request.
 
-Every run gets a distinct mount namespace and target. The mount remains alive while any process
-in that worker tree retains the namespace, then the kernel tears it down when the tree is gone;
-only afterward does the broker remove the owned underlying directory and token-bound report.
-Normal completion, cancellation, and replacement-broker recovery use the same ordering. Tmpfs is
-temporary virtual memory rather than a general filesystem sandbox; the kernel's
+Every successfully applied tmpfs request gets a distinct mount namespace and target. The mount
+remains alive while any process in that worker tree retains the namespace, then the kernel tears
+it down when the tree is gone; only afterward does the broker remove the owned underlying
+directory and token-bound report. Normal completion, cancellation, and replacement-broker
+recovery use the same ordering. Tmpfs is temporary virtual memory rather than a general
+filesystem sandbox; the kernel's
 [tmpfs contract](https://www.kernel.org/doc/html/latest/filesystems/tmpfs.html) defines its size,
 inode, and swap behavior.
 
@@ -512,11 +512,12 @@ the manifest; a changed path, mount, attributes, limits, or token is refused rat
 
 Required probe or setup failures stop before user code with
 `failure_reason=resource-enforcement-failed`. When both bindings are `best-effort`, an unavailable
-backend or pre-spawn setup failure is recorded as unapplied and the command uses AGCoord's normal
-private disk directory. A worker that cannot prove it dropped the broker's capabilities is never
-released, regardless of quota mode. The checkout, bind mounts, and every path outside `TMPDIR`
-remain outside the quota. Project quotas are resource accounting, not a confidentiality boundary:
-processes of the same account may be able to name sibling paths. The kernel [`quotactl(2)`
+backend or pre-spawn setup failure is recorded as unapplied and the command continues with
+`TMPDIR`, `TMP`, and `TEMP` absent. AGCoord does not substitute an unbounded disk directory. A
+worker that cannot prove it dropped the broker's capabilities is never released, regardless of
+quota mode. The checkout, bind mounts, and every path outside `TMPDIR` remain outside the quota.
+Project quotas are resource accounting, not a confidentiality boundary: processes of the same
+account may be able to name sibling paths. The kernel [`quotactl(2)`
 contract](https://man7.org/linux/man-pages/man2/quotactl.2.html), [ext4 project-quota
 options](https://www.man7.org/linux/man-pages/man5/ext4.5.html), and [XFS project-tree
 semantics](https://www.man7.org/linux/man-pages/man8/xfs_quota.8.html) define the underlying
@@ -995,18 +996,25 @@ and `l` reads one combined gate-and-publication transcript rather than separate 
 
 ## Worker scratch and cleanup
 
-Every admitted job receives a private owner-only run directory rooted under the host system
-temporary filesystem. AGCoord overrides `TMPDIR`, `TMP`, and `TEMP` even if the caller set a
-different value. A stable namespace prevents two state directories or repositories from
-colliding, and the exact run ID is the leaf.
+Scratch is an explicit resource entitlement. A run receives an AGCoord-managed temporary path
+only after it requests and successfully applies either a complete tmpfs byte/inode/memory policy
+or a complete project-quota storage/inode policy. The broker then sets `TMPDIR`, `TMP`, and `TEMP`
+to that private path. A job cannot combine the two providers.
 
-The root exists while the worker process group is live, including both gate and publication
-phases of one land. Terminal status is withheld until the group is gone, the leader is
-reaped, and scratch has been reclaimed. Cleanup restores
-owner traversal on nested mode-`000` trees before removal. On restart, the broker removes
-terminal and orphan roots but preserves the root of a genuinely live recovered process.
-Reclamation returns temporary pages to the kernel and prevents one job inheriting another's
-files.
+If a run declares neither provider, the broker creates no per-run scratch directory and removes
+`TMPDIR`, `TMP`, and `TEMP` inherited from the caller. The same no-scratch environment is used when
+a best-effort scratch provider cannot be applied. This boundary means the run has no
+AGCoord-provided or accounted scratch entitlement; it is not a general filesystem sandbox.
+Commands can still name their checkout or other paths directly, and language runtimes may choose
+a system fallback such as `/tmp` when all three variables are absent. Jobs that require bounded
+temporary storage must declare a provider and use the advertised path.
+
+An applied provider's root exists while the worker process group is live, including both gate and
+publication phases of one land. Terminal status is withheld until the group is gone, the leader
+is reaped, and owned scratch has been reclaimed. Cleanup restores owner traversal on nested
+mode-`000` trees before removal. On restart, the broker preserves a genuinely live recovered
+provider root and reclaims only identity-verified terminal or orphan state. Reclamation returns
+temporary pages or quota capacity to the kernel and prevents one job inheriting another's files.
 
 ## Migrations
 

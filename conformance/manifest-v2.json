@@ -1,5 +1,5 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "protocols": {
     "python_reference": 4,
     "rust_native": 5
@@ -93,6 +93,18 @@
       "tests": {
         "python_reference": ["tests/test_queue.py::test_backend_lifecycle_applies_and_measures_a_typed_resource"],
         "rust_native": ["scheduler::typed_cgroup_fixture_applies_controls_before_release_and_cleans_owned_leaf"]
+      }
+    },
+    {
+      "id": "resources.zero-scratch-default",
+      "domain": "resources",
+      "description": "Jobs without a scratch provider inherit no temporary-directory variables and receive no managed run scratch path.",
+      "tests": {
+        "python_reference": [
+          "tests/test_queue.py::test_workers_without_scratch_do_not_receive_or_inherit_temp_paths",
+          "tests/test_queue.py::test_land_without_scratch_does_not_receive_or_inherit_temp_paths"
+        ],
+        "rust_native": ["scheduler::workers_without_scratch_resources_do_not_inherit_caller_temp_paths"]
       }
     },
     {
@@ -204,7 +216,7 @@
       "domain": "crash_cleanup",
       "description": "Terminal cleanup is durable, retryable, and reclaims only test-owned trees.",
       "tests": {
-        "python_reference": ["tests/test_queue.py::test_terminal_cleanup_reclaims_worker_created_mode_zero_trees"],
+        "python_reference": ["tests/test_cgroup_tmpfs.py::test_successful_launcher_setup_is_durable_before_user_code_and_reports_usage"],
         "rust_native": ["scheduler::worker_identity_and_terminal_commit_crashes_recover_durably"]
       }
     },

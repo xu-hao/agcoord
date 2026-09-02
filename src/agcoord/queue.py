@@ -4065,6 +4065,8 @@ class CoordinatorBroker:
         environment.pop(CGROUP_ISOLATE_ENV, None)
         environment.pop(PROJECT_QUOTA_DROP_ENV, None)
         environment.pop(TMPFS_SETUP_ENV, None)
+        for variable in ("TMPDIR", "TMP", "TEMP"):
+            environment.pop(variable, None)
         worker_tmp = self._worker_tmp_path(run_id)
         release_read = -1
         release_write = -1
@@ -4114,24 +4116,30 @@ class CoordinatorBroker:
                 "SELECT * FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
             quota_scratch = self._project_quota_scratch_path(db, prepared_row)
-            scratch_target = worker_tmp if quota_scratch is None else quota_scratch
-            if quota_scratch is None:
+            tmpfs_requested = bool(self._tmpfs_resource_names(prepared_row))
+            scratch_target = quota_scratch
+            tmpfs_setup = None
+            if tmpfs_requested:
+                scratch_target = worker_tmp
                 scratch_target.mkdir(mode=0o700)
                 scratch_target.chmod(0o700)
-            else:
+                tmpfs_setup = self._prepare_tmpfs_setup(
+                    db,
+                    prepared_row,
+                    scratch_target,
+                )
+                if tmpfs_setup is None:
+                    scratch_target = None
+            elif quota_scratch is not None:
                 environment[PROJECT_QUOTA_DROP_ENV] = "1"
-            tmpfs_setup = self._prepare_tmpfs_setup(
-                db,
-                prepared_row,
-                scratch_target,
-            )
             if tmpfs_setup is not None:
                 environment[TMPFS_SETUP_ENV] = json.dumps(
                     tmpfs_setup,
                     separators=(",", ":"),
                 )
-            for variable in ("TMPDIR", "TMP", "TEMP"):
-                environment[variable] = str(scratch_target)
+            if scratch_target is not None:
+                for variable in ("TMPDIR", "TMP", "TEMP"):
+                    environment[variable] = str(scratch_target)
             release_read, release_write = os.pipe()
             worker_setup_required = tmpfs_setup is not None or quota_scratch is not None
             if worker_setup_required:

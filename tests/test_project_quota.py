@@ -424,7 +424,7 @@ class _RefusingScratchBackend(ProjectQuotaBackend):
     ("mode", "expected_status", "ran"),
     [("required", "failed", False), ("best-effort", "passed", True)],
 )
-def test_post_allocation_refusal_fails_required_or_falls_back_before_spawn(
+def test_post_allocation_refusal_fails_required_or_runs_without_scratch(
     tmp_path: Path,
     mode: str,
     expected_status: str,
@@ -461,7 +461,7 @@ import json
 import os
 from pathlib import Path
 import sys
-Path(sys.argv[1]).write_text(json.dumps({"tmp": os.environ["TMPDIR"]}))
+Path(sys.argv[1]).write_text(json.dumps({"tmp": os.environ.get("TMPDIR")}))
 """,
                 str(report),
             ],
@@ -486,8 +486,7 @@ Path(sys.argv[1]).write_text(json.dumps({"tmp": os.environ["TMPDIR"]}))
             "failed" if mode == "required" else "unapplied"
         }
         if ran:
-            target = Path(json.loads(report.read_text(encoding="utf-8"))["tmp"])
-            assert PROJECT_QUOTA_BACKEND not in target.parts
+            assert json.loads(report.read_text(encoding="utf-8")) == {"tmp": None}
     finally:
         running.stop()
 
@@ -623,7 +622,7 @@ def test_persistent_and_tmpfs_scratch_providers_are_rejected_together():
         ("best-effort", "passed", 0, True),
     ],
 )
-def test_unavailable_quota_backend_obeys_required_or_private_disk_fallback(
+def test_unavailable_quota_backend_obeys_required_or_no_scratch_mode(
     tmp_path: Path,
     mode: str,
     expected_status: str,
@@ -645,15 +644,15 @@ def test_unavailable_quota_backend_obeys_required_or_private_disk_fallback(
     )
     client = running.start()
     repository = _repository(tmp_path / "repository")
-    marker = tmp_path / "user-code-ran"
+    report = tmp_path / "user-code.json"
 
     try:
         run_id = client.submit(
             [
                 sys.executable,
                 "-c",
-                "from pathlib import Path; Path(__import__('sys').argv[1]).touch()",
-                str(marker),
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}))",
+                str(report),
             ],
             checkout=str(repository),
             resources={"disk": 8 * MIB, "disk_inodes": 64},
@@ -666,7 +665,13 @@ def test_unavailable_quota_backend_obeys_required_or_private_disk_fallback(
         )
         assert finished["status"] == expected_status
         assert finished["exit_status"] == expected_exit
-        assert marker.exists() is ran
+        assert report.exists() is ran
+        if ran:
+            assert json.loads(report.read_text(encoding="utf-8")) == {
+                "TMPDIR": None,
+                "TMP": None,
+                "TEMP": None,
+            }
         events = [
             event
             for event in finished["resource_receipt"]["events"]

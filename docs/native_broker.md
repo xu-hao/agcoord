@@ -271,15 +271,17 @@ run leaves, controller enablement and readback, attachment, namespace rooting, r
 cancellation, and cleanup. It enforces CPU, process, memory, memory-pressure, swap, tmpfs,
 bandwidth, IOPS, and I/O-weight bindings, and retains conservative peaks and deduplicated events
 in the same receipt shape as the Python owner. Required setup failures stop before user code;
-best-effort tmpfs mount failures can receive an explicit second release onto the owned disk
-directory only after capability and descriptor cleanup still verifies.
+after capability and descriptor cleanup still verifies, a best-effort tmpfs mount failure can
+receive an explicit second release only with `TMPDIR`, `TMP`, and `TEMP` removed. It never gains
+an unbounded disk fallback.
 
 The native `project-quota` backend implements the same independent persistent-scratch contract as
 the Python owner. It resolves a directly identifiable local ext4 or XFS mount, allocates a
 collision-safe high-range project ID under a mount-global lock, applies and reads back byte and
 inode limits, and records the exact mount, tree, and project identity for recovery. Required
-failures stop before user code, and best-effort fallback is allowed only before allocation and
-after the launcher proves capability cleanup and `no_new_privs`. Completion, cancellation, and
+failures stop before user code. When a best-effort backend is unavailable before allocation, the
+command continues without AGCoord-managed scratch. After allocation, a failure to prove
+capability cleanup and `no_new_privs` always stops the worker. Completion, cancellation, and
 replacement-broker recovery retain terminal usage before clearing limits and removing only the
 identity-verified owned tree. Unsupported or changed topology and durable state are refused
 without enabling filesystem features, editing system project databases, or mutating an
@@ -403,6 +405,11 @@ roots the visible cgroup hierarchy at its leaf, provisions optional tmpfs, enter
 the admitted AppArmor domain when managed policy is active, drops effective, permitted,
 inheritable and ambient capabilities, sets `no_new_privs`, reports verified setup, and waits for
 the final release. It then `execve`s the submitted command.
+
+Before building the immutable `execve` environment, the owner removes caller-supplied `TMPDIR`,
+`TMP`, and `TEMP`. It adds them back only for a successfully prepared tmpfs or project-quota
+provider. A job with no scratch declaration therefore receives no native-broker scratch path;
+this resource boundary does not prevent the command from explicitly naming paths outside it.
 
 The setup-only `agcoord-broker` AppArmor profile attaches to the immutable root-owned executable,
 not to a user-editable service directive. Its public command parser exposes no worker mode or

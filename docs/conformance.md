@@ -2,20 +2,25 @@
 
 AGCoord keeps the protocol-4 Python broker as an executable reference oracle while the
 protocol-5 Rust broker is the only production owner selected by installed clients. The strict
-versioned contract in `conformance/manifest-v1.json` pairs public black-box tests for those two
+versioned contract in `conformance/manifest-v2.json` pairs public black-box tests for those two
 implementations. A release is not conformant merely because both test suites happen to pass:
 every required domain and every intentional difference must also remain named in the manifest
 and backed by collected tests.
 
-## Version 1 contract
+## Version 2 contract
 
-Version 1 requires paired coverage for public commands, repository lanes, atomic publication,
+Version 2 retains the version-1 domains and requires paired coverage for public commands,
+repository lanes, atomic publication,
 the real TUI, protocol handling, typed resources and receipts, migrations, contention,
 cancellation, and replacement recovery. It separately names crash boundaries around database
 transactions, launcher release, cgroup attachment, publication authority, terminal cleanup,
 and replacement ownership. Its client and stored-state corpora cover malformed values, and its
 safety properties prove no duplicate execution, stale publication, unrelated process kill, or
 unverified enforcement claim.
+
+Resource coverage also proves the zero-scratch default at the worker boundary: both owners remove
+caller temporary-directory variables and create no managed run scratch path unless a provider is
+declared.
 
 Contention coverage includes durable maintenance draining: competing submissions linearize
 entirely before or after the guard, accepted work and authoritative publication complete, a
@@ -36,7 +41,7 @@ The manifest also records two intentional differences:
   enforcement remains an explicit dedicated-host proof.
 
 Changing a required domain, implementation identity, or execution contract requires a new
-manifest version. Adding behavior within version 1 requires paired public tests and a manifest
+manifest version. Adding behavior within version 2 requires paired public tests and a manifest
 entry in the same change.
 
 ## Executable gate

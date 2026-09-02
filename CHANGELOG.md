@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Stop granting implicit unbounded scratch to jobs that declare no scratch resources. The Python
+  and native brokers now remove inherited `TMPDIR`, `TMP`, and `TEMP` values and create no per-run
+  scratch directory unless the job requests a complete tmpfs or project-quota policy. A
+  best-effort scratch setup failure likewise continues without managed scratch instead of
+  falling back to an unbounded disk directory.
 - Add `agc host install` and `agc host upgrade` as verified one-command native-host operations
   after the exact matching Python client is installed. They validate the complete release bundle,
   enforce the managed default-spool boundary, orchestrate fresh activation or exact-ID draining,

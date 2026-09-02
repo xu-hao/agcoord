@@ -10,7 +10,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = ROOT / "conformance" / "manifest-v1.json"
+MANIFEST = ROOT / "conformance" / "manifest-v2.json"
 CHECKER = ROOT / "scripts" / "check-conformance"
 
 
@@ -35,7 +35,7 @@ def test_versioned_conformance_manifest_passes_its_public_validator():
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == (
-        "conformance manifest v1 passed: 24 behaviors, 2 intentional differences"
+        "conformance manifest v2 passed: 25 behaviors, 2 intentional differences"
     )
     assert completed.stderr == ""
 
@@ -46,8 +46,8 @@ def test_public_checker_lists_both_implementation_selector_sets():
     assert completed.returncode == 0, completed.stderr
     selectors = json.loads(completed.stdout)
     assert set(selectors) == {"python_reference", "rust_native"}
-    assert len(selectors["python_reference"]) == 31
-    assert len(selectors["rust_native"]) == 28
+    assert len(selectors["python_reference"]) == 33
+    assert len(selectors["rust_native"]) == 29
     assert (
         "tests/test_queue.py::test_submit_and_snapshot_have_the_strict_generic_schema"
         in selectors["python_reference"]
@@ -66,8 +66,8 @@ def test_public_checker_lists_both_implementation_selector_sets():
     ("mutate", "message"),
     [
         (
-            lambda document: document.update(manifest_version=2),
-            "manifest_version must be exactly 1",
+            lambda document: document.update(manifest_version=1),
+            "manifest_version must be exactly 2",
         ),
         (
             lambda document: document["required_domains"].pop(),

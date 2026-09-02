@@ -381,7 +381,10 @@ def launcher_main() -> None:
         if code != "ok":
             print(f"AGCoord: worker setup unavailable: {code}", file=sys.stderr, flush=True)
             if continue_run and raw_spec is not None and drop_admin is None:
-                _exec(command, os.environ)
+                environment = dict(os.environ)
+                for variable in ("TMPDIR", "TMP", "TEMP"):
+                    environment.pop(variable, None)
+                _exec(command, environment)
             raise SystemExit(125)
         if not continue_run:
             if mounted and spec is not None:

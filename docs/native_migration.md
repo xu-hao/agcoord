@@ -25,6 +25,13 @@ invents resource enforcement, child leases, exact-head evidence, or publication 
 the older schema could not represent. There is no supported live mixed-owner mode and no
 configuration switch that makes the 0.3 client fall back to the Python broker.
 
+Before deploying a build with the no-scratch default, audit admitted commands that relied on an
+implicit private temporary directory. Such jobs must request a complete tmpfs policy or a complete
+project-quota policy and honor the resulting `TMPDIR`; otherwise both owners remove inherited
+`TMPDIR`, `TMP`, and `TEMP` and provision no per-run scratch path. Best-effort provider failure has
+the same no-scratch environment. This is not a general filesystem sandbox, so separately named
+checkout and host paths remain outside the resource contract.
+
 The supported production host is x86_64 Ubuntu with the requirements in the
 [host runbook](native_host.md). The release executable target is
 `x86_64-unknown-linux-musl`; a client and broker must both be on the 0.3 release line, and a
