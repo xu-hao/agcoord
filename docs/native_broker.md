@@ -179,6 +179,14 @@ The selected executable and a live owner must have the same supported version an
 identity. A missing, stale, malformed, or incompatible executable produces an actionable
 refusal without accepting work or replacing the live owner.
 
+One managed host upgrade is the single exception, and it is narrower than it sounds. The
+upgrade's drain must command the broker that is still installed, which is on the outgoing
+release line until activation replaces it, so that selection admits any stable version on the
+same durable protocol. Every other selection boundary is unchanged: the file must still be a
+non-symlink, non-group-writable, correctly owned regular executable reporting the exact
+protocol, implementation, and supported target. Ordinary client commands keep the strict
+release-line policy.
+
 Managed admitted workers retain a deliberately narrow callback surface for their own run:
 admission verification, land phase/result reporting, own-run status, and authenticated child
 CPU leases. A user namespace cannot represent the installed file's host-root owner, so Linux
