@@ -39,6 +39,9 @@ fn print_help() {
             "  {NAME} host-preflight --state-dir PATH\n",
             "  {NAME} host-client-preflight\n",
             "  {NAME} host-drain-check|host-drain-hold --state-dir PATH\n",
+            "  {NAME} drain --state-dir PATH --drain-id ID --reason TEXT\n",
+            "  {NAME} drain-status --state-dir PATH\n",
+            "  {NAME} resume --state-dir PATH --drain-id ID\n",
             "  {NAME} submit --state-dir PATH [OPTIONS] -- COMMAND...\n",
             "  {NAME} snapshot|status|log|cancel|clear --state-dir PATH [OPTIONS]\n",
             "  {NAME} verify|phase|report --state-dir PATH [OPTIONS]\n",
@@ -52,6 +55,9 @@ fn print_help() {
             "  host-client-preflight Verify admitted client calls stay restricted\n",
             "  host-drain-check Prove a spool is idle and unowned before activation\n",
             "  host-drain-hold  Hold the verified maintenance lock until input closes\n",
+            "  drain            Atomically refuse new work and retain a durable receipt\n",
+            "  drain-status     Read one durable drain without starting a broker\n",
+            "  resume           Remove the guard for one exact completed drain\n",
             "  submit           Append one validated immutable run\n",
             "  snapshot         Read the live queue snapshot\n",
             "  status           Read one durable run\n",
@@ -127,6 +133,57 @@ fn parse_state_only(arguments: &[String]) -> Result<PathBuf> {
         return Ok(PathBuf::from(&arguments[1]));
     }
     Err(AppError::usage("command requires exactly --state-dir PATH"))
+}
+
+fn parse_drain(arguments: &[String]) -> Result<(PathBuf, String, String)> {
+    let mut state_dir = None;
+    let mut drain_id = None;
+    let mut reason = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir" | "--drain-id" | "--reason" => {
+                option_value(arguments, &mut index, &option)?
+            }
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--drain-id" => drain_id = Some(value),
+            "--reason" => reason = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    Ok((
+        state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?,
+        drain_id.ok_or_else(|| AppError::usage("--drain-id is required"))?,
+        reason.ok_or_else(|| AppError::usage("--reason is required"))?,
+    ))
+}
+
+fn parse_resume(arguments: &[String]) -> Result<(PathBuf, String)> {
+    let mut state_dir = None;
+    let mut drain_id = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir" | "--drain-id" => option_value(arguments, &mut index, &option)?,
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--drain-id" => drain_id = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    Ok((
+        state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?,
+        drain_id.ok_or_else(|| AppError::usage("--drain-id is required"))?,
+    ))
 }
 
 fn parse_host_preflight(arguments: &[String]) -> Result<host::PreflightOptions> {
@@ -906,6 +963,17 @@ fn run_command(arguments: &[String]) -> Result<()> {
             Ok(())
         }
         [command, rest @ ..] if command == "serve" => Broker::start(parse_serve(rest)?)?.serve(),
+        [command, rest @ ..] if command == "drain" => {
+            let (state_dir, drain_id, reason) = parse_drain(rest)?;
+            emit_json(&store::begin_drain(&state_dir, &drain_id, &reason)?)
+        }
+        [command, rest @ ..] if command == "drain-status" => {
+            emit_json(&store::drain_status(&parse_state_only(rest)?)?)
+        }
+        [command, rest @ ..] if command == "resume" => {
+            let (state_dir, drain_id) = parse_resume(rest)?;
+            emit_json(&store::resume(&state_dir, &drain_id)?)
+        }
         [command, rest @ ..] if command == "submit" => {
             let (paths, request) = parse_submit(rest)?;
             emit_json(&store::submit(&paths, &request)?)

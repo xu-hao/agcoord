@@ -13,7 +13,7 @@ usage() {
     printf '%s\n' \
         'usage:' \
         '  install-native-host stage PACKAGE [--root ROOT]' \
-        '  install-native-host activate STATE_DIR [--root ROOT]' >&2
+        '  install-native-host activate STATE_DIR [--drain-id ID] [--root ROOT]' >&2
     exit 2
 }
 
@@ -22,11 +22,17 @@ subject=${2:-}
 [[ -n "$action" && -n "$subject" ]] || usage
 shift 2
 install_root=/
+drain_id=
 while (($#)); do
     case "$1" in
         --root)
             (($# >= 2)) || usage
             install_root=$2
+            shift 2
+            ;;
+        --drain-id)
+            (($# >= 2)) || usage
+            drain_id=$2
             shift 2
             ;;
         *) usage ;;
@@ -43,6 +49,7 @@ active="$install_root/var/lib/agcoord/native-host-active"
 
 case "$action" in
     stage)
+        [[ -z "$drain_id" ]] || usage
         package=$(readlink -f "$subject")
         "$package_checker" "$package"
         digest=$(sha256sum "$package" | awk '{print $1}')
@@ -90,6 +97,17 @@ case "$action" in
             printf 'state directory must already exist as a real owner-only directory\n' >&2
             exit 1
         fi
+        existing_spool=false
+        if [[ -f "$state_dir/queue.sqlite3" ]]; then
+            existing_spool=true
+            if [[ ! "$drain_id" =~ ^drain-[0-9a-f]{12}$ ]]; then
+                printf 'an existing spool requires the exact ID returned by agc drain\n' >&2
+                exit 2
+            fi
+        elif [[ -n "$drain_id" ]]; then
+            printf 'a fresh spool does not accept --drain-id\n' >&2
+            exit 2
+        fi
         coproc AGCOORD_MAINTENANCE {
             "$binary" host-drain-hold --state-dir "$state_dir"
         }
@@ -101,7 +119,13 @@ case "$action" in
             printf 'cannot acquire the native host maintenance lock\n' >&2
             exit 1
         fi
-        if ! jq -e '.drained == true and .live == 0' <<<"$maintenance_status" >/dev/null; then
+        if [[ "$existing_spool" == true ]]; then
+            ready_filter='.drained == true and .state == "drained" and .live == 0 and .drain_id == $drain_id'
+        else
+            ready_filter='.drained == true and .live == 0 and .protocol == null'
+        fi
+        if ! jq -e --arg drain_id "$drain_id" "$ready_filter" \
+            <<<"$maintenance_status" >/dev/null; then
             printf 'native host maintenance returned an invalid readiness record\n' >&2
             exit 1
         fi
@@ -158,8 +182,15 @@ case "$action" in
         fi
         printf '%s\n' \
             "activated native host package $digest without restarting the broker" \
-            "run: systemctl --user daemon-reload" \
-            "then: systemctl --user start agcoord-broker.service"
+            "run: systemctl --user daemon-reload"
+        if [[ "$existing_spool" == true ]]; then
+            protocol=$(jq -r '.protocol' <<<"$maintenance_status")
+            if ((protocol < 5)); then
+                printf 'then: agc --state-dir %q migrate\n' "$state_dir"
+            fi
+            printf 'then: agc --state-dir %q resume %q\n' "$state_dir" "$drain_id"
+        fi
+        printf '%s\n' "then: systemctl --user start agcoord-broker.service"
         ;;
     *) usage ;;
 esac
