@@ -13,14 +13,11 @@ import sys
 import pytest
 
 from agcoord.queue import (
-    CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
-    PROTOCOL,
-    migrate_queue,
 )
 
-from conftest import RunningCoordinator, RunningReferenceBroker, caller_environment, wait_for
+from conftest import RunningCoordinator, caller_environment, wait_for
 
 
 def _git(path: Path, *arguments: str) -> str:
@@ -47,139 +44,6 @@ def _repository(path: Path) -> Path:
 def _terminal(client: CoordinatorClient, run_id: str) -> dict[str, object] | None:
     row = client.status(run_id)
     return row if row["status"] not in {"queued", "running"} else None
-
-
-def test_protocol_three_history_requires_migration_before_child_leases(
-    tmp_path: Path,
-):
-    state_dir = tmp_path / "state"
-    repository = _repository(tmp_path / "repository")
-    original = RunningReferenceBroker(
-        state_dir,
-        capacities={"jobs": 1, "cpu": 1},
-    )
-    original_client = original.start()
-    historical_run = original_client.submit(
-        [sys.executable, "-c", "print('historical protocol-three run')"],
-        checkout=str(repository),
-        caller_pid=os.getpid(),
-        environment=caller_environment(),
-    )
-    historical = wait_for(
-        lambda: _terminal(original_client, historical_run),
-        "the history fixture did not finish",
-    )
-    assert historical["status"] == "passed"
-    original.stop()
-
-    database = state_dir / "queue.sqlite3"
-    with sqlite3.connect(database) as db:
-        db.execute("DROP TABLE child_cpu_leases")
-        db.execute(
-            "UPDATE coordinator_meta SET value = '3' WHERE key = 'protocol'"
-        )
-
-    with pytest.raises(CoordinatorError, match="migrate|protocol"):
-        CoordinatorBroker(
-            state_dir,
-            capacities={"jobs": 1, "cpu": 1},
-            idle_timeout=None,
-        )
-
-    assert migrate_queue(state_dir=state_dir) == {
-        "changed": True,
-        "from_protocol": 3,
-        "to_protocol": PROTOCOL,
-    }
-
-    migrated = RunningReferenceBroker(
-        state_dir,
-        capacities={"jobs": 1, "cpu": 1},
-    )
-    client = migrated.start()
-    report = tmp_path / "migrated-lease.json"
-    try:
-        assert client.status(historical_run)["status"] == "passed"
-        leased_run = client.submit(
-            [
-                sys.executable,
-                "-u",
-                "-c",
-                """
-import json
-import os
-from pathlib import Path
-
-from agcoord import ChildCpuLease, CoordinatorClient
-
-client = CoordinatorClient(
-    state_dir=os.environ["AGCOORD_STATE_DIR"],
-    autostart=False,
-)
-with client.acquire_child_cpu_lease(1, timeout=5) as lease:
-    Path(os.environ["LEASE_REPORT"]).write_text(
-        json.dumps({"granted": lease.granted, "full": lease.full}),
-        encoding="utf-8",
-    )
-""",
-            ],
-            checkout=str(repository),
-            resources={"cpu": 1},
-            caller_pid=os.getpid(),
-            environment={
-                **caller_environment(),
-                "LEASE_REPORT": str(report),
-            },
-        )
-        finished = wait_for(
-            lambda: _terminal(client, leased_run),
-            "the migrated spool could not grant a child CPU lease",
-        )
-        assert finished["status"] == "passed"
-        assert json.loads(report.read_text(encoding="utf-8")) == {
-            "granted": 1,
-            "full": True,
-        }
-        assert client.child_cpu_leases(
-            leased_run,
-            include_terminal=True,
-        )[0]["status"] == "released"
-    finally:
-        migrated.stop()
-
-
-_CONTROLLER_SOURCE = """
-import json
-import os
-from pathlib import Path
-import time
-
-from agcoord.queue import CoordinatorClient
-
-client = CoordinatorClient(
-    state_dir=os.environ["AGCOORD_STATE_DIR"],
-    autostart=False,
-)
-lease = client.acquire_child_cpu_lease(
-    int(os.environ["LEASE_REQUESTED"]),
-    minimum=int(os.environ["LEASE_MINIMUM"]),
-    timeout=10,
-)
-with lease:
-    Path(os.environ["LEASE_REPORT"]).write_text(json.dumps({
-        "lease_id": lease.lease_id,
-        "requested": lease.requested,
-        "minimum": lease.minimum,
-        "granted": lease.granted,
-        "full": lease.full,
-    }), encoding="utf-8")
-    if os.environ.get("LEASE_CRASH") == "1":
-        os._exit(17)
-    release = Path(os.environ["LEASE_RELEASE"])
-    while not release.exists():
-        time.sleep(0.01)
-"""
-
 
 def _wait_for_report(
     client: CoordinatorClient,
@@ -512,6 +376,39 @@ while not release.exists():
     finally:
         release.touch()
         running.stop()
+
+
+_CONTROLLER_SOURCE = """
+import json
+import os
+from pathlib import Path
+import time
+
+from agcoord.queue import CoordinatorClient
+
+client = CoordinatorClient(
+    state_dir=os.environ["AGCOORD_STATE_DIR"],
+    autostart=False,
+)
+lease = client.acquire_child_cpu_lease(
+    int(os.environ["LEASE_REQUESTED"]),
+    minimum=int(os.environ["LEASE_MINIMUM"]),
+    timeout=10,
+)
+with lease:
+    Path(os.environ["LEASE_REPORT"]).write_text(json.dumps({
+        "lease_id": lease.lease_id,
+        "requested": lease.requested,
+        "minimum": lease.minimum,
+        "granted": lease.granted,
+        "full": lease.full,
+    }), encoding="utf-8")
+    if os.environ.get("LEASE_CRASH") == "1":
+        os._exit(17)
+    release = Path(os.environ["LEASE_RELEASE"])
+    while not release.exists():
+        time.sleep(0.01)
+"""
 
 
 def test_fifo_bounded_bypass_keeps_small_work_moving_without_starving_large(

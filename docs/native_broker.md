@@ -2,7 +2,7 @@
 
 This document defines the boundary for AGCoord's single-executable Rust broker. It is
 normative for the native implementation, Python client compatibility, host packaging, and the
-migration from the protocol-4 Python broker.
+migration of a pre-native protocol-4 spool.
 
 ## Scope and one-executable definition
 
@@ -215,9 +215,10 @@ callback boundary.
 The native executable implements the protocol-5 owner lock, SQLite spool initialization,
 submission validation, admission, repository barriers, queue-order-preserving round-robin
 selection, generic capacity accounting, cancellation, land-phase authority, history reads,
-worker observation, child leases, durable drain/status/resume, and explicit migration and
-rollback. The Python CLI, client, TUI, and pytest-xdist adapter use these native commands while
-retaining their public JSON and environment contracts.
+worker observation, child leases, durable drain/status/resume, and protocol-4-to-5 migration
+and rollback. The Python client, TUI, and pytest-xdist adapter use these native commands while
+retaining their public JSON and environment contracts; migration and rollback are broker-internal
+and are no longer exposed as client commands.
 
 `serve` validates the complete schema and every stored run before changing activity metadata,
 puts new and migrated databases in WAL mode, and uses `database_timeout` from the state
@@ -472,17 +473,13 @@ sequence observed before rollback. A protocol-4 client excludes every receipt at
 cutoff, whether selected automatically or named explicitly, so publication requires a new full
 gate after rollback.
 
-Python clients recognize protocol-4 history only to provide a controlled migration path. A
-default/autostart client never launches or joins the old Python owner. The explicit drain path
-can guard a live protocol-4 spool and let its accepted work finish before the owner stops; an
-idle older spool otherwise requires `agc migrate`. The native broker refuses an old spool until
-that explicit migration succeeds, while the old Python `serve` entry point refuses protocol 5.
-Internal non-autostart compatibility access remains available only for migration tests,
-maintenance observation, and already admitted legacy workers; it is not a public startup
-fallback. Operators use the separately tested
-[native migration and rollback runbook](native_migration.md) for compatibility selection,
-whole-spool backup, rollback rehearsal, live transition, capability evidence, troubleshooting,
-and retirement of the old production path.
+AGCoord 0.6.0 retired the Python reference broker, its `serve` entry point, and the client's
+in-process migrations. A default/autostart client that meets a spool below protocol 5 refuses
+every command and names AGCoord 0.5.2 as the release that migrates it; it never launches or joins
+a pre-native owner. The native broker still carries the protocol-4-to-5 `migrate` and `rollback`
+commands that AGCoord 0.5.2 drives and that the conformance suite exercises directly, but the
+current client no longer invokes them. Operators migrating a pre-native spool follow the
+[pre-native spool guide](native_migration.md).
 
 ## Implementation and release order
 

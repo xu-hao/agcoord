@@ -19,8 +19,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/verify-release-candidate"
 RELEASE = runpy.run_path(str(SCRIPT))
 CandidateError = RELEASE["CandidateError"]
-MIGRATION_SCRIPT = ROOT / "scripts/rehearse-native-migration"
-MIGRATION = runpy.run_path(str(MIGRATION_SCRIPT))
 
 
 def test_cli_preserves_the_supplied_virtualenv_interpreter(
@@ -69,49 +67,9 @@ def test_cli_preserves_the_supplied_virtualenv_interpreter(
     assert RELEASE["main"]() == 0
     assert observed["python"] == virtualenv_python
 
-
-def test_migration_cli_preserves_the_supplied_virtualenv_interpreter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    base_python = tmp_path / "base-python"
-    base_python.write_text("base\n", encoding="utf-8")
-    virtualenv_bin = tmp_path / "migration-venv/bin"
-    virtualenv_bin.mkdir(parents=True)
-    virtualenv_python = virtualenv_bin / "python"
-    virtualenv_python.symlink_to(base_python)
-    agc = tmp_path / "agc"
-    broker = tmp_path / "agcoord-broker"
-    observed: dict[str, Path] = {}
-
-    def fake_rehearse(python: Path, supplied_agc: Path, supplied_broker: Path):
-        observed["python"] = python
-        observed["agc"] = supplied_agc
-        observed["broker"] = supplied_broker
-        return {"final_protocol": 5}
-
-    monkeypatch.setitem(MIGRATION["main"].__globals__, "rehearse", fake_rehearse)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(MIGRATION_SCRIPT),
-            "--python",
-            str(virtualenv_python),
-            "--agc",
-            str(agc),
-            "--broker",
-            str(broker),
-        ],
-    )
-
-    assert MIGRATION["main"]() == 0
-    assert observed["python"] == virtualenv_python
-
-
 def test_release_sources_declare_one_stable_version_and_ship_the_gate():
     assert RELEASE["source_versions"]() == ("0.5.2", "0.5.2", "0.5.2")
     assert SCRIPT.stat().st_mode & 0o111
-    assert (ROOT / "scripts/rehearse-native-migration").stat().st_mode & 0o111
     manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
     assert "include scripts/verify-release-candidate" in manifest
     assert "include scripts/*native*" in manifest
@@ -293,7 +251,7 @@ def _write_sdist(path: Path, *, executable: bool = True) -> None:
             (ROOT / "docs/native_migration.md").read_bytes(),
             0o644,
         )
-        for script in ("rehearse-native-migration", "verify-release-candidate"):
+        for script in ("verify-release-candidate",):
             _tar_file(
                 archive,
                 f"{prefix}scripts/{script}",
@@ -340,11 +298,6 @@ def test_assembled_bundle_has_one_complete_aggregate_checksum_set(tmp_path: Path
         "0.3.0",
         identity,
         {"identity": identity},
-        {
-            "backup_sha256": "1" * 64,
-            "final_protocol": 5,
-            "rollback_protocol": 4,
-        },
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["version"] == "0.3.0"
@@ -364,5 +317,4 @@ def test_assembled_bundle_has_one_complete_aggregate_checksum_set(tmp_path: Path
             "0.3.0",
             identity,
             {"identity": identity},
-            {"backup_sha256": "1" * 64},
         )

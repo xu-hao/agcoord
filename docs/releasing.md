@@ -59,19 +59,17 @@ together with the raw native executable. The archive's manifest binds the execut
 service unit, and AppArmor policy; see the [native host runbook](native_host.md) for supported
 hosts, activation, and rollback.
 
-The client/owner/state combinations admitted for release are fixed in the
-[native compatibility matrix](native_migration.md#compatibility-matrix). Python and native
-versions must be the same stable 0.5.x version, the native artifact and host manifest must report
-the same protocol-5 identity, and the running owner must match the exact configured build. No
-release workflow admits a live Python/Rust mixed-owner state.
+The client and native broker ship at the same stable version, the native artifact and host
+manifest must report the same protocol-5 identity, and the running owner must match the exact
+configured build. The native broker is the only broker AGCoord ships.
 
 Building the artifact does not activate it. Host packaging installs the verified executable at
 `/usr/libexec/agcoord/agcoord-broker`, and a development configuration may explicitly select
 another absolute path with `native_broker.allow_development=true`. Python clients verify the
 regular-file mode and ownership plus the exact `identity --json` version, protocol,
 implementation, build, and target before startup and commands. They never search `PATH`, accept
-a symlink, or silently fall back to the Python broker. The Python wheel deliberately contains
-no copied interpreter or native executable.
+a symlink, or silently fall back to an unpinned broker. The Python wheel deliberately contains
+no native executable.
 
 ## Dependency posture
 
@@ -94,7 +92,7 @@ interface and must be smoke-tested from the built wheel.
 2. Land that exact commit through `agc land` with `./scripts/check-conformance`. The checker
    validates the version-3 manifest and collected native selectors before running both
    complete suites serially at their process boundary. It includes generic scheduling, atomic
-   publication, real TUI behavior, resources/receipts, migration/rollback rehearsal, malformed
+   publication, real TUI behavior, resources/receipts, migration/rollback, malformed
    state, contention, cancellation, and crash-recovery safety properties. Missing declared
    coverage closes the gate.
 3. On every host, run the deterministic cgroup lifecycle suite. On an exclusive delegated v2
@@ -150,20 +148,19 @@ interface and must be smoke-tested from the built wheel.
    native-host pin that is absent, names another version, or does not match both the released
    broker and the broker inside the host package. It then
    installs the wheel with `xdist` and the sdist into separate fresh environments outside the
-   checkout, verifies `agc`/module entry points and the pytest plugin, and runs the complete
-   protocol-4 backup/migrate/rollback/remigrate rehearsal against the exact release ELF. Only
+   checkout, and verifies `agc`/module entry points and the pytest plugin. Only
    after those checks pass does it create `release-manifest.json` and aggregate `SHA256SUMS`.
    GitHub's zipped workflow-artifact transport normalizes file modes, so the workflow restores
    `0755` on only the fixed broker and three fixed helper names before running this verifier;
    content sidecars and the host archive's internal modes remain independently checked.
 7. Install the host bundle on the supported Ubuntu configuration through the staged runbook.
    For an existing spool, retain the exact durable drain receipt, require activation to match its
-   ID, preserve it through migration, and resume only after owner-locked maintenance completes.
+   ID and resume only after owner-locked maintenance completes.
    Keep `kernel.apparmor_restrict_unprivileged_userns=1`, start the ordinary unprivileged managed
    service, and retain the shipped `cpu=1` receipt proving its AppArmor transition, cgroup
-   namespace root, exact CPU control, and durable applied/peak evidence. Rehearse the operator
-   backup and rollback steps in the [migration runbook](native_migration.md) before making the
-   native owner the default for an existing spool.
+   namespace root, exact CPU control, and durable applied/peak evidence. A spool left below
+   protocol 5 by a pre-0.6.0 release is migrated through AGCoord 0.5.2 per the
+   [pre-native spool guide](native_migration.md).
 8. A PyPI upload is a separate, explicit maintainer action. Only after the user explicitly asks
    for it, upload the exact wheel and sdist already named in `release-manifest.json` with Twine.
    Twine reads an owner-only `~/.pypirc` and a project-scoped token; never put credentials in the
@@ -182,6 +179,6 @@ interface and must be smoke-tested from the built wheel.
 
 The release workflow contains no package-index credentials, upload step, service activation, or
 implicit spool migration. It fails closed on a dirty/mistagged source, missing conformance,
-artifact or identity mismatch, failed clean install, failed rollback rehearsal, or incomplete
+artifact or identity mismatch, failed clean install, or incomplete
 checksum set. Release automation owns only temporary state and never opens the user's default
 spool.

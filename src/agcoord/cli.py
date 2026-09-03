@@ -99,7 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("run_id")
     state(commands.add_parser("clear", help="clear terminal history and logs while idle"))
     state(commands.add_parser("tui", help="open the machine queue terminal view"))
-    state(commands.add_parser("migrate", help="explicitly migrate an idle spool"))
     drain = state(
         commands.add_parser(
             "drain",
@@ -370,24 +369,6 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
                 f"proof {result['proof_run_id']} passed",
                 file=out,
             )
-        return 0
-
-    if args.command == "migrate":
-        result = CoordinatorClient(
-            state_dir=args.state_dir,
-            checkout=checkout,
-            autostart=False,
-        ).migrate()
-        if emit:
-            emit(result)
-        elif result["changed"]:
-            print(
-                f"AGCoord: migrated protocol {result['from_protocol']} "
-                f"to {result['to_protocol']}",
-                file=out,
-            )
-        else:
-            print(f"AGCoord: protocol {result['to_protocol']} already current", file=out)
         return 0
 
     if args.command == "avoid":
