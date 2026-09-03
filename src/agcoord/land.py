@@ -14,6 +14,7 @@ from .merge import (
     EXIT_MERGE_ERROR,
     MergePublisher,
     PullRequestMetadataClient,
+    Wait,
     execute as publish,
     prepare,
 )
@@ -114,6 +115,7 @@ def execute(
     phase_changed: PhaseChanged | None = None,
     head_changed: HeadChanged | None = None,
     synchronize_target: bool = True,
+    wait: Wait | None = None,
 ) -> int:
     """Preflight, gate, and publish without releasing the caller's reservation."""
     selected = Path(checkout).expanduser().resolve()
@@ -134,6 +136,7 @@ def execute(
         err=err,
         synchronize_target=synchronize_target,
         head_changed=retargeted,
+        wait=wait,
     )
     if status != 0:
         return status
