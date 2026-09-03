@@ -246,14 +246,40 @@ def pinned_broker_digest() -> str | None:
     return pin["broker_sha256"]
 
 
-def require_pinned_broker_digest() -> str:
-    """Return the pinned broker digest, refusing a client that carries none."""
-    digest = pinned_broker_digest()
+def expected_broker_digest(supplied: str | None = None) -> str | None:
+    """Return the digest a package must carry, honoring an operator's own digest.
+
+    A supplied digest lets a development client demand a comparison it could not make
+    on its own. It never relaxes one: a released client's shipped pin wins, and a
+    supplied digest that disagrees with it is a refusal rather than an override.
+    """
+    pinned = pinned_broker_digest()
+    if supplied is None:
+        return pinned
+    if not isinstance(supplied, str) or _DIGEST.fullmatch(supplied) is None:
+        raise CoordinatorError(
+            f"supplied broker digest {supplied!r} is not 64 lowercase hexadecimal digits",
+            code="native-host-digest-invalid",
+        )
+    if pinned is not None and supplied != pinned:
+        raise CoordinatorError(
+            f"supplied broker digest {supplied} does not match the digest {pinned} this "
+            f"agc {__version__} client was released against; a supplied digest cannot "
+            "replace a shipped pin",
+            code="native-host-pin-conflict",
+        )
+    return supplied
+
+
+def require_expected_broker_digest(supplied: str | None = None) -> str:
+    """Return the expected broker digest, refusing an operation that has none."""
+    digest = expected_broker_digest(supplied)
     if digest is None:
         raise CoordinatorError(
             f"this agc {__version__} client carries no native-host pin, so a downloaded "
             "bundle cannot be verified against an independent digest; install a release "
-            "client or pass a bundle path you verified yourself",
+            "client, pass a bundle path you verified yourself, or supply the digest you "
+            "expect with --broker-sha256",
             code="native-host-unpinned-client",
         )
     return digest
@@ -286,14 +312,24 @@ def _archived_broker_digest(package: Path) -> str:
     return reader.hexdigest()
 
 
-def _verify_pinned_broker(package: Path, *, require_pin: bool) -> str | None:
-    """Compare the package's own broker bytes against this client's pin.
+def _verify_pinned_broker(
+    package: Path,
+    *,
+    require_pin: bool,
+    supplied: str | None = None,
+) -> str | None:
+    """Compare the package's own broker bytes against the expected digest.
 
     The package manifest and the ``.sha256`` sidecars travel with the bytes they
     describe, so they cannot establish that a bundle is the one this client was
-    released against. Only the pin, which arrived with the client itself, can.
+    released against. Only a digest that reached the host another way can: the pin that
+    arrived with the client, or one the operator supplies for a client without a pin.
     """
-    expected = require_pinned_broker_digest() if require_pin else pinned_broker_digest()
+    expected = (
+        require_expected_broker_digest(supplied)
+        if require_pin
+        else expected_broker_digest(supplied)
+    )
     if expected is None:
         return None
     actual = _archived_broker_digest(package)
@@ -596,6 +632,7 @@ def _release_inputs(
     package: str | os.PathLike[str],
     *,
     require_pin: bool = False,
+    broker_sha256: str | None = None,
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
     selected, installer, probe = _verified_bundle(package)
     _run_checked(
@@ -603,7 +640,7 @@ def _release_inputs(
         phase="package validation",
         code="native-host-bundle-invalid",
     )
-    _verify_pinned_broker(selected, require_pin=require_pin)
+    _verify_pinned_broker(selected, require_pin=require_pin, supplied=broker_sha256)
     return selected, installer, probe, _expected_identity(selected)
 
 
@@ -687,12 +724,14 @@ def install_native_host(
     state_dir: str | os.PathLike[str] | None = None,
     checkout: str | os.PathLike[str] | None = None,
     require_pin: bool = False,
+    broker_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Install one verified managed native host onto a fresh default spool."""
     _operator_context()
     selected, installer, probe, expected_identity = _release_inputs(
         package,
         require_pin=require_pin,
+        broker_sha256=broker_sha256,
     )
     checkout_path = Path(checkout or ".").expanduser().resolve()
     paths = queue_paths(state_dir=state_dir, checkout=checkout_path)
@@ -767,12 +806,14 @@ def upgrade_native_host(
     state_dir: str | os.PathLike[str] | None = None,
     checkout: str | os.PathLike[str] | None = None,
     require_pin: bool = False,
+    broker_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Upgrade one managed native host without reopening an unverified activation."""
     _operator_context()
     selected, installer, probe, expected_identity = _release_inputs(
         package,
         require_pin=require_pin,
+        broker_sha256=broker_sha256,
     )
     checkout_path = Path(checkout or ".").expanduser().resolve()
     paths = queue_paths(state_dir=state_dir, checkout=checkout_path)
