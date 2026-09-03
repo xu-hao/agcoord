@@ -11,6 +11,7 @@ import sys
 from typing import Callable, Mapping, Sequence, TextIO
 
 from .merge import (
+    EXIT_AVOIDED,
     EXIT_MERGE_ERROR,
     MergePublisher,
     PullRequestMetadataClient,
@@ -114,6 +115,7 @@ def execute(
     phase_changed: PhaseChanged | None = None,
     head_changed: HeadChanged | None = None,
     synchronize_target: bool = True,
+    avoid_commits: Mapping[str, str] | None = None,
 ) -> int:
     """Preflight, gate, and publish without releasing the caller's reservation."""
     selected = Path(checkout).expanduser().resolve()
@@ -123,6 +125,26 @@ def execute(
     retargeted = head_changed or (lambda _old_head, _new_head: None)
 
     changed("preflight", None)
+    avoided = dict(avoid_commits or {})
+    if avoided:
+        print(
+            "Land coordinator: avoiding "
+            f"{len(avoided)} commit(s): "
+            + ", ".join(f"{sha} ({reason})" for sha, reason in avoided.items()),
+            file=out,
+            flush=True,
+        )
+        refusal = _avoided_refusal(
+            selected,
+            request=request,
+            metadata_client=metadata_client,
+            heads={"request head": head_sha},
+            avoided=avoided,
+            out=out,
+            err=err,
+        )
+        if refusal is not None:
+            return refusal
     status, effective_head = prepare(
         request,
         checkout=str(selected),
@@ -134,6 +156,7 @@ def execute(
         err=err,
         synchronize_target=synchronize_target,
         head_changed=retargeted,
+        avoid_commits=avoided or None,
     )
     if status != 0:
         return status
@@ -156,6 +179,19 @@ def execute(
         )
         return gate_status
 
+    if avoided:
+        refusal = _avoided_refusal(
+            selected,
+            request=request,
+            metadata_client=metadata_client,
+            heads={"gated head": effective_head},
+            avoided=avoided,
+            out=out,
+            err=err,
+        )
+        if refusal is not None:
+            return refusal
+
     # The durable transition is also the cancellation boundary. Once it succeeds, the
     # coordinator must observe the authenticated publication through an exact result.
     changed("publishing", 0)
@@ -170,6 +206,74 @@ def execute(
         out=out,
         err=err,
     )
+
+
+def _avoided_refusal(
+    checkout: Path,
+    *,
+    request: int,
+    metadata_client: PullRequestMetadataClient,
+    heads: Mapping[str, str],
+    avoided: Mapping[str, str],
+    out: TextIO,
+    err: TextIO,
+) -> int | None:
+    """Refuse when a named head or the current target reaches an avoided commit.
+
+    The target is re-read from the remote every time, so a commit re-imported after an
+    earlier check is still caught before publication.
+    """
+    from .avoid import reachable_avoided
+    from .queue import CoordinatorError
+
+    try:
+        base = str(metadata_client.pull_request(request)["base_ref"])
+        fetched = subprocess.run(
+            ["git", "-C", str(checkout), "fetch", "--quiet", "origin", f"refs/heads/{base}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if fetched.returncode != 0:
+            detail = fetched.stderr.strip() or f"exit {fetched.returncode}"
+            print(
+                f"Land coordinator: REFUSED (merge-error) — cannot read target {base} "
+                f"for the avoided-commit check: {detail}",
+                file=err,
+                flush=True,
+            )
+            return EXIT_MERGE_ERROR
+        subjects = {**heads, f"current {base}": "FETCH_HEAD"}
+        reported_unknown = False
+        for description, revision in subjects.items():
+            reachable, unknown = reachable_avoided(checkout, revision, avoided)
+            if unknown and not reported_unknown:
+                reported_unknown = True
+                print(
+                    "Land coordinator: avoided commit(s) unknown to this repository, "
+                    "treated as unreachable: " + ", ".join(unknown),
+                    file=out,
+                    flush=True,
+                )
+            if reachable:
+                sha = reachable[0]
+                print(
+                    f"Land coordinator: REFUSED (avoided-commit) — {description} reaches "
+                    f"avoided commit {sha} ({avoided[sha]}); rebuild the request as a "
+                    f"fresh branch from the current {base} and rerun the full gate",
+                    file=err,
+                    flush=True,
+                )
+                return EXIT_AVOIDED
+    except (CoordinatorError, KeyError, TypeError) as exc:
+        print(
+            f"Land coordinator: REFUSED (merge-error) — avoided-commit check failed: {exc}",
+            file=err,
+            flush=True,
+        )
+        return EXIT_MERGE_ERROR
+    return None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -225,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_MERGE_ERROR
 
+    from .avoid import resolve_avoid_commits
     from .github import GitHubMergePublisher, GitHubMetadataClient
     from .queue import CoordinatorClient, CoordinatorError, LAND_TARGET_SYNC_ENV
 
@@ -246,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             raise CoordinatorError(
                 f"land admission has invalid {LAND_TARGET_SYNC_ENV} state"
             )
+        avoid_commits = resolve_avoid_commits(args.state_dir, os.environ)
 
         def phase_changed(phase: str, gate_exit_status: int | None) -> None:
             client.update_land_phase(
@@ -278,6 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             phase_changed=phase_changed,
             head_changed=head_changed,
             synchronize_target=(target_sync == "1" and not args.no_target_sync),
+            avoid_commits=avoid_commits,
         )
         client.report_land_result(
             args.run_id,

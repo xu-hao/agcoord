@@ -18,6 +18,7 @@ import pytest
 
 from agcoord.config import config_path
 from agcoord.queue import (
+    LAND_AVOID_ENV,
     CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
@@ -3016,3 +3017,50 @@ def test_clear_refuses_live_work_then_removes_only_terminal_history_and_logs(
     finally:
         release.touch()
         running.stop()
+
+
+def test_land_avoid_commits_are_validated_before_any_broker_can_start(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    _unreachable_native_state(state_dir)
+    repository = _repository(tmp_path / "repository")
+    client = CoordinatorClient(state_dir=state_dir)
+
+    with pytest.raises(CoordinatorError, match="40 hexadecimal|hexadecimal"):
+        client.submit_land(
+            "github",
+            123,
+            _python("raise SystemExit('must not run')"),
+            checkout=str(repository),
+            avoid_commits=["not-a-sha"],
+        )
+    with pytest.raises(CoordinatorError, match="sequence"):
+        client.submit_land(
+            "github",
+            123,
+            _python("raise SystemExit('must not run')"),
+            checkout=str(repository),
+            avoid_commits="a" * 40,
+        )
+    assert not (state_dir / "broker.lock").exists()
+    assert not (state_dir / "queue.sqlite3").exists()
+
+
+def test_land_reserves_the_avoid_environment_name_for_the_coordinator(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    environment = caller_environment()
+    environment[LAND_AVOID_ENV] = "a" * 40
+
+    with pytest.raises(CoordinatorError, match=f"reserved {LAND_AVOID_ENV}"):
+        client.submit_land(
+            "github",
+            123,
+            _python("raise SystemExit('must not run')"),
+            checkout=str(repository),
+            environment=environment,
+        )
+    snapshot = client.snapshot()
+    assert snapshot["active"] == [] and snapshot["queued"] == [] and snapshot["recent"] == []
