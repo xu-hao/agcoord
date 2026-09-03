@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add `agc verify-admission` as a public subcommand with the same arguments and exit codes as the
+  hidden `python -m agcoord.queue verify-admission` entry point, so an admitted worker whose own
+  interpreter has no `agcoord` installed can prove its exact admission through the machine's `agc`.
+  The module entry point keeps working for the transition.
+
 ## 0.5.1 — 2026-09-03
 
 - Create every downloaded native-host asset and cache directory owner-only regardless of the

@@ -230,6 +230,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     avoid.add_argument("--list", dest="list_entries", action="store_true", help="show the set")
     avoid.add_argument("--remove", metavar="SHA", help="remove one stored commit")
+
+    verify = state(
+        commands.add_parser(
+            "verify-admission",
+            help="prove, from inside an admitted worker, that this process is its exact admission",
+        )
+    )
+    verify.add_argument("--checkout", required=True, help="the worker's resolved checkout root")
+    verify.add_argument("--run-id", required=True, help="the admitted run (AGCOORD_RUN_ID)")
+    verify.add_argument(
+        "--kind",
+        choices=("full", "merge", "land"),
+        required=True,
+        help="the exact durable kind (AGCOORD_RUN_KIND)",
+    )
+    verify.add_argument("--head-sha", required=True, help="the fresh exact 40-hex checkout head")
+    verify.add_argument(
+        "--worker-pid",
+        type=int,
+        required=True,
+        help="the admitted worker PID: the full wrapper itself, or a land gate's parent",
+    )
     return parser
 
 
@@ -370,6 +392,24 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
 
     if args.command == "avoid":
         return _avoid(args, emit=emit, out=out)
+
+    if args.command == "verify-admission":
+        CoordinatorClient(
+            state_dir=getattr(args, "state_dir", None),
+            checkout=args.checkout,
+            autostart=False,
+        ).verify_admission(
+            args.run_id,
+            kind=args.kind,
+            checkout=args.checkout,
+            head_sha=args.head_sha,
+            worker_pid=args.worker_pid,
+        )
+        if emit:
+            emit({"run_id": args.run_id, "kind": args.kind, "verified": True})
+        else:
+            print(f"AGCoord: verified admission {args.run_id} ({args.kind})", file=out)
+        return 0
 
     if args.command in {"drain", "resume"}:
         client = CoordinatorClient(
