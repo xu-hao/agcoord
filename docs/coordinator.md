@@ -879,6 +879,14 @@ row's durable head while it is still in `preflight`. Preflight is then repeated 
 head. This retry is bounded if the target keeps moving. `--no-target-sync` instead returns the
 original `stale-main` refusal without changing the source.
 
+Immediately after that push, the forge's pull-request metadata can still report the head the
+push replaced. The repeated preflight treats exactly that head as read-after-write lag: it
+re-reads the metadata every 2 seconds for at most 30 seconds before deciding, and proceeds once
+the forge reports the synchronized head. Any other head, or the replaced head still reported when
+the wait ends, is the ordinary `head-changed` refusal. The tolerance applies only to the head the
+coordinator itself just replaced and never relaxes the remote-ref comparison or the atomic
+before-OID checks, so lag cannot admit a real concurrent source change.
+
 A merge conflict is aborted before the gate, restores the exact clean source checkout, and
 reports the conflicting paths. A concurrent source update or rejected push also fails before
 the gate; the lease prevents overwriting another writer. Once preflight succeeds, the worker

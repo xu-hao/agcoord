@@ -37,6 +37,43 @@ class MetadataClient:
         return dict(self.record)
 
 
+class SequencedMetadataClient(MetadataClient):
+    """Serve the forge's reported head from a fixed sequence, repeating its last value."""
+
+    def __init__(self, record: dict[str, object], heads: list[str]):
+        super().__init__(record)
+        self.heads = list(heads)
+
+    def pull_request(self, number: int) -> dict[str, object]:
+        served = super().pull_request(number)
+        served["head_sha"] = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
+        return served
+
+
+class LaggingMetadataClient(MetadataClient):
+    """Keep reporting a replaced head for a few reads after the durable head moved."""
+
+    def __init__(self, record: dict[str, object], *, stale_reads: int):
+        super().__init__(record)
+        self.stale_reads = stale_reads
+        self.pending_head: str | None = None
+        self.served: list[str] = []
+
+    def replace_head(self, new_head: str) -> None:
+        self.pending_head = new_head
+
+    def pull_request(self, number: int) -> dict[str, object]:
+        if self.pending_head is not None:
+            if self.stale_reads > 0:
+                self.stale_reads -= 1
+            else:
+                self.record["head_sha"] = self.pending_head
+                self.pending_head = None
+        served = super().pull_request(number)
+        self.served.append(str(served["head_sha"]))
+        return served
+
+
 class Publisher:
     """Forge double that creates objects and updates both refs transactionally."""
 
@@ -414,6 +451,43 @@ def _execute(
         err=err,
     )
     return status, out.getvalue(), err.getvalue()
+
+
+def _push_replacement_head(repository: Repository) -> str:
+    """Advance the source exactly as a target-sync push would, leaving the checkout clean."""
+    (repository.checkout / "synchronized.txt").write_text("synchronized\n", encoding="utf-8")
+    _git(repository.checkout, "add", "synchronized.txt")
+    _git(repository.checkout, "commit", "-m", "synchronized head")
+    _git(repository.checkout, "push", "origin", BRANCH)
+    return _sha(repository.checkout, "HEAD")
+
+
+def _preflight(
+    repository: Repository,
+    metadata_client: MetadataClient,
+    *,
+    head_sha: str,
+    replaced_head: str | None = None,
+    waits: list[float],
+) -> tuple[int, str, str, Publisher]:
+    from agcoord.merge import preflight
+
+    out = StringIO()
+    err = StringIO()
+    publisher = Publisher(repository)
+    status = preflight(
+        PR_NUMBER,
+        checkout=str(repository.checkout),
+        branch=BRANCH,
+        head_sha=head_sha,
+        metadata_client=metadata_client,
+        publisher=publisher,
+        out=out,
+        err=err,
+        replaced_head=replaced_head,
+        wait=waits.append,
+    )
+    return status, out.getvalue(), err.getvalue(), publisher
 
 
 def _land_execute(
@@ -974,6 +1048,183 @@ def test_land_merges_an_advanced_target_into_the_source_before_gating(
     assert _remote_sha(repository, "refs/heads/main") == candidate
     assert publisher.created[-1]["parent_shas"] == (advanced_main, merge_head)
     assert f"gate started for {merge_head}" in out
+
+
+def test_preflight_waits_for_the_forge_to_report_the_head_its_own_push_replaced(
+    repository: Repository,
+):
+    old_head = repository.head_sha
+    new_head = _push_replacement_head(repository)
+    client = SequencedMetadataClient(
+        _metadata(repository).record,
+        [old_head, old_head, new_head],
+    )
+    waits: list[float] = []
+
+    status, out, err, publisher = _preflight(
+        repository,
+        client,
+        head_sha=new_head,
+        replaced_head=old_head,
+        waits=waits,
+    )
+
+    assert status == 0, err
+    assert f"preflight passed for request {PR_NUMBER} at {new_head}" in out
+    assert client.calls == [PR_NUMBER] * 3
+    assert waits == [2.0, 2.0]
+    assert old_head in out and new_head in out and "propagat" in out.lower()
+    assert "REFUSED" not in err
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
+
+
+def test_preflight_refuses_a_third_head_after_its_own_push_without_waiting(
+    repository: Repository,
+):
+    old_head = repository.head_sha
+    new_head = _push_replacement_head(repository)
+    third_head = _commit_object(repository, new_head, "concurrent source change")
+    client = SequencedMetadataClient(_metadata(repository).record, [third_head, new_head])
+    waits: list[float] = []
+
+    status, _out, err, publisher = _preflight(
+        repository,
+        client,
+        head_sha=new_head,
+        replaced_head=old_head,
+        waits=waits,
+    )
+
+    assert status == 76
+    assert "REFUSED (head-changed)" in err
+    assert f"pull-request head changed from gated {new_head} to {third_head}" in err
+    assert waits == []
+    assert client.calls == [PR_NUMBER]
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
+
+
+def test_preflight_propagation_wait_is_bounded_and_still_refuses_the_replaced_head(
+    repository: Repository,
+):
+    old_head = repository.head_sha
+    new_head = _push_replacement_head(repository)
+    client = SequencedMetadataClient(_metadata(repository).record, [old_head])
+    waits: list[float] = []
+
+    status, _out, err, publisher = _preflight(
+        repository,
+        client,
+        head_sha=new_head,
+        replaced_head=old_head,
+        waits=waits,
+    )
+
+    assert status == 76
+    assert "REFUSED (head-changed)" in err
+    assert old_head in err and new_head in err and "replaced" in err
+    assert waits and all(interval == 2.0 for interval in waits)
+    assert sum(waits) == 30.0
+    assert client.calls == [PR_NUMBER] * (len(waits) + 1)
+    assert publisher.create_calls == []
+    assert publisher.update_calls == []
+
+
+def test_preflight_without_a_replaced_head_refuses_a_stale_forge_head_immediately(
+    repository: Repository,
+):
+    old_head = repository.head_sha
+    new_head = _push_replacement_head(repository)
+    client = SequencedMetadataClient(_metadata(repository).record, [old_head, new_head])
+    waits: list[float] = []
+
+    status, _out, err, _publisher = _preflight(
+        repository,
+        client,
+        head_sha=new_head,
+        waits=waits,
+    )
+
+    assert status == 76
+    assert f"pull-request head changed from gated {new_head} to {old_head}" in err
+    assert waits == []
+    assert client.calls == [PR_NUMBER]
+
+
+def test_land_tolerates_forge_lag_after_its_own_target_sync_push(
+    repository: Repository,
+    tmp_path: Path,
+):
+    from agcoord.land import execute
+
+    advanced_main = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "first land\n"},
+    )
+    old_head = repository.head_sha
+    client = LaggingMetadataClient(_metadata(repository).record, stale_reads=2)
+    gate_marker = tmp_path / "gate-ran"
+    publisher = Publisher(repository)
+    waits: list[float] = []
+    phases: list[tuple[str, int | None]] = []
+    out = StringIO()
+    err = StringIO()
+
+    status = execute(
+        PR_NUMBER,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            str(gate_marker),
+        ],
+        checkout=str(repository.checkout),
+        branch=BRANCH,
+        head_sha=old_head,
+        environment=dict(os.environ),
+        metadata_client=client,
+        publisher=publisher,
+        out=out,
+        err=err,
+        phase_changed=lambda phase, gate_status: phases.append((phase, gate_status)),
+        head_changed=lambda _old_head, new_head: client.replace_head(new_head),
+        wait=waits.append,
+    )
+
+    assert status == 0, err.getvalue()
+    merge_head = _sha(repository.checkout, "HEAD")
+    assert merge_head != old_head
+    assert _git(
+        repository.checkout,
+        "show",
+        "-s",
+        "--format=%P",
+        merge_head,
+    ).stdout.split() == [old_head, advanced_main]
+    assert gate_marker.exists()
+    assert phases == [
+        ("preflight", None),
+        ("gating", None),
+        ("publishing", 0),
+    ]
+    assert waits == [2.0, 2.0]
+    assert client.served == [
+        old_head,
+        old_head,
+        old_head,
+        old_head,
+        merge_head,
+        merge_head,
+    ]
+    assert "REFUSED" not in err.getvalue()
+    transcript = out.getvalue()
+    assert "propagat" in transcript.lower()
+    assert f"gate started for {merge_head}" in transcript
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == merge_head
+    assert _remote_sha(repository, "refs/heads/main") == publisher.created[-1]["sha"]
+    assert publisher.created[-1]["parent_shas"] == (advanced_main, merge_head)
 
 
 def test_land_can_opt_out_of_target_synchronization(

@@ -13,6 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BROKER: &str = env!("CARGO_BIN_EXE_agcoord-broker");
 const MIB: u64 = 1024 * 1024;
+/// Longest a test waits for its own deliberate queue write lock.
+const QUEUE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Busy timeout of one lock attempt, shorter than a frozen broker would hold the lock.
+const QUEUE_LOCK_ATTEMPT: Duration = Duration::from_millis(100);
 
 struct TestDirectory(PathBuf);
 
@@ -237,6 +241,79 @@ fn wait_for_nonempty_file(path: &Path, timeout: Duration) -> Vec<u8> {
         _ => false,
     });
     contents.unwrap()
+}
+
+/// A deliberate queue write lock held from a test-owned connection.
+///
+/// The broker under test commits a short write transaction on every poll tick, so one
+/// `BEGIN IMMEDIATE` attempt can outlast the connection's busy timeout on a loaded host.
+/// The lock is retried within a bound so a slow tick cannot fail a test before it reaches
+/// the behaviour it asserts.
+fn lock_queue_writes(state: &Path) -> Connection {
+    let locker = open_queue_locker(state);
+    let deadline = Instant::now() + QUEUE_LOCK_TIMEOUT;
+    loop {
+        match locker.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => return locker,
+            Err(error) => assert!(
+                is_database_busy(&error) && Instant::now() < deadline,
+                "could not take the queue write lock: {error}"
+            ),
+        }
+    }
+}
+
+/// Stops `broker_pid` with SIGSTOP at a moment when it holds no queue write transaction.
+///
+/// A stop that lands inside one of the broker's poll-tick transactions would hold the
+/// WAL writer lock until the matching SIGCONT, so no later lock attempt by the test could
+/// succeed. Taking and releasing a probe lock proves the freeze fell between ticks; on
+/// contention the broker is resumed and stopped again.
+fn freeze_broker_outside_queue_writes(broker_pid: u32, state: &Path) {
+    let probe = open_queue_locker(state);
+    let deadline = Instant::now() + QUEUE_LOCK_TIMEOUT;
+    loop {
+        signal_process(broker_pid, "-STOP");
+        match probe.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {
+                probe.execute_batch("ROLLBACK").unwrap();
+                return;
+            }
+            Err(error) => {
+                assert!(
+                    is_database_busy(&error) && Instant::now() < deadline,
+                    "could not freeze the broker outside a queue write transaction: {error}"
+                );
+                signal_process(broker_pid, "-CONT");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+fn open_queue_locker(state: &Path) -> Connection {
+    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
+    locker.busy_timeout(QUEUE_LOCK_ATTEMPT).unwrap();
+    locker
+}
+
+fn is_database_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+fn signal_process(pid: u32, signal: &str) {
+    assert!(
+        Command::new("/bin/kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "could not send {signal} to process {pid}"
+    );
 }
 
 fn run(arguments: &[&str]) -> Output {
@@ -1168,8 +1245,7 @@ fn committed_cancellation_wins_a_waiting_terminal_transition() {
     );
     wait_for(Duration::from_secs(5), || entered.exists());
 
-    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
-    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locker = lock_queue_writes(&state);
     locker
         .execute(
             "UPDATE runs SET cancel_requested = 1,
@@ -1411,8 +1487,7 @@ fn graceful_sigterm_retries_a_contended_cancellation_commit() {
         },
     );
     wait_for(Duration::from_secs(5), || entered.exists());
-    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
-    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locker = lock_queue_writes(&state);
     broker.signal_terminate();
     thread::sleep(Duration::from_millis(150));
     let retained_ownership = broker.is_running();
@@ -1501,8 +1576,7 @@ fn transient_database_contention_keeps_the_same_owner_and_honors_timeout() {
         },
     );
 
-    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
-    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locker = lock_queue_writes(&state);
     fs::write(&release, "release").unwrap();
     thread::sleep(Duration::from_millis(180));
     let started = Instant::now();
@@ -1562,8 +1636,7 @@ fn identity_commit_contention_never_orphans_a_started_worker() {
         row["status"] == "running" && row["worker_pid"].is_null()
     });
 
-    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
-    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locker = lock_queue_writes(&state);
     let _fifo_reader = OpenOptions::new().read(true).open(&fifo).unwrap();
     thread::sleep(Duration::from_millis(150));
     assert!(
@@ -5528,8 +5601,7 @@ fn worker_identity_and_terminal_commit_crashes_recover_durably() {
         status(&terminal_state, "terminal-crash")["status"],
         "passed"
     );
-    let terminal_database = Connection::open(terminal_state.join("queue.sqlite3")).unwrap();
-    terminal_database.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let terminal_database = lock_queue_writes(&terminal_state);
     let release_database = thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
         terminal_database.execute_batch("COMMIT").unwrap();
@@ -6015,14 +6087,8 @@ fn a_dead_land_worker_identity_cannot_advance_publication() {
     let row = status(&state, "dead-land-worker");
     let worker_pid = row["worker_pid"].as_u64().unwrap();
     let worker_token = process_start_token(worker_pid);
-    let broker_pid = broker.child.as_ref().unwrap().id().to_string();
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-STOP", &broker_pid])
-            .status()
-            .unwrap()
-            .success()
-    );
+    let broker_pid = broker.child.as_ref().unwrap().id();
+    freeze_broker_outside_queue_writes(broker_pid, &state);
     assert!(
         Command::new("/bin/kill")
             .args(["-KILL", "--", &format!("-{worker_pid}")])
@@ -6033,8 +6099,7 @@ fn a_dead_land_worker_identity_cannot_advance_publication() {
     wait_for(Duration::from_secs(5), || {
         process_state(worker_pid).is_none_or(|state| state == "Z")
     });
-    let locker = Connection::open(state.join("queue.sqlite3")).unwrap();
-    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locker = lock_queue_writes(&state);
     let unlocker = thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
         locker.execute_batch("ROLLBACK").unwrap();
@@ -6072,13 +6137,7 @@ fn a_dead_land_worker_identity_cannot_advance_publication() {
         "broker-land-identity-mismatch"
     );
 
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-CONT", &broker_pid])
-            .status()
-            .unwrap()
-            .success()
-    );
+    signal_process(broker_pid, "-CONT");
     wait_status(&state, "dead-land-worker", "failed");
     assert!(broker.terminate().success());
 }
