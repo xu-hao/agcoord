@@ -694,12 +694,13 @@ def test_native_host_upgrade_is_one_public_cli_operation(monkeypatch, tmp_path: 
         "proof_run_id": "check-native-host-proof",
     }
 
-    def fake_upgrade(package_path, *, state_dir, checkout):
+    def fake_upgrade(package_path, *, state_dir, checkout, require_pin):
         observed.append(
             {
                 "package": package_path,
                 "state_dir": state_dir,
                 "checkout": checkout,
+                "require_pin": require_pin,
             }
         )
         return result
@@ -724,8 +725,74 @@ def test_native_host_upgrade_is_one_public_cli_operation(monkeypatch, tmp_path: 
             "package": package.resolve(),
             "state_dir": str(state_dir),
             "checkout": Path.cwd(),
+            "require_pin": False,
         }
     ]
+
+
+def _install_result() -> dict[str, object]:
+    return {
+        "state": "complete",
+        "operation": "install",
+        "version": "0.4.1",
+        "service": "active",
+        "proof_run_id": "check-native-host-proof",
+    }
+
+
+def test_native_host_install_downloads_this_client_s_matching_bundle(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord import github_release
+
+    fetched = tmp_path / "cache/agcoord-native-host-x86_64-linux.tar.gz"
+    fetched.parent.mkdir(parents=True)
+    fetched.write_bytes(b"downloaded release package")
+    observed: list[dict[str, object]] = []
+
+    def fake_fetch():
+        observed.append({"fetched": True})
+        return fetched
+
+    def fake_install(package_path, *, state_dir, checkout, require_pin):
+        observed.append({"package": package_path, "require_pin": require_pin})
+        return _install_result()
+
+    monkeypatch.setattr(github_release, "fetch_native_host_bundle", fake_fetch)
+    monkeypatch.setattr(cli, "install_native_host", fake_install, raising=False)
+    output = StringIO()
+
+    assert cli.run(_args("--json", "host", "install", "--download"), out=output) == 0
+    assert json.loads(output.getvalue()) == _install_result()
+    assert observed == [
+        {"fetched": True},
+        {"package": fetched, "require_pin": True},
+    ]
+
+
+def test_native_host_install_refuses_two_bundle_sources(tmp_path: Path):
+    package = tmp_path / "agcoord-native-host-x86_64-linux.tar.gz"
+    package.write_bytes(b"verified release package")
+
+    with pytest.raises(CoordinatorError) as failure:
+        cli.run(_args("host", "install", str(package), "--download"))
+
+    assert failure.value.code == "native-host-bundle-source-conflict"
+
+
+def test_native_host_install_refuses_no_bundle_source():
+    with pytest.raises(CoordinatorError) as failure:
+        cli.run(_args("host", "install"))
+
+    assert failure.value.code == "native-host-bundle-source-missing"
+
+
+def test_native_host_install_refuses_an_unknown_download_adapter():
+    with pytest.raises(CoordinatorError) as failure:
+        cli.run(_args("host", "install", "--download", "--adapter", "gitlab"))
+
+    assert failure.value.code == "native-host-download-unknown-adapter"
 
 
 def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: Path):
@@ -741,12 +808,13 @@ def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: 
         "proof_run_id": "check-native-host-proof",
     }
 
-    def fake_install(package_path, *, state_dir, checkout):
+    def fake_install(package_path, *, state_dir, checkout, require_pin):
         observed.append(
             {
                 "package": package_path,
                 "state_dir": state_dir,
                 "checkout": checkout,
+                "require_pin": require_pin,
             }
         )
         return result
@@ -771,5 +839,6 @@ def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: 
             "package": package.resolve(),
             "state_dir": str(state_dir),
             "checkout": Path.cwd(),
+            "require_pin": False,
         }
     ]
