@@ -22,7 +22,6 @@ PUBLIC_COMMANDS = {
     "cancel",
     "tui",
     "land",
-    "migrate",
     "drain",
     "resume",
     "clear",
@@ -102,11 +101,10 @@ def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 builtins.__import__ = guarded_import
 import agcoord
-from agcoord.queue import CoordinatorBroker, CoordinatorClient
+from agcoord.queue import CoordinatorClient
 
 print(json.dumps({
     "package": agcoord.__name__,
-    "broker": CoordinatorBroker.__name__,
     "client": CoordinatorClient.__name__,
     "package_root": agcoord.__file__.split("/")[-2],
 }))
@@ -126,7 +124,6 @@ print(json.dumps({
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == {
         "package": "agcoord",
-        "broker": "CoordinatorBroker",
         "client": "CoordinatorClient",
         "package_root": "agcoord",
     }

@@ -29,8 +29,7 @@ requires a release musl identity and installs every live file as root-owned.
 The Python wheel intentionally contains no broker executable. “One executable” describes the
 statically linked Rust runtime, not a one-file installation: configuration, durable state,
 systemd supervision, AppArmor policy, checksums, provenance, and the Python clients remain
-external and independently auditable. The exact boundary and compatibility matrix are in the
-[migration runbook](native_migration.md#what-one-executable-means).
+external and independently auditable. The exact boundary is defined in the [native broker contract](native_broker.md).
 
 ## Configuration
 
@@ -253,18 +252,19 @@ systemctl --user start agcoord-broker.service
 agc list
 ```
 
-For an existing spool, first complete the backup and rollback rehearsal and follow the explicit
-transition in the [native migration runbook](native_migration.md). After activation and reload,
-keep the service stopped while completing the remaining steps:
+For an existing spool, follow the explicit transition in the
+[pre-native spool guide](native_migration.md); a spool left below protocol 5 by a pre-0.6.0
+release is migrated through AGCoord 0.5.2 before this host runs, so the spool this host adopts is
+already protocol 5. After activation and reload, keep the service stopped while completing the
+remaining steps:
 
 ```bash
-agc migrate                 # omit for an already protocol-5 spool
 agc resume "$drain_id"
 systemctl --user start agcoord-broker.service
 agc list
 ```
 
-Migration preserves the drain marker across protocol 4 to 5, and activation never removes it.
+Activation preserves the drain marker and never removes it.
 Resume only after every owner-locked maintenance step has succeeded. If any step fails, leave
 the service stopped and the marker in place; rerunning `drain` reports the same ID.
 
@@ -357,13 +357,11 @@ file before start. Never delete or replace the state directory as host-package r
 
 To roll back between protocol-compatible native packages, stage the previously retained bundle
 and use the identical drain, stop, activate, reload, resume, and start sequence. Host activation
-never rewrites the spool. To return to the Python protocol-4 owner, first drain and stop the
-native service, run `/usr/libexec/agcoord/agcoord-broker rollback --state-dir PATH` while the
-current binary is still installed, then use the current client to `agc resume ID` before changing
-the client/configuration according to the target release. That rollback restores
-the verified protocol-4 baseline, replays terminal native history, and invalidates every old
-gate receipt through the recorded cutoff. Preserve the state directory and its rollback backup;
-a fresh exact-head gate is required before legacy publication. Follow the complete
-[rollback procedure](native_migration.md#roll-back-during-the-retained-window), including the
-configuration change and retirement criteria; do not treat this abbreviated host-package
-sequence as a live-spool runbook.
+never rewrites the spool. To roll a spool back to its retained protocol-4 baseline, first drain
+and stop the native service, run `/usr/libexec/agcoord/agcoord-broker rollback --state-dir PATH`
+while the current binary is still installed, then `agc resume ID`. That rollback restores the
+verified protocol-4 baseline, replays terminal native history, and invalidates every old gate
+receipt through the recorded cutoff, after which AGCoord 0.5.2 owns the protocol-4 spool.
+Preserve the state directory and its rollback backup; a fresh exact-head gate is required before
+legacy publication. The [pre-native spool guide](native_migration.md) covers migrating forward
+again.

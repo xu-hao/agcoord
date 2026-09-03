@@ -13,7 +13,7 @@ import threading
 import pytest
 
 from agcoord import cli
-from agcoord.queue import PROTOCOL, CoordinatorError
+from agcoord.queue import NATIVE_PROTOCOL, CoordinatorError
 
 from conftest import RunningCoordinator, caller_environment, wait_for
 
@@ -87,7 +87,7 @@ def _row(
 
 def _snapshot() -> dict[str, object]:
     return {
-        "protocol": PROTOCOL,
+        "protocol": NATIVE_PROTOCOL,
         "broker_pid": 4001,
         "captured_at": "2026-08-30T12:00:03+00:00",
         "capacities": {"jobs": 2, "cpu": 4, "browser": 1},
@@ -144,7 +144,6 @@ def fake_client(monkeypatch):
         "cancel": [],
         "log": [],
         "clear": [],
-        "migrate": [],
         "drain": [],
         "resume": [],
         "follow": [],
@@ -223,10 +222,6 @@ def fake_client(monkeypatch):
         def clear(self):
             observations["clear"].append(True)
             return {"cleared": 3}
-
-        def migrate(self):
-            observations["migrate"].append(True)
-            return {"changed": True, "from_protocol": 4, "to_protocol": 5}
 
         def drain(self, *, reason="maintenance", wait=True):
             observations["drain"].append({"reason": reason, "wait": wait})
@@ -608,26 +603,6 @@ def test_tui_constructs_the_client_lazily(fake_client, monkeypatch):
     monkeypatch.setattr(tui, "run", fake_tui_run)
     assert cli.run(_args("tui"), out=StringIO()) == 19
     assert len(fake_client["constructed"]) == 1
-
-
-def test_migration_is_explicit_and_never_autostarts_a_broker(fake_client, tmp_path: Path):
-    fake_client["constructed"].clear()
-    output = StringIO()
-    state_dir = tmp_path / "legacy"
-
-    assert cli.run(_args("--state-dir", str(state_dir), "migrate"), out=output) == 0
-    assert fake_client["migrate"] == [True]
-    assert fake_client["constructed"] == [
-        {
-            "state_dir": str(state_dir),
-            "checkout": Path.cwd(),
-            "autostart": False,
-            "thread": threading.get_ident(),
-        }
-    ]
-    assert "protocol 4" in output.getvalue()
-    assert "to 5" in output.getvalue()
-
 
 def test_drain_and_resume_are_explicit_non_autostarting_cli_operations(
     fake_client,

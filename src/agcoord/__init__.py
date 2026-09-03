@@ -2,7 +2,6 @@
 
 from .queue import (
     ChildCpuLease,
-    CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
     RepositoryIdentity,
@@ -11,7 +10,6 @@ from .queue import (
 
 __all__ = [
     "ChildCpuLease",
-    "CoordinatorBroker",
     "CoordinatorClient",
     "CoordinatorError",
     "RepositoryIdentity",

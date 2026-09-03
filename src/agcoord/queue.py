@@ -18,23 +18,14 @@ import json
 import os
 from pathlib import Path
 import re
-import select
-import shutil
-import signal
 import sqlite3
 import stat
 import subprocess
 import sys
-import threading
 import time
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
 
-from .cgroup import (
-    CGROUP_BACKEND,
-    CGROUP_ISOLATE_ENV,
-    CgroupV2Backend,
-)
 from .config import BrokerConfig, BrokerConfigError, load_broker_config
 from .native_client import (
     NATIVE_IMPLEMENTATION,
@@ -42,37 +33,21 @@ from .native_client import (
     NativeBrokerCommand,
     NativeClientError,
 )
-from .project_quota import PROJECT_QUOTA_BACKEND, ProjectQuotaBackend
 from .resources import (
-    ResourceBackend,
     ResourceBackendError,
     ResourceContractError,
-    ResourceObservation,
-    ResourceRequest,
-    capability_issue,
-    configured_resource_bindings,
-    initial_resource_receipt,
-    probe_resource_backends,
-    resource_contract,
-    validate_backend_state,
-    validate_resource_backends,
     validate_resource_bindings,
     validate_resource_capabilities,
-    validate_resource_contract,
-    validate_resource_measurement,
-    validate_resource_receipt,
 )
-from .worker import PROJECT_QUOTA_DROP_ENV, TMPFS_SETUP_ENV
 
 
-PROTOCOL = 4
+LAST_MIGRATING_RELEASE = "0.5.2"
 TERMINAL_STATUSES = frozenset({
     "passed", "failed", "cancelled", "interrupted",
 })
 LIVE_STATUSES = frozenset({"queued", "running"})
 STATUSES = LIVE_STATUSES | TERMINAL_STATUSES
 DEFAULT_RECENT_LIMIT = 50
-DEFAULT_IDLE_SECONDS = 60.0
 DEFAULT_JOB_CAPACITY = 2
 DEFAULT_DATABASE_TIMEOUT = 10.0
 MAX_LOG_BYTES = 64 * 1024
@@ -98,7 +73,6 @@ _DRAIN_ID = re.compile(r"^drain-[0-9a-f]{12}$")
 _MAINTENANCE_TIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$"
 )
-_WORKER_LAUNCHER = "from agcoord.worker import launcher_main; launcher_main()\n"
 MAINTENANCE_REFUSAL = "agcoord-maintenance-draining"
 MAINTENANCE_STATES = frozenset({"draining", "drained"})
 MAINTENANCE_TRIGGER_NAMES = (
@@ -572,6 +546,24 @@ def _spool_initializing_error(error: CoordinatorError) -> bool:
     )
 
 
+def _pre_native_spool_refusal(
+    paths: CoordinatorPaths,
+    protocol: int,
+) -> CoordinatorError:
+    """Refuse a spool below the native protocol and name the release that migrates it.
+
+    The Python reference broker and its in-process migrations were retired in AGCoord
+    0.6.0. A spool at protocol 1 through 4 is migrated by the last release that still
+    shipped them, after which the native broker owns it at protocol 5.
+    """
+    return CoordinatorError(
+        f"gate queue at {paths.database} uses protocol {protocol}; AGCoord owns only "
+        f"protocol {NATIVE_PROTOCOL} native spools and no longer migrates older ones — "
+        f"install AGCoord {LAST_MIGRATING_RELEASE} to migrate this spool to the native "
+        "broker, then upgrade"
+    )
+
+
 def _validate_resources(
     resources: Mapping[str, int] | None,
     capacities: Mapping[str, int],
@@ -695,87 +687,10 @@ def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
     return owner
 
 
-def _flock_holder_pid(path: Path) -> int | None:
-    """Return the kernel-reported PID holding one exclusive Linux flock."""
-    try:
-        details = path.stat()
-        lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise CoordinatorError(
-            f"cannot verify the gate broker ownership lock: {exc}"
-        ) from exc
-    expected = (os.major(details.st_dev), os.minor(details.st_dev), details.st_ino)
-    holders: set[int] = set()
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 6 or fields[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
-            continue
-        device = fields[5].split(":")
-        if len(device) != 3:
-            continue
-        try:
-            identity = (int(device[0], 16), int(device[1], 16), int(device[2]))
-            pid = int(fields[4])
-        except ValueError:
-            continue
-        if identity == expected and pid > 0:
-            holders.add(pid)
-    if len(holders) > 1:
-        raise CoordinatorError("gate broker ownership lock has multiple kernel holders")
-    return next(iter(holders), None)
 
 
-def _stop_verified_legacy_owner(
-    paths: CoordinatorPaths,
-    owner: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Signal only the exact process the kernel identifies as the legacy lock holder."""
-    pid = owner["pid"]
-    try:
-        pidfd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        return _read_broker_owner(paths)
-    except OSError as exc:
-        raise CoordinatorError(
-            f"cannot identify the drained legacy broker {pid}: {exc}"
-        ) from exc
-    try:
-        current = _read_broker_owner(paths)
-        if (
-            current is None
-            or current["protocol"] != PROTOCOL
-            or current["pid"] != pid
-        ):
-            return current
-        if _flock_holder_pid(paths.owner_lock) != pid:
-            refreshed = _read_broker_owner(paths)
-            if refreshed is None or refreshed["pid"] != pid:
-                return refreshed
-            raise CoordinatorError(
-                "cannot verify the drained legacy broker as the ownership-lock holder"
-            )
-        try:
-            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-        except ProcessLookupError:
-            return _read_broker_owner(paths)
-        except OSError as exc:
-            raise CoordinatorError(
-                f"cannot stop the drained legacy broker {pid}: {exc}"
-            ) from exc
-    finally:
-        os.close(pidfd)
-    return current
 
 
-def _broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
-    """Read only the legacy protocol-4 owner used by the Python reference broker."""
-    owner = _read_broker_owner(paths)
-    if owner is not None and owner["protocol"] != PROTOCOL:
-        raise CoordinatorError(
-            f"gate coordinator protocol mismatch: broker has {owner['protocol']}, "
-            f"Python reference broker needs {PROTOCOL}"
-        )
-    return owner
 
 
 def _maintenance_record(
@@ -832,74 +747,10 @@ def _maintenance_record(
     return values
 
 
-def _install_maintenance_guards(db: sqlite3.Connection) -> None:
-    db.execute(
-        f"""
-        CREATE TRIGGER {MAINTENANCE_TRIGGER_NAMES[0]}
-        BEFORE INSERT ON runs
-        WHEN EXISTS (
-            SELECT 1 FROM coordinator_meta
-            WHERE key = 'maintenance_state'
-              AND value IN ('draining', 'drained')
-        )
-        BEGIN
-            SELECT RAISE(ABORT, '{MAINTENANCE_REFUSAL}');
-        END
-        """
-    )
-    db.execute(
-        f"""
-        CREATE TRIGGER {MAINTENANCE_TRIGGER_NAMES[1]}
-        BEFORE INSERT ON coordinator_meta
-        WHEN NEW.key = 'last_activity'
-          AND EXISTS (
-              SELECT 1 FROM coordinator_meta
-              WHERE key = 'maintenance_state'
-                AND value = 'drained'
-          )
-        BEGIN
-            SELECT RAISE(ABORT, '{MAINTENANCE_REFUSAL}');
-        END
-        """
-    )
-    db.execute(
-        f"""
-        CREATE TRIGGER {MAINTENANCE_TRIGGER_NAMES[2]}
-        BEFORE UPDATE OF value ON coordinator_meta
-        WHEN OLD.key = 'last_activity'
-          AND EXISTS (
-              SELECT 1 FROM coordinator_meta
-              WHERE key = 'maintenance_state'
-                AND value = 'drained'
-          )
-        BEGIN
-            SELECT RAISE(ABORT, '{MAINTENANCE_REFUSAL}');
-        END
-        """
-    )
 
 
-def _remove_maintenance_guards(db: sqlite3.Connection) -> None:
-    for name in MAINTENANCE_TRIGGER_NAMES:
-        db.execute(f"DROP TRIGGER IF EXISTS {name}")
 
 
-def _maintenance_public(
-    record: Mapping[str, str],
-    *,
-    protocol: int,
-    live: int,
-    owner: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    return {
-        "state": record["maintenance_state"],
-        "drain_id": record["maintenance_id"],
-        "reason": record["maintenance_reason"],
-        "started_at": record["maintenance_started_at"],
-        "protocol": protocol,
-        "live": live,
-        "broker_pid": None if owner is None else owner["pid"],
-    }
 
 
 def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
@@ -942,7 +793,7 @@ def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
         raise CoordinatorError(
             "coordinator returned an invalid maintenance start time"
         ) from exc
-    if value["protocol"] not in {PROTOCOL, NATIVE_PROTOCOL}:
+    if value["protocol"] != NATIVE_PROTOCOL:
         raise CoordinatorError("coordinator returned an invalid maintenance protocol")
     if (
         not isinstance(value["live"], int)
@@ -960,3622 +811,18 @@ def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
     return value
 
 
-def _legacy_maintenance_status(
-    paths: CoordinatorPaths,
-    *,
-    transition: bool,
-) -> dict[str, Any]:
-    if not paths.database.is_file():
-        raise CoordinatorError(f"no gate queue database exists at {paths.database}")
-    configuration = broker_config(paths.state_dir)
-    timeout = (
-        DEFAULT_DATABASE_TIMEOUT
-        if configuration.database_timeout is None
-        else configuration.database_timeout
-    )
-    with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
-        db.row_factory = sqlite3.Row
-        record = _maintenance_record(db)
-        if record is None:
-            raise CoordinatorError("coordinator is not draining")
-        protocol_row = db.execute(
-            "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-        ).fetchone()
-        try:
-            protocol = int(protocol_row["value"])
-        except (TypeError, ValueError) as exc:
-            raise CoordinatorError("coordinator protocol metadata is invalid") from exc
-        live = int(
-            db.execute(
-                "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')"
-            ).fetchone()[0]
-        )
-    owner = _read_broker_owner(paths)
-    if (
-        transition
-        and record["maintenance_state"] == "draining"
-        and live == 0
-        and owner is not None
-        and owner["protocol"] == PROTOCOL
-        and owner["pid"] != os.getpid()
-    ):
-        owner = _stop_verified_legacy_owner(paths, owner)
-    if (
-        transition
-        and record["maintenance_state"] == "draining"
-        and live == 0
-        and owner is None
-    ):
-        descriptor = os.open(paths.owner_lock, os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(descriptor, 0o600)
-        try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                owner = _read_broker_owner(paths)
-            else:
-                with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
-                    db.row_factory = sqlite3.Row
-                    db.execute("BEGIN IMMEDIATE")
-                    current = _maintenance_record(db)
-                    current_live = int(
-                        db.execute(
-                            "SELECT COUNT(*) FROM runs "
-                            "WHERE status IN ('queued', 'running')"
-                        ).fetchone()[0]
-                    )
-                    if (
-                        current is not None
-                        and current["maintenance_state"] == "draining"
-                        and current_live == 0
-                    ):
-                        db.execute(
-                            "UPDATE coordinator_meta SET value = 'drained' "
-                            "WHERE key = 'maintenance_state'"
-                        )
-                        current = dict(current)
-                        current["maintenance_state"] = "drained"
-                    db.commit()
-                    if current is None:
-                        raise CoordinatorError("coordinator is not draining")
-                    record = current
-                    live = current_live
-                owner = None
-        finally:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
-    return _maintenance_public(record, protocol=protocol, live=live, owner=owner)
 
 
-def _legacy_begin_drain(
-    paths: CoordinatorPaths,
-    *,
-    drain_id: str,
-    reason: str,
-) -> dict[str, Any]:
-    if not paths.database.is_file():
-        raise CoordinatorError(f"no gate queue database exists at {paths.database}")
-    configuration = broker_config(paths.state_dir)
-    timeout = (
-        DEFAULT_DATABASE_TIMEOUT
-        if configuration.database_timeout is None
-        else configuration.database_timeout
-    )
-    with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
-        db.row_factory = sqlite3.Row
-        db.execute("BEGIN IMMEDIATE")
-        protocol_row = db.execute(
-            "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-        ).fetchone()
-        if protocol_row is None or protocol_row["value"] != str(PROTOCOL):
-            selected = None if protocol_row is None else protocol_row["value"]
-            raise CoordinatorError(
-                f"durable draining supports protocol {PROTOCOL} and {NATIVE_PROTOCOL}; "
-                f"state uses {selected!r}"
-            )
-        existing = _maintenance_record(db)
-        if existing is None:
-            started_at = _now()
-            db.execute(
-                "INSERT INTO coordinator_meta(key, value) VALUES ('last_activity', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(time.time()),),
-            )
-            _install_maintenance_guards(db)
-            for key, value in (
-                ("maintenance_state", "draining"),
-                ("maintenance_id", drain_id),
-                ("maintenance_reason", reason),
-                ("maintenance_started_at", started_at),
-            ):
-                db.execute(
-                    "INSERT INTO coordinator_meta(key, value) VALUES (?, ?)",
-                    (key, value),
-                )
-        db.commit()
-    return _legacy_maintenance_status(paths, transition=True)
 
 
-def _legacy_resume(paths: CoordinatorPaths, drain_id: str) -> dict[str, Any]:
-    configuration = broker_config(paths.state_dir)
-    timeout = (
-        DEFAULT_DATABASE_TIMEOUT
-        if configuration.database_timeout is None
-        else configuration.database_timeout
-    )
-    descriptor = os.open(paths.owner_lock, os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(descriptor, 0o600)
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise CoordinatorError(
-                "cannot resume while a broker or maintenance operation owns the queue"
-            ) from exc
-        with closing(sqlite3.connect(paths.database, timeout=timeout)) as db:
-            db.row_factory = sqlite3.Row
-            db.execute("BEGIN IMMEDIATE")
-            record = _maintenance_record(db)
-            if record is None:
-                raise CoordinatorError("coordinator is not draining")
-            if record["maintenance_id"] != drain_id:
-                raise CoordinatorError("maintenance drain ID does not match")
-            live = db.execute(
-                "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
-                "ORDER BY sequence"
-            ).fetchall()
-            if live:
-                raise CoordinatorError(
-                    "cannot resume while drained work remains live: "
-                    + ", ".join(str(row["run_id"]) for row in live)
-                )
-            _remove_maintenance_guards(db)
-            db.execute(
-                "DELETE FROM coordinator_meta WHERE key IN (?, ?, ?, ?)",
-                MAINTENANCE_METADATA_KEYS,
-            )
-            db.commit()
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-    return {"state": "open", "drain_id": drain_id, "resumed": True}
 
 
-def _create_child_cpu_lease_table(db: sqlite3.Connection) -> None:
-    db.execute(
-        """
-        CREATE TABLE child_cpu_leases (
-            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-            lease_id TEXT NOT NULL UNIQUE,
-            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-            status TEXT NOT NULL CHECK (
-                status IN ('waiting', 'active', 'released', 'cancelled')
-            ),
-            requested INTEGER NOT NULL CHECK (requested > 0),
-            minimum INTEGER NOT NULL CHECK (minimum > 0 AND minimum <= requested),
-            granted INTEGER NOT NULL DEFAULT 0 CHECK (
-                granted >= 0 AND granted <= requested
-            ),
-            owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
-            owner_start_token TEXT NOT NULL,
-            bypass_count INTEGER NOT NULL DEFAULT 0 CHECK (bypass_count >= 0),
-            created_at TEXT NOT NULL,
-            acquired_at TEXT,
-            finished_at TEXT
-        )
-        """
-    )
-    db.execute(
-        "CREATE INDEX child_cpu_leases_run_sequence "
-        "ON child_cpu_leases(run_id, sequence)"
-    )
-    db.execute(
-        "CREATE INDEX child_cpu_leases_status_sequence "
-        "ON child_cpu_leases(status, sequence)"
-    )
 
 
-def _enable_wal(db: sqlite3.Connection) -> None:
-    selected = db.execute("PRAGMA journal_mode = WAL").fetchone()
-    mode = None if selected is None else str(selected[0]).lower()
-    if mode != "wal":
-        raise CoordinatorError(
-            f"gate queue database refused WAL journal mode (reported {mode!r})"
-        )
 
 
-def migrate_queue(
-    *,
-    state_dir: str | os.PathLike[str] | None = None,
-    checkout: str | os.PathLike[str] | None = None,
-) -> dict[str, int | bool]:
-    """Validate an idle spool and perform only explicitly defined protocol migrations."""
-    paths = queue_paths(state_dir=state_dir, checkout=checkout)
-    try:
-        state_details = paths.state_dir.lstat()
-    except FileNotFoundError as exc:
-        raise CoordinatorError(
-            f"no gate queue state exists at {paths.state_dir}"
-        ) from exc
-    except OSError as exc:
-        raise CoordinatorError(
-            f"cannot inspect gate queue state {paths.state_dir}: {exc}"
-        ) from exc
-    if stat.S_ISLNK(state_details.st_mode) or not stat.S_ISDIR(state_details.st_mode):
-        raise CoordinatorError(
-            f"gate queue state path {paths.state_dir} is not a real directory"
-        )
-    if state_details.st_uid != os.getuid():
-        raise CoordinatorError(
-            f"gate queue state {paths.state_dir} belongs to another user"
-        )
-    if not paths.database.is_file():
-        raise CoordinatorError(
-            f"no gate queue database exists at {paths.database}"
-        )
-    configuration = broker_config(paths.state_dir)
-    database_timeout = (
-        DEFAULT_DATABASE_TIMEOUT
-        if configuration.database_timeout is None
-        else configuration.database_timeout
-    )
 
-    descriptor = os.open(paths.owner_lock, os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(descriptor, 0o600)
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise CoordinatorError(
-                "cannot migrate while a gate broker owns the queue; let every live "
-                "run and the old broker finish first"
-            ) from exc
 
-        with sqlite3.connect(paths.database, timeout=database_timeout) as db:
-            db.row_factory = sqlite3.Row
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                stored = db.execute(
-                    "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-                ).fetchone()
-            except sqlite3.Error as exc:
-                raise CoordinatorError(
-                    "gate queue database has no readable protocol metadata"
-                ) from exc
-            if stored is None:
-                raise CoordinatorError(
-                    "gate queue database has no protocol value"
-                )
-            previous = int(stored["value"])
-            original_protocol = previous
-            changed = False
-            if previous not in {1, 2, 3, PROTOCOL}:
-                raise CoordinatorError(
-                    f"queue protocol is {previous}; no migration to {PROTOCOL} is defined"
-                )
-            if previous in {1, 2, 3}:
-                live = db.execute(
-                    "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
-                    "ORDER BY sequence"
-                ).fetchall()
-                if live:
-                    raise CoordinatorError(
-                        f"cannot migrate protocol {previous} with live runs: "
-                        + ", ".join(row["run_id"] for row in live)
-                    )
-            if previous == 1:
-                db.execute(
-                    """
-                    CREATE TABLE runs_v2 (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        run_id TEXT NOT NULL UNIQUE,
-                        status TEXT NOT NULL CHECK (
-                            status IN ('queued', 'running', 'passed', 'failed',
-                                       'cancelled', 'interrupted')
-                        ),
-                        kind TEXT NOT NULL CHECK (
-                            kind IN ('check', 'full', 'merge', 'land')
-                        ),
-                        phase TEXT NOT NULL CHECK (
-                            phase IN ('queued', 'running', 'preflight', 'gating',
-                                      'publishing', 'complete')
-                        ),
-                        label TEXT NOT NULL,
-                        agent TEXT NOT NULL,
-                        repository_id TEXT NOT NULL,
-                        repository TEXT NOT NULL,
-                        worktree_id TEXT NOT NULL,
-                        checkout TEXT NOT NULL,
-                        branch TEXT NOT NULL,
-                        head_sha TEXT,
-                        barrier INTEGER NOT NULL CHECK (barrier IN (0, 1)),
-                        resources_json TEXT NOT NULL,
-                        gate_run_id TEXT,
-                        publication_adapter TEXT,
-                        publication_request TEXT,
-                        failure_reason TEXT,
-                        gate_exit_status INTEGER,
-                        reported_exit_status INTEGER,
-                        caller_pid INTEGER NOT NULL,
-                        command_json TEXT NOT NULL,
-                        environment_json TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        started_at TEXT,
-                        finished_at TEXT,
-                        exit_status INTEGER,
-                        worker_pid INTEGER,
-                        worker_start_token TEXT,
-                        cancel_requested INTEGER NOT NULL DEFAULT 0,
-                        cancel_requested_at TEXT
-                    )
-                    """
-                )
-                db.execute(
-                    """
-                    INSERT INTO runs_v2 (
-                        sequence, run_id, status, kind, phase, label, agent,
-                        repository_id, repository, worktree_id, checkout, branch,
-                        head_sha, barrier, resources_json, gate_run_id,
-                        publication_adapter, publication_request, failure_reason,
-                        gate_exit_status, reported_exit_status, caller_pid,
-                        command_json, environment_json,
-                        created_at, started_at, finished_at, exit_status, worker_pid,
-                        worker_start_token, cancel_requested, cancel_requested_at
-                    )
-                    SELECT sequence, run_id, status, kind, 'complete', label, agent,
-                           repository_id, repository, worktree_id, checkout, branch,
-                           head_sha, barrier, resources_json, gate_run_id,
-                           publication_adapter, publication_request, failure_reason,
-                           NULL, NULL, caller_pid, command_json, environment_json, created_at,
-                           started_at, finished_at, exit_status, worker_pid,
-                           worker_start_token, cancel_requested, cancel_requested_at
-                    FROM runs ORDER BY sequence
-                    """
-                )
-                db.execute("DROP TABLE runs")
-                db.execute("ALTER TABLE runs_v2 RENAME TO runs")
-                db.execute(
-                    "CREATE INDEX runs_status_sequence ON runs(status, sequence)"
-                )
-                db.execute(
-                    "CREATE INDEX runs_repository_sequence "
-                    "ON runs(repository_id, sequence)"
-                )
-                db.execute(
-                    "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
-                    ("2",),
-                )
-                previous = 2
-                changed = True
-            if previous == 2:
-                db.execute(
-                    "ALTER TABLE runs ADD COLUMN resource_contract_json "
-                    "TEXT NOT NULL DEFAULT '{}'"
-                )
-                db.execute(
-                    "ALTER TABLE runs ADD COLUMN resource_receipt_json "
-                    "TEXT NOT NULL DEFAULT '{}'"
-                )
-                db.execute(
-                    "ALTER TABLE runs ADD COLUMN resource_state_json "
-                    "TEXT NOT NULL DEFAULT '{}'"
-                )
-                rows = db.execute(
-                    "SELECT run_id, resources_json FROM runs ORDER BY sequence"
-                ).fetchall()
-                for row in rows:
-                    try:
-                        resources = _positive_mapping(
-                            json.loads(row["resources_json"]),
-                            subject="legacy stored resource",
-                            include_job=False,
-                        )
-                        contract = resource_contract(resources, {})
-                        receipt = initial_resource_receipt(resources)
-                    except (
-                        TypeError,
-                        json.JSONDecodeError,
-                        CoordinatorError,
-                        ResourceContractError,
-                    ) as exc:
-                        raise CoordinatorError(
-                            f"cannot migrate run {row['run_id']}: invalid stored resources"
-                        ) from exc
-                    db.execute(
-                        "UPDATE runs SET resource_contract_json = ?, "
-                        "resource_receipt_json = ?, resource_state_json = '{}' "
-                        "WHERE run_id = ?",
-                        (
-                            json.dumps(contract, separators=(",", ":")),
-                            json.dumps(receipt, separators=(",", ":")),
-                            row["run_id"],
-                        ),
-                    )
-                db.execute(
-                    "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
-                    ("3",),
-                )
-                previous = 3
-                changed = True
-            if previous == 3:
-                _create_child_cpu_lease_table(db)
-                db.execute(
-                    "UPDATE coordinator_meta SET value = ? WHERE key = 'protocol'",
-                    (str(PROTOCOL),),
-                )
-                changed = True
-            db.commit()
-            _enable_wal(db)
-        paths.database.chmod(0o600)
-        return {
-            "changed": changed,
-            "from_protocol": original_protocol,
-            "to_protocol": PROTOCOL,
-        }
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-
-
-class CoordinatorBroker:
-    """Own one fair queue and supervise its compatible active subprocesses.
-
-    ``idle_timeout=None`` is useful for an explicitly managed server and for tests.  The
-    on-demand daemon uses a short idle timeout once no live run remains, avoiding a broker
-    from an old branch living indefinitely; the SQLite history remains for the next one.
-    """
-
-    def __init__(
-        self,
-        state_dir: str | os.PathLike[str],
-        *,
-        idle_timeout: float | None = DEFAULT_IDLE_SECONDS,
-        recent_limit: int = DEFAULT_RECENT_LIMIT,
-        capacities: Mapping[str, int] | None = None,
-        resource_bindings: Mapping[str, Mapping[str, object]] | None = None,
-        resource_backends: Mapping[str, ResourceBackend] | None = None,
-    ):
-        if recent_limit < 1:
-            raise ValueError("recent_limit must be positive")
-        if idle_timeout is not None and idle_timeout <= 0:
-            raise ValueError("idle_timeout must be positive or None")
-        self.paths = queue_paths(state_dir=state_dir)
-        self.idle_timeout = idle_timeout
-        self.recent_limit = recent_limit
-        # One read of the state directory's configuration file serves capacity, bindings,
-        # and the delegated cgroup root, so a broker cannot mix two file revisions.
-        configuration = broker_config(self.paths.state_dir)
-        self.database_timeout = (
-            DEFAULT_DATABASE_TIMEOUT
-            if configuration.database_timeout is None
-            else configuration.database_timeout
-        )
-        self.capacities = (
-            configured_capacities(configuration.capacities)
-            if capacities is None
-            else _positive_mapping(capacities, subject="capacity", include_job=False)
-        )
-        if "jobs" not in self.capacities:
-            raise ValueError("capacities must include a positive 'jobs' capacity")
-        try:
-            self.resource_bindings = validate_resource_bindings(
-                configured_resource_bindings(configuration.bindings)
-                if resource_bindings is None
-                else resource_bindings
-            )
-            self.resource_backends = validate_resource_backends(resource_backends)
-            referenced_backends = {
-                binding["backend"]
-                for binding in self.resource_bindings.values()
-                if binding["backend"] is not None
-            }
-            if (
-                CGROUP_BACKEND in referenced_backends
-                and CGROUP_BACKEND not in self.resource_backends
-            ):
-                self.resource_backends[CGROUP_BACKEND] = CgroupV2Backend.from_config(
-                    configuration.cgroup_root,
-                    state_dir=self.paths.state_dir,
-                    cgroup_io=configuration.cgroup_io,
-                )
-            if (
-                PROJECT_QUOTA_BACKEND in referenced_backends
-                and PROJECT_QUOTA_BACKEND not in self.resource_backends
-            ):
-                self.resource_backends[PROJECT_QUOTA_BACKEND] = ProjectQuotaBackend(
-                    self.paths.state_dir
-                )
-            self.resource_capabilities = probe_resource_backends(
-                self.resource_backends,
-                self.resource_bindings,
-            )
-        except ResourceContractError as exc:
-            raise CoordinatorError(str(exc)) from exc
-        self._db_lock = threading.RLock()
-        self._lifecycle_lock = threading.RLock()
-        self._stop = threading.Event()
-        self.ready = threading.Event()
-        self._last_request = time.monotonic()
-        self._last_activity_write = 0.0
-        self._owner_fd: int | None = None
-        self._children: dict[str, subprocess.Popen[bytes]] = {}
-        self._group_drain_started: dict[str, float] = {}
-        self._last_repository: str | None = None
-        self._serving_thread: int | None = None
-        self._closed = False
-        self._prepare_paths()
-        self._initialize_database()
-
-    def _prepare_paths(self) -> None:
-        self.paths.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            details = self.paths.state_dir.stat()
-        except OSError as exc:
-            raise CoordinatorError(
-                f"cannot inspect gate queue directory {self.paths.state_dir}: {exc}"
-            ) from exc
-        if details.st_uid != os.getuid():
-            raise CoordinatorError(
-                f"gate queue directory {self.paths.state_dir} belongs to another user"
-            )
-        if details.st_mode & 0o077:
-            self.paths.state_dir.chmod(0o700)
-        self.paths.logs.mkdir(exist_ok=True, mode=0o700)
-        if self.paths.logs.stat().st_mode & 0o077:
-            self.paths.logs.chmod(0o700)
-        self.paths.daemon_log.touch(exist_ok=True)
-        self.paths.daemon_log.chmod(0o600)
-
-    def _prepare_worker_tmp_paths(self) -> None:
-        """Allocate tmpfs namespace only for the process that owns scheduling."""
-        for directory in (self.paths.worker_tmp.parent, self.paths.worker_tmp):
-            try:
-                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                details = directory.lstat()
-            except OSError as exc:
-                raise CoordinatorError(
-                    f"cannot prepare gate worker temp directory {directory}: {exc}"
-                ) from exc
-            if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
-                raise CoordinatorError(
-                    f"gate worker temp path {directory} is not a real directory"
-                )
-            if details.st_uid != os.getuid():
-                raise CoordinatorError(
-                    f"gate worker temp directory {directory} belongs to another user"
-                )
-            if details.st_mode & 0o077:
-                directory.chmod(0o700)
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.paths.database,
-            timeout=self.database_timeout,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
-    def _initialize_database(self) -> None:
-        with self._db_lock, self._connect() as db:
-            # Serialize only first creation. Existing schemas are inspected before any DDL
-            # so merely starting a client can never become an implicit migration.
-            db.execute("BEGIN IMMEDIATE")
-            tables = {
-                row["name"]
-                for row in db.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('runs', 'coordinator_meta')"
-                )
-            }
-            if not tables:
-                db.execute(
-                    """
-                    CREATE TABLE runs (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        run_id TEXT NOT NULL UNIQUE,
-                        status TEXT NOT NULL CHECK (
-                            status IN ('queued', 'running', 'passed', 'failed',
-                                       'cancelled', 'interrupted')
-                        ),
-                        kind TEXT NOT NULL CHECK (
-                            kind IN ('check', 'full', 'merge', 'land')
-                        ),
-                        phase TEXT NOT NULL CHECK (
-                            phase IN ('queued', 'running', 'preflight', 'gating',
-                                      'publishing', 'complete')
-                        ),
-                        label TEXT NOT NULL,
-                        agent TEXT NOT NULL,
-                        repository_id TEXT NOT NULL,
-                        repository TEXT NOT NULL,
-                        worktree_id TEXT NOT NULL,
-                        checkout TEXT NOT NULL,
-                        branch TEXT NOT NULL,
-                        head_sha TEXT,
-                        barrier INTEGER NOT NULL CHECK (barrier IN (0, 1)),
-                        resources_json TEXT NOT NULL,
-                        resource_contract_json TEXT NOT NULL,
-                        resource_receipt_json TEXT NOT NULL,
-                        resource_state_json TEXT NOT NULL,
-                        gate_run_id TEXT,
-                        publication_adapter TEXT,
-                        publication_request TEXT,
-                        failure_reason TEXT,
-                        gate_exit_status INTEGER,
-                        reported_exit_status INTEGER,
-                        caller_pid INTEGER NOT NULL,
-                        command_json TEXT NOT NULL,
-                        environment_json TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        started_at TEXT,
-                        finished_at TEXT,
-                        exit_status INTEGER,
-                        worker_pid INTEGER,
-                        worker_start_token TEXT,
-                        cancel_requested INTEGER NOT NULL DEFAULT 0,
-                        cancel_requested_at TEXT
-                    )
-                    """
-                )
-                db.execute(
-                    "CREATE INDEX runs_status_sequence ON runs(status, sequence)"
-                )
-                db.execute(
-                    "CREATE INDEX runs_repository_sequence "
-                    "ON runs(repository_id, sequence)"
-                )
-                db.execute(
-                    "CREATE TABLE coordinator_meta ("
-                    "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-                )
-                db.execute(
-                    "INSERT INTO coordinator_meta(key, value) VALUES ('protocol', ?)",
-                    (str(PROTOCOL),),
-                )
-                _create_child_cpu_lease_table(db)
-            elif tables != {"runs", "coordinator_meta"}:
-                raise CoordinatorError(
-                    "gate queue database is partially initialized; it needs explicit "
-                    "repair, not startup mutation"
-                )
-            stored = db.execute(
-                "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-            ).fetchone()
-            if stored is None:
-                raise CoordinatorError(
-                    "gate queue database has no protocol value"
-                )
-            if stored["value"] != str(PROTOCOL):
-                raise CoordinatorError(
-                    f"gate queue database protocol is {stored['value']}; need {PROTOCOL}; "
-                    "after the old broker exits run `agc "
-                    f"migrate --state-dir {self.paths.state_dir}`"
-                )
-            lease_table = db.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'child_cpu_leases'"
-            ).fetchone()
-            if lease_table is None:
-                raise CoordinatorError(
-                    "gate queue database is missing the child CPU lease table"
-                )
-            required = {
-                "kind", "phase", "agent", "repository_id", "repository", "worktree_id",
-                "head_sha", "barrier", "resources_json", "gate_run_id",
-                "resource_contract_json", "resource_receipt_json", "resource_state_json",
-                "publication_adapter", "publication_request", "failure_reason",
-                "gate_exit_status", "reported_exit_status",
-                "created_at", "finished_at",
-            }
-            columns = {
-                row["name"] for row in db.execute("PRAGMA table_info(runs)")
-            }
-            missing = sorted(required - columns)
-            if missing:
-                raise CoordinatorError(
-                    "gate queue database is missing current protocol columns: "
-                    + ", ".join(missing)
-                )
-            db.commit()
-            _enable_wal(db)
-        try:
-            self.paths.database.chmod(0o600)
-        except OSError as exc:
-            raise CoordinatorError(
-                f"cannot protect gate queue database {self.paths.database}: {exc}"
-            ) from exc
-
-    def _acquire_ownership(self) -> None:
-        descriptor = os.open(
-            self.paths.owner_lock,
-            os.O_RDWR | os.O_CREAT,
-            0o600,
-        )
-        os.fchmod(descriptor, 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(descriptor)
-            raise CoordinatorError(
-                f"another gate broker already owns {self.paths.state_dir}"
-            ) from exc
-        # Erase bytes left by the previous owner before doing fallible preparation. A
-        # concurrent client sees the held flock plus incomplete metadata and waits; it can
-        # never mistake the previous PID for this owner.
-        os.ftruncate(descriptor, 0)
-        self._owner_fd = descriptor
-        try:
-            self._prepare_worker_tmp_paths()
-            self._remove_orphaned_worker_tmp()
-            with self._db_lock, self._connect() as db:
-                maintenance = _maintenance_record(db)
-                if maintenance is not None:
-                    live = int(
-                        db.execute(
-                            "SELECT COUNT(*) FROM runs "
-                            "WHERE status IN ('queued', 'running')"
-                        ).fetchone()[0]
-                    )
-                    if live == 0:
-                        db.execute(
-                            "UPDATE coordinator_meta SET value = 'drained' "
-                            "WHERE key = 'maintenance_state'"
-                        )
-                        raise CoordinatorError(
-                            f"coordinator is drained as {maintenance['maintenance_id']}; "
-                            "resume it before starting a broker"
-                        )
-                    if maintenance["maintenance_state"] == "drained":
-                        raise CoordinatorError(
-                            "coordinator maintenance state is drained but live rows remain"
-                        )
-            self._touch()
-            # Publish readable owner metadata last. Concurrent first clients already see
-            # the flock and retry through this bounded preparation interval; none can
-            # submit to an owner whose tmpfs sweep later fails.
-            os.write(
-                descriptor,
-                (
-                    f"pid={os.getpid()}\n"
-                    f"protocol={PROTOCOL}\n"
-                    f"capacities={json.dumps(self.capacities, separators=(',', ':'))}\n"
-                    f"resource_bindings="
-                    f"{json.dumps(self.resource_bindings, separators=(',', ':'))}\n"
-                    f"resource_capabilities="
-                    f"{json.dumps(self.resource_capabilities, separators=(',', ':'))}\n"
-                    f"started_at={_now()}\n"
-                ).encode(),
-            )
-        except BaseException:
-            self._release_ownership()
-            raise
-
-    def serve_forever(self) -> None:
-        """Own the durable inbox and pump until explicitly closed or idle."""
-        with self._lifecycle_lock:
-            if self._closed:
-                raise CoordinatorError("this gate broker is closed")
-            if self._serving_thread is not None:
-                raise CoordinatorError("this gate broker is already serving")
-            self._acquire_ownership()
-            self._serving_thread = threading.get_ident()
-            self.ready.set()
-            self._append_daemon_log(
-                f"broker {os.getpid()} started; protocol={PROTOCOL}; "
-                f"capacities={self.capacities}; resource backends="
-                f"{sorted(self.resource_capabilities)}"
-            )
-        failure: BaseException | None = None
-        try:
-            self._pump()
-        except BaseException as exc:
-            failure = exc
-            self._append_daemon_log(
-                f"broker failure: {type(exc).__name__}: {exc}; "
-                "live workers left for replacement supervision"
-            )
-            raise
-        finally:
-            try:
-                if failure is None:
-                    # An explicit close is a cancellation request and retains ownership
-                    # until every safe worker is reaped. An unexpected broker failure must
-                    # release ownership without rewriting or signalling live rows, so a
-                    # replacement can adopt their durable process identities.
-                    self._cancel_active_for_shutdown()
-            finally:
-                with self._lifecycle_lock:
-                    self._closed = True
-                    self.ready.clear()
-                self._append_daemon_log(f"broker {os.getpid()} stopped")
-                self._release_ownership()
-
-    def close(self) -> None:
-        """Stop this broker, cancelling safe workers and preserving an active merge."""
-        with self._lifecycle_lock:
-            if self._closed:
-                return
-            if self._serving_thread is None:
-                self._closed = True
-            self._stop.set()
-        if self._serving_thread is None:
-            self._release_ownership()
-
-    def _release_ownership(self) -> None:
-        descriptor = self._owner_fd
-        if descriptor is None:
-            return
-        try:
-            self.paths.worker_tmp.rmdir()
-            self.paths.worker_tmp.parent.rmdir()
-        except OSError:
-            # A live run, another repository namespace, or an unclean-recovery artifact
-            # keeps the exact owner-only directory in place for the next broker to inspect.
-            pass
-        try:
-            self.paths.legacy_worker_tmp.rmdir()
-        except OSError:
-            pass
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-            self._owner_fd = None
-
-    def _cancel_active_for_shutdown(self) -> None:
-        """Stop cancellable work, but let an in-flight merge reach an authoritative result."""
-        with self._db_lock, self._connect() as db:
-            active = db.execute(
-                "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
-            ).fetchall()
-            now = _now()
-            for row in active:
-                # Killing an authenticated ref mutation can lose its response after the
-                # forge committed it. Once a merge starts, graceful shutdown preserves the
-                # worker and this broker's ownership until its exact result is durable.
-                if row["kind"] == "merge" or (
-                    row["kind"] == "land" and row["phase"] == "publishing"
-                ):
-                    continue
-                db.execute(
-                    "UPDATE runs SET cancel_requested = 1, cancel_requested_at = ? "
-                    "WHERE run_id = ?",
-                    (now, row["run_id"]),
-                )
-                self._cancel_resources(db, row)
-                self._signal_worker(row, signal.SIGTERM)
-
-        while True:
-            with self._db_lock, self._connect() as db:
-                active = db.execute(
-                    "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
-                ).fetchall()
-                for row in active:
-                    self._observe_active(db, row)
-                active = db.execute(
-                    "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
-                ).fetchall()
-            if not active:
-                break
-            time.sleep(0.05)
-
-        # _observe_active polls and reaps every child that still has a running row. If an
-        # inconsistent terminal-row repair left an owned child behind, graceful shutdown
-        # still waits: it must never trade a quicker exit for an unknown merge outcome.
-        for run_id, child in list(self._children.items()):
-            child.wait()
-            self._children.pop(run_id, None)
-
-        with self._db_lock, self._connect() as db:
-            self._prune(db)
-
-    def _touch(self) -> None:
-        self._last_request = time.monotonic()
-        # Client operations happen in other processes, so the serving broker's monotonic
-        # field cannot see them. A throttled durable heartbeat keeps an open TUI/follower
-        # from losing its broker without turning every 100 ms log poll into a write.
-        if self._last_request - self._last_activity_write < 0.5:
-            return
-        try:
-            with self._db_lock, self._connect() as db:
-                if _maintenance_record(db) is not None:
-                    return
-                db.execute(
-                    "INSERT INTO coordinator_meta(key, value) VALUES ('last_activity', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (str(time.time()),),
-                )
-        except sqlite3.OperationalError as exc:
-            if not _transient_database_error(exc):
-                raise
-            # The public operation already committed before its activity heartbeat. Never
-            # turn an accepted submission or successful read into an apparent failure.
-            self._append_daemon_log(
-                f"activity heartbeat database contention; deferred: {exc}"
-            )
-            return
-        self._last_activity_write = self._last_request
-
-    # --------------------------------------------------------------- public operations
-
-    def submit(
-        self,
-        command: Sequence[str],
-        *,
-        checkout: str,
-        kind: str = "check",
-        label: str = "run",
-        resources: Mapping[str, int] | None = None,
-        agent: str | None = None,
-        repository: str | None = None,
-        branch: str | None = None,
-        head_sha: str | None = None,
-        caller_pid: int | None = None,
-        environment: Mapping[str, str] | None = None,
-    ) -> str:
-        selected_command = _validate_command(command)
-        if kind not in RUN_KINDS:
-            raise CoordinatorError(
-                "kind must be exactly 'check', 'full', 'merge', or 'land'"
-            )
-        if kind in {"merge", "land"}:
-            raise CoordinatorError(
-                f"{kind} can only be submitted through submit_{kind}"
-            )
-        if not isinstance(label, str) or not label.strip():
-            raise CoordinatorError("label must be a non-empty string")
-        identity = discover_repository(checkout, repository=repository)
-        selected_checkout = str(identity.checkout)
-        selected_branch = branch.strip() if isinstance(branch, str) else _git_branch(identity.checkout)
-        if not selected_branch:
-            raise CoordinatorError("branch must be a non-empty string")
-        selected_head = _validate_head_sha(head_sha, required=False)
-        if kind == "full":
-            selected_head = selected_head or _git_head(identity.checkout)
-            _assert_clean_head(identity.checkout, selected_head)
-        selected_pid = os.getpid() if caller_pid is None else caller_pid
-        if (
-            not isinstance(selected_pid, int)
-            or isinstance(selected_pid, bool)
-            or selected_pid <= 0
-        ):
-            raise CoordinatorError("caller_pid must be a positive integer")
-        selected_agent = _agent_identity(agent)
-        owner = _broker_owner(self.paths)
-        capacities = owner["capacities"] if owner is not None else self.capacities
-        selected_resources = _validate_resources(resources, capacities)
-        selected_bindings = (
-            owner["resource_bindings"] if owner is not None else self.resource_bindings
-        )
-        selected_contract = resource_contract(selected_resources, selected_bindings)
-        selected_resource_receipt = initial_resource_receipt(selected_resources)
-        selected_environment = _validate_environment(environment)
-        run_id = f"{kind}-{uuid4().hex[:12]}"
-        with self._db_lock, self._connect() as db:
-            try:
-                db.execute(
-                    """
-                    INSERT INTO runs (
-                    run_id, status, kind, phase, label, agent, repository_id, repository,
-                    worktree_id, checkout, branch, head_sha, barrier, resources_json,
-                    resource_contract_json, resource_receipt_json, resource_state_json,
-                    caller_pid, command_json, environment_json, created_at
-                ) VALUES (?, 'queued', ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          '{}', ?, ?, ?, ?)
-                    """,
-                    (
-                    run_id,
-                    kind,
-                    label.strip(),
-                    selected_agent,
-                    identity.repository_id,
-                    identity.repository,
-                    identity.worktree_id,
-                    selected_checkout,
-                    selected_branch,
-                    selected_head,
-                    0,  # only merge and land rows are lane barriers
-                    json.dumps(selected_resources, separators=(",", ":")),
-                    json.dumps(selected_contract, separators=(",", ":")),
-                    json.dumps(selected_resource_receipt, separators=(",", ":")),
-                    selected_pid,
-                    json.dumps(selected_command, separators=(",", ":")),
-                    json.dumps(selected_environment, separators=(",", ":")),
-                    _now(),
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                if MAINTENANCE_REFUSAL in str(exc):
-                    raise CoordinatorError(
-                        "coordinator is draining; new submissions are refused",
-                        code="broker-draining",
-                    ) from exc
-                raise
-        self._touch()
-        return run_id
-
-    def submit_merge(
-        self,
-        adapter: str,
-        request: object,
-        *,
-        checkout: str,
-        gate_run_id: str | None = None,
-        resources: Mapping[str, int] | None = None,
-        agent: str | None = None,
-        repository: str | None = None,
-        branch: str | None = None,
-        head_sha: str | None = None,
-        caller_pid: int | None = None,
-        environment: Mapping[str, str] | None = None,
-        worker_python: str | os.PathLike[str] | None = None,
-    ) -> str:
-        """Queue one merge authorized by a passed full gate for this exact commit."""
-        if adapter != "github":
-            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
-        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
-            raise CoordinatorError("the GitHub publication request must be a positive PR number")
-        identity = discover_repository(checkout, repository=repository)
-        selected_checkout = str(identity.checkout)
-        selected_branch = branch.strip() if isinstance(branch, str) else _git_branch(identity.checkout)
-        if not selected_branch:
-            raise CoordinatorError("branch must be a non-empty string")
-        selected_head = _validate_head_sha(head_sha, required=False) or _git_head(identity.checkout)
-        _assert_clean_head(identity.checkout, selected_head)
-        selected_pid = os.getpid() if caller_pid is None else caller_pid
-        if (
-            not isinstance(selected_pid, int)
-            or isinstance(selected_pid, bool)
-            or selected_pid <= 0
-        ):
-            raise CoordinatorError("caller_pid must be a positive integer")
-        selected_agent = _agent_identity(agent)
-        owner = _broker_owner(self.paths)
-        capacities = owner["capacities"] if owner is not None else self.capacities
-        selected_resources = _validate_resources(resources, capacities)
-        selected_bindings = (
-            owner["resource_bindings"] if owner is not None else self.resource_bindings
-        )
-        selected_contract = resource_contract(selected_resources, selected_bindings)
-        selected_resource_receipt = initial_resource_receipt(selected_resources)
-        selected_environment = _validate_environment(environment)
-        executable_path = Path(worker_python or sys.executable).expanduser()
-        if not executable_path.is_absolute():
-            executable_path = Path.cwd() / executable_path
-        executable = str(executable_path.absolute())
-        if not Path(executable).is_file():
-            raise CoordinatorError(
-                f"merge worker Python does not exist: {executable}"
-            )
-        if gate_run_id is not None and (
-            not isinstance(gate_run_id, str) or not gate_run_id
-        ):
-            raise CoordinatorError("gate_run_id must be a non-empty string")
-
-        run_id = f"merge-{uuid4().hex[:12]}"
-        command = [
-            executable,
-            "-m",
-            "agcoord.github",
-            "--run-id",
-            run_id,
-            "--state-dir",
-            str(self.paths.state_dir),
-            "--checkout",
-            selected_checkout,
-            "--branch",
-            selected_branch,
-            "--head-sha",
-            selected_head,
-            str(request),
-        ]
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if _maintenance_record(db) is not None:
-                raise CoordinatorError(
-                    "coordinator is draining; new submissions are refused",
-                    code="broker-draining",
-                )
-            cutoff_row = db.execute(
-                "SELECT value FROM coordinator_meta "
-                "WHERE key = 'invalid_gate_through_sequence'"
-            ).fetchone()
-            try:
-                invalid_gate_through = (
-                    0 if cutoff_row is None else int(cutoff_row["value"])
-                )
-            except (TypeError, ValueError) as exc:
-                raise CoordinatorError(
-                    "rollback gate cutoff metadata is invalid"
-                ) from exc
-            if invalid_gate_through < 0:
-                raise CoordinatorError("rollback gate cutoff metadata is invalid")
-            if gate_run_id is None:
-                receipt = db.execute(
-                    """
-                    SELECT * FROM runs
-                    WHERE kind = 'full' AND status = 'passed'
-                      AND repository_id = ? AND branch = ? AND head_sha = ?
-                      AND sequence > ?
-                    ORDER BY sequence DESC LIMIT 1
-                    """,
-                    (
-                        identity.repository_id,
-                        selected_branch,
-                        selected_head,
-                        invalid_gate_through,
-                    ),
-                ).fetchone()
-                if receipt is None:
-                    raise CoordinatorError(
-                        "no passed full-gate receipt matches this checkout, branch, "
-                        "and head; run the full gate for the exact current commit"
-                    )
-            else:
-                receipt = db.execute(
-                    "SELECT * FROM runs WHERE run_id = ?",
-                    (gate_run_id,),
-                ).fetchone()
-                if receipt is None:
-                    raise CoordinatorError(
-                        f"unknown full-gate receipt {gate_run_id!r}"
-                    )
-                if receipt["sequence"] <= invalid_gate_through:
-                    raise CoordinatorError(
-                        f"gate receipt {gate_run_id} is stale after rollback; "
-                        "run a new full gate"
-                    )
-                mismatches: list[str] = []
-                if receipt["kind"] != "full" or receipt["status"] != "passed":
-                    mismatches.append("a passed full gate")
-                if receipt["repository_id"] != identity.repository_id:
-                    mismatches.append("repository")
-                if receipt["branch"] != selected_branch:
-                    mismatches.append("branch")
-                if receipt["head_sha"] != selected_head:
-                    mismatches.append("head")
-                if mismatches:
-                    raise CoordinatorError(
-                        f"gate receipt {gate_run_id} does not match "
-                        + ", ".join(mismatches)
-                    )
-            selected_gate_receipt = receipt["run_id"]
-            db.execute(
-                """
-                INSERT INTO runs (
-                    run_id, status, kind, phase, label, agent, repository_id, repository,
-                    worktree_id, checkout, branch, head_sha, barrier, resources_json,
-                    resource_contract_json, resource_receipt_json, resource_state_json,
-                    gate_run_id, publication_adapter, publication_request, caller_pid,
-                    command_json, environment_json, created_at
-                ) VALUES (?, 'queued', 'merge', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?,
-                          ?, '{}', ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    f"merge GitHub PR #{request}",
-                    selected_agent,
-                    identity.repository_id,
-                    identity.repository,
-                    identity.worktree_id,
-                    selected_checkout,
-                    selected_branch,
-                    selected_head,
-                    json.dumps(selected_resources, separators=(",", ":")),
-                    json.dumps(selected_contract, separators=(",", ":")),
-                    json.dumps(selected_resource_receipt, separators=(",", ":")),
-                    selected_gate_receipt,
-                    adapter,
-                    json.dumps(request, separators=(",", ":")),
-                    selected_pid,
-                    json.dumps(command, separators=(",", ":")),
-                    json.dumps(selected_environment, separators=(",", ":")),
-                    _now(),
-                ),
-            )
-        self._touch()
-        return run_id
-
-    def submit_land(
-        self,
-        adapter: str,
-        request: object,
-        command: Sequence[str],
-        *,
-        checkout: str,
-        label: str = "land",
-        resources: Mapping[str, int] | None = None,
-        agent: str | None = None,
-        repository: str | None = None,
-        branch: str | None = None,
-        head_sha: str | None = None,
-        caller_pid: int | None = None,
-        environment: Mapping[str, str] | None = None,
-        synchronize_target: bool = True,
-        avoid_commits: Sequence[str] = (),
-    ) -> str:
-        """Queue one indivisible exact-head gate and publication."""
-        selected_command = _validate_command(command)
-        if adapter != "github":
-            raise CoordinatorError(f"unknown publication adapter {adapter!r}")
-        if not isinstance(request, int) or isinstance(request, bool) or request <= 0:
-            raise CoordinatorError(
-                "the GitHub publication request must be a positive PR number"
-            )
-        if not isinstance(label, str) or not label.strip():
-            raise CoordinatorError("label must be a non-empty string")
-        if not isinstance(synchronize_target, bool):
-            raise CoordinatorError("synchronize_target must be boolean")
-        identity = discover_repository(checkout, repository=repository)
-        selected_checkout = str(identity.checkout)
-        selected_branch = (
-            branch.strip() if isinstance(branch, str) else _git_branch(identity.checkout)
-        )
-        if not selected_branch:
-            raise CoordinatorError("branch must be a non-empty string")
-        selected_head = (
-            _validate_head_sha(head_sha, required=False) or _git_head(identity.checkout)
-        )
-        _assert_clean_head(identity.checkout, selected_head)
-        selected_pid = os.getpid() if caller_pid is None else caller_pid
-        if (
-            not isinstance(selected_pid, int)
-            or isinstance(selected_pid, bool)
-            or selected_pid <= 0
-        ):
-            raise CoordinatorError("caller_pid must be a positive integer")
-        selected_agent = _agent_identity(agent)
-        owner = _broker_owner(self.paths)
-        capacities = owner["capacities"] if owner is not None else self.capacities
-        selected_resources = _validate_resources(resources, capacities)
-        selected_bindings = (
-            owner["resource_bindings"] if owner is not None else self.resource_bindings
-        )
-        selected_contract = resource_contract(selected_resources, selected_bindings)
-        selected_receipt = initial_resource_receipt(selected_resources)
-        selected_environment = _validate_environment(environment)
-        selected_avoid = _validate_avoid_commits(avoid_commits)
-        if LAND_TARGET_SYNC_ENV in selected_environment:
-            raise CoordinatorError(
-                f"gate environment uses the reserved {LAND_TARGET_SYNC_ENV} name"
-            )
-        selected_environment[LAND_TARGET_SYNC_ENV] = (
-            "1" if synchronize_target else "0"
-        )
-        if LAND_AVOID_ENV in selected_environment:
-            raise CoordinatorError(
-                f"gate environment uses the reserved {LAND_AVOID_ENV} name"
-            )
-        if selected_avoid:
-            selected_environment[LAND_AVOID_ENV] = ",".join(selected_avoid)
-        run_id = f"land-{uuid4().hex[:12]}"
-        with self._db_lock, self._connect() as db:
-            try:
-                db.execute(
-                    """
-                    INSERT INTO runs (
-                    run_id, status, kind, phase, label, agent, repository_id,
-                    repository, worktree_id, checkout, branch, head_sha, barrier,
-                    resources_json, resource_contract_json, resource_receipt_json,
-                    resource_state_json, publication_adapter, publication_request,
-                    caller_pid, command_json, environment_json, created_at
-                ) VALUES (?, 'queued', 'land', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 1,
-                          ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                    run_id,
-                    label.strip(),
-                    selected_agent,
-                    identity.repository_id,
-                    identity.repository,
-                    identity.worktree_id,
-                    selected_checkout,
-                    selected_branch,
-                    selected_head,
-                    json.dumps(selected_resources, separators=(",", ":")),
-                    json.dumps(selected_contract, separators=(",", ":")),
-                    json.dumps(selected_receipt, separators=(",", ":")),
-                    adapter,
-                    json.dumps(request, separators=(",", ":")),
-                    selected_pid,
-                    json.dumps(selected_command, separators=(",", ":")),
-                    json.dumps(selected_environment, separators=(",", ":")),
-                    _now(),
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                if MAINTENANCE_REFUSAL in str(exc):
-                    raise CoordinatorError(
-                        "coordinator is draining; new submissions are refused",
-                        code="broker-draining",
-                    ) from exc
-                raise
-        self._touch()
-        return run_id
-
-    def snapshot(self) -> dict[str, Any]:
-        owner = _broker_owner(self.paths)
-        with self._db_lock, self._connect() as db:
-            maintenance = _maintenance_record(db)
-            if owner is None and maintenance is None:
-                raise CoordinatorError(
-                    f"no gate broker owns {self.paths.state_dir}"
-                )
-            rows = db.execute("SELECT * FROM runs ORDER BY sequence").fetchall()
-        queued_rows = [row for row in rows if row["status"] == "queued"]
-        active_rows = [row for row in rows if row["status"] == "running"]
-        recent_rows = [row for row in rows if row["status"] in TERMINAL_STATUSES]
-        recent_rows = list(reversed(recent_rows[-self.recent_limit:]))
-        capacities = owner["capacities"] if owner is not None else self.capacities
-        bindings = (
-            owner["resource_bindings"]
-            if owner is not None
-            else self.resource_bindings
-        )
-        capabilities = (
-            owner["resource_capabilities"]
-            if owner is not None
-            else {}
-        )
-        used = self._allocations(active_rows)
-        allocations = {
-            name: used.get(name, 0) for name in capacities
-        }
-        queued = [
-            self._public(
-                row,
-                position=index,
-                active=active_rows,
-                queued=queued_rows,
-                capacities=capacities,
-            )
-            for index, row in enumerate(queued_rows, start=1)
-        ]
-        self._touch()
-        return {
-            "protocol": PROTOCOL,
-            "broker_pid": None if owner is None else owner["pid"],
-            "captured_at": _now(),
-            "capacities": capacities,
-            "allocations": allocations,
-            "resource_bindings": bindings,
-            "resource_capabilities": capabilities,
-            "maintenance": (
-                None
-                if maintenance is None
-                else _maintenance_public(
-                    maintenance,
-                    protocol=PROTOCOL,
-                    live=len(active_rows) + len(queued_rows),
-                    owner=owner,
-                )
-            ),
-            "active": [self._public(row, position=None) for row in active_rows],
-            "queued": queued,
-            "recent": [self._public(row, position=None) for row in recent_rows],
-        }
-
-    def status(self, run_id: str) -> dict[str, Any]:
-        if not isinstance(run_id, str) or not run_id:
-            raise CoordinatorError("run_id must be a non-empty string")
-        position: int | None = None
-        active: list[sqlite3.Row] = []
-        queued: list[sqlite3.Row] = []
-        capacities: Mapping[str, int] | None = None
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN")
-            row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise CoordinatorError(f"unknown run {run_id!r}")
-            if row["status"] == "queued":
-                active = db.execute(
-                    "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
-                ).fetchall()
-                queued = db.execute(
-                    "SELECT * FROM runs WHERE status = 'queued' ORDER BY sequence"
-                ).fetchall()
-                position = next(
-                    index for index, candidate in enumerate(queued, start=1)
-                    if candidate["run_id"] == run_id
-                )
-        if row["status"] == "queued":
-            owner = _broker_owner(self.paths)
-            capacities = owner["capacities"] if owner is not None else self.capacities
-        self._touch()
-        return self._public(
-            row,
-            position=position,
-            active=active,
-            queued=queued,
-            capacities=capacities,
-        )
-
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise CoordinatorError(f"unknown gate run {run_id!r}")
-            if row["status"] in TERMINAL_STATUSES:
-                raise CoordinatorError(
-                    f"gate run {run_id} is already {row['status']}"
-                )
-            if row["status"] == "running" and (
-                row["kind"] == "merge"
-                or (row["kind"] == "land" and row["phase"] == "publishing")
-            ):
-                raise CoordinatorError(
-                    f"publication job {run_id} is already publishing and cannot be cancelled; "
-                    "wait for its authoritative result"
-                )
-            now = _now()
-            if row["status"] == "queued":
-                db.execute(
-                    "UPDATE runs SET status = 'cancelled', phase = 'complete', finished_at = ?, "
-                    "exit_status = 130, cancel_requested = 1, "
-                    "cancel_requested_at = ?, environment_json = '{}' WHERE run_id = ?",
-                    (now, now, run_id),
-                )
-                self._prune(db)
-            else:
-                db.execute(
-                    "UPDATE runs SET cancel_requested = 1, cancel_requested_at = ? "
-                    "WHERE run_id = ?",
-                    (now, run_id),
-                )
-                # A client may live in a different PID namespace from the detached owner.
-                # The durable request is the operation; only the broker pump supervises
-                # and signals the recorded worker process group.
-        self._touch()
-        return self.status(run_id)
-
-    def clear(self) -> dict[str, int]:
-        """Remove terminal history and logs without deleting live state or ownership."""
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if _maintenance_record(db) is not None:
-                raise CoordinatorError(
-                    "cannot clear history while the coordinator is draining"
-                )
-            live = db.execute(
-                "SELECT run_id FROM runs WHERE status IN ('queued', 'running') "
-                "ORDER BY sequence"
-            ).fetchall()
-            if live:
-                raise CoordinatorError(
-                    "cannot clear history while work is queued or running: "
-                    + ", ".join(row["run_id"] for row in live)
-                )
-            rows = db.execute(
-                "SELECT run_id FROM runs WHERE status IN "
-                "('passed', 'failed', 'cancelled', 'interrupted')"
-            ).fetchall()
-            for row in rows:
-                run_id = row["run_id"]
-                if not self._remove_worker_tmp(run_id):
-                    raise CoordinatorError(f"cannot clear unreclaimed temp state for {run_id}")
-                self._log_path(run_id).unlink(missing_ok=True)
-            db.execute(
-                "DELETE FROM runs WHERE status IN "
-                "('passed', 'failed', 'cancelled', 'interrupted')"
-            )
-        self._touch()
-        return {"cleared": len(rows)}
-
-    def _admitted_child_run(
-        self,
-        db: sqlite3.Connection,
-        run_id: str,
-        *,
-        owner_pid: int,
-        owner_start_token: str,
-    ) -> sqlite3.Row:
-        row = db.execute(
-            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if row is None:
-            raise CoordinatorError(f"unknown parent run {run_id!r}")
-        if row["status"] != "running" or row["cancel_requested"]:
-            raise CoordinatorError(
-                f"parent run {run_id} is not accepting child CPU leases"
-            )
-        worker_pid = row["worker_pid"]
-        worker_token = row["worker_start_token"]
-        if not _same_process(worker_pid, worker_token):
-            raise CoordinatorError(
-                f"parent run {run_id} has no live worker identity"
-            )
-        if not _is_descendant_process(
-            owner_pid,
-            owner_start_token,
-            ancestor_pid=worker_pid,
-            ancestor_token=worker_token,
-        ):
-            raise CoordinatorError(
-                f"caller is not a live descendant of admitted run {run_id}"
-            )
-        return row
-
-    def request_child_cpu_lease(
-        self,
-        run_id: str,
-        *,
-        requested: int,
-        minimum: int,
-    ) -> dict[str, Any]:
-        """Create one authenticated FIFO request within a running parent's CPU budget."""
-        if not isinstance(run_id, str) or not run_id:
-            raise CoordinatorError("child CPU lease parent run ID must be non-empty")
-        if (
-            not isinstance(requested, int)
-            or isinstance(requested, bool)
-            or requested <= 0
-        ):
-            raise CoordinatorError("child CPU lease request must be a positive integer")
-        if (
-            not isinstance(minimum, int)
-            or isinstance(minimum, bool)
-            or minimum <= 0
-            or minimum > requested
-        ):
-            raise CoordinatorError(
-                "child CPU lease minimum must be positive and no greater than requested"
-            )
-        if _broker_owner(self.paths) is None:
-            raise CoordinatorError(
-                f"no gate broker owns {self.paths.state_dir}"
-            )
-        owner_pid = os.getpid()
-        owner_start_token = _process_start_token(owner_pid)
-        if owner_start_token is None:
-            raise CoordinatorError("cannot identify child CPU lease owner process")
-        lease_id = f"cpu-lease-{uuid4().hex[:12]}"
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            parent = self._admitted_child_run(
-                db,
-                run_id,
-                owner_pid=owner_pid,
-                owner_start_token=owner_start_token,
-            )
-            budget = self._row_resources(parent).get(CHILD_CPU_RESOURCE)
-            if budget is None:
-                raise CoordinatorError(
-                    f"parent run {run_id} has no {CHILD_CPU_RESOURCE!r} resource budget"
-                )
-            if minimum > budget:
-                raise CoordinatorError(
-                    f"child CPU lease minimum {minimum} exceeds parent budget {budget}"
-                )
-            db.execute(
-                "INSERT INTO child_cpu_leases ("
-                "lease_id, run_id, status, requested, minimum, owner_pid, "
-                "owner_start_token, created_at"
-                ") VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?)",
-                (
-                    lease_id,
-                    run_id,
-                    requested,
-                    minimum,
-                    owner_pid,
-                    owner_start_token,
-                    _now(),
-                ),
-            )
-            self._maintain_child_cpu_leases(db)
-            row = db.execute(
-                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
-            ).fetchone()
-        self._touch()
-        return self._public_child_cpu_lease(row, position=self._lease_position(row))
-
-    def child_cpu_lease_status(self, lease_id: str) -> dict[str, Any]:
-        if not isinstance(lease_id, str) or not lease_id:
-            raise CoordinatorError("child CPU lease ID must be non-empty")
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            self._maintain_child_cpu_leases(db)
-            row = db.execute(
-                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
-            ).fetchone()
-            if row is None:
-                raise CoordinatorError(f"unknown child CPU lease {lease_id!r}")
-            position = self._lease_position(row, db=db)
-        self._touch()
-        return self._public_child_cpu_lease(row, position=position)
-
-    def child_cpu_leases(
-        self,
-        run_id: str | None = None,
-        *,
-        include_terminal: bool = False,
-    ) -> list[dict[str, Any]]:
-        if run_id is not None and (not isinstance(run_id, str) or not run_id):
-            raise CoordinatorError("child CPU lease parent run ID must be non-empty")
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            self._maintain_child_cpu_leases(db)
-            if run_id is not None:
-                parent = db.execute(
-                    "SELECT run_id FROM runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                if parent is None:
-                    raise CoordinatorError(f"unknown parent run {run_id!r}")
-            conditions: list[str] = []
-            values: list[object] = []
-            if run_id is not None:
-                conditions.append("run_id = ?")
-                values.append(run_id)
-            if not include_terminal:
-                conditions.append("status IN ('waiting', 'active')")
-            where = " WHERE " + " AND ".join(conditions) if conditions else ""
-            rows = db.execute(
-                "SELECT * FROM child_cpu_leases" + where + " ORDER BY sequence",
-                values,
-            ).fetchall()
-            waiting_positions: dict[str, int] = {}
-            public: list[dict[str, Any]] = []
-            for row in rows:
-                position = None
-                if row["status"] == "waiting":
-                    waiting_positions[row["run_id"]] = (
-                        waiting_positions.get(row["run_id"], 0) + 1
-                    )
-                    position = waiting_positions[row["run_id"]]
-                public.append(self._public_child_cpu_lease(row, position=position))
-        self._touch()
-        return public
-
-    def _finish_child_cpu_lease(self, lease_id: str, *, status: str) -> dict[str, Any]:
-        if status not in {"released", "cancelled"}:
-            raise ValueError("child CPU lease terminal status is invalid")
-        if not isinstance(lease_id, str) or not lease_id:
-            raise CoordinatorError("child CPU lease ID must be non-empty")
-        owner_pid = os.getpid()
-        owner_start_token = _process_start_token(owner_pid)
-        if owner_start_token is None:
-            raise CoordinatorError("cannot identify child CPU lease owner process")
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
-            ).fetchone()
-            if row is None:
-                raise CoordinatorError(f"unknown child CPU lease {lease_id!r}")
-            if row["owner_pid"] != owner_pid or row["owner_start_token"] != owner_start_token:
-                raise CoordinatorError(
-                    f"caller does not own child CPU lease {lease_id}"
-                )
-            if row["status"] in {"waiting", "active"}:
-                db.execute(
-                    "UPDATE child_cpu_leases SET status = ?, finished_at = ? "
-                    "WHERE lease_id = ?",
-                    (status, _now(), lease_id),
-                )
-                self._maintain_child_cpu_leases(db)
-            row = db.execute(
-                "SELECT * FROM child_cpu_leases WHERE lease_id = ?", (lease_id,)
-            ).fetchone()
-        self._touch()
-        return self._public_child_cpu_lease(row, position=None)
-
-    def release_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
-        return self._finish_child_cpu_lease(lease_id, status="released")
-
-    def cancel_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
-        return self._finish_child_cpu_lease(lease_id, status="cancelled")
-
-    def _lease_position(
-        self,
-        row: sqlite3.Row,
-        *,
-        db: sqlite3.Connection | None = None,
-    ) -> int | None:
-        if row["status"] != "waiting":
-            return None
-        if db is None:
-            with self._db_lock, self._connect() as selected:
-                return selected.execute(
-                    "SELECT COUNT(*) FROM child_cpu_leases "
-                    "WHERE run_id = ? AND status = 'waiting' AND sequence <= ?",
-                    (row["run_id"], row["sequence"]),
-                ).fetchone()[0]
-        return db.execute(
-            "SELECT COUNT(*) FROM child_cpu_leases "
-            "WHERE run_id = ? AND status = 'waiting' AND sequence <= ?",
-            (row["run_id"], row["sequence"]),
-        ).fetchone()[0]
-
-    def _public_child_cpu_lease(
-        self,
-        row: sqlite3.Row,
-        *,
-        position: int | None,
-    ) -> dict[str, Any]:
-        granted = row["granted"]
-        return {
-            "lease_id": row["lease_id"],
-            "run_id": row["run_id"],
-            "status": row["status"],
-            "requested": row["requested"],
-            "minimum": row["minimum"],
-            "granted": granted,
-            "full": granted > 0 and granted == row["requested"],
-            "owner_pid": row["owner_pid"],
-            "created_at": row["created_at"],
-            "acquired_at": row["acquired_at"],
-            "finished_at": row["finished_at"],
-            "position": position,
-        }
-
-    def _maintain_child_cpu_leases(self, db: sqlite3.Connection) -> None:
-        """Reclaim dead owners and fairly admit durable requests per parent run."""
-        now = _now()
-        live = db.execute(
-            "SELECT leases.*, runs.status AS run_status, "
-            "runs.cancel_requested AS run_cancel_requested, "
-            "runs.worker_pid AS run_worker_pid, "
-            "runs.worker_start_token AS run_worker_start_token "
-            "FROM child_cpu_leases AS leases JOIN runs USING (run_id) "
-            "WHERE leases.status IN ('waiting', 'active') ORDER BY leases.sequence"
-        ).fetchall()
-        for lease in live:
-            valid = (
-                lease["run_status"] == "running"
-                and not lease["run_cancel_requested"]
-                and _same_process(
-                    lease["run_worker_pid"], lease["run_worker_start_token"]
-                )
-                and _same_process(lease["owner_pid"], lease["owner_start_token"])
-                and _is_descendant_process(
-                    lease["owner_pid"],
-                    lease["owner_start_token"],
-                    ancestor_pid=lease["run_worker_pid"],
-                    ancestor_token=lease["run_worker_start_token"],
-                )
-            )
-            if not valid:
-                db.execute(
-                    "UPDATE child_cpu_leases SET status = 'cancelled', finished_at = ? "
-                    "WHERE lease_id = ? AND status IN ('waiting', 'active')",
-                    (now, lease["lease_id"]),
-                )
-
-        run_ids = [
-            row["run_id"]
-            for row in db.execute(
-                "SELECT DISTINCT run_id FROM child_cpu_leases "
-                "WHERE status IN ('waiting', 'active') ORDER BY run_id"
-            )
-        ]
-        for run_id in run_ids:
-            parent = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if parent is None or parent["status"] != "running" or parent["cancel_requested"]:
-                continue
-            budget = self._row_resources(parent).get(CHILD_CPU_RESOURCE)
-            if budget is None:
-                raise CoordinatorError(
-                    f"parent run {run_id} has live child leases without a CPU budget"
-                )
-            active = db.execute(
-                "SELECT * FROM child_cpu_leases "
-                "WHERE run_id = ? AND status = 'active' ORDER BY sequence",
-                (run_id,),
-            ).fetchall()
-            used = sum(row["granted"] for row in active)
-            if used > budget:
-                raise CoordinatorError(
-                    f"child CPU leases for {run_id} hold {used}, above parent budget {budget}"
-                )
-            available = budget - used
-            waiting = list(db.execute(
-                "SELECT * FROM child_cpu_leases "
-                "WHERE run_id = ? AND status = 'waiting' ORDER BY sequence",
-                (run_id,),
-            ).fetchall())
-            while available > 0 and waiting:
-                oldest = waiting[0]
-                selected = oldest if oldest["minimum"] <= available else None
-                if selected is None:
-                    if oldest["bypass_count"] >= CHILD_LEASE_MAX_BYPASSES:
-                        break
-                    selected = next(
-                        (candidate for candidate in waiting[1:] if candidate["minimum"] <= available),
-                        None,
-                    )
-                    if selected is None:
-                        break
-                    db.execute(
-                        "UPDATE child_cpu_leases SET bypass_count = bypass_count + 1 "
-                        "WHERE lease_id = ?",
-                        (oldest["lease_id"],),
-                    )
-                granted = min(selected["requested"], available)
-                if granted < selected["minimum"]:
-                    raise CoordinatorError("child CPU lease scheduler selected an impossible grant")
-                db.execute(
-                    "UPDATE child_cpu_leases SET status = 'active', granted = ?, "
-                    "acquired_at = ? WHERE lease_id = ? AND status = 'waiting'",
-                    (granted, now, selected["lease_id"]),
-                )
-                available -= granted
-                waiting = [
-                    candidate for candidate in waiting
-                    if candidate["lease_id"] != selected["lease_id"]
-                ]
-
-    def verify_admission(
-        self,
-        run_id: str,
-        *,
-        kind: str,
-        checkout: str,
-        head_sha: str,
-        worker_pid: int,
-    ) -> None:
-        """Prove that this exact barrier worker owns one durable admission."""
-        if not isinstance(run_id, str) or not run_id:
-            raise CoordinatorError("broker admission run ID must be non-empty")
-        if kind not in {"full", "merge", "land"}:
-            raise CoordinatorError(
-                "broker admission kind must be 'full', 'merge', or 'land'"
-            )
-        selected_checkout = str(_absolute(checkout))
-        selected_head = _validate_head_sha(head_sha, required=True)
-        if (
-            not isinstance(worker_pid, int)
-            or isinstance(worker_pid, bool)
-            or worker_pid <= 0
-        ):
-            raise CoordinatorError("broker admission worker PID must be positive")
-        owner = _broker_owner(self.paths)
-        if owner is None:
-            raise CoordinatorError(
-                f"run {run_id!r} has no live broker admission"
-            )
-        with self._db_lock, self._connect() as db:
-            row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        mismatches: list[str] = []
-        if row is None:
-            mismatches.append("run ID is not in the durable queue")
-        else:
-            if row["status"] != "running":
-                mismatches.append(f"status is {row['status']!r}, not 'running'")
-            if row["kind"] != kind:
-                mismatches.append(f"kind is {row['kind']!r}, not {kind!r}")
-            if row["checkout"] != selected_checkout:
-                mismatches.append("checkout does not match")
-            if row["head_sha"] != selected_head:
-                mismatches.append("head does not match")
-            identity_mismatch = _admitted_worker_mismatch(row, worker_pid)
-            if identity_mismatch is not None:
-                mismatches.append(identity_mismatch)
-        if mismatches:
-            raise CoordinatorError(
-                f"run {run_id!r} has no exact broker admission: "
-                + "; ".join(mismatches)
-            )
-        self._touch()
-
-    def update_land_phase(
-        self,
-        run_id: str,
-        *,
-        phase: str,
-        gate_exit_status: int | None,
-        worker_pid: int,
-        new_head_sha: str | None = None,
-    ) -> None:
-        """Advance one admitted land worker and establish its cancellation boundary."""
-        if phase not in {"preflight", "gating", "publishing"}:
-            raise CoordinatorError(f"invalid land phase {phase!r}")
-        if gate_exit_status is not None and (
-            not isinstance(gate_exit_status, int)
-            or isinstance(gate_exit_status, bool)
-            or not 0 <= gate_exit_status <= 255
-        ):
-            raise CoordinatorError("gate exit status must be null or an integer from 0 to 255")
-        if not isinstance(worker_pid, int) or isinstance(worker_pid, bool) or worker_pid <= 0:
-            raise CoordinatorError("land worker PID must be positive")
-        selected_new_head = (
-            _validate_head_sha(new_head_sha, required=True)
-            if new_head_sha is not None
-            else None
-        )
-        order = {"preflight": 0, "gating": 1, "publishing": 2}
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            mismatches: list[str] = []
-            if row is None:
-                mismatches.append("run ID is not in the durable queue")
-            else:
-                if row["kind"] != "land":
-                    mismatches.append(f"kind is {row['kind']!r}, not 'land'")
-                if row["status"] != "running":
-                    mismatches.append(f"status is {row['status']!r}, not 'running'")
-                identity_mismatch = _admitted_worker_mismatch(row, worker_pid)
-                if identity_mismatch is not None:
-                    mismatches.append(identity_mismatch)
-                current_phase = row["phase"]
-                if current_phase not in order:
-                    mismatches.append(f"phase is {current_phase!r}, not a live land phase")
-                elif order[phase] < order[current_phase]:
-                    mismatches.append(
-                        f"phase cannot move backward from {current_phase!r} to {phase!r}"
-                    )
-                stored_gate_status = row["gate_exit_status"]
-                if (
-                    stored_gate_status is not None
-                    and gate_exit_status is not None
-                    and stored_gate_status != gate_exit_status
-                ):
-                    mismatches.append("gate exit status cannot change")
-                selected_gate_status = (
-                    stored_gate_status if gate_exit_status is None else gate_exit_status
-                )
-                if phase == "preflight" and selected_gate_status is not None:
-                    mismatches.append("preflight cannot have a gate exit status")
-                if phase == "publishing" and selected_gate_status != 0:
-                    mismatches.append("publication requires a passed gate")
-                if selected_new_head is not None and (
-                    phase != "preflight"
-                    or current_phase != "preflight"
-                    or selected_new_head == row["head_sha"]
-                ):
-                    mismatches.append(
-                        "the durable head can change only during preflight and must differ"
-                    )
-                if row["cancel_requested"]:
-                    raise CoordinatorError(
-                        f"land job {run_id} has a cancellation request; publication refused"
-                    )
-            if mismatches:
-                raise CoordinatorError(
-                    f"run {run_id!r} cannot advance land phase: " + "; ".join(mismatches)
-                )
-            db.execute(
-                "UPDATE runs SET phase = ?, gate_exit_status = ?, head_sha = ? "
-                "WHERE run_id = ?",
-                (
-                    phase,
-                    selected_gate_status,
-                    selected_new_head or row["head_sha"],
-                    run_id,
-                ),
-            )
-        self._touch()
-
-    def report_land_result(
-        self,
-        run_id: str,
-        *,
-        exit_status: int,
-        worker_pid: int,
-    ) -> None:
-        """Durably report a land result without exposing terminal state early."""
-        if (
-            not isinstance(exit_status, int)
-            or isinstance(exit_status, bool)
-            or not 0 <= exit_status <= 255
-        ):
-            raise CoordinatorError("land result must be an integer exit status from 0 to 255")
-        if not isinstance(worker_pid, int) or isinstance(worker_pid, bool) or worker_pid <= 0:
-            raise CoordinatorError("land worker PID must be positive")
-        with self._db_lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            mismatches: list[str] = []
-            if row is None:
-                mismatches.append("run ID is not in the durable queue")
-            else:
-                if row["kind"] != "land":
-                    mismatches.append(f"kind is {row['kind']!r}, not 'land'")
-                if row["status"] != "running":
-                    mismatches.append(f"status is {row['status']!r}, not 'running'")
-                identity_mismatch = _admitted_worker_mismatch(row, worker_pid)
-                if identity_mismatch is not None:
-                    mismatches.append(identity_mismatch)
-                if row["reported_exit_status"] is not None:
-                    mismatches.append("land result was already reported")
-                if row["phase"] == "gating" and row["gate_exit_status"] is None:
-                    mismatches.append("gating result has no gate exit status")
-                if row["phase"] == "publishing" and row["gate_exit_status"] != 0:
-                    mismatches.append("publication result has no passed gate")
-            if mismatches:
-                raise CoordinatorError(
-                    f"run {run_id!r} cannot report land result: " + "; ".join(mismatches)
-                )
-            db.execute(
-                "UPDATE runs SET reported_exit_status = ? WHERE run_id = ?",
-                (exit_status, run_id),
-            )
-        self._touch()
-
-    def log(
-        self,
-        run_id: str,
-        *,
-        offset: int = 0,
-        limit: int = MAX_LOG_BYTES,
-    ) -> dict[str, Any]:
-        self._one(run_id)
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise CoordinatorError("gate log offset must be a non-negative integer")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LOG_BYTES:
-            raise CoordinatorError(
-                f"gate log limit must be between 1 and {MAX_LOG_BYTES}"
-            )
-        path = self._log_path(run_id)
-        if not path.exists():
-            data = b""
-            size = 0
-        else:
-            size = path.stat().st_size
-            with path.open("rb") as stream:
-                stream.seek(offset)
-                data = stream.read(limit)
-        if offset > size:
-            raise CoordinatorError(
-                f"gate log offset {offset} is past its {size}-byte end"
-            )
-        next_offset = offset + len(data)
-        self._touch()
-        return {
-            "run_id": run_id,
-            "offset": offset,
-            "next_offset": next_offset,
-            "text": data.decode("utf-8", errors="replace"),
-            "eof": next_offset >= size,
-        }
-
-    def _one(self, run_id: str) -> sqlite3.Row:
-        if not isinstance(run_id, str) or not run_id:
-            raise CoordinatorError("gate run_id must be a non-empty string")
-        with self._db_lock, self._connect() as db:
-            row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        if row is None:
-            raise CoordinatorError(f"unknown gate run {run_id!r}")
-        return row
-
-    def _row_resources(self, row: sqlite3.Row) -> dict[str, int]:
-        try:
-            raw = json.loads(row["resources_json"])
-            return _positive_mapping(raw, subject="stored resource", include_job=False)
-        except (TypeError, json.JSONDecodeError, CoordinatorError) as exc:
-            raise CoordinatorError(
-                f"run {row['run_id']} has invalid stored resources"
-            ) from exc
-
-    def _row_resource_contract(self, row: sqlite3.Row) -> dict[str, dict[str, object]]:
-        resources = self._row_resources(row)
-        try:
-            return validate_resource_contract(
-                json.loads(row["resource_contract_json"]),
-                resources,
-            )
-        except (TypeError, json.JSONDecodeError, ResourceContractError) as exc:
-            raise CoordinatorError(
-                f"run {row['run_id']} has an invalid stored resource contract"
-            ) from exc
-
-    def _row_resource_receipt(self, row: sqlite3.Row) -> dict[str, object]:
-        resources = self._row_resources(row)
-        try:
-            return validate_resource_receipt(
-                json.loads(row["resource_receipt_json"]),
-                resources,
-            )
-        except (TypeError, json.JSONDecodeError, ResourceContractError) as exc:
-            raise CoordinatorError(
-                f"run {row['run_id']} has an invalid stored resource receipt"
-            ) from exc
-
-    def _row_resource_state(self, row: sqlite3.Row) -> dict[str, dict[str, object]]:
-        try:
-            return validate_backend_state(json.loads(row["resource_state_json"]))
-        except (TypeError, json.JSONDecodeError, ResourceContractError) as exc:
-            raise CoordinatorError(
-                f"run {row['run_id']} has invalid private resource state"
-            ) from exc
-
-    def _allocations(self, rows: Sequence[sqlite3.Row]) -> dict[str, int]:
-        allocated: dict[str, int] = {}
-        for row in rows:
-            for name, units in self._row_resources(row).items():
-                allocated[name] = allocated.get(name, 0) + units
-        return dict(sorted(allocated.items()))
-
-    def _blocked_by(
-        self,
-        row: sqlite3.Row,
-        *,
-        active: Sequence[sqlite3.Row],
-        queued: Sequence[sqlite3.Row],
-        capacities: Mapping[str, int],
-    ) -> list[str]:
-        if row["status"] != "queued":
-            return []
-        reasons: list[str] = []
-        same_active = [
-            candidate for candidate in active
-            if candidate["repository_id"] == row["repository_id"]
-        ]
-        earlier = [
-            candidate for candidate in queued
-            if candidate["repository_id"] == row["repository_id"]
-            and candidate["sequence"] < row["sequence"]
-        ]
-        # A barrier (land or retained merge) excludes every other barrier in its lane and
-        # every job that shares its worktree.  Ordinary work in another worktree of the
-        # same repository only competes for capacity.
-        if row["barrier"]:
-            reasons.extend(
-                f"repository:{row['repository_id']}:active:{candidate['run_id']}"
-                for candidate in same_active
-                if candidate["barrier"] or candidate["worktree_id"] == row["worktree_id"]
-            )
-            fifo = [
-                candidate for candidate in earlier
-                if candidate["barrier"] or candidate["worktree_id"] == row["worktree_id"]
-            ]
-            if fifo:
-                reasons.append(
-                    f"repository:{row['repository_id']}:fifo:{fifo[0]['run_id']}"
-                )
-        else:
-            barriers = [
-                candidate for candidate in [*same_active, *earlier]
-                if candidate["barrier"] and candidate["worktree_id"] == row["worktree_id"]
-            ]
-            if barriers:
-                reasons.append(
-                    f"repository:{row['repository_id']}:barrier:{barriers[0]['run_id']}"
-                )
-        allocated = self._allocations(active)
-        for name, units in self._row_resources(row).items():
-            if allocated.get(name, 0) + units > capacities.get(name, 0):
-                reasons.append(f"resource:{name}")
-        return reasons
-
-    def _public(
-        self,
-        row: sqlite3.Row,
-        *,
-        position: int | None,
-        active: Sequence[sqlite3.Row] = (),
-        queued: Sequence[sqlite3.Row] = (),
-        capacities: Mapping[str, int] | None = None,
-    ) -> dict[str, Any]:
-        path = self._log_path(row["run_id"])
-        try:
-            log_bytes = path.stat().st_size
-        except FileNotFoundError:
-            log_bytes = 0
-        command = json.loads(row["command_json"])
-        if not isinstance(command, list) or not all(isinstance(v, str) for v in command):
-            raise CoordinatorError(
-                f"gate run {row['run_id']} has an invalid stored command"
-            )
-        publication = None
-        if row["publication_adapter"] is not None:
-            try:
-                request = json.loads(row["publication_request"])
-            except json.JSONDecodeError as exc:
-                raise CoordinatorError(
-                    f"run {row['run_id']} has an invalid publication request"
-                ) from exc
-            publication = {
-                "adapter": row["publication_adapter"],
-                "request": request,
-            }
-        selected_capacities = capacities or self.capacities
-        return {
-            "run_id": row["run_id"],
-            "sequence": row["sequence"],
-            "status": row["status"],
-            "kind": row["kind"],
-            "phase": row["phase"],
-            "label": row["label"],
-            "agent": row["agent"],
-            "repository_id": row["repository_id"],
-            "repository": row["repository"],
-            "worktree_id": row["worktree_id"],
-            "checkout": row["checkout"],
-            "branch": row["branch"],
-            "head_sha": row["head_sha"],
-            "barrier": bool(row["barrier"]),
-            "resources": self._row_resources(row),
-            "resource_contract": self._row_resource_contract(row),
-            "resource_receipt": self._row_resource_receipt(row),
-            "blocked_by": self._blocked_by(
-                row,
-                active=active,
-                queued=queued,
-                capacities=selected_capacities,
-            ),
-            "gate_run_id": row["gate_run_id"],
-            "publication": publication,
-            "failure_reason": row["failure_reason"],
-            "gate_exit_status": row["gate_exit_status"],
-            "caller_pid": row["caller_pid"],
-            "command": command,
-            "created_at": row["created_at"],
-            "started_at": row["started_at"],
-            "finished_at": row["finished_at"],
-            "exit_status": row["exit_status"],
-            "worker_pid": row["worker_pid"],
-            "cancel_requested": bool(row["cancel_requested"]),
-            "log_bytes": log_bytes,
-            "position": position,
-        }
-
-    def _log_path(self, run_id: str) -> Path:
-        return self.paths.logs / f"{run_id}.log"
-
-    def _worker_tmp_path(self, run_id: str) -> Path:
-        return self.paths.worker_tmp / run_id
-
-    def _worker_tmp_paths(self, run_id: str) -> tuple[Path, Path]:
-        if Path(run_id).name != run_id:
-            raise CoordinatorError(f"invalid gate run id for temp cleanup: {run_id!r}")
-        return (
-            self._worker_tmp_path(run_id),
-            self.paths.legacy_worker_tmp / run_id,
-        )
-
-    def _make_owned_tree_deletable(self, root: Path) -> None:
-        pending = [root]
-        while pending:
-            current = pending.pop()
-            try:
-                if current.is_symlink():
-                    continue
-                current.chmod(0o700)
-                with os.scandir(current) as entries:
-                    for entry in entries:
-                        if entry.is_dir(follow_symlinks=False):
-                            pending.append(Path(entry.path))
-            except FileNotFoundError:
-                continue
-
-    def _remove_worker_tmp(self, run_id: str) -> bool:
-        removed = True
-        for path in self._worker_tmp_paths(run_id):
-            try:
-                if path.is_symlink():
-                    path.unlink()
-                else:
-                    self._make_owned_tree_deletable(path)
-                    shutil.rmtree(path)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                removed = False
-                self._append_daemon_log(
-                    f"could not remove worker temp for {run_id}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-        return removed
-
-    def _remove_orphaned_worker_tmp(self) -> None:
-        with self._db_lock, self._connect() as db:
-            live = {
-                row["run_id"]
-                for row in db.execute(
-                    "SELECT run_id FROM runs WHERE status = 'running'"
-                )
-            }
-        roots = (self.paths.worker_tmp, self.paths.legacy_worker_tmp)
-        for root in roots:
-            if not root.is_dir():
-                continue
-            for path in root.iterdir():
-                if path.name not in live and not self._remove_worker_tmp(path.name):
-                    raise CoordinatorError(
-                        f"cannot reclaim orphaned gate temp directory {path}"
-                    )
-
-    def _drain_finished_process_group(self, row: sqlite3.Row) -> bool:
-        run_id = row["run_id"]
-        process_group = row["worker_pid"]
-        if not _process_group_exists(process_group):
-            self._group_drain_started.pop(run_id, None)
-            return True
-        if row["cancel_requested"]:
-            requested = _parse_time(row["cancel_requested_at"])
-            elapsed = (
-                (datetime.now(timezone.utc) - requested).total_seconds()
-                if requested is not None else 0.0
-            )
-        else:
-            started = self._group_drain_started.setdefault(run_id, time.monotonic())
-            elapsed = time.monotonic() - started
-        sent = signal.SIGKILL if elapsed >= CANCEL_GRACE_SECONDS else signal.SIGTERM
-        try:
-            os.killpg(process_group, sent)
-        except ProcessLookupError:
-            self._group_drain_started.pop(run_id, None)
-            return True
-        except OSError as exc:
-            raise CoordinatorError(
-                f"cannot drain gate worker process group {process_group}: {exc}"
-            ) from exc
-        return not _process_group_exists(process_group)
-
-    # ---------------------------------------------------------------------- queue pump
-
-    def _pump(self) -> None:
-        while not self._stop.wait(0.1):
-            try:
-                self._pump_once()
-            except sqlite3.OperationalError as exc:
-                if _transient_database_error(exc):
-                    self._append_daemon_log(
-                        f"pump database contention; retrying: {exc}"
-                    )
-                else:
-                    self._append_daemon_log(
-                        f"pump error: {type(exc).__name__}: {exc}"
-                    )
-            except Exception as exc:  # keep one bad row from silently killing admission
-                self._append_daemon_log(f"pump error: {type(exc).__name__}: {exc}")
-            if self._should_idle_exit():
-                return
-
-    def _pump_once(self) -> None:
-        with self._db_lock, self._connect() as db:
-            self._maintain_child_cpu_leases(db)
-            active = db.execute(
-                "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
-            ).fetchall()
-            self._validate_active_set(active)
-            for row in active:
-                self._observe_active(db, row)
-
-            self._maintain_child_cpu_leases(db)
-
-            # Observation may have completed any number of workers.  Admission reasons
-            # from the durable rows again, in the same transaction.
-            active = db.execute(
-                "SELECT * FROM runs WHERE status = 'running' ORDER BY sequence"
-            ).fetchall()
-            self._validate_active_set(active)
-            queued = db.execute(
-                "SELECT * FROM runs WHERE status = 'queued' ORDER BY sequence"
-            ).fetchall()
-            while queued:
-                row = self._next_admissible(active, queued)
-                if row is None:
-                    return
-                now = _now()
-                db.execute(
-                    "UPDATE runs SET status = 'running', phase = CASE "
-                    "WHEN kind = 'land' THEN 'preflight' ELSE 'running' END, "
-                    "started_at = ? WHERE run_id = ?",
-                    (now, row["run_id"]),
-                )
-                refreshed = db.execute(
-                    "SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)
-                ).fetchone()
-                self._start_worker(db, refreshed)
-                current = db.execute(
-                    "SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)
-                ).fetchone()
-                queued = [candidate for candidate in queued if candidate["run_id"] != row["run_id"]]
-                if current["status"] == "running":
-                    active = [*active, current]
-                self._last_repository = row["repository_id"]
-
-    def _next_admissible(
-        self,
-        active: Sequence[sqlite3.Row],
-        queued: Sequence[sqlite3.Row],
-    ) -> sqlite3.Row | None:
-        """Choose one repository lane's first admissible job in round-robin order.
-
-        Within a lane, a queued job that is blocked by a barrier, by its worktree, or by
-        capacity lets later admissible lane work pass it; the blockers themselves keep
-        barriers in submission order.
-        """
-        heads: list[sqlite3.Row] = []
-        seen: set[str] = set()
-        for row in queued:
-            repository_id = row["repository_id"]
-            if repository_id in seen:
-                continue
-            if not self._blocked_by(
-                row,
-                active=active,
-                queued=queued,
-                capacities=self.capacities,
-            ):
-                seen.add(repository_id)
-                heads.append(row)
-        if self._last_repository is not None:
-            after = [row for row in heads if row["repository_id"] > self._last_repository]
-            before = [row for row in heads if row["repository_id"] <= self._last_repository]
-            heads = [*after, *before]
-        return heads[0] if heads else None
-
-    def _validate_active_set(self, active: Sequence[sqlite3.Row]) -> None:
-        allocations = self._allocations(active)
-        for name, units in allocations.items():
-            if units > self.capacities.get(name, 0):
-                raise CoordinatorError(
-                    f"active allocation for {name!r} is {units}, above capacity "
-                    f"{self.capacities.get(name, 0)}"
-                )
-        repositories: dict[str, list[sqlite3.Row]] = {}
-        for row in active:
-            repositories.setdefault(row["repository_id"], []).append(row)
-        for repository_id, rows in repositories.items():
-            barriers = [row for row in rows if row["barrier"]]
-            if not barriers:
-                continue
-            overlap = len(barriers) > 1 or any(
-                not row["barrier"] and row["worktree_id"] == barriers[0]["worktree_id"]
-                for row in rows
-            )
-            if overlap:
-                identities = ", ".join(row["run_id"] for row in rows)
-                raise CoordinatorError(
-                    f"repository {repository_id} has a barrier overlap: {identities}"
-                )
-
-    def _resource_request(
-        self,
-        row: sqlite3.Row,
-        backend: str,
-        names: Sequence[str],
-    ) -> ResourceRequest:
-        resources = self._row_resources(row)
-        contract = self._row_resource_contract(row)
-        selected_resources: dict[str, int] = {}
-        selected_bindings: dict[str, Mapping[str, object]] = {}
-        for name in names:
-            binding = contract.get(name)
-            if binding is None or binding["backend"] != backend:
-                raise CoordinatorError(
-                    f"run {row['run_id']} has inconsistent private resource state"
-                )
-            selected_resources[name] = resources[name]
-            selected_bindings[name] = binding
-        return ResourceRequest.build(
-            row["run_id"],
-            backend,
-            selected_resources,
-            selected_bindings,
-        )
-
-    def _append_resource_event(
-        self,
-        receipt: dict[str, object],
-        *,
-        backend: str,
-        resource: str,
-        stage: str,
-        status: str,
-        code: str,
-    ) -> None:
-        events = receipt["events"]
-        if not isinstance(events, list):
-            raise CoordinatorError("resource receipt events are not mutable")
-        events.append(
-            {
-                "at": _now(),
-                "backend": backend,
-                "resource": resource,
-                "stage": stage,
-                "status": status,
-                "code": code,
-            }
-        )
-
-    def _save_resource_records(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-        receipt: Mapping[str, object],
-        state: Mapping[str, Mapping[str, object]],
-    ) -> None:
-        resources = self._row_resources(row)
-        try:
-            selected_receipt = validate_resource_receipt(receipt, resources)
-            selected_state = validate_backend_state(state)
-        except ResourceContractError as exc:
-            raise CoordinatorError(
-                f"run {row['run_id']} produced invalid resource lifecycle data"
-            ) from exc
-        db.execute(
-            "UPDATE runs SET resource_receipt_json = ?, resource_state_json = ? "
-            "WHERE run_id = ?",
-            (
-                json.dumps(selected_receipt, separators=(",", ":")),
-                json.dumps(selected_state, separators=(",", ":")),
-                row["run_id"],
-            ),
-        )
-
-    def _cleanup_resource_records(
-        self,
-        row: sqlite3.Row,
-        receipt: dict[str, object],
-        state: dict[str, dict[str, object]],
-        *,
-        only: set[str] | None = None,
-    ) -> None:
-        for backend_name in list(state):
-            if only is not None and backend_name not in only:
-                continue
-            record = state[backend_name]
-            names = record["resources"]
-            request = self._resource_request(row, backend_name, names)
-            backend = self.resource_backends.get(backend_name)
-            try:
-                if backend is None:
-                    raise ResourceContractError("backend unavailable")
-                backend.cleanup(request, record["handle"])
-            except Exception as exc:
-                failure_code = _resource_failure_code(exc, "cleanup-failed")
-                self._append_daemon_log(
-                    f"resource cleanup failed for {row['run_id']} via "
-                    f"{backend_name}: {type(exc).__name__}"
-                )
-                for name in names:
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="cleanup",
-                        status="failed",
-                        code=failure_code,
-                    )
-            else:
-                for name in names:
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="cleanup",
-                        status="recorded",
-                        code="cleaned",
-                    )
-            del state[backend_name]
-
-    def _prepare_resources(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
-        receipt = self._row_resource_receipt(row)
-        state = self._row_resource_state(row)
-        if state:
-            raise CoordinatorError(
-                f"run {row['run_id']} already has prepared resource state"
-            )
-        contract = self._row_resource_contract(row)
-        eligible: dict[str, list[str]] = {}
-        required_failure = False
-        for name, binding in contract.items():
-            mode = binding["mode"]
-            if mode == "admission-only":
-                continue
-            backend_name = str(binding["backend"])
-            issue = capability_issue(
-                binding,
-                self.resource_capabilities.get(backend_name),
-            )
-            if issue is not None:
-                self._append_resource_event(
-                    receipt,
-                    backend=backend_name,
-                    resource=name,
-                    stage="probe",
-                    status="failed" if mode == "required" else "unapplied",
-                    code=issue,
-                )
-                required_failure = required_failure or mode == "required"
-            else:
-                eligible.setdefault(backend_name, []).append(name)
-        if required_failure:
-            self._save_resource_records(db, row, receipt, state)
-            raise _ResourceEnforcementError(
-                "a required resource backend or unit is unavailable"
-            )
-
-        for backend_name, names in sorted(eligible.items()):
-            request = self._resource_request(row, backend_name, names)
-            backend = self.resource_backends[backend_name]
-            try:
-                handle = backend.prepare(request)
-                candidate = {
-                    "handle": handle,
-                    "resources": list(names),
-                    "finished": False,
-                    "cancelled": False,
-                }
-                selected = validate_backend_state({backend_name: candidate})
-                state[backend_name] = selected[backend_name]
-            except Exception as exc:
-                failure_code = _resource_failure_code(exc, "prepare-failed")
-                self._append_daemon_log(
-                    f"resource prepare failed for {row['run_id']} via "
-                    f"{backend_name}: {type(exc).__name__}"
-                )
-                for name in names:
-                    mode = contract[name]["mode"]
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="prepare",
-                        status="failed" if mode == "required" else "unapplied",
-                        code=failure_code,
-                    )
-                    required_failure = required_failure or mode == "required"
-            else:
-                for name in names:
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="prepare",
-                        status="recorded",
-                        code="prepared",
-                    )
-        if required_failure:
-            self._cleanup_resource_records(row, receipt, state)
-            self._save_resource_records(db, row, receipt, state)
-            raise _ResourceEnforcementError("a required resource could not be prepared")
-        self._save_resource_records(db, row, receipt, state)
-
-    def _attach_resources(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-        worker_pid: int,
-    ) -> None:
-        receipt = self._row_resource_receipt(row)
-        state = self._row_resource_state(row)
-        contract = self._row_resource_contract(row)
-        required_failure = False
-        failed_best_effort: set[str] = set()
-        applied = receipt["applied"]
-        if not isinstance(applied, dict):
-            raise CoordinatorError("resource receipt application record is not mutable")
-        for backend_name, record in state.items():
-            names = record["resources"]
-            request = self._resource_request(row, backend_name, names)
-            backend = self.resource_backends.get(backend_name)
-            try:
-                if backend is None:
-                    raise ResourceContractError("backend unavailable")
-                backend.attach(request, record["handle"], worker_pid)
-            except Exception as exc:
-                failure_code = _resource_failure_code(exc, "attach-failed")
-                self._append_daemon_log(
-                    f"resource attach failed for {row['run_id']} via "
-                    f"{backend_name}: {type(exc).__name__}"
-                )
-                for name in names:
-                    mode = contract[name]["mode"]
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="attach",
-                        status="failed" if mode == "required" else "unapplied",
-                        code=failure_code,
-                    )
-                    required_failure = required_failure or mode == "required"
-                if not any(contract[name]["mode"] == "required" for name in names):
-                    failed_best_effort.add(backend_name)
-            else:
-                for name, units in request.resources.items():
-                    if (
-                        backend_name == CGROUP_BACKEND
-                        and contract[name]["kind"] in {"inodes", "tmpfs"}
-                    ) or backend_name == PROJECT_QUOTA_BACKEND:
-                        continue
-                    applied[name] = units
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="attach",
-                        status="applied",
-                        code="applied",
-                    )
-        if required_failure:
-            self._cleanup_resource_records(row, receipt, state)
-        elif failed_best_effort:
-            self._cleanup_resource_records(
-                row,
-                receipt,
-                state,
-                only=failed_best_effort,
-            )
-        self._save_resource_records(db, row, receipt, state)
-        if required_failure:
-            raise _ResourceEnforcementError("a required resource could not be attached")
-
-    def _resource_measurement(
-        self,
-        value: object,
-        *,
-        expected: set[str],
-    ) -> tuple[dict[str, int], tuple[ResourceObservation, ...]]:
-        return validate_resource_measurement(value, expected=expected)
-
-    def _capture_resource_usage(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-        *,
-        final: bool,
-    ) -> None:
-        receipt = self._row_resource_receipt(row)
-        state = self._row_resource_state(row)
-        peak = receipt["peak"]
-        if not isinstance(peak, dict):
-            raise CoordinatorError("resource receipt peak record is not mutable")
-        changed = False
-        for backend_name, record in state.items():
-            if record["finished"]:
-                continue
-            names = record["resources"]
-            request = self._resource_request(row, backend_name, names)
-            backend = self.resource_backends.get(backend_name)
-            stage = "finish" if final else "usage"
-            try:
-                if backend is None:
-                    raise ResourceContractError("backend unavailable")
-                raw = (
-                    backend.finish(request, record["handle"])
-                    if final
-                    else backend.usage(request, record["handle"])
-                )
-                measured, observations = self._resource_measurement(
-                    raw,
-                    expected=set(names),
-                )
-            except Exception as exc:
-                failure_code = _resource_failure_code(exc, f"{stage}-failed")
-                already_recorded = any(
-                    event["backend"] == backend_name
-                    and event["stage"] == stage
-                    and event["code"] == failure_code
-                    for event in receipt["events"]
-                )
-                if not already_recorded:
-                    self._append_daemon_log(
-                        f"resource {stage} failed for {row['run_id']} via "
-                        f"{backend_name}: {type(exc).__name__}"
-                    )
-                    for name in names:
-                        self._append_resource_event(
-                            receipt,
-                            backend=backend_name,
-                            resource=name,
-                            stage=stage,
-                            status="failed",
-                            code=failure_code,
-                        )
-                    changed = True
-            else:
-                for name, units in measured.items():
-                    if units > peak.get(name, -1):
-                        peak[name] = units
-                        changed = True
-                for observation in observations:
-                    if any(
-                        event["backend"] == backend_name
-                        and event["resource"] == observation.resource
-                        and event["code"] == observation.code
-                        for event in receipt["events"]
-                    ):
-                        continue
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=observation.resource,
-                        stage=stage,
-                        status="recorded",
-                        code=observation.code,
-                    )
-                    changed = True
-                if final:
-                    for name in names:
-                        self._append_resource_event(
-                            receipt,
-                            backend=backend_name,
-                            resource=name,
-                            stage="finish",
-                            status="recorded",
-                            code="finished",
-                        )
-                    changed = True
-            if final:
-                record["finished"] = True
-                changed = True
-        if changed:
-            self._save_resource_records(db, row, receipt, state)
-
-    def _finish_and_cleanup_resources(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-    ) -> None:
-        self._capture_resource_usage(db, row, final=True)
-        refreshed = db.execute(
-            "SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)
-        ).fetchone()
-        receipt = self._row_resource_receipt(refreshed)
-        state = self._row_resource_state(refreshed)
-        if state:
-            self._cleanup_resource_records(refreshed, receipt, state)
-            self._save_resource_records(db, refreshed, receipt, state)
-
-    def _cancel_resources(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
-        receipt = self._row_resource_receipt(row)
-        state = self._row_resource_state(row)
-        changed = False
-        for backend_name, record in state.items():
-            if record["cancelled"]:
-                continue
-            names = record["resources"]
-            request = self._resource_request(row, backend_name, names)
-            backend = self.resource_backends.get(backend_name)
-            try:
-                if backend is None:
-                    raise ResourceContractError("backend unavailable")
-                backend.cancel(request, record["handle"])
-            except Exception as exc:
-                failure_code = _resource_failure_code(exc, "cancel-failed")
-                self._append_daemon_log(
-                    f"resource cancel failed for {row['run_id']} via "
-                    f"{backend_name}: {type(exc).__name__}"
-                )
-                for name in names:
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="cancel",
-                        status="failed",
-                        code=failure_code,
-                    )
-            else:
-                for name in names:
-                    self._append_resource_event(
-                        receipt,
-                        backend=backend_name,
-                        resource=name,
-                        stage="cancel",
-                        status="recorded",
-                        code="cancelled",
-                    )
-            record["cancelled"] = True
-            changed = True
-        if changed:
-            self._save_resource_records(db, row, receipt, state)
-
-    def _tmpfs_resource_names(self, row: sqlite3.Row) -> list[str]:
-        contract = self._row_resource_contract(row)
-        return [
-            name
-            for name, binding in contract.items()
-            if binding["backend"] == CGROUP_BACKEND
-            and binding["kind"] in {"inodes", "tmpfs"}
-        ]
-
-    def _project_quota_scratch_path(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-    ) -> Path | None:
-        state = self._row_resource_state(row)
-        record = state.get(PROJECT_QUOTA_BACKEND)
-        if record is None:
-            return None
-        backend = self.resource_backends.get(PROJECT_QUOTA_BACKEND)
-        try:
-            if not isinstance(backend, ProjectQuotaBackend):
-                raise ResourceContractError(
-                    "project quota scratch backend is unavailable"
-                )
-            request = self._resource_request(
-                row,
-                PROJECT_QUOTA_BACKEND,
-                record["resources"],
-            )
-            return backend.scratch_path(request, record["handle"])
-        except Exception as exc:
-            receipt = self._row_resource_receipt(row)
-            contract = self._row_resource_contract(row)
-            code = _resource_failure_code(exc, "quota-tree-unavailable")
-            required = False
-            for name in record["resources"]:
-                mode = str(contract[name]["mode"])
-                required = required or mode == "required"
-                self._append_resource_event(
-                    receipt,
-                    backend=PROJECT_QUOTA_BACKEND,
-                    resource=name,
-                    stage="attach",
-                    status="failed" if mode == "required" else "unapplied",
-                    code=code,
-                )
-            self._cleanup_resource_records(
-                row,
-                receipt,
-                state,
-                only={PROJECT_QUOTA_BACKEND},
-            )
-            self._save_resource_records(db, row, receipt, state)
-            cleanup_failed = any(
-                event["backend"] == PROJECT_QUOTA_BACKEND
-                and event["stage"] == "cleanup"
-                and event["status"] == "failed"
-                for event in receipt["events"]
-            )
-            if required or cleanup_failed:
-                raise _ResourceEnforcementError(
-                    "project quota scratch path is unavailable"
-                ) from exc
-            return None
-
-    def _record_project_quota_worker_setup(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-        *,
-        code: str,
-    ) -> bool:
-        state = self._row_resource_state(row)
-        record = state.get(PROJECT_QUOTA_BACKEND)
-        if record is None:
-            raise CoordinatorError("project quota setup has no backend state")
-        receipt = self._row_resource_receipt(row)
-        contract = self._row_resource_contract(row)
-        requested = self._row_resources(row)
-        applied = receipt["applied"]
-        if not isinstance(applied, dict):
-            raise CoordinatorError("resource receipt application record is not mutable")
-        if code == "ok":
-            for name in record["resources"]:
-                applied[name] = requested[name]
-                self._append_resource_event(
-                    receipt,
-                    backend=PROJECT_QUOTA_BACKEND,
-                    resource=name,
-                    stage="attach",
-                    status="applied",
-                    code="quota-ready",
-                )
-            failed = False
-        else:
-            if not _SETUP_CODE.fullmatch(code):
-                code = "worker-setup-failed"
-            for name in record["resources"]:
-                mode = str(contract[name]["mode"])
-                self._append_resource_event(
-                    receipt,
-                    backend=PROJECT_QUOTA_BACKEND,
-                    resource=name,
-                    stage="attach",
-                    status="failed" if mode == "required" else "unapplied",
-                    code=code,
-                )
-            # A command must never inherit the broker's quota-administration power,
-            # even when the quota resources themselves were requested best-effort.
-            failed = True
-        self._save_resource_records(db, row, receipt, state)
-        return failed
-
-    def _record_tmpfs_setup(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-        *,
-        code: str,
-        setup: Mapping[str, object] | None,
-    ) -> bool:
-        names = self._tmpfs_resource_names(row)
-        if not names:
-            return False
-        receipt = self._row_resource_receipt(row)
-        state = self._row_resource_state(row)
-        contract = self._row_resource_contract(row)
-        requested = self._row_resources(row)
-        applied = receipt["applied"]
-        if not isinstance(applied, dict):
-            raise CoordinatorError("resource receipt application record is not mutable")
-        required_failure = False
-        if code == "ok":
-            if setup is None:
-                raise CoordinatorError("successful tmpfs setup has no private setup record")
-            values = {
-                "tmpfs": setup["size"],
-                "inodes": setup["inodes"],
-            }
-            for name in names:
-                value = values[str(contract[name]["kind"])]
-                if (
-                    not isinstance(value, int)
-                    or isinstance(value, bool)
-                    or value <= 0
-                    or value > requested[name]
-                ):
-                    raise CoordinatorError("tmpfs setup applied an invalid capacity")
-                applied[name] = value
-                self._append_resource_event(
-                    receipt,
-                    backend=CGROUP_BACKEND,
-                    resource=name,
-                    stage="attach",
-                    status="applied",
-                    code="tmpfs-mounted",
-                )
-        else:
-            if not _SETUP_CODE.fullmatch(code):
-                code = "tmpfs-setup-failed"
-            namespace_failure = code.startswith("namespace-") or code in {
-                "controller-files-exposed",
-                "tmpfs-namespace-required",
-            }
-            for name in names:
-                mode = str(contract[name]["mode"])
-                self._append_resource_event(
-                    receipt,
-                    backend=CGROUP_BACKEND,
-                    resource=name,
-                    stage="attach",
-                    status="failed" if mode == "required" else "unapplied",
-                    code=code,
-                )
-                required_failure = required_failure or mode == "required"
-            if namespace_failure:
-                required_failure = required_failure or any(
-                    binding["backend"] == CGROUP_BACKEND
-                    and binding["mode"] == "required"
-                    for binding in contract.values()
-                )
-            record = state.get(CGROUP_BACKEND)
-            if isinstance(record, dict):
-                record["resources"] = [
-                    name
-                    for name in record["resources"]
-                    if name not in names
-                ]
-        self._save_resource_records(db, row, receipt, state)
-        return required_failure
-
-    def _prepare_tmpfs_setup(
-        self,
-        db: sqlite3.Connection,
-        row: sqlite3.Row,
-        target: Path,
-    ) -> dict[str, object] | None:
-        names = self._tmpfs_resource_names(row)
-        if not names:
-            return None
-        state = self._row_resource_state(row)
-        record = state.get(CGROUP_BACKEND)
-        backend = self.resource_backends.get(CGROUP_BACKEND)
-        try:
-            if record is None or not isinstance(backend, CgroupV2Backend):
-                raise ResourceContractError("tmpfs cgroup state is unavailable")
-            request = self._resource_request(
-                row,
-                CGROUP_BACKEND,
-                record["resources"],
-            )
-            raw = backend.tmpfs_setup(request, record["handle"], target)
-            if not isinstance(raw, Mapping):
-                raise ResourceContractError("tmpfs setup is unavailable")
-            setup = dict(raw)
-            if (
-                set(setup)
-                != {"version", "target", "size", "inodes", "report", "token"}
-                or type(setup["version"]) is not int
-                or setup["version"] != 1
-                or setup["target"] != str(target)
-                or not isinstance(setup["report"], str)
-                or not Path(setup["report"]).is_absolute()
-                or not isinstance(setup["token"], str)
-                or not re.fullmatch(r"[0-9a-f]{32}", setup["token"])
-                or not isinstance(setup["size"], int)
-                or isinstance(setup["size"], bool)
-                or setup["size"] <= 0
-                or not isinstance(setup["inodes"], int)
-                or isinstance(setup["inodes"], bool)
-                or setup["inodes"] <= 0
-            ):
-                raise ResourceContractError("tmpfs setup is invalid")
-        except Exception as exc:
-            code = _resource_failure_code(exc, "tmpfs-setup-failed")
-            if self._record_tmpfs_setup(db, row, code=code, setup=None):
-                raise _ResourceEnforcementError(
-                    "a required tmpfs could not be prepared"
-                ) from exc
-            return None
-        return setup
-
-    @staticmethod
-    def _read_worker_setup(descriptor: int, *, timeout: float = 5.0) -> str:
-        readable, _writable, _exceptional = select.select(
-            [descriptor],
-            [],
-            [],
-            timeout,
-        )
-        if not readable:
-            return "tmpfs-setup-timeout"
-        try:
-            payload = os.read(descriptor, 128).decode("ascii")
-        except (OSError, UnicodeError):
-            return "tmpfs-setup-failed"
-        return payload if _SETUP_CODE.fullmatch(payload) else "tmpfs-setup-invalid"
-
-    def _start_worker(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
-        run_id = row["run_id"]
-        command = json.loads(row["command_json"])
-        log_path = self._log_path(run_id)
-        environment = json.loads(row["environment_json"])
-        if not isinstance(environment, dict) or not all(
-            isinstance(key, str) and key and "=" not in key and "\0" not in key
-            and isinstance(value, str) and "\0" not in value
-            for key, value in environment.items()
-        ):
-            raise CoordinatorError(
-                f"gate run {run_id} has an invalid stored environment"
-            )
-        environment[RUN_ID_ENV] = run_id
-        environment[RUN_KIND_ENV] = row["kind"]
-        environment[STATE_DIR_ENV] = str(self.paths.state_dir)
-        environment.pop(CGROUP_ISOLATE_ENV, None)
-        environment.pop(PROJECT_QUOTA_DROP_ENV, None)
-        environment.pop(TMPFS_SETUP_ENV, None)
-        for variable in ("TMPDIR", "TMP", "TEMP"):
-            environment.pop(variable, None)
-        worker_tmp = self._worker_tmp_path(run_id)
-        release_read = -1
-        release_write = -1
-        setup_read = -1
-        setup_write = -1
-        process: subprocess.Popen[bytes] | None = None
-        released = False
-        try:
-            self._prepare_resources(db, row)
-            prepared_row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            prepared_state = self._row_resource_state(prepared_row)
-            cgroup_backend = self.resource_backends.get(CGROUP_BACKEND)
-            if (
-                CGROUP_BACKEND in prepared_state
-                and isinstance(cgroup_backend, CgroupV2Backend)
-                and cgroup_backend.isolate_workers
-            ):
-                environment[CGROUP_ISOLATE_ENV] = "1"
-            if row["kind"] in {"full", "merge", "land"}:
-                _assert_clean_head(Path(row["checkout"]), row["head_sha"])
-            worker_command = command
-            if row["kind"] == "land":
-                worker_command = [
-                    sys.executable,
-                    "-m",
-                    "agcoord.land",
-                    "--run-id",
-                    run_id,
-                    "--state-dir",
-                    str(self.paths.state_dir),
-                    "--checkout",
-                    row["checkout"],
-                    "--branch",
-                    row["branch"],
-                    "--head-sha",
-                    row["head_sha"],
-                    "--adapter",
-                    row["publication_adapter"],
-                    "--request-json",
-                    row["publication_request"],
-                    "--",
-                    *command,
-                ]
-            prepared_row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            quota_scratch = self._project_quota_scratch_path(db, prepared_row)
-            tmpfs_requested = bool(self._tmpfs_resource_names(prepared_row))
-            scratch_target = quota_scratch
-            tmpfs_setup = None
-            if tmpfs_requested:
-                scratch_target = worker_tmp
-                scratch_target.mkdir(mode=0o700)
-                scratch_target.chmod(0o700)
-                tmpfs_setup = self._prepare_tmpfs_setup(
-                    db,
-                    prepared_row,
-                    scratch_target,
-                )
-                if tmpfs_setup is None:
-                    scratch_target = None
-            elif quota_scratch is not None:
-                environment[PROJECT_QUOTA_DROP_ENV] = "1"
-            if tmpfs_setup is not None:
-                environment[TMPFS_SETUP_ENV] = json.dumps(
-                    tmpfs_setup,
-                    separators=(",", ":"),
-                )
-            if scratch_target is not None:
-                for variable in ("TMPDIR", "TMP", "TEMP"):
-                    environment[variable] = str(scratch_target)
-            release_read, release_write = os.pipe()
-            worker_setup_required = tmpfs_setup is not None or quota_scratch is not None
-            if worker_setup_required:
-                setup_read, setup_write = os.pipe()
-            with log_path.open("ab", buffering=0) as output:
-                log_path.chmod(0o600)
-                process = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-c",
-                        _WORKER_LAUNCHER,
-                        str(release_read),
-                        str(setup_write),
-                        *worker_command,
-                    ],
-                    cwd=row["checkout"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=subprocess.STDOUT,
-                    env=environment,
-                    start_new_session=True,
-                    pass_fds=(
-                        (release_read,)
-                        if setup_write < 0
-                        else (release_read, setup_write)
-                    ),
-                )
-            os.close(release_read)
-            release_read = -1
-            if setup_write >= 0:
-                os.close(setup_write)
-                setup_write = -1
-            token = _process_start_token(process.pid)
-            if token is None:
-                raise CoordinatorError(
-                    f"could not identify gate launcher process {process.pid}"
-                )
-            prepared_row = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            self._attach_resources(db, prepared_row, process.pid)
-            db.execute(
-                "UPDATE runs SET worker_pid = ?, worker_start_token = ?, "
-                "environment_json = '{}' WHERE run_id = ?",
-                (process.pid, token, run_id),
-            )
-            # The launcher cannot exec the requested command until this identity is
-            # durable. If the broker dies before commit/release, pipe EOF makes it exit;
-            # the row can never roll back to queued beside a live duplicate.
-            db.commit()
-            self._children[run_id] = process
-            os.write(release_write, b"1")
-            if worker_setup_required:
-                setup_code = self._read_worker_setup(setup_read)
-                os.close(setup_read)
-                setup_read = -1
-                setup_row = db.execute(
-                    "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                if tmpfs_setup is not None:
-                    setup_failure = self._record_tmpfs_setup(
-                        db,
-                        setup_row,
-                        code=setup_code,
-                        setup=tmpfs_setup,
-                    )
-                else:
-                    setup_failure = self._record_project_quota_worker_setup(
-                        db,
-                        setup_row,
-                        code=setup_code,
-                    )
-                db.commit()
-                os.write(release_write, b"0" if setup_failure else b"1")
-                if setup_failure:
-                    raise _ResourceEnforcementError(
-                        "required worker resource setup failed"
-                    )
-            released = True
-        except Exception as exc:
-            self._children.pop(run_id, None)
-            self._group_drain_started.pop(run_id, None)
-            if process is not None and not released:
-                os.close(release_write)
-                release_write = -1
-                try:
-                    process.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait(timeout=1.0)
-            refreshed = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            try:
-                receipt = self._row_resource_receipt(refreshed)
-                resource_state = self._row_resource_state(refreshed)
-                if resource_state:
-                    self._cleanup_resource_records(
-                        refreshed,
-                        receipt,
-                        resource_state,
-                    )
-                    self._save_resource_records(
-                        db,
-                        refreshed,
-                        receipt,
-                        resource_state,
-                    )
-            except Exception as cleanup_exc:
-                self._append_daemon_log(
-                    f"resource rollback failed for {run_id}: "
-                    f"{type(cleanup_exc).__name__}"
-                )
-            with log_path.open("a", encoding="utf-8") as output:
-                output.write(f"Gate coordinator: could not start worker: {exc}\n")
-            log_path.chmod(0o600)
-            if not self._remove_worker_tmp(run_id):
-                db.execute(
-                    "UPDATE runs SET environment_json = '{}' WHERE run_id = ?",
-                    (run_id,),
-                )
-                return
-            resource_failure = isinstance(exc, _ResourceEnforcementError)
-            failure_reason = (
-                "resource-enforcement-failed"
-                if resource_failure
-                else ("merge-error" if row["kind"] == "merge" else None)
-            )
-            db.execute(
-                "UPDATE runs SET status = 'failed', phase = 'complete', "
-                "finished_at = ?, exit_status = ?, "
-                "failure_reason = ?, environment_json = '{}' WHERE run_id = ?",
-                (_now(), 125 if resource_failure else 127, failure_reason, run_id),
-            )
-            self._prune(db)
-        finally:
-            if release_read >= 0:
-                os.close(release_read)
-            if release_write >= 0:
-                os.close(release_write)
-            if setup_read >= 0:
-                os.close(setup_read)
-            if setup_write >= 0:
-                os.close(setup_write)
-
-    def _failure_reason_for(
-        self,
-        row: sqlite3.Row,
-        *,
-        status: str,
-        exit_status: int | None,
-    ) -> str | None:
-        if status != "failed":
-            return None
-        receipt = self._row_resource_receipt(row)
-        if any(event["code"] == "memory-oom" for event in receipt["events"]):
-            return "memory-oom"
-        if row["kind"] not in {"merge", "land"}:
-            return None
-        from .merge import FAILURE_REASONS
-
-        if (
-            row["kind"] == "land"
-            and row["phase"] == "gating"
-            and row["gate_exit_status"] is not None
-        ):
-            return "gate-failed"
-        return FAILURE_REASONS.get(exit_status, "merge-error")
-
-    def _observe_active(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
-        run_id = row["run_id"]
-        child = self._children.get(run_id)
-        if child is not None:
-            returncode = child.poll()
-            if returncode is None:
-                self._capture_resource_usage(db, row, final=False)
-                refreshed = db.execute(
-                    "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                self._escalate_cancel(db, refreshed)
-                return
-            if not self._drain_finished_process_group(row):
-                return
-            self._finish_and_cleanup_resources(db, row)
-            if not self._remove_worker_tmp(run_id):
-                return
-            refreshed = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            exit_status = _shell_status(returncode)
-            if refreshed["cancel_requested"]:
-                status = "cancelled"
-                exit_status = 130
-            else:
-                status = "passed" if exit_status == 0 else "failed"
-            failure_reason = self._failure_reason_for(
-                refreshed,
-                status=status,
-                exit_status=exit_status,
-            )
-            db.execute(
-                "UPDATE runs SET status = ?, phase = 'complete', finished_at = ?, exit_status = ?, "
-                "failure_reason = ? "
-                "WHERE run_id = ?",
-                (status, _now(), exit_status, failure_reason, run_id),
-            )
-            self._prune(db)
-            # Keep the owned Popen until the terminal row update succeeds. A transient
-            # writer lock can roll this transaction back; retaining the child preserves
-            # its already-observed return code for the next pump attempt.
-            self._children.pop(run_id, None)
-            self._group_drain_started.pop(run_id, None)
-            return
-
-        # A broker can be SIGKILLed while its process group remains. The replacement does
-        # not launch a second worker: it observes the exact pid+start token until the old
-        # group ends, preserving the coordinator as the sole exclusion boundary.
-        if _same_process(row["worker_pid"], row["worker_start_token"]):
-            self._capture_resource_usage(db, row, final=False)
-            refreshed = db.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            self._escalate_cancel(db, refreshed)
-            return
-        if not self._drain_finished_process_group(row):
-            return
-        self._finish_and_cleanup_resources(db, row)
-        if not self._remove_worker_tmp(run_id):
-            return
-        self._group_drain_started.pop(run_id, None)
-        # Re-read after the process disappears: a recovered land worker durably reports
-        # immediately before exit, potentially after this pump's initial active snapshot.
-        refreshed = db.execute(
-            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if refreshed["cancel_requested"]:
-            status = "cancelled"
-            exit_status = 130
-        elif refreshed["kind"] == "land" and refreshed["reported_exit_status"] is not None:
-            exit_status = refreshed["reported_exit_status"]
-            status = "passed" if exit_status == 0 else "failed"
-        else:
-            status = "interrupted"
-            exit_status = None
-        failure_reason = self._failure_reason_for(
-            refreshed,
-            status=status,
-            exit_status=exit_status,
-        )
-        db.execute(
-            "UPDATE runs SET status = ?, phase = 'complete', finished_at = ?, "
-            "exit_status = ?, failure_reason = ? WHERE run_id = ?",
-            (status, _now(), exit_status, failure_reason, run_id),
-        )
-        self._prune(db)
-
-    def _escalate_cancel(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
-        if not row["cancel_requested"]:
-            return
-        self._cancel_resources(db, row)
-        requested = _parse_time(row["cancel_requested_at"])
-        if requested is None:
-            return
-        elapsed = (datetime.now(timezone.utc) - requested).total_seconds()
-        self._signal_worker(
-            row,
-            signal.SIGKILL if elapsed >= CANCEL_GRACE_SECONDS else signal.SIGTERM,
-        )
-
-    def _signal_worker(self, row: sqlite3.Row, sent: signal.Signals) -> None:
-        pid = row["worker_pid"]
-        if not _same_process(pid, row["worker_start_token"]):
-            return
-        try:
-            os.killpg(pid, sent)
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            raise CoordinatorError(
-                f"cannot signal gate worker {pid}: {exc}"
-            ) from exc
-
-    def _prune(self, db: sqlite3.Connection) -> None:
-        stale = db.execute(
-            """
-            SELECT run_id FROM runs
-            WHERE status IN ('passed', 'failed', 'cancelled', 'interrupted')
-              AND run_id NOT IN (
-                  SELECT gate_run_id FROM runs
-                  WHERE kind = 'merge' AND status IN ('queued', 'running')
-                    AND gate_run_id IS NOT NULL
-              )
-            ORDER BY sequence DESC LIMIT -1 OFFSET ?
-            """,
-            (self.recent_limit,),
-        ).fetchall()
-        for row in stale:
-            if not self._remove_worker_tmp(row["run_id"]):
-                continue
-            self._log_path(row["run_id"]).unlink(missing_ok=True)
-            db.execute("DELETE FROM runs WHERE run_id = ?", (row["run_id"],))
-
-    def _should_idle_exit(self) -> bool:
-        try:
-            with self._db_lock, self._connect() as db:
-                maintenance = _maintenance_record(db)
-                activity = db.execute(
-                    "SELECT value FROM coordinator_meta WHERE key = 'last_activity'"
-                ).fetchone()
-                live = db.execute(
-                    "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')"
-                ).fetchone()[0]
-        except sqlite3.OperationalError as exc:
-            if not _transient_database_error(exc):
-                raise
-            # A health check that cannot read the live-row count cannot prove idleness.
-            # Treat contention as "not idle" and let the next pump iteration retry.
-            self._append_daemon_log(
-                f"idle check database contention; retrying: {exc}"
-            )
-            return False
-        if live:
-            return False
-        if maintenance is not None:
-            if maintenance["maintenance_state"] != "drained":
-                with self._db_lock, self._connect() as db:
-                    db.execute(
-                        "UPDATE coordinator_meta SET value = 'drained' "
-                        "WHERE key = 'maintenance_state'"
-                    )
-            return True
-        if self.idle_timeout is None:
-            return False
-        last_activity = float(activity["value"]) if activity is not None else 0.0
-        return time.time() - last_activity >= self.idle_timeout
-
-    def _append_daemon_log(self, message: str) -> None:
-        try:
-            with self.paths.daemon_log.open("a", encoding="utf-8") as output:
-                output.write(f"{_now()} {message}\n")
-            self.paths.daemon_log.chmod(0o600)
-        except OSError:
-            pass
 
 def _validate_command(command: Any) -> list[str]:
     if not isinstance(command, (list, tuple)) or not command:
@@ -4658,17 +905,9 @@ class CoordinatorClient:
         self.autostart = autostart
         self.host_maintenance = host_maintenance
         self.connect_timeout = connect_timeout
-        self._catalogue_instance: CoordinatorBroker | None = None
         self._native_command_instance: NativeBrokerCommand | None = None
         self._native_callback_command_instance: NativeBrokerCommand | None = None
 
-    def _catalogue(self) -> CoordinatorBroker:
-        if self._catalogue_instance is None:
-            self._catalogue_instance = CoordinatorBroker(
-                self.paths.state_dir,
-                idle_timeout=None,
-            )
-        return self._catalogue_instance
 
     def _native_command(self) -> NativeBrokerCommand:
         if self._native_command_instance is None:
@@ -4794,15 +1033,6 @@ class CoordinatorClient:
             db.row_factory = sqlite3.Row
             if _maintenance_record(db) is None:
                 return None
-        if protocol == PROTOCOL:
-            try:
-                return _validated_maintenance_receipt(
-                    _legacy_maintenance_status(self.paths, transition=True)
-                )
-            except CoordinatorError as exc:
-                if str(exc) == "coordinator is not draining":
-                    return None
-                raise
         if protocol == NATIVE_PROTOCOL:
             try:
                 result = self._native_invoke("drain-status")
@@ -4879,11 +1109,10 @@ class CoordinatorClient:
                 raise
             break
         if owner is not None:
-            if owner["protocol"] == NATIVE_PROTOCOL:
-                self._validate_native_owner(
-                    owner,
-                    admitted_callback=admitted_callback,
-                )
+            self._validate_native_owner(
+                owner,
+                admitted_callback=admitted_callback,
+            )
             if for_submission:
                 maintenance = self._maintenance_if_active()
                 if maintenance is not None:
@@ -4893,18 +1122,8 @@ class CoordinatorClient:
                         "until resume",
                         code="broker-draining",
                     )
-            if owner["protocol"] == PROTOCOL:
-                if self.autostart:
-                    raise CoordinatorError(
-                        "a legacy protocol-4 Python broker still owns this state directory; "
-                        "let it finish and stop, then run 'agc migrate' before retrying"
-                    )
-            elif owner["protocol"] != NATIVE_PROTOCOL:
-                raise CoordinatorError(
-                    f"gate coordinator protocol mismatch: broker has "
-                    f"{owner['protocol']}; client supports {PROTOCOL} and "
-                    f"{NATIVE_PROTOCOL}"
-                )
+            if owner["protocol"] != NATIVE_PROTOCOL:
+                raise _pre_native_spool_refusal(self.paths, owner["protocol"])
             return self._public_owner(owner)
         if maintenance is not None:
             if (
@@ -4967,28 +1186,14 @@ class CoordinatorClient:
             exact_head=kind == "full",
         )
         owner = self._ensure_broker(for_submission=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            return self._native_submit(
-                selected_command,
-                kind=kind,
-                label=label.strip(),
-                resources=resources,
-                agent=agent,
-                prepared=prepared,
-                owner=owner,
-            )
-        return self._catalogue().submit(
-            command,
-            checkout=checkout,
+        return self._native_submit(
+            selected_command,
             kind=kind,
-            label=label,
+            label=label.strip(),
             resources=resources,
             agent=agent,
-            repository=repository,
-            branch=branch,
-            head_sha=head_sha,
-            caller_pid=caller_pid,
-            environment=environment,
+            prepared=prepared,
+            owner=owner,
         )
 
     def _prepare_submission(
@@ -5162,29 +1367,14 @@ class CoordinatorClient:
             exact_head=True,
         )
         owner = self._ensure_broker(for_submission=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            return self._native_submit_merge(
-                adapter,
-                request,
-                gate_run_id=gate_run_id,
-                resources=resources,
-                agent=agent,
-                prepared=prepared,
-                owner=owner,
-            )
-        return self._catalogue().submit_merge(
+        return self._native_submit_merge(
             adapter,
             request,
-            checkout=checkout,
             gate_run_id=gate_run_id,
             resources=resources,
             agent=agent,
-            repository=repository,
-            branch=branch,
-            head_sha=head_sha,
-            caller_pid=caller_pid,
-            environment=environment,
-            worker_python=sys.executable,
+            prepared=prepared,
+            owner=owner,
         )
 
     def _native_submit_merge(
@@ -5278,34 +1468,17 @@ class CoordinatorClient:
             exact_head=True,
         )
         owner = self._ensure_broker(for_submission=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            return self._native_submit_land(
-                adapter,
-                request,
-                selected_command,
-                label=label.strip(),
-                resources=resources,
-                agent=agent,
-                prepared=prepared,
-                synchronize_target=synchronize_target,
-                avoid_commits=selected_avoid,
-                owner=owner,
-            )
-        return self._catalogue().submit_land(
+        return self._native_submit_land(
             adapter,
             request,
-            command,
-            checkout=checkout,
-            label=label,
+            selected_command,
+            label=label.strip(),
             resources=resources,
             agent=agent,
-            repository=repository,
-            branch=branch,
-            head_sha=head_sha,
-            caller_pid=caller_pid,
-            environment=environment,
+            prepared=prepared,
             synchronize_target=synchronize_target,
             avoid_commits=selected_avoid,
+            owner=owner,
         )
 
     def _native_submit_land(
@@ -5369,20 +1542,15 @@ class CoordinatorClient:
         maintenance = self._maintenance_if_active()
         if maintenance is not None:
             maintenance = self._recover_native_drain(maintenance)
-            if maintenance["protocol"] == PROTOCOL:
-                return self._catalogue().snapshot()
-            if maintenance["protocol"] == NATIVE_PROTOCOL:
-                result = self._native_invoke("snapshot")
-                if not isinstance(result, dict):
-                    raise CoordinatorError("native broker returned an invalid snapshot")
-                return result
-        owner = self._ensure_broker()
-        if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("snapshot")
             if not isinstance(result, dict):
                 raise CoordinatorError("native broker returned an invalid snapshot")
             return result
-        return self._catalogue().snapshot()
+        self._ensure_broker()
+        result = self._native_invoke("snapshot")
+        if not isinstance(result, dict):
+            raise CoordinatorError("native broker returned an invalid snapshot")
+        return result
 
     def status(self, run_id: str) -> dict[str, Any]:
         return self._status(run_id, admitted_callback=False)
@@ -5399,54 +1567,42 @@ class CoordinatorClient:
         admitted_callback: bool,
     ) -> dict[str, Any]:
         if admitted_callback:
-            owner = self._ensure_broker(admitted_callback=True)
-            if owner["protocol"] == NATIVE_PROTOCOL:
-                result = self._native_callback_invoke(
-                    "status",
-                    ("--run-id", run_id),
-                )
-                if not isinstance(result, dict) or result.get("run_id") != run_id:
-                    raise CoordinatorError("native broker returned an invalid run status")
-                return result
-            return self._catalogue().status(run_id)
+            self._ensure_broker(admitted_callback=True)
+            result = self._native_callback_invoke(
+                "status",
+                ("--run-id", run_id),
+            )
+            if not isinstance(result, dict) or result.get("run_id") != run_id:
+                raise CoordinatorError("native broker returned an invalid run status")
+            return result
         maintenance = self._maintenance_if_active()
         if maintenance is not None:
             maintenance = self._recover_native_drain(maintenance)
-            if maintenance["protocol"] == PROTOCOL:
-                return self._catalogue().status(run_id)
-            if maintenance["protocol"] == NATIVE_PROTOCOL:
-                result = self._native_invoke("status", ("--run-id", run_id))
-                if not isinstance(result, dict):
-                    raise CoordinatorError("native broker returned an invalid run status")
-                return result
-        owner = self._ensure_broker()
-        if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("status", ("--run-id", run_id))
             if not isinstance(result, dict):
                 raise CoordinatorError("native broker returned an invalid run status")
             return result
-        return self._catalogue().status(run_id)
+        self._ensure_broker()
+        result = self._native_invoke("status", ("--run-id", run_id))
+        if not isinstance(result, dict):
+            raise CoordinatorError("native broker returned an invalid run status")
+        return result
 
     def cancel(self, run_id: str) -> dict[str, Any]:
         maintenance = self._maintenance_if_active()
         if maintenance is not None:
             maintenance = self._recover_native_drain(maintenance)
-            if maintenance["protocol"] == PROTOCOL:
-                return self._catalogue().cancel(run_id)
-            if maintenance["protocol"] == NATIVE_PROTOCOL:
-                result = self._native_invoke("cancel", ("--run-id", run_id))
-                if not isinstance(result, dict):
-                    raise CoordinatorError(
-                        "native broker returned an invalid cancellation receipt"
-                    )
-                return result
-        owner = self._ensure_broker()
-        if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke("cancel", ("--run-id", run_id))
             if not isinstance(result, dict):
-                raise CoordinatorError("native broker returned an invalid cancellation receipt")
+                raise CoordinatorError(
+                    "native broker returned an invalid cancellation receipt"
+                )
             return result
-        return self._catalogue().cancel(run_id)
+        self._ensure_broker()
+        result = self._native_invoke("cancel", ("--run-id", run_id))
+        if not isinstance(result, dict):
+            raise CoordinatorError("native broker returned an invalid cancellation receipt")
+        return result
 
     def clear(self) -> dict[str, int]:
         maintenance = self._maintenance_if_active()
@@ -5454,28 +1610,16 @@ class CoordinatorClient:
             raise CoordinatorError(
                 f"cannot clear history while the coordinator is {maintenance['state']}"
             )
-        owner = self._ensure_broker()
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            result = self._native_invoke("clear")
-            if (
-                not isinstance(result, dict)
-                or set(result) != {"cleared"}
-                or not isinstance(result["cleared"], int)
-            ):
-                raise CoordinatorError("native broker returned an invalid clear receipt")
-            return result
-        return self._catalogue().clear()
-
-    def migrate(self) -> dict[str, Any]:
-        """Run the selected executable's explicit idle-spool migration."""
-        if _read_broker_owner(self.paths) is not None:
-            raise CoordinatorError(
-                "cannot migrate while a gate broker owns the state directory"
-            )
-        result = self._native_invoke("migrate")
-        if not isinstance(result, dict):
-            raise CoordinatorError("native broker returned an invalid migration receipt")
+        self._ensure_broker()
+        result = self._native_invoke("clear")
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"cleared"}
+            or not isinstance(result["cleared"], int)
+        ):
+            raise CoordinatorError("native broker returned an invalid clear receipt")
         return result
+
 
     def drain(
         self,
@@ -5504,13 +1648,7 @@ class CoordinatorClient:
                 f"no gate queue database exists at {self.paths.database}"
             )
         drain_id = f"drain-{uuid4().hex[:12]}"
-        if protocol == PROTOCOL:
-            result = _legacy_begin_drain(
-                self.paths,
-                drain_id=drain_id,
-                reason=reason.strip(),
-            )
-        elif protocol == NATIVE_PROTOCOL:
+        if protocol == NATIVE_PROTOCOL:
             result = self._native_invoke(
                 "drain",
                 ("--drain-id", drain_id, "--reason", reason.strip()),
@@ -5533,9 +1671,7 @@ class CoordinatorClient:
     def drain_status(self) -> dict[str, Any]:
         """Return the validated durable drain status without starting a broker."""
         protocol = _spool_protocol(self.paths)
-        if protocol == PROTOCOL:
-            result = _legacy_maintenance_status(self.paths, transition=True)
-        elif protocol == NATIVE_PROTOCOL:
+        if protocol == NATIVE_PROTOCOL:
             result = self._native_invoke("drain-status")
         elif protocol is None:
             raise CoordinatorError(
@@ -5552,9 +1688,7 @@ class CoordinatorClient:
         if not isinstance(drain_id, str) or not _DRAIN_ID.fullmatch(drain_id):
             raise CoordinatorError("maintenance drain ID is invalid")
         protocol = _spool_protocol(self.paths)
-        if protocol == PROTOCOL:
-            result = _legacy_resume(self.paths, drain_id)
-        elif protocol == NATIVE_PROTOCOL:
+        if protocol == NATIVE_PROTOCOL:
             result = self._native_invoke(
                 "resume",
                 ("--drain-id", drain_id),
@@ -5596,53 +1730,46 @@ class CoordinatorClient:
                 "child CPU lease parent does not match the admitted run context"
             )
         selected_minimum = requested if minimum is None else minimum
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            if (
-                not isinstance(requested, int)
-                or isinstance(requested, bool)
-                or requested <= 0
-            ):
-                raise CoordinatorError("child CPU lease request must be a positive integer")
-            if (
-                not isinstance(selected_minimum, int)
-                or isinstance(selected_minimum, bool)
-                or selected_minimum <= 0
-                or selected_minimum > requested
-            ):
-                raise CoordinatorError(
-                    "child CPU lease minimum must be positive and no greater than requested"
-                )
-            owner_pid = os.getpid()
-            owner_token = _process_start_token(owner_pid)
-            if owner_token is None:
-                raise CoordinatorError("cannot identify child CPU lease owner process")
-            lease_id = f"cpu-lease-{uuid4().hex[:12]}"
-            row = self._native_callback_invoke(
-                "lease-request",
-                (
-                    "--lease-id",
-                    lease_id,
-                    "--run-id",
-                    selected_run,
-                    "--requested",
-                    str(requested),
-                    "--minimum",
-                    str(selected_minimum),
-                    "--owner-pid",
-                    str(owner_pid),
-                    "--owner-start-token",
-                    owner_token,
-                ),
+        self._ensure_broker(admitted_callback=True)
+        if (
+            not isinstance(requested, int)
+            or isinstance(requested, bool)
+            or requested <= 0
+        ):
+            raise CoordinatorError("child CPU lease request must be a positive integer")
+        if (
+            not isinstance(selected_minimum, int)
+            or isinstance(selected_minimum, bool)
+            or selected_minimum <= 0
+            or selected_minimum > requested
+        ):
+            raise CoordinatorError(
+                "child CPU lease minimum must be positive and no greater than requested"
             )
-            if not isinstance(row, dict) or row.get("lease_id") != lease_id:
-                raise CoordinatorError("native broker returned an invalid child lease receipt")
-        else:
-            row = self._catalogue().request_child_cpu_lease(
+        owner_pid = os.getpid()
+        owner_token = _process_start_token(owner_pid)
+        if owner_token is None:
+            raise CoordinatorError("cannot identify child CPU lease owner process")
+        lease_id = f"cpu-lease-{uuid4().hex[:12]}"
+        row = self._native_callback_invoke(
+            "lease-request",
+            (
+                "--lease-id",
+                lease_id,
+                "--run-id",
                 selected_run,
-                requested=requested,
-                minimum=selected_minimum,
-            )
+                "--requested",
+                str(requested),
+                "--minimum",
+                str(selected_minimum),
+                "--owner-pid",
+                str(owner_pid),
+                "--owner-start-token",
+                owner_token,
+            ),
+        )
+        if not isinstance(row, dict) or row.get("lease_id") != lease_id:
+            raise CoordinatorError("native broker returned an invalid child lease receipt")
         lease_id = row["lease_id"]
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
@@ -5677,20 +1804,18 @@ class CoordinatorClient:
 
     def _child_cpu_lease_status(self, lease_id: str) -> dict[str, Any]:
         run_id = self._admitted_callback_run_id()
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            result = self._native_callback_invoke(
-                "lease-status",
-                ("--lease-id", lease_id),
-            )
-            if (
-                not isinstance(result, dict)
-                or result.get("lease_id") != lease_id
-                or result.get("run_id") != run_id
-            ):
-                raise CoordinatorError("native broker returned an invalid child lease status")
-            return result
-        result = self._catalogue().child_cpu_lease_status(lease_id)
+        self._ensure_broker(admitted_callback=True)
+        result = self._native_callback_invoke(
+            "lease-status",
+            ("--lease-id", lease_id),
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("lease_id") != lease_id
+            or result.get("run_id") != run_id
+        ):
+            raise CoordinatorError("native broker returned an invalid child lease status")
+        return result
         if result.get("run_id") != run_id:
             raise CoordinatorError("child CPU lease does not belong to the admitted run")
         return result
@@ -5701,39 +1826,30 @@ class CoordinatorClient:
         *,
         include_terminal: bool = False,
     ) -> list[dict[str, Any]]:
-        owner = self._ensure_broker()
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            arguments: list[str] = []
-            if run_id is not None:
-                if not isinstance(run_id, str) or not run_id:
-                    raise CoordinatorError("child CPU lease parent run ID must be non-empty")
-                arguments.extend(("--run-id", run_id))
-            if include_terminal:
-                arguments.append("--include-terminal")
-            result = self._native_invoke("lease-list", arguments)
-            if not isinstance(result, list) or any(
-                not isinstance(row, dict) for row in result
-            ):
-                raise CoordinatorError("native broker returned an invalid child lease list")
-            return result
-        return self._catalogue().child_cpu_leases(
-            run_id,
-            include_terminal=include_terminal,
-        )
+        self._ensure_broker()
+        arguments: list[str] = []
+        if run_id is not None:
+            if not isinstance(run_id, str) or not run_id:
+                raise CoordinatorError("child CPU lease parent run ID must be non-empty")
+            arguments.extend(("--run-id", run_id))
+        if include_terminal:
+            arguments.append("--include-terminal")
+        result = self._native_invoke("lease-list", arguments)
+        if not isinstance(result, list) or any(
+            not isinstance(row, dict) for row in result
+        ):
+            raise CoordinatorError("native broker returned an invalid child lease list")
+        return result
 
     def release_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
         self._admitted_callback_run_id()
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            return self._native_finish_child_lease(lease_id, "lease-release")
-        return self._catalogue().release_child_cpu_lease(lease_id)
+        self._ensure_broker(admitted_callback=True)
+        return self._native_finish_child_lease(lease_id, "lease-release")
 
     def cancel_child_cpu_lease(self, lease_id: str) -> dict[str, Any]:
         self._admitted_callback_run_id()
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            return self._native_finish_child_lease(lease_id, "lease-cancel")
-        return self._catalogue().cancel_child_cpu_lease(lease_id)
+        self._ensure_broker(admitted_callback=True)
+        return self._native_finish_child_lease(lease_id, "lease-cancel")
 
     def _native_finish_child_lease(
         self,
@@ -5776,42 +1892,34 @@ class CoordinatorClient:
         worker_pid: int,
     ) -> None:
         self._assert_admitted_callback(run_id)
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            if kind not in {"full", "merge", "land"}:
-                raise CoordinatorError(
-                    "broker admission kind must be 'full', 'merge', or 'land'"
-                )
-            token = _process_start_token(worker_pid)
-            if token is None:
-                raise CoordinatorError("cannot identify admitted worker process")
-            result = self._native_callback_invoke(
-                "verify",
-                (
-                    "--run-id",
-                    run_id,
-                    "--kind",
-                    kind,
-                    "--worker-pid",
-                    str(worker_pid),
-                    "--worker-start-token",
-                    token,
-                    "--checkout",
-                    str(_absolute(checkout)),
-                    "--head",
-                    _validate_head_sha(head_sha, required=True) or "",
-                ),
+        self._ensure_broker(admitted_callback=True)
+        if kind not in {"full", "merge", "land"}:
+            raise CoordinatorError(
+                "broker admission kind must be 'full', 'merge', or 'land'"
             )
-            if result != {"verified": True}:
-                raise CoordinatorError("native broker returned an invalid admission receipt")
-            return
-        self._catalogue().verify_admission(
-            run_id,
-            kind=kind,
-            checkout=checkout,
-            head_sha=head_sha,
-            worker_pid=worker_pid,
+        token = _process_start_token(worker_pid)
+        if token is None:
+            raise CoordinatorError("cannot identify admitted worker process")
+        result = self._native_callback_invoke(
+            "verify",
+            (
+                "--run-id",
+                run_id,
+                "--kind",
+                kind,
+                "--worker-pid",
+                str(worker_pid),
+                "--worker-start-token",
+                token,
+                "--checkout",
+                str(_absolute(checkout)),
+                "--head",
+                _validate_head_sha(head_sha, required=True) or "",
+            ),
         )
+        if result != {"verified": True}:
+            raise CoordinatorError("native broker returned an invalid admission receipt")
+        return
 
     def update_land_phase(
         self,
@@ -5823,46 +1931,38 @@ class CoordinatorClient:
         new_head_sha: str | None = None,
     ) -> None:
         self._assert_admitted_callback(run_id)
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            token = _process_start_token(worker_pid)
-            if token is None:
-                raise CoordinatorError("cannot identify admitted land worker process")
-            row = self.admitted_run_status(run_id)
-            arguments = [
-                "--run-id",
-                run_id,
-                "--worker-pid",
-                str(worker_pid),
-                "--worker-start-token",
-                token,
-                "--checkout",
-                str(row["checkout"]),
-                "--head",
-                str(row["head_sha"]),
-                "--phase",
-                phase,
-            ]
-            if gate_exit_status is not None:
-                arguments.extend(("--gate-exit-status", str(gate_exit_status)))
-            if new_head_sha is not None:
-                arguments.extend(
-                    (
-                        "--new-head",
-                        _validate_head_sha(new_head_sha, required=True) or "",
-                    )
-                )
-            result = self._native_callback_invoke("phase", arguments)
-            if not isinstance(result, dict) or result.get("run_id") != run_id:
-                raise CoordinatorError("native broker returned an invalid land phase receipt")
-            return
-        self._catalogue().update_land_phase(
+        self._ensure_broker(admitted_callback=True)
+        token = _process_start_token(worker_pid)
+        if token is None:
+            raise CoordinatorError("cannot identify admitted land worker process")
+        row = self.admitted_run_status(run_id)
+        arguments = [
+            "--run-id",
             run_id,
-            phase=phase,
-            gate_exit_status=gate_exit_status,
-            worker_pid=worker_pid,
-            new_head_sha=new_head_sha,
-        )
+            "--worker-pid",
+            str(worker_pid),
+            "--worker-start-token",
+            token,
+            "--checkout",
+            str(row["checkout"]),
+            "--head",
+            str(row["head_sha"]),
+            "--phase",
+            phase,
+        ]
+        if gate_exit_status is not None:
+            arguments.extend(("--gate-exit-status", str(gate_exit_status)))
+        if new_head_sha is not None:
+            arguments.extend(
+                (
+                    "--new-head",
+                    _validate_head_sha(new_head_sha, required=True) or "",
+                )
+            )
+        result = self._native_callback_invoke("phase", arguments)
+        if not isinstance(result, dict) or result.get("run_id") != run_id:
+            raise CoordinatorError("native broker returned an invalid land phase receipt")
+        return
 
     def report_land_result(
         self,
@@ -5872,32 +1972,26 @@ class CoordinatorClient:
         worker_pid: int,
     ) -> None:
         self._assert_admitted_callback(run_id)
-        owner = self._ensure_broker(admitted_callback=True)
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            token = _process_start_token(worker_pid)
-            if token is None:
-                raise CoordinatorError("cannot identify admitted land worker process")
-            result = self._native_callback_invoke(
-                "report",
-                (
-                    "--run-id",
-                    run_id,
-                    "--worker-pid",
-                    str(worker_pid),
-                    "--worker-start-token",
-                    token,
-                    "--exit-status",
-                    str(exit_status),
-                ),
-            )
-            if result != {"reported": True}:
-                raise CoordinatorError("native broker returned an invalid land result receipt")
-            return
-        self._catalogue().report_land_result(
-            run_id,
-            exit_status=exit_status,
-            worker_pid=worker_pid,
+        self._ensure_broker(admitted_callback=True)
+        token = _process_start_token(worker_pid)
+        if token is None:
+            raise CoordinatorError("cannot identify admitted land worker process")
+        result = self._native_callback_invoke(
+            "report",
+            (
+                "--run-id",
+                run_id,
+                "--worker-pid",
+                str(worker_pid),
+                "--worker-start-token",
+                token,
+                "--exit-status",
+                str(exit_status),
+            ),
         )
+        if result != {"reported": True}:
+            raise CoordinatorError("native broker returned an invalid land result receipt")
+        return
 
     def log(
         self,
@@ -5915,25 +2009,6 @@ class CoordinatorClient:
         maintenance = self._maintenance_if_active()
         if maintenance is not None:
             maintenance = self._recover_native_drain(maintenance)
-            if maintenance["protocol"] == PROTOCOL:
-                return self._catalogue().log(run_id, offset=offset, limit=limit)
-            if maintenance["protocol"] == NATIVE_PROTOCOL:
-                result = self._native_invoke(
-                    "log",
-                    (
-                        "--run-id",
-                        run_id,
-                        "--offset",
-                        str(offset),
-                        "--limit",
-                        str(limit),
-                    ),
-                )
-                if not isinstance(result, dict):
-                    raise CoordinatorError("native broker returned an invalid log page")
-                return result
-        owner = self._ensure_broker()
-        if owner["protocol"] == NATIVE_PROTOCOL:
             result = self._native_invoke(
                 "log",
                 (
@@ -5948,7 +2023,21 @@ class CoordinatorClient:
             if not isinstance(result, dict):
                 raise CoordinatorError("native broker returned an invalid log page")
             return result
-        return self._catalogue().log(run_id, offset=offset, limit=limit)
+        self._ensure_broker()
+        result = self._native_invoke(
+            "log",
+            (
+                "--run-id",
+                run_id,
+                "--offset",
+                str(offset),
+                "--limit",
+                str(limit),
+            ),
+        )
+        if not isinstance(result, dict):
+            raise CoordinatorError("native broker returned an invalid log page")
+        return result
 
     def ping(self) -> dict[str, Any]:
         owner = _read_broker_owner(self.paths)
@@ -5956,17 +2045,9 @@ class CoordinatorClient:
             raise CoordinatorError(
                 f"no gate broker owns {self.paths.state_dir}"
             )
-        if owner["protocol"] == NATIVE_PROTOCOL:
-            self._validate_native_owner(owner)
-        elif owner["protocol"] == PROTOCOL and self.autostart:
-            raise CoordinatorError(
-                "a legacy protocol-4 Python broker still owns this state directory; "
-                "let it finish and stop, then run 'agc migrate' before retrying"
-            )
-        elif owner["protocol"] != PROTOCOL:
-            raise CoordinatorError(
-                f"gate coordinator protocol mismatch: broker has {owner['protocol']}"
-            )
+        if owner["protocol"] != NATIVE_PROTOCOL:
+            raise _pre_native_spool_refusal(self.paths, owner["protocol"])
+        self._validate_native_owner(owner)
         return self._public_owner(owner)
 
     def _start_broker(self) -> None:
@@ -5987,14 +2068,7 @@ class CoordinatorClient:
                     raise exc
                 time.sleep(0.01)
         if existing_protocol is not None and existing_protocol != NATIVE_PROTOCOL:
-            if 1 <= existing_protocol <= PROTOCOL:
-                raise CoordinatorError(
-                    f"gate queue uses protocol {existing_protocol}; run 'agc migrate' "
-                    "while it is idle before starting the native broker"
-                )
-            raise CoordinatorError(
-                f"gate queue protocol {existing_protocol} is unsupported by this client"
-            )
+            raise _pre_native_spool_refusal(self.paths, existing_protocol)
         selected = self._native_command()
         config = broker_config(self.paths.state_dir)
         capacities = configured_capacities(config.capacities)
@@ -6173,9 +2247,6 @@ def wait(client: CoordinatorClient, run_id: str, *, poll_interval: float = 0.1) 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agc queue")
     commands = parser.add_subparsers(dest="command_name", required=True)
-    serve = commands.add_parser("serve", help=argparse.SUPPRESS)
-    serve.add_argument("--state-dir", required=True)
-    serve.add_argument("--idle-seconds", type=float, default=DEFAULT_IDLE_SECONDS)
     submit = commands.add_parser("submit", help=argparse.SUPPRESS)
     submit.add_argument("--state-dir")
     submit.add_argument("--checkout", required=True)
@@ -6200,28 +2271,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    if args.command_name == "serve":
-        try:
-            broker = CoordinatorBroker(
-                args.state_dir,
-                idle_timeout=args.idle_seconds,
-            )
-        except CoordinatorError as exc:
-            print(f"AGCoord: invalid broker configuration: {exc}", file=sys.stderr)
-            return 2
-
-        def stop(_signum, _frame):
-            threading.Thread(target=broker.close, daemon=True).start()
-
-        signal.signal(signal.SIGTERM, stop)
-        signal.signal(signal.SIGINT, stop)
-        try:
-            broker.serve_forever()
-        except CoordinatorError as exc:
-            print(f"AGCoord: {exc}", file=sys.stderr)
-            return 2
-        return 0
-
     if args.command_name == "verify-admission":
         try:
             client = CoordinatorClient(
