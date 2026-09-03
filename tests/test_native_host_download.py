@@ -44,6 +44,18 @@ def _sidecar(path: Path) -> None:
     )
 
 
+def _strip_group_world_write(directory: Path) -> None:
+    """Make a staged bundle's modes umask-independent for the mode checks it must pass.
+
+    A bundle directory or asset created under a group-writable umask would be refused by
+    the native-host verification exactly as a real tampered bundle is; the fixtures own the
+    modes they rely on instead of inheriting the caller's umask.
+    """
+    directory.chmod(0o755)
+    for entry in directory.iterdir():
+        entry.chmod(entry.stat().st_mode & ~0o022)
+
+
 def _release(directory: Path, *, broker: bytes = b"static broker bytes\n") -> Path:
     """Write one publishable release layout and return the served directory."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -72,6 +84,7 @@ def _release(directory: Path, *, broker: bytes = b"static broker bytes\n") -> Pa
         helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         helper.chmod(0o644)
         _sidecar(helper)
+    _strip_group_world_write(directory)
     return directory
 
 
@@ -579,6 +592,33 @@ def test_downloaded_assets_are_owner_only_regardless_of_umask(
         "test-native-host-enforcement",
     )
     native_host._verify_pinned_broker(selected, require_pin=True, supplied=None)
+
+
+def test_a_staged_install_bundle_is_owner_clean_regardless_of_umask(
+    tmp_path: Path,
+    permissive_umask,
+):
+    """A fixture-staged install bundle must pass the same mode checks as a downloaded one.
+
+    The client refuses a group- or world-writable bundle directory or asset, so the fixture
+    that builds one owns those modes rather than inheriting a permissive caller umask.
+    """
+    from agcoord import native_host
+
+    bundle = _release(tmp_path / "bundle")
+    offenders = [str(bundle)] if _writable_by_others(bundle) else []
+    offenders += [
+        str(path.relative_to(bundle))
+        for path in bundle.iterdir()
+        if _writable_by_others(path)
+    ]
+    assert offenders == [], f"group- or world-writable bundle entries: {offenders}"
+    selected, installer, probe = native_host._verified_bundle(bundle / PACKAGE_NAME)
+    assert (selected, installer.name, probe.name) == (
+        bundle / PACKAGE_NAME,
+        "install-native-host",
+        "test-native-host-enforcement",
+    )
 
 
 def test_a_cache_left_group_writable_by_an_older_client_is_repaired_on_reuse(

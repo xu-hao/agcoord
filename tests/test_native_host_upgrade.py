@@ -55,6 +55,17 @@ def _sidecar(path: Path) -> None:
     )
 
 
+def _strip_group_world_write(directory: Path) -> None:
+    """Own a staged bundle's modes instead of inheriting the caller's umask.
+
+    A bundle directory or asset left group-writable would be refused by the native-host
+    verification exactly as a real tampered bundle is, so the fixture strips those bits.
+    """
+    directory.chmod(0o755)
+    for entry in directory.iterdir():
+        entry.chmod(entry.stat().st_mode & ~0o022)
+
+
 def _release_bundle(
     tmp_path: Path,
     *,
@@ -89,7 +100,33 @@ def _release_bundle(
         helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         helper.chmod(0o644)
         _sidecar(helper)
+    _strip_group_world_write(bundle)
     return package
+
+
+def test_a_staged_upgrade_bundle_is_owner_clean_regardless_of_umask(tmp_path: Path):
+    """A fixture-staged upgrade bundle must pass the same mode checks as a real one.
+
+    The client refuses a group- or world-writable bundle directory or asset, so the fixture
+    stages one with owner-only write bits regardless of the caller's umask.
+    """
+    from agcoord import native_host
+
+    previous = os.umask(0o002)
+    try:
+        package = _release_bundle(tmp_path)
+    finally:
+        os.umask(previous)
+    bundle = package.parent
+    offenders = [str(bundle)] if bundle.stat().st_mode & 0o022 else []
+    offenders += [
+        str(path.relative_to(bundle))
+        for path in bundle.iterdir()
+        if path.stat().st_mode & 0o022
+    ]
+    assert offenders == [], f"group- or world-writable bundle entries: {offenders}"
+    selected, installer, probe = native_host._verified_bundle(package)
+    assert selected == package
 
 
 def _proof() -> dict[str, object]:
