@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.5.0 — 2026-09-03
+
+- Move the client's supported native broker line to 0.5.x. A 0.5.0 Python client selects and
+  commands only a 0.5.x broker for ordinary work and refuses a retained 0.4.x executable; the
+  host upgrade's maintenance drain still admits the outgoing 0.4.x broker.
 - Make `land` the only repository-lane barrier and scope it to its worktree. A `full` keeps its
   clean exact-head submission requirement and receipt but is admitted like a check, and a running
   or earlier-queued land now excludes only other lands in its repository and jobs submitted from
