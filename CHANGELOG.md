@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.6.1 — 2026-09-03
 
 - Let a `tmpfs` binding opt in to executable scratch with `"exec": true` in the broker's
   configuration: the run's tmpfs is then mounted `nosuid,nodev` without `noexec` and verified as
