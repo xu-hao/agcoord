@@ -908,9 +908,9 @@ fn supervise_tmpfs(plan: &ExecPlan, setup: &TmpfsSetup, baseline: TmpfsBaseline)
         thread::sleep(Duration::from_millis(50));
     };
     cleanup_emulated_tmpfs(setup);
-    if unmount_current_tmpfs(setup).is_err() {
-        unsafe { libc::_exit(125) }
-    }
+    // #181: the launcher dropped every capability before the final release, so it can no
+    // longer unmount the scratch it supervised, and the run's status must be the command's
+    // own. The kernel tears the private mount namespace down with this process tree.
     if libc::WIFEXITED(status) {
         unsafe { libc::_exit(libc::WEXITSTATUS(status)) }
     }
@@ -1051,9 +1051,6 @@ fn child_main(
         token
     };
     if !write_all_fd(setup_write, &setup_message(&setup_token, code)) {
-        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
-            let _ = unmount_current_tmpfs(setup);
-        }
         unsafe { libc::_exit(125) }
     }
     let mut final_release = [0_u8; CONTROL_BYTES];
@@ -1062,15 +1059,12 @@ fn child_main(
         || final_release[4] != FINAL_RELEASE
         || final_release[5..] != token[..]
     {
-        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
-            let _ = unmount_current_tmpfs(setup);
-        }
         unsafe { libc::_exit(125) }
     }
     if code != SetupCode::Ok {
-        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
-            let _ = unmount_current_tmpfs(setup);
-        }
+        // A best-effort scratch that was mounted before a later setup step failed stays in
+        // this private namespace, unreferenced by the environment, until the tree ends;
+        // the launcher holds no capability to unmount it once privileges are dropped.
         exec_plan(plan, false);
     }
     if let (Some(setup), Some(baseline)) = (&plan.setup.tmpfs, tmpfs_baseline)
