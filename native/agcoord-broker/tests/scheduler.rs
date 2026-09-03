@@ -6873,12 +6873,17 @@ fn cgroup_fixture_records_an_exec_tmpfs_binding_in_the_contract_only_when_set() 
     let temporary = TestDirectory::new("cgroup-tmpfs-exec-contract");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
-    for (name, exec) in [("plain", None), ("exec", Some(true)), ("explicit-off", Some(false))] {
+    for (name, exec) in [
+        ("plain", None),
+        ("exec", Some(true)),
+        ("explicit-off", Some(false)),
+    ] {
         let state = temporary.path().join(format!("state-{name}"));
         let root = temporary.path().join(format!("root-{name}"));
         fs::create_dir(&state).unwrap();
         fs::create_dir(&root).unwrap();
-        let mut scratch = json!({"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"});
+        let mut scratch =
+            json!({"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"});
         if let Some(exec) = exec {
             scratch["exec"] = json!(exec);
         }
@@ -6925,7 +6930,15 @@ fn cgroup_fixture_records_an_exec_tmpfs_binding_in_the_contract_only_when_set() 
         // The flag rides the stored contract only when the operator set it; a configuration
         // that never mentions it, or says false, keeps the exact shape every contract had.
         assert_eq!(contract["kind"], "tmpfs");
-        assert_eq!(contract.get("exec").cloned(), if exec == Some(true) { Some(json!(true)) } else { None }, "{name}");
+        assert_eq!(
+            contract.get("exec").cloned(),
+            if exec == Some(true) {
+                Some(json!(true))
+            } else {
+                None
+            },
+            "{name}"
+        );
         drop(broker);
     }
 }
@@ -6957,7 +6970,12 @@ fn real_cgroup_exec_tmpfs_binding_mounts_without_noexec_and_runs_a_program() {
     .unwrap();
     let mut broker = RunningBroker::start(
         &state,
-        &[("jobs", 1), ("ram", 128 * MIB), ("scratch", 64 * MIB), ("scratch_inodes", 2048)],
+        &[
+            ("jobs", 1),
+            ("ram", 128 * MIB),
+            ("scratch", 64 * MIB),
+            ("scratch_inodes", 2048),
+        ],
     );
     let script = r#"
 import json
@@ -7002,7 +7020,11 @@ Path(sys.argv[1]).write_text(json.dumps({
         submit_with_resources(
             &state,
             &submission,
-            &[("ram", 128 * MIB), ("scratch", 64 * MIB), ("scratch_inodes", 2048)],
+            &[
+                ("ram", 128 * MIB),
+                ("scratch", 64 * MIB),
+                ("scratch_inodes", 2048)
+            ],
         )
         .status
         .success()
@@ -7010,10 +7032,21 @@ Path(sys.argv[1]).write_text(json.dumps({
     wait_status(&state, submission.run_id, "passed");
     let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
     for option in ["nodev", "nosuid"] {
-        assert!(observed["options"].as_array().unwrap().iter().any(|o| o == option), "{option}");
+        assert!(
+            observed["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o == option),
+            "{option}"
+        );
     }
     assert!(
-        !observed["options"].as_array().unwrap().iter().any(|o| o == "noexec"),
+        !observed["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "noexec"),
         "an exec binding must not mount noexec: {:?}",
         observed["options"]
     );
@@ -7062,7 +7095,10 @@ fn a_configuration_that_misuses_exec_is_refused_naming_the_binding() {
             .output()
             .expect("start native broker");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{name}: the broker accepted a misused exec");
+        assert!(
+            !output.status.success(),
+            "{name}: the broker accepted a misused exec"
+        );
         assert!(stderr.contains(expected), "{name}: {stderr}");
     }
 }
