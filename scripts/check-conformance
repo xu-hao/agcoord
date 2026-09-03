@@ -15,8 +15,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MANIFEST = ROOT / "conformance" / "manifest-v2.json"
-IMPLEMENTATIONS = ("python_reference", "rust_native")
+DEFAULT_MANIFEST = ROOT / "conformance" / "manifest-v3.json"
+IMPLEMENTATIONS = ("rust_native",)
 REQUIRED_DOMAINS = (
     "commands",
     "repositories",
@@ -54,13 +54,10 @@ BEHAVIOR_KEYS = {"id", "domain", "description", "tests"}
 DIFFERENCE_KEYS = {
     "id",
     "description",
-    "python_reference",
-    "rust_native",
     "rationale",
     "tests",
 }
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
-PYTHON_SELECTOR = re.compile(r"^tests/[a-z0-9_]+\.py::test_[A-Za-z0-9_]+$")
 NATIVE_SELECTOR = re.compile(
     r"^(client_compatibility|identity|scheduler)::[a-z][a-z0-9_]+$"
 )
@@ -105,7 +102,7 @@ def _selectors(value: Any, subject: str) -> dict[str, list[str]]:
             raise ConformanceError(
                 f"{subject}.{implementation} must be a non-empty unique string list"
             )
-        pattern = PYTHON_SELECTOR if implementation == "python_reference" else NATIVE_SELECTOR
+        pattern = NATIVE_SELECTOR
         for entry in entries:
             if not pattern.fullmatch(entry):
                 raise ConformanceError(
@@ -125,15 +122,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ConformanceError(f"conformance manifest {path} is invalid JSON: {exc}") from exc
     manifest = _object(document, "conformance manifest", MANIFEST_KEYS)
-    if manifest["manifest_version"] != 2:
-        raise ConformanceError("conformance manifest_version must be exactly 2")
-    if manifest["protocols"] != {"python_reference": 4, "rust_native": 5}:
+    if manifest["manifest_version"] != 3:
+        raise ConformanceError("conformance manifest_version must be exactly 3")
+    if manifest["protocols"] != {"rust_native": 5}:
         raise ConformanceError(
-            "conformance protocols must identify Python reference 4 and Rust native 5"
+            "conformance protocols must identify the single native owner as protocol 5"
         )
     if manifest["required_domains"] != list(REQUIRED_DOMAINS):
         raise ConformanceError(
-            "conformance required_domains must exactly match the version-2 contract"
+            "conformance required_domains must exactly match the version-3 contract"
         )
     if manifest["execution"] != {
         "rust_build_jobs": 4,
@@ -158,7 +155,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         behavior_ids.add(behavior_id)
         domain = _text(behavior["domain"], f"{subject}.domain")
         if domain not in REQUIRED_DOMAINS:
-            raise ConformanceError(f"{subject}.domain is not required by version 2")
+            raise ConformanceError(f"{subject}.domain is not required by version 3")
         covered_domains[domain] += 1
         _text(behavior["description"], f"{subject}.description")
         behavior["tests"] = _selectors(behavior["tests"], f"{subject}.tests")
@@ -179,7 +176,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         if not ID_PATTERN.fullmatch(difference_id) or difference_id in difference_ids:
             raise ConformanceError(f"{subject}.id must be unique canonical dotted text")
         difference_ids.add(difference_id)
-        for key in ("description", "python_reference", "rust_native", "rationale"):
+        for key in ("description", "rationale"):
             _text(difference[key], f"{subject}.{key}")
         difference["tests"] = _selectors(difference["tests"], f"{subject}.tests")
     return manifest
@@ -216,24 +213,6 @@ def _all_selectors(manifest: dict[str, Any], implementation: str) -> set[str]:
 
 
 def verify_collected_coverage(manifest: dict[str, Any]) -> None:
-    python = _run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
-        capture=True,
-    )
-    collected_python = {
-        line.strip()
-        for line in python.stdout.splitlines()
-        if line.strip().startswith("tests/") and "::" in line
-    }
-    missing_python = sorted(
-        selector
-        for selector in _all_selectors(manifest, "python_reference")
-        if not any(
-            node == selector or node.startswith(f"{selector}[")
-            for node in collected_python
-        )
-    )
-
     rust_jobs = str(manifest["execution"]["rust_build_jobs"])
     native_by_target: dict[str, set[str]] = {}
     for selector in _all_selectors(manifest, "rust_native"):
@@ -267,10 +246,7 @@ def verify_collected_coverage(manifest: dict[str, Any]) -> None:
         if selector.split("::", 1)[1]
         not in native_by_target[selector.split("::", 1)[0]]
     )
-    missing = [
-        *(f"python_reference:{selector}" for selector in missing_python),
-        *(f"rust_native:{selector}" for selector in missing_native),
-    ]
+    missing = [f"rust_native:{selector}" for selector in missing_native]
     if missing:
         raise ConformanceError(
             "conformance selectors were not collected: " + ", ".join(missing)
@@ -326,10 +302,11 @@ def main() -> int:
     except ConformanceError as exc:
         print(f"conformance refused: {exc}", file=sys.stderr)
         return 1
+    differences = len(manifest["intentional_differences"])
     print(
-        "conformance manifest v2 passed: "
+        "conformance manifest v3 passed: "
         f"{len(manifest['behaviors'])} behaviors, "
-        f"{len(manifest['intentional_differences'])} intentional differences"
+        f"{differences} intentional difference{'' if differences == 1 else 's'}"
     )
     return 0
 
