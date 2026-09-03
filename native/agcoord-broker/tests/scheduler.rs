@@ -6865,3 +6865,204 @@ fn full_worker_under_a_tmpfs_policy_verifies_its_admission() {
     }
     drop(broker);
 }
+
+// ---------------------------------------------------------------- #177: executable scratch
+
+#[test]
+fn cgroup_fixture_records_an_exec_tmpfs_binding_in_the_contract_only_when_set() {
+    let temporary = TestDirectory::new("cgroup-tmpfs-exec-contract");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    for (name, exec) in [("plain", None), ("exec", Some(true)), ("explicit-off", Some(false))] {
+        let state = temporary.path().join(format!("state-{name}"));
+        let root = temporary.path().join(format!("root-{name}"));
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&root).unwrap();
+        let mut scratch = json!({"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"});
+        if let Some(exec) = exec {
+            scratch["exec"] = json!(exec);
+        }
+        fs::write(
+            state.join("config.json"),
+            serde_json::to_vec(&json!({
+                "bindings": {
+                    "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                    "scratch": scratch,
+                    "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+                },
+                "cgroup_root": root,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let requested = [
+            ("ram", 64 * 1024 * 1024),
+            ("scratch", 16 * 1024 * 1024),
+            ("scratch_inodes", 128),
+        ];
+        let mut capacities = vec![("jobs", 1)];
+        capacities.extend(requested);
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &capacities,
+            &["--cgroup-fixture", root.to_str().unwrap()],
+        );
+        let submission = Submission {
+            run_id: name,
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: vec!["/bin/true".to_owned()],
+            gate_run_id: None,
+        };
+        assert!(
+            submit_with_resources(&state, &submission, &requested)
+                .status
+                .success()
+        );
+        let passed = wait_status(&state, submission.run_id, "passed");
+        let contract = &passed["resource_contract"]["scratch"];
+        // The flag rides the stored contract only when the operator set it; a configuration
+        // that never mentions it, or says false, keeps the exact shape every contract had.
+        assert_eq!(contract["kind"], "tmpfs");
+        assert_eq!(contract.get("exec").cloned(), if exec == Some(true) { Some(json!(true)) } else { None }, "{name}");
+        drop(broker);
+    }
+}
+
+#[test]
+fn real_cgroup_exec_tmpfs_binding_mounts_without_noexec_and_runs_a_program() {
+    let Some(root) = real_cgroup_root() else {
+        return;
+    };
+    const MIB: u64 = 1024 * 1024;
+    let temporary = TestDirectory::new("real-cgroup-tmpfs-exec");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("observed.json");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes", "exec": true},
+                "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(
+        &state,
+        &[("jobs", 1), ("ram", 128 * MIB), ("scratch", 64 * MIB), ("scratch_inodes", 2048)],
+    );
+    let script = r#"
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+target = Path(os.environ['TMPDIR'])
+options = None
+for line in Path('/proc/self/mountinfo').read_text(encoding='ascii').splitlines():
+    left, separator, right = line.partition(' - ')
+    if separator and left.split()[4] == str(target):
+        options = sorted(set(left.split()[5].split(',') + right.split()[2].split(',')))
+        break
+if options is None:
+    raise AssertionError('TMPDIR is not a mount')
+program = target / 'double.sh'
+program.write_text('#!/bin/sh\necho ran-from-scratch\n', encoding='ascii')
+program.chmod(program.stat().st_mode | stat.S_IEXEC)
+ran = subprocess.run([str(program)], capture_output=True, text=True)
+Path(sys.argv[1]).write_text(json.dumps({
+    'options': options,
+    'returncode': ran.returncode,
+    'stdout': ran.stdout.strip(),
+}), encoding='ascii')
+"#;
+    let submission = Submission {
+        run_id: "real-cgroup-tmpfs-exec",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            report.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(
+            &state,
+            &submission,
+            &[("ram", 128 * MIB), ("scratch", 64 * MIB), ("scratch_inodes", 2048)],
+        )
+        .status
+        .success()
+    );
+    wait_status(&state, submission.run_id, "passed");
+    let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    for option in ["nodev", "nosuid"] {
+        assert!(observed["options"].as_array().unwrap().iter().any(|o| o == option), "{option}");
+    }
+    assert!(
+        !observed["options"].as_array().unwrap().iter().any(|o| o == "noexec"),
+        "an exec binding must not mount noexec: {:?}",
+        observed["options"]
+    );
+    assert_eq!(observed["returncode"], 0);
+    assert_eq!(observed["stdout"], "ran-from-scratch");
+    drop(broker);
+}
+
+#[test]
+fn a_configuration_that_misuses_exec_is_refused_naming_the_binding() {
+    let temporary = TestDirectory::new("cgroup-tmpfs-exec-refusal");
+    for (name, bindings, expected) in [
+        (
+            "wrong-kind",
+            json!({"ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes", "exec": true}}),
+            "resource binding ram sets exec, which only a tmpfs binding may",
+        ),
+        (
+            "not-a-bool",
+            json!({"scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes", "exec": "yes"}}),
+            "resource binding scratch exec must be true or false",
+        ),
+        (
+            "unknown-key",
+            json!({"scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes", "executable": true}}),
+            "resource binding scratch must contain exactly backend, kind, mode, and unit",
+        ),
+    ] {
+        let state = temporary.path().join(format!("state-{name}"));
+        let root = temporary.path().join(format!("root-{name}"));
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            state.join("config.json"),
+            serde_json::to_vec(&json!({"bindings": bindings, "cgroup_root": root})).unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(BROKER)
+            .arg("serve")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--idle-timeout")
+            .arg("5")
+            .arg("--capacity")
+            .arg("jobs=1")
+            .output()
+            .expect("start native broker");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}: the broker accepted a misused exec");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+    }
+}
