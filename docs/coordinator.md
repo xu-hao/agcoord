@@ -752,7 +752,10 @@ explicit admitted callback path. The path accepts only the exact current run and
 the fixed installed release, the worker's exact one-entry user-namespace maps, and the restricted
 native client-profile attestation. `agc show "$AGCOORD_RUN_ID"` uses the same path for the exact
 parent row. Other CLI reads and every submission retain ordinary client selection, so a gate
-script remains a standalone command and never needs to invoke a nested coordinator.
+script remains a standalone command and never needs to invoke a nested coordinator. A submission
+made from inside an admitted run is refused by the client before it selects or starts any broker,
+so the attempt leaves no owner or queue behind in the target state directory; a dirty checkout is
+still refused before the nesting rule is.
 
 ### Child CPU leases for parallel tools
 
