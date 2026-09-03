@@ -43,6 +43,7 @@ HOST_FILES = {
     f"{HOST_NAME}.sha256",
     *(name for helper in HELPERS for name in (helper, f"{helper}.sha256")),
 }
+PIN_SOURCE = ROOT / "src/agcoord/native_host_pin.json"
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 
@@ -294,6 +295,39 @@ def _host_artifacts(directory: Path, version: str) -> dict[str, Any]:
     return manifest
 
 
+def _shipped_pin(native_artifact: Path, host_package: Path, version: str) -> str:
+    """Require the client to pin the exact broker this release publishes.
+
+    A downloaded bundle carries its own manifest and sidecars, so only a digest that
+    reached the operator through the Python distribution can establish that a bundle is
+    this release. That digest is checked in, and a release refuses to ship without it.
+    """
+    try:
+        pin = json.loads(PIN_SOURCE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CandidateError(f"native-host pin is unreadable: {exc}") from exc
+    if not isinstance(pin, dict) or pin.get("format") != 1 or pin.get("version") != version:
+        raise CandidateError("native-host pin does not name this release version")
+    pinned = pin.get("broker_sha256")
+    if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned):
+        raise CandidateError(
+            "native-host pin carries no broker digest; record the reproducible broker "
+            "checksum in src/agcoord/native_host_pin.json before releasing"
+        )
+    if pinned != _sha256(native_artifact):
+        raise CandidateError("native-host pin does not match the released broker")
+    with tarfile.open(host_package, "r:gz") as archive:
+        member = archive.extractfile("./usr/libexec/agcoord/agcoord-broker")
+        if member is None:
+            raise CandidateError("host package carries no broker executable")
+        reader = hashlib.sha256()
+        for block in iter(lambda: member.read(1024 * 1024), b""):
+            reader.update(block)
+    if reader.hexdigest() != pinned:
+        raise CandidateError("host package broker does not match the native-host pin")
+    return pinned
+
+
 def _clean_environment() -> dict[str, str]:
     environment = os.environ.copy()
     for name in (
@@ -512,6 +546,7 @@ def verify_candidate(
     _run([python, "-m", "twine", "check", wheel, sdist])
     native_identity = _native_artifacts(native_dir, version)
     host_manifest = _host_artifacts(host_dir, version)
+    pinned_broker = _shipped_pin(native_dir / NATIVE_NAME, host_dir / HOST_NAME, version)
     migration_receipt = _clean_install_artifacts(
         python,
         wheel,
@@ -538,6 +573,7 @@ def verify_candidate(
         "bundle": os.fspath(output),
         "manifest_sha256": _sha256(manifest_path),
         "migration_backup_sha256": migration_receipt["backup_sha256"],
+        "pinned_broker_sha256": pinned_broker,
         "protocol": 5,
         "version": version,
     }
