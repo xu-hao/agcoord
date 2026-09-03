@@ -262,7 +262,10 @@ permitted, inheritable, and ambient capabilities, setting `no_new_privs`, and ve
 values from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the
 two private channels, reports the token-bound setup result, waits for final release, closes those
 channels, verifies the final descriptor set, and calls `execve`. Submitted `_AGCOORD_*` variables
-are removed; the broker supplies only the public admission context itself. Debug builds can
+are removed; the broker supplies only the public admission context itself. A land request's
+reserved facts — the target-sync opt-out and the commits avoided for that landing — are
+translated into the land worker's `--no-target-sync` and `--avoid` arguments before that removal,
+and an invalid setting is refused at submission. Debug builds can
 inject bounded launcher, token, channel, privilege, descriptor, setup, and release failures;
 release builds do not accept those controls.
 

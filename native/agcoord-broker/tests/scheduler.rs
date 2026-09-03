@@ -635,7 +635,7 @@ fn submit_in_worktree(
         let passthrough = submission.checkout.join("agcoord-test-land-python");
         fs::write(
             &passthrough,
-            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$0.argv\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
         )
         .unwrap();
         fs::set_permissions(&passthrough, fs::Permissions::from_mode(0o755)).unwrap();
@@ -5988,6 +5988,211 @@ fn cancellation_commit_crash_preserves_the_request_for_the_owner() {
     assert_eq!(cancellation.status.code(), Some(86));
     let finished = wait_status(&state, "cancel-crash", "cancelled");
     assert_eq!(finished["exit_status"], 130);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn land_request_options_reach_the_worker_as_arguments() {
+    let temporary = TestDirectory::new("land-request-options");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let avoided = [
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccccccccccc",
+    ];
+    let avoid_value = avoided.join(",");
+    let submission = Submission {
+        run_id: "land-options",
+        kind: "land",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+
+    assert_submitted(
+        &submission,
+        submit_in_worktree(
+            &state,
+            &submission,
+            &[],
+            &[
+                ("_AGCOORD_LAND_TARGET_SYNC", "0"),
+                ("_AGCOORD_LAND_AVOID", avoid_value.as_str()),
+            ],
+            None,
+        ),
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let recorded = fs::read_to_string(checkout.join("agcoord-test-land-python.argv")).unwrap();
+    let arguments: Vec<&str> = recorded.lines().collect();
+    let separator = arguments
+        .iter()
+        .position(|argument| *argument == "--")
+        .expect("the land worker command separates its gate command");
+    let options = &arguments[..separator];
+    assert!(options.contains(&"--no-target-sync"), "{options:?}");
+    let requested: Vec<&str> = options
+        .windows(2)
+        .filter(|pair| pair[0] == "--avoid")
+        .map(|pair| pair[1])
+        .collect();
+    assert_eq!(requested, avoided);
+    assert!(
+        options
+            .iter()
+            .all(|argument| !argument.contains("_AGCOORD_"))
+    );
+    fs::write(&release, b"").unwrap();
+    wait_terminal(&state, "land-options");
+
+    for (name, value) in [
+        ("_AGCOORD_LAND_TARGET_SYNC", "maybe"),
+        (
+            "_AGCOORD_LAND_AVOID",
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        ),
+    ] {
+        let refused = submit_in_worktree(
+            &state,
+            &Submission {
+                run_id: "land-invalid-option",
+                kind: "land",
+                repository: "repo-a",
+                checkout: &checkout,
+                command: blocking_command(&entered, &release, None),
+                gate_run_id: None,
+            },
+            &[],
+            &[(name, value)],
+            None,
+        );
+        assert!(!refused.status.success(), "{name}={value} was accepted");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+            "broker-submission-invalid"
+        );
+    }
+    assert!(
+        snapshot(&state).unwrap()["active"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn failed_lands_record_their_documented_failure_reason() {
+    let temporary = TestDirectory::new("land-failure-reasons");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let report = |run_id: &str, row: &Value, exit_status: &str| {
+        let worker_pid = row["worker_pid"].as_u64().unwrap();
+        let token = process_start_token(worker_pid);
+        let pid = worker_pid.to_string();
+        let reported = run(&[
+            "report",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            run_id,
+            "--worker-pid",
+            &pid,
+            "--worker-start-token",
+            &token,
+            "--exit-status",
+            exit_status,
+        ]);
+        assert!(
+            reported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reported.stderr)
+        );
+    };
+    let land = |run_id: &'static str, entered: &Path, release: &Path| {
+        let submission = Submission {
+            run_id,
+            kind: "land",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(entered, release, None),
+            gate_run_id: None,
+        };
+        submit_ok(&state, &submission);
+        wait_for(Duration::from_secs(5), || entered.exists());
+        status(&state, run_id)
+    };
+
+    // A preflight handback carries the stable code of the status the worker reported.
+    let stale_entered = temporary.path().join("stale-entered");
+    let stale_release = temporary.path().join("stale-release");
+    let stale = land("land-stale", &stale_entered, &stale_release);
+    report("land-stale", &stale, "75");
+    fs::write(&stale_release, b"").unwrap();
+    let stale = wait_status(&state, "land-stale", "failed");
+    assert_eq!(stale["exit_status"], 75);
+    assert_eq!(stale["failure_reason"], "stale-main");
+
+    // A red gate keeps its shell status under gate-failed.
+    let red_entered = temporary.path().join("red-entered");
+    let red_release = temporary.path().join("red-release");
+    let red = land("land-red", &red_entered, &red_release);
+    let gating = advance_land_phase(&state, "land-red", &red, "gating");
+    assert!(
+        gating.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gating.stderr)
+    );
+    let worker_pid = red["worker_pid"].as_u64().unwrap();
+    let token = process_start_token(worker_pid);
+    let pid = worker_pid.to_string();
+    let recorded = run(&[
+        "phase",
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "land-red",
+        "--worker-pid",
+        &pid,
+        "--worker-start-token",
+        &token,
+        "--checkout",
+        red["checkout"].as_str().unwrap(),
+        "--head",
+        red["head_sha"].as_str().unwrap(),
+        "--phase",
+        "gating",
+        "--gate-exit-status",
+        "3",
+    ]);
+    assert!(
+        recorded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    report("land-red", &red, "3");
+    fs::write(&red_release, b"").unwrap();
+    let red = wait_status(&state, "land-red", "failed");
+    assert_eq!(red["exit_status"], 3);
+    assert_eq!(red["gate_exit_status"], 3);
+    assert_eq!(red["failure_reason"], "gate-failed");
+
+    // An unknown handback status is a merge error.
+    let other_entered = temporary.path().join("other-entered");
+    let other_release = temporary.path().join("other-release");
+    let other = land("land-other", &other_entered, &other_release);
+    report("land-other", &other, "9");
+    fs::write(&other_release, b"").unwrap();
+    let other = wait_status(&state, "land-other", "failed");
+    assert_eq!(other["exit_status"], 9);
+    assert_eq!(other["failure_reason"], "merge-error");
     assert!(broker.terminate().success());
 }
 

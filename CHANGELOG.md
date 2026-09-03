@@ -5,6 +5,23 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Fix `--repository` against the native broker: an explicit repository identity is now hashed
+  into its `repository_id` like a discovered one, so names such as `example/widgets` are no
+  longer refused as invalid identifiers (#168).
+- Fix `agc land --no-target-sync` and per-request `agc land --avoid` on the native broker. The
+  broker removed every coordinator-reserved environment name before launching the land worker,
+  so both options were silently ignored; it now passes them to the worker as `--no-target-sync`
+  and `--avoid` arguments and refuses an invalid setting at submission (#169).
+- Fix failed lands on the native broker recording no `failure_reason`. A red gate now records
+  `gate-failed` and every other handback its documented stable code (`stale-main`,
+  `head-changed`, `pr-not-ready`, `publish-failed`, `merge-error`, `avoided-commit`), as the
+  coordinator guide describes (#170).
+- The Python test suite drives a test-owned native broker. `tests/conftest.py` builds the
+  development `agcoord-broker` on first use (or takes `AGCOORD_TEST_NATIVE_BROKER`), and
+  client-boundary tests run against that protocol-5 owner instead of the in-process protocol-4
+  reference; `scripts/check-conformance` builds the broker before the Python suite. Second
+  stage of retiring the Python broker (#165).
+
 - Make conformance single-implementation. Manifest version 3 names native test selectors only,
   drops the Python-reference owner-eligibility difference, and `scripts/check-conformance`
   validates and collects one implementation while still running the complete Python and Rust

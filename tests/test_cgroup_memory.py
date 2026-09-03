@@ -12,7 +12,7 @@ import pytest
 from agcoord.cgroup import CgroupProbe, CgroupV2Backend
 from agcoord.resources import ResourceMeasurement, ResourceRequest
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningReferenceBroker, caller_environment, wait_for
 from test_cgroup import _repository, _terminal
 from test_cgroup_compute import ControllerFakeCgroupV2System
 
@@ -132,7 +132,7 @@ def test_memory_limits_apply_before_user_code_and_preserve_pressure_evidence(
     system = MemoryFakeCgroupV2System(root)
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "pressure": 64 * MIB, "ram": 96 * MIB, "swap": 8 * MIB},
         resource_bindings=MEMORY_BINDINGS,
@@ -226,7 +226,7 @@ def test_local_oom_is_a_stable_reason_but_cancellation_wins_terminal_status(
     system = MemoryFakeCgroupV2System(root)
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "ram": 64 * MIB},
         resource_bindings={"ram": MEMORY_BINDINGS["ram"]},
@@ -351,7 +351,7 @@ def test_unavailable_or_impossible_memory_policies_refuse_before_user_code(
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
     bindings = {name: MEMORY_BINDINGS[name] for name in resources}
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, **resources},
         resource_bindings=bindings,
@@ -440,7 +440,7 @@ def test_real_hard_oom_is_local_and_high_limit_is_pressure_not_oom(tmp_path: Pat
     capability = backend.probe()
     assert capability["available"] is True
     assert {"memory", "memory-high", "swap"} <= set(capability["kinds"])
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 2, "pressure": 32 * MIB, "ram": 128 * MIB},
         resource_bindings={

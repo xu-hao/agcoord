@@ -289,6 +289,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--request-json", required=True)
     parser.add_argument("--no-target-sync", action="store_true")
+    parser.add_argument("--avoid", action="append", default=[])
     parser.add_argument("gate_command", nargs=argparse.REMAINDER)
     return parser
 
@@ -354,7 +355,11 @@ def main(argv: list[str] | None = None) -> int:
             raise CoordinatorError(
                 f"land admission has invalid {LAND_TARGET_SYNC_ENV} state"
             )
-        avoid_commits = resolve_avoid_commits(args.state_dir, os.environ)
+        avoid_commits = resolve_avoid_commits(
+            args.state_dir,
+            os.environ,
+            requested=args.avoid,
+        )
 
         def phase_changed(phase: str, gate_exit_status: int | None) -> None:
             client.update_land_phase(

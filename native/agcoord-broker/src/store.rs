@@ -2342,6 +2342,13 @@ pub fn maintain_child_cpu_leases(connection: &Connection) -> Result<()> {
     }
 }
 
+pub(crate) fn commit_sha_valid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn identifier_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
@@ -2428,6 +2435,26 @@ fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
             return Err(AppError::new(
                 "broker-submission-invalid",
                 "land submission requires an absolute existing Python worker",
+            ));
+        }
+        if request
+            .environment
+            .get("_AGCOORD_LAND_TARGET_SYNC")
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "1"))
+        {
+            return Err(AppError::new(
+                "broker-submission-invalid",
+                "land target-sync setting must be 0 or 1",
+            ));
+        }
+        if request
+            .environment
+            .get("_AGCOORD_LAND_AVOID")
+            .is_some_and(|value| !value.split(',').all(commit_sha_valid))
+        {
+            return Err(AppError::new(
+                "broker-submission-invalid",
+                "land avoided commits must be full lowercase hexadecimal SHAs",
             ));
         }
     }

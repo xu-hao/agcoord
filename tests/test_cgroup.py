@@ -27,7 +27,7 @@ from agcoord.cgroup import (
 from agcoord.queue import CoordinatorClient
 from agcoord.resources import ResourceRequest
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningReferenceBroker, caller_environment, wait_for
 
 
 LIFECYCLE_BINDING = {
@@ -379,7 +379,7 @@ def test_blocked_launcher_joins_owned_leaf_before_command_and_descendant_start(
         system=system,
         empty_timeout=2,
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cgroup-slot": 1},
         resource_bindings=LIFECYCLE_BINDING,
@@ -474,7 +474,7 @@ def test_double_forked_descendant_cannot_survive_cgroup_cancellation(
         system=system,
         empty_timeout=2,
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cgroup-slot": 1},
         resource_bindings=LIFECYCLE_BINDING,
@@ -643,7 +643,7 @@ CoordinatorBroker(
         env=caller_environment(),
     )
     client = CoordinatorClient(state_dir=state_dir, autostart=False)
-    replacement: RunningCoordinator | None = None
+    replacement: RunningReferenceBroker | None = None
     worker_pid: int | None = None
 
     try:
@@ -695,7 +695,7 @@ while not Path(os.environ["CGROUP_RELEASE"]).exists():
             state_dir=state_dir,
             system=replacement_system,
         )
-        replacement = RunningCoordinator(
+        replacement = RunningReferenceBroker(
             state_dir,
             capacities={"jobs": 1, "cgroup-slot": 1},
             resource_bindings=LIFECYCLE_BINDING,
@@ -759,7 +759,7 @@ def test_unavailable_delegation_obeys_required_or_best_effort_mode(
             "mode": mode,
         }
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cgroup-slot": 1},
         resource_bindings=binding,
@@ -890,7 +890,7 @@ def test_real_delegation_hides_controller_files_from_the_worker(tmp_path: Path):
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir)
     assert backend.probe()["available"] is True
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cgroup-slot": 1},
         resource_bindings=LIFECYCLE_BINDING,

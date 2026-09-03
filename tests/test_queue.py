@@ -22,6 +22,7 @@ from agcoord.queue import (
     CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
+    NATIVE_PROTOCOL,
     PROTOCOL,
     migrate_queue,
     state_dir_for,
@@ -29,6 +30,7 @@ from agcoord.queue import (
 from agcoord.resources import ResourceMeasurement, ResourceObservation
 
 from conftest import (
+    RunningReferenceBroker,
     RunningCoordinator,
     caller_environment,
     wait_for,
@@ -411,7 +413,7 @@ def test_wal_writer_contention_does_not_stop_or_cancel_the_live_broker(
         capacities={"jobs": 1},
         database_timeout=0.05,
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities=None,
         idle_timeout=60,
@@ -470,7 +472,7 @@ def test_idle_health_check_retries_a_transient_legacy_journal_lock(
         capacities={"jobs": 1},
         database_timeout=0.05,
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities=None,
         idle_timeout=60,
@@ -587,7 +589,7 @@ def test_resource_bindings_from_the_configuration_file_freeze_in_broker_metadata
             }
         },
     )
-    running = RunningCoordinator(state_dir, capacities=None)
+    running = RunningReferenceBroker(state_dir, capacities=None)
     client = running.start()
     repository = _repository(tmp_path / "repository")
     try:
@@ -724,7 +726,7 @@ def test_legacy_history_requires_explicit_migration_without_inventing_enforcemen
     }
     with sqlite3.connect(database) as db:
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    running = RunningCoordinator(state_dir, capacities={"jobs": 1})
+    running = RunningReferenceBroker(state_dir, capacities={"jobs": 1})
     client = running.start()
     try:
         legacy = client.status("full-legacy")
@@ -767,7 +769,7 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
 
     assert set(row) == ROW_KEYS
     assert set(snapshot) == SNAPSHOT_KEYS
-    assert snapshot["protocol"] == PROTOCOL
+    assert snapshot["protocol"] == NATIVE_PROTOCOL
     assert snapshot["capacities"] == {"jobs": 2}
     assert snapshot["allocations"] == {"jobs": 0}
     assert row["kind"] == "check"
@@ -956,7 +958,7 @@ def test_unbound_resource_names_keep_admission_only_meaning(tmp_path: Path):
 
 
 def test_required_unavailable_resource_backend_refuses_before_user_code(tmp_path: Path):
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -993,7 +995,7 @@ def test_best_effort_unavailable_resource_is_visible_without_claiming_applicatio
             "mode": "best-effort",
         }
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=binding,
@@ -1016,7 +1018,7 @@ def test_best_effort_unavailable_resource_is_visible_without_claiming_applicatio
 
 def test_backend_lifecycle_applies_and_measures_a_typed_resource(tmp_path: Path):
     backend = RecordingResourceBackend()
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1041,7 +1043,7 @@ def test_backend_lifecycle_applies_and_measures_a_typed_resource(tmp_path: Path)
 
 def test_backend_observations_are_sanitized_and_recorded_once(tmp_path: Path):
     backend = ObservingResourceBackend()
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1086,7 +1088,7 @@ def test_typed_resource_receipt_survives_an_idle_broker_restart(tmp_path: Path):
     state_dir = tmp_path / "state"
     repository = _repository(tmp_path / "repository")
     first_backend = RecordingResourceBackend()
-    first = RunningCoordinator(
+    first = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1104,7 +1106,7 @@ def test_typed_resource_receipt_survives_an_idle_broker_restart(tmp_path: Path):
     finally:
         first.stop()
 
-    replacement = RunningCoordinator(
+    replacement = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1121,7 +1123,7 @@ def test_typed_resource_receipt_survives_an_idle_broker_restart(tmp_path: Path):
 
 def test_backend_lifecycle_receives_cancellation_before_cleanup(tmp_path: Path):
     backend = RecordingResourceBackend()
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1159,7 +1161,7 @@ def test_backend_exception_paths_are_not_exposed_in_public_receipts(tmp_path: Pa
         def prepare(self, request):
             raise RuntimeError("/sys/fs/cgroup/private-machine-path")
 
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1179,7 +1181,7 @@ def test_backend_exception_paths_are_not_exposed_in_public_receipts(tmp_path: Pa
 
 def test_required_binding_fails_when_backend_does_not_support_its_unit(tmp_path: Path):
     backend = RecordingResourceBackend(units=("bytes",))
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=RESOURCE_BINDING,
@@ -1862,6 +1864,50 @@ def test_land_target_sync_opt_out_retains_the_stale_target_refusal(
     ).split()[0] == advanced_main
 
 
+def test_land_refuses_a_commit_avoided_for_one_landing_before_any_push(
+    coordinator,
+    tmp_path: Path,
+):
+    _running, client = coordinator
+    checkout, _remote, branch, head = _publication_repository(tmp_path / "repository")
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    gate_marker = tmp_path / "gate-ran"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head,
+        tag="avoid-request",
+        event_log=events,
+    )
+
+    land_id = client.submit_land(
+        "github",
+        125,
+        _python(
+            "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+            gate_marker,
+        ),
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        avoid_commits=[head],
+    )
+    receipt = _row(client, land_id, "failed")
+
+    assert receipt["exit_status"] == 80
+    assert receipt["failure_reason"] == "avoided-commit"
+    assert not gate_marker.exists()
+    assert not events.exists()
+    assert _git(
+        checkout,
+        "ls-remote",
+        "origin",
+        f"refs/heads/{branch}",
+    ).split()[0] == head
+
+
 def test_land_rejects_dirty_or_nested_requests_without_accepting_a_row(
     coordinator,
     tmp_path: Path,
@@ -2109,33 +2155,13 @@ def test_replacement_broker_finishes_one_recovered_land_without_rerunning_gate(
     events = tmp_path / "events"
     gate_entered = tmp_path / "gate-entered"
     gate_release = tmp_path / "gate-release"
-    owner = subprocess.Popen(
-        _python(
-            """
-import sys
-from agcoord.queue import CoordinatorBroker
-
-broker = CoordinatorBroker(
-    state_dir=sys.argv[1],
-    capacities={"jobs": 1},
-    idle_timeout=None,
-)
-broker.serve_forever()
-""",
-            state_dir,
-        ),
-        env=caller_environment(),
-    )
-    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    original = RunningCoordinator(state_dir, capacities={"jobs": 1})
+    client = original.start()
     replacement: RunningCoordinator | None = None
     worker_pid: int | None = None
 
     try:
-        snapshot = wait_for(
-            lambda: client.snapshot(),
-            "the original land broker never acquired ownership",
-        )
-        assert snapshot["broker_pid"] == owner.pid
+        assert client.snapshot()["broker_pid"] == original.pid
         run_id = client.submit_land(
             "github",
             104,
@@ -2161,8 +2187,7 @@ broker.serve_forever()
         assert live["phase"] == "gating"
         worker_pid = live["worker_pid"]
         assert isinstance(worker_pid, int)
-        os.kill(owner.pid, signal.SIGKILL)
-        owner.wait(timeout=5)
+        original.kill()
         replacement = RunningCoordinator(state_dir, capacities={"jobs": 1})
         recovered_client = replacement.start()
         recovered = recovered_client.status(run_id)
@@ -2182,9 +2207,8 @@ broker.serve_forever()
         ]
     finally:
         gate_release.touch()
-        if owner.poll() is None:
-            owner.terminate()
-            owner.wait(timeout=5)
+        if original.is_running():
+            original.kill()
         if replacement is not None:
             replacement.stop()
         elif worker_pid is not None:
@@ -2201,45 +2225,13 @@ def test_replacement_broker_preserves_a_full_worker_after_the_owner_crashes(
     repository = _repository(tmp_path / "repository")
     entered = tmp_path / "entered"
     release = tmp_path / "release"
-    crash = tmp_path / "crash"
-    owner = subprocess.Popen(
-        _python(
-            """
-import sys
-from pathlib import Path
-
-from agcoord.queue import CoordinatorBroker
-
-class CrashingBroker(CoordinatorBroker):
-    def _should_idle_exit(self):
-        if Path(sys.argv[2]).exists():
-            raise RuntimeError("injected broker failure")
-        return False
-
-broker = CrashingBroker(
-    state_dir=sys.argv[1],
-    capacities={"jobs": 1},
-    idle_timeout=None,
-)
-broker.serve_forever()
-""",
-            state_dir,
-            crash,
-        ),
-        env=caller_environment(),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    original = RunningCoordinator(state_dir, capacities={"jobs": 1})
+    client = original.start()
     replacement: RunningCoordinator | None = None
     worker_pid: int | None = None
 
     try:
-        snapshot = wait_for(
-            lambda: client.snapshot(),
-            "the original full broker never acquired ownership",
-        )
-        assert snapshot["broker_pid"] == owner.pid
+        assert client.snapshot()["broker_pid"] == original.pid
         run_id = _submit(
             client,
             _blocking_command(entered, release, "recovered full"),
@@ -2252,8 +2244,7 @@ broker.serve_forever()
         worker_pid = live["worker_pid"]
         assert isinstance(worker_pid, int)
 
-        crash.touch()
-        assert owner.wait(timeout=5) != 0
+        original.kill()
 
         replacement = RunningCoordinator(state_dir, capacities={"jobs": 1})
         recovered_client = replacement.start()
@@ -2265,14 +2256,14 @@ broker.serve_forever()
 
         release.touch()
         finished = _row(recovered_client, run_id, "interrupted")
-        assert finished["exit_status"] is None
+        assert finished["exit_status"] == 125
+        assert finished["failure_reason"] == "worker-result-lost"
         assert finished["worker_pid"] == worker_pid
         assert "recovered full" in recovered_client.log(run_id)["text"]
     finally:
         release.touch()
-        if owner.poll() is None:
-            owner.terminate()
-            owner.wait(timeout=5)
+        if original.is_running():
+            original.kill()
         if replacement is not None:
             replacement.stop()
         elif worker_pid is not None:
@@ -2344,10 +2335,10 @@ def test_merge_submission_consumes_only_an_exact_repository_receipt(
 
 
 def test_rollback_cutoff_prevents_reusing_any_pre_rollback_gate(
-    coordinator,
+    reference_coordinator,
     tmp_path: Path,
 ):
-    broker, client = coordinator
+    broker, client = reference_coordinator
     repository = _repository(tmp_path / "repository")
     receipt_id = _submit(
         client,
@@ -2560,7 +2551,7 @@ Path(sys.argv[1]).write_text(json.dumps({
         assert json.loads(report.read_text(encoding="utf-8")) == {
             "AGCOORD_RUN_ID": run_id,
             "AGCOORD_RUN_KIND": kind,
-            "AGCOORD_STATE_DIR": str(running.broker.paths.state_dir),
+            "AGCOORD_STATE_DIR": str(running.paths.state_dir),
         }
     finally:
         running.stop()
@@ -2684,7 +2675,7 @@ report.write_text(json.dumps({
         assert observed["context"] == {
             "AGCOORD_RUN_ID": run_id,
             "AGCOORD_RUN_KIND": "land",
-            "AGCOORD_STATE_DIR": str(running.broker.paths.state_dir),
+            "AGCOORD_STATE_DIR": str(running.paths.state_dir),
         }
         assert observed["valid"] is True
         assert observed["wrong_state"] is False
@@ -2726,7 +2717,7 @@ def test_drain_rejects_legacy_inserts_and_preserves_existing_work_until_resume(
     tmp_path: Path,
 ):
     state_dir = tmp_path / "state"
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1},
         idle_timeout=None,
@@ -2805,7 +2796,7 @@ def test_drain_rejects_legacy_inserts_and_preserves_existing_work_until_resume(
             "resumed": True,
         }
 
-        replacement = RunningCoordinator(
+        replacement = RunningReferenceBroker(
             state_dir,
             capacities={"jobs": 1},
             idle_timeout=None,
@@ -2911,7 +2902,7 @@ def test_drain_status_fails_closed_for_an_invalid_durable_start_time(
 
 def test_drain_preserves_an_authoritative_land_publication(tmp_path: Path):
     state_dir = tmp_path / "state"
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1},
         idle_timeout=None,
@@ -2976,7 +2967,7 @@ def test_drain_preserves_an_authoritative_land_publication(tmp_path: Path):
 
 def test_drain_and_concurrent_submissions_have_one_atomic_order(tmp_path: Path):
     state_dir = tmp_path / "state"
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 4},
         idle_timeout=None,
@@ -3088,7 +3079,7 @@ while not release.exists():
         wait_for(report.exists, "the worker did not report its temporary root")
         observed = json.loads(report.read_text(encoding="utf-8"))
         assert observed["variables"] == {"TMPDIR": None, "TMP": None, "TEMP": None}
-        assert not (running.broker.paths.worker_tmp / run_id).exists()
+        assert not (running.paths.worker_tmp / run_id).exists()
 
         release.touch()
         _row(client, run_id, "passed")
@@ -3145,7 +3136,7 @@ Path(sys.argv[1]).write_text(json.dumps({
             "TMP": None,
             "TEMP": None,
         }
-        assert not (running.broker.paths.worker_tmp / run_id).exists()
+        assert not (running.paths.worker_tmp / run_id).exists()
     finally:
         running.stop()
 

@@ -31,7 +31,7 @@ from agcoord.queue import (
     CoordinatorError,
 )
 
-from conftest import RunningCoordinator
+from conftest import RunningReferenceBroker
 
 
 def _identity_executable(
@@ -573,7 +573,7 @@ def test_unsupported_platform_refusal_precedes_executable_discovery(
 def test_default_client_refuses_a_live_protocol_four_owner_as_actionable_mixed_version(
     tmp_path: Path,
 ):
-    running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 1})
+    running = RunningReferenceBroker(tmp_path / "state", capacities={"jobs": 1})
     explicit_legacy_client = running.start()
     try:
         with pytest.raises(CoordinatorError, match="protocol-4|migrate"):

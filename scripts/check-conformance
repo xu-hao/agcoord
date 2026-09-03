@@ -254,8 +254,19 @@ def verify_collected_coverage(manifest: dict[str, Any]) -> None:
 
 
 def execute_gate(manifest: dict[str, Any]) -> None:
-    _run([sys.executable, "-m", "pytest", "-q", "-n", "0"])
     execution = manifest["execution"]
+    _run(
+        [
+            "cargo",
+            "build",
+            "--frozen",
+            "-j",
+            str(execution["rust_build_jobs"]),
+            "-p",
+            "agcoord-broker",
+        ]
+    )
+    _run([sys.executable, "-m", "pytest", "-q", "-n", "0"])
     _run(
         [
             "cargo",
