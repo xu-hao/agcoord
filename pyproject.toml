@@ -57,7 +57,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-agcoord = ["py.typed"]
+agcoord = ["py.typed", "native_host_pin.json"]
 
 [tool.setuptools.dynamic]
 version = {attr = "agcoord.__version__"}

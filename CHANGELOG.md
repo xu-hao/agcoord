@@ -11,7 +11,18 @@ versioning; dates use ISO 8601.
   can no longer leave a new owner and queue behind in the target state directory. Only the
   owner's declared capacities are checked after a broker exists, and a dirty checkout is still
   refused before a nested submission is.
-
+- Fetch the matching native-host bundle with `agc host install --download` and
+  `agc host upgrade --download` instead of requiring an operator to assemble the eight release
+  files by hand. The download is an optional GitHub adapter; the coordinator core still accepts
+  only a prepared bundle directory, and an explicit bundle path keeps working unchanged for
+  hosts without network access.
+- Refuse a native-host package whose broker is not the one this client release was built
+  against. Clients now ship a checked-in digest of the reproducible broker, compare it against
+  the bytes the package actually carries, and refuse to download at all when a client carries no
+  pin. A bundle's own manifest and `.sha256` sidecars travel with the files they describe, so
+  they cannot establish which release a download is; the shipped pin arrives with the Python
+  distribution instead. The release gate refuses to publish a version whose pin is missing or
+  does not match the released broker.
 - Stop reporting a completed `agc host install` or `agc host upgrade` as a failure. Starting the
   managed service and owning the state directory are separate events, so verification now waits
   for the restarted broker to own the spool before submitting the enforcement proof, and still

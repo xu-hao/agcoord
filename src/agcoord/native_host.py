@@ -44,8 +44,14 @@ CHECKER_NAME = "check-native-host-package"
 INSTALLER_NAME = "install-native-host"
 PROBE_NAME = "test-native-host-enforcement"
 MANIFEST_NAME = "./usr/share/doc/agcoord/native-host-manifest.json"
+BROKER_NAME = "./usr/libexec/agcoord/agcoord-broker"
+PIN_NAME = "native_host_pin.json"
+PIN_PATH = Path(__file__).with_name(PIN_NAME)
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_BROKER_BYTES = 128 * 1024 * 1024
+BROKER_READ_SIZE = 1024 * 1024
 _SHA256_LINE = re.compile(r"^([0-9a-f]{64})  ([^\r\n]+)\n?$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_BUILD = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DRAIN_ID = re.compile(r"^drain-[0-9a-f]{12}$")
 
@@ -195,6 +201,110 @@ def _expected_identity(package: Path) -> dict[str, Any]:
             code="native-host-version-mismatch",
         )
     return dict(identity)
+
+
+def native_host_pin() -> dict[str, Any]:
+    """Return this client's checked-in native-host pin."""
+    try:
+        raw = PIN_PATH.read_bytes()
+    except OSError as exc:
+        raise CoordinatorError(
+            f"cannot read the native-host pin shipped with this client: {exc}",
+            code="native-host-pin-invalid",
+        ) from exc
+    try:
+        pin = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CoordinatorError(
+            "the native-host pin shipped with this client is not valid JSON",
+            code="native-host-pin-invalid",
+        ) from exc
+    digest = pin.get("broker_sha256") if isinstance(pin, dict) else None
+    if (
+        not isinstance(pin, dict)
+        or pin.get("format") != 1
+        or not isinstance(pin.get("version"), str)
+        or not pin["version"]
+        or not (digest is None or (isinstance(digest, str) and _DIGEST.fullmatch(digest)))
+    ):
+        raise CoordinatorError(
+            "the native-host pin shipped with this client is malformed",
+            code="native-host-pin-invalid",
+        )
+    return {"format": 1, "version": pin["version"], "broker_sha256": digest}
+
+
+def pinned_broker_digest() -> str | None:
+    """Return the broker digest this exact client release was pinned to, if any.
+
+    A development checkout, or a pin left behind by an earlier version, carries no
+    enforceable expectation and returns ``None``.
+    """
+    pin = native_host_pin()
+    if pin["version"] != __version__:
+        return None
+    return pin["broker_sha256"]
+
+
+def require_pinned_broker_digest() -> str:
+    """Return the pinned broker digest, refusing a client that carries none."""
+    digest = pinned_broker_digest()
+    if digest is None:
+        raise CoordinatorError(
+            f"this agc {__version__} client carries no native-host pin, so a downloaded "
+            "bundle cannot be verified against an independent digest; install a release "
+            "client or pass a bundle path you verified yourself",
+            code="native-host-unpinned-client",
+        )
+    return digest
+
+
+def _archived_broker_digest(package: Path) -> str:
+    """Digest the broker the package actually carries rather than its own claims."""
+    reader = hashlib.sha256()
+    try:
+        with tarfile.open(package, "r:gz") as archive:
+            member = archive.getmember(BROKER_NAME)
+            if not member.isfile():
+                raise _invalid_bundle("native-host package broker entry is not a file")
+            if member.size > MAX_BROKER_BYTES:
+                raise _invalid_bundle("native-host package broker entry is oversized")
+            source = archive.extractfile(member)
+            if source is None:
+                raise _invalid_bundle("native-host package broker entry is unreadable")
+            remaining = MAX_BROKER_BYTES
+            while remaining > 0:
+                block = source.read(min(BROKER_READ_SIZE, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                reader.update(block)
+            if source.read(1):
+                raise _invalid_bundle("native-host package broker entry is oversized")
+    except (OSError, tarfile.TarError, KeyError) as exc:
+        raise _invalid_bundle(f"cannot read the native-host package broker: {exc}") from exc
+    return reader.hexdigest()
+
+
+def _verify_pinned_broker(package: Path, *, require_pin: bool) -> str | None:
+    """Compare the package's own broker bytes against this client's pin.
+
+    The package manifest and the ``.sha256`` sidecars travel with the bytes they
+    describe, so they cannot establish that a bundle is the one this client was
+    released against. Only the pin, which arrived with the client itself, can.
+    """
+    expected = require_pinned_broker_digest() if require_pin else pinned_broker_digest()
+    if expected is None:
+        return None
+    actual = _archived_broker_digest(package)
+    if actual != expected:
+        raise CoordinatorError(
+            f"native-host package broker digest {actual} does not match the digest "
+            f"{expected} pinned by this agc {__version__} client; the package is not the "
+            "one this client was released against",
+            code="native-host-pin-mismatch",
+        )
+    return actual
 
 
 def _cpu_capacity() -> int:
@@ -484,6 +594,8 @@ def _operator_context() -> None:
 
 def _release_inputs(
     package: str | os.PathLike[str],
+    *,
+    require_pin: bool = False,
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
     selected, installer, probe = _verified_bundle(package)
     _run_checked(
@@ -491,6 +603,7 @@ def _release_inputs(
         phase="package validation",
         code="native-host-bundle-invalid",
     )
+    _verify_pinned_broker(selected, require_pin=require_pin)
     return selected, installer, probe, _expected_identity(selected)
 
 
@@ -573,10 +686,14 @@ def install_native_host(
     *,
     state_dir: str | os.PathLike[str] | None = None,
     checkout: str | os.PathLike[str] | None = None,
+    require_pin: bool = False,
 ) -> dict[str, Any]:
     """Install one verified managed native host onto a fresh default spool."""
     _operator_context()
-    selected, installer, probe, expected_identity = _release_inputs(package)
+    selected, installer, probe, expected_identity = _release_inputs(
+        package,
+        require_pin=require_pin,
+    )
     checkout_path = Path(checkout or ".").expanduser().resolve()
     paths = queue_paths(state_dir=state_dir, checkout=checkout_path)
     _prepare_state(paths.state_dir, operation="install")
@@ -649,10 +766,14 @@ def upgrade_native_host(
     *,
     state_dir: str | os.PathLike[str] | None = None,
     checkout: str | os.PathLike[str] | None = None,
+    require_pin: bool = False,
 ) -> dict[str, Any]:
     """Upgrade one managed native host without reopening an unverified activation."""
     _operator_context()
-    selected, installer, probe, expected_identity = _release_inputs(package)
+    selected, installer, probe, expected_identity = _release_inputs(
+        package,
+        require_pin=require_pin,
+    )
     checkout_path = Path(checkout or ".").expanduser().resolve()
     paths = queue_paths(state_dir=state_dir, checkout=checkout_path)
     _prepare_state(paths.state_dir, operation="upgrade")
