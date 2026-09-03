@@ -20,7 +20,7 @@ from agcoord.cgroup import (
 from agcoord.config import BrokerConfigError, parse_broker_config
 from agcoord.resources import ResourceMeasurement, ResourceRequest
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningReferenceBroker, caller_environment, wait_for
 from test_cgroup import _repository, _terminal
 from test_cgroup_compute import ControllerFakeCgroupV2System
 
@@ -212,7 +212,7 @@ def test_directional_limits_and_weight_apply_before_code_and_meter_rates(
         "write_iops": 60,
         "io_weight": 250,
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, **requested},
         resource_bindings=IO_BINDINGS,
@@ -305,7 +305,7 @@ def test_sibling_io_limits_do_not_mutate_parent_or_each_other(tmp_path: Path):
         io_resolver=StaticIoResolver(),
     )
     binding = {"write_bps": IO_BINDINGS["write_bps"]}
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         tmp_path / "state",
         capacities={"jobs": 2, "write_bps": 12 * MIB},
         resource_bindings=binding,
@@ -389,7 +389,7 @@ def test_final_io_statistics_survive_completion_and_leaf_cleanup(
         io_resolver=StaticIoResolver(),
     )
     binding = {"write_bps": IO_BINDINGS["write_bps"]}
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "write_bps": 8 * MIB},
         resource_bindings=binding,
@@ -477,7 +477,7 @@ def test_ambiguous_device_resolution_obeys_enforcement_mode(
     binding = {
         "write_bps": {**IO_BINDINGS["write_bps"], "mode": mode},
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "write_bps": MIB},
         resource_bindings=binding,
@@ -810,7 +810,7 @@ def test_required_io_controller_refusal_happens_before_user_code(tmp_path: Path)
         io_paths=[scratch],
         io_resolver=StaticIoResolver(),
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "write_bps": MIB},
         resource_bindings={"write_bps": IO_BINDINGS["write_bps"]},
@@ -870,7 +870,7 @@ def test_real_loop_ext4_limits_buffered_bandwidth_and_direct_iops(
     os.truncate(image, 128 * MIB)
     subprocess.run(["mkfs.ext4", "-q", "-F", str(image)], check=True)
     mounted = False
-    running: RunningCoordinator | None = None
+    running: RunningReferenceBroker | None = None
     try:
         subprocess.run(
             ["mount", "-o", "loop", str(image), str(mountpoint)],
@@ -894,7 +894,7 @@ def test_real_loop_ext4_limits_buffered_bandwidth_and_direct_iops(
             "write_bps": IO_BINDINGS["write_bps"],
             "write_iops": IO_BINDINGS["write_iops"],
         }
-        running = RunningCoordinator(
+        running = RunningReferenceBroker(
             state_dir,
             capacities={"jobs": 1, "write_bps": MIB, "write_iops": 16},
             resource_bindings=bindings,

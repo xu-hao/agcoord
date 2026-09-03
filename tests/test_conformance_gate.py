@@ -35,7 +35,7 @@ def test_versioned_conformance_manifest_passes_its_public_validator():
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == (
-        "conformance manifest v3 passed: 27 behaviors, 1 intentional difference"
+        "conformance manifest v3 passed: 29 behaviors, 1 intentional difference"
     )
     assert completed.stderr == ""
 
@@ -46,7 +46,7 @@ def test_public_checker_lists_both_implementation_selector_sets():
     assert completed.returncode == 0, completed.stderr
     selectors = json.loads(completed.stdout)
     assert set(selectors) == {"rust_native"}
-    assert len(selectors["rust_native"]) == 30
+    assert len(selectors["rust_native"]) == 32
     assert (
         "client_compatibility::python_public_commands_keep_the_protocol_five_json_contract"
         in selectors["rust_native"]
