@@ -61,7 +61,7 @@ hosts, activation, and rollback.
 
 The client/owner/state combinations admitted for release are fixed in the
 [native compatibility matrix](native_migration.md#compatibility-matrix). Python and native
-versions must be the same stable 0.4.x version, the native artifact and host manifest must report
+versions must be the same stable 0.5.x version, the native artifact and host manifest must report
 the same protocol-5 identity, and the running owner must match the exact configured build. No
 release workflow admits a live Python/Rust mixed-owner state.
 
