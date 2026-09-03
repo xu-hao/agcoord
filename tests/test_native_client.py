@@ -37,7 +37,7 @@ from conftest import RunningCoordinator
 def _identity_executable(
     path: Path,
     *,
-    version: str = "0.4.0",
+    version: str = "0.5.0",
     build: str = "development",
     target: str = "x86_64-unknown-linux-gnu",
 ) -> Path:
@@ -149,7 +149,7 @@ def test_selection_admits_this_release_line_and_refuses_the_previous_one(tmp_pat
     )
     assert selected.identity.version == __version__
 
-    previous = _identity_executable(tmp_path / "previous", version="0.3.2")
+    previous = _identity_executable(tmp_path / "previous", version="0.4.1")
     with pytest.raises(NativeClientError, match="version is unsupported"):
         NativeBrokerCommand.select(
             NativeBrokerConfig(path=str(previous), allow_development=True)
@@ -157,14 +157,14 @@ def test_selection_admits_this_release_line_and_refuses_the_previous_one(tmp_pat
 
 
 def test_host_maintenance_selection_admits_the_outgoing_broker_line(tmp_path: Path):
-    outgoing = _identity_executable(tmp_path / "outgoing", version="0.3.2")
+    outgoing = _identity_executable(tmp_path / "outgoing", version="0.4.1")
     config = NativeBrokerConfig(path=str(outgoing), allow_development=True)
 
     with pytest.raises(NativeClientError, match="version is unsupported"):
         NativeBrokerCommand.select(config)
 
     maintenance = NativeBrokerCommand.select_for_host_maintenance(config)
-    assert maintenance.identity.version == "0.3.2"
+    assert maintenance.identity.version == "0.4.1"
     assert maintenance.identity.protocol == NATIVE_PROTOCOL
     assert maintenance.identity.implementation == NATIVE_IMPLEMENTATION
 
@@ -214,7 +214,7 @@ def _mock_admitted_release(
     identity = json.dumps(
         {
             "name": "agcoord-broker",
-            "version": "0.4.0",
+            "version": "0.5.0",
             "protocol": 5,
             "implementation": "rust-native",
             "build": f"sha256:{'a' * 64}",
@@ -384,7 +384,7 @@ def test_client_routes_only_exact_admitted_status_through_the_callback_selector(
     build = f"sha256:{'a' * 64}"
     identity = NativeBrokerIdentity(
         name="agcoord-broker",
-        version="0.4.0",
+        version="0.5.0",
         protocol=NATIVE_PROTOCOL,
         implementation=NATIVE_IMPLEMENTATION,
         build=build,

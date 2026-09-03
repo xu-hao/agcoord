@@ -376,7 +376,7 @@ def test_upgrade_stages_before_drain_and_proves_the_restarted_host(
 
 
 def test_upgrade_drains_a_previous_minor_installed_broker(monkeypatch, tmp_path: Path):
-    outgoing = _outgoing_broker(tmp_path / "outgoing-broker", version="0.3.2")
+    outgoing = _outgoing_broker(tmp_path / "outgoing-broker", version="0.4.1")
     native_host, timeline, clients = _install_fakes(
         monkeypatch,
         installed_broker=outgoing,
@@ -396,7 +396,7 @@ def test_upgrade_drains_a_previous_minor_installed_broker(monkeypatch, tmp_path:
 
     assert result["state"] == "complete"
     assert result["version"] == __version__
-    assert ("drain-selected", "0.3.2") in timeline
+    assert ("drain-selected", "0.4.1") in timeline
     assert clients[0].host_maintenance is True
     assert clients[1].host_maintenance is False
 
