@@ -18,6 +18,24 @@ from agcoord.native_client import NativeBrokerCommand, NativeClientError
 from agcoord.queue import CoordinatorError, RUN_ID_ENV, STATE_DIR_ENV
 
 
+
+@pytest.fixture(autouse=True)
+def _unpinned_client(monkeypatch, tmp_path: Path) -> None:
+    """Own the client's native-host pin so these tests are independent of the release pin.
+
+    A release commit ships a real broker digest, and a pinned client digests the broker inside
+    any bundle before staging. These tests exercise host operations with fake bundles and
+    must behave the same way in a development checkout and in the release commit itself.
+    """
+    from agcoord import native_host
+
+    pin = tmp_path / "native_host_pin.json"
+    pin.write_text(
+        json.dumps({"format": 1, "version": __version__, "broker_sha256": None}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_host, "PIN_PATH", pin)
+
 IDENTITY = {
     "name": "agcoord-broker",
     "version": __version__,
