@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 from io import StringIO
-from typing import Any, Callable, Protocol, TextIO
+from typing import Any, Callable, Mapping, Protocol, TextIO
 from uuid import uuid4
 
 
@@ -25,12 +25,14 @@ EXIT_HEAD_CHANGED = 76
 EXIT_PR_NOT_READY = 77
 EXIT_PUBLISH_FAILED = 78
 EXIT_MERGE_ERROR = 79
+EXIT_AVOIDED = 80
 FAILURE_REASONS = {
     EXIT_STALE_MAIN: "stale-main",
     EXIT_HEAD_CHANGED: "head-changed",
     EXIT_PR_NOT_READY: "pr-not-ready",
     EXIT_PUBLISH_FAILED: "publish-failed",
     EXIT_MERGE_ERROR: "merge-error",
+    EXIT_AVOIDED: "avoided-commit",
 }
 _METADATA_FIELDS = {
     "number",
@@ -320,6 +322,7 @@ def _synchronize_target(
     metadata_client: PullRequestMetadataClient,
     out: TextIO,
     err: TextIO,
+    avoid_commits: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
     """Merge one observed target into the source and push it with an exact lease."""
     expected_head = _sha(head_sha, field="submitted head")
@@ -500,6 +503,15 @@ def _synchronize_target(
                 "target synchronization did not create one clean ordered merge commit",
             )
 
+        for avoided, reason in (avoid_commits or {}).items():
+            if _is_ancestor(selected, avoided, merge_head):
+                _restore_completed_merge(selected, expected_head, merge_head)
+                raise _MergeRefusal(
+                    EXIT_AVOIDED,
+                    f"synchronized head {merge_head} would reach avoided commit "
+                    f"{avoided} ({reason}); rebuild the request as a fresh branch from "
+                    f"the current {base} and rerun the full gate",
+                )
         before_push = _remote_refs(selected, base, branch, require_head=True)
         if before_push[head_ref] != expected_head:
             _restore_completed_merge(selected, expected_head, merge_head)
@@ -891,6 +903,7 @@ def prepare(
     err: TextIO,
     synchronize_target: bool = True,
     head_changed: Callable[[str, str], None] | None = None,
+    avoid_commits: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
     """Reach one exact preflight head, synchronizing an advanced target by default."""
     effective_head = _sha(head_sha, field="submitted head")
@@ -927,6 +940,7 @@ def prepare(
             metadata_client=metadata_client,
             out=out,
             err=err,
+            avoid_commits=avoid_commits,
         )
         if status != 0:
             return status, effective_head
