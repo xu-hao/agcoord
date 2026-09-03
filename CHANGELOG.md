@@ -3,6 +3,15 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Let a `tmpfs` binding opt in to executable scratch with `"exec": true` in the broker's
+  configuration: the run's tmpfs is then mounted `nosuid,nodev` without `noexec` and verified as
+  such, so jobs that execute what they write under `TMPDIR` — command doubles, throwaway virtual
+  environments, downloaded plugin executables — can run on accounted scratch. The default and
+  every existing configuration stay `noexec`; `exec` on any other kind or a non-boolean value is
+  refused at configuration load, and stored contracts carry the flag only when set (#177).
+
 ## 0.6.0 — 2026-09-03
 
 - **Breaking:** retire the Python reference broker. `CoordinatorBroker`, the hidden `serve`

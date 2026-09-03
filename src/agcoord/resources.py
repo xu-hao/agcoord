@@ -56,6 +56,7 @@ RESOURCE_EVENT_STATUSES = frozenset({"applied", "recorded", "unapplied", "failed
 _NAME = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _BINDING_KEYS = frozenset({"kind", "unit", "mode", "backend"})
+_BINDING_OPTIONAL_KEYS = frozenset({"exec"})
 _CAPABILITY_KEYS = frozenset(
     {"available", "kinds", "units", "operations", "reason"}
 )
@@ -213,15 +214,28 @@ def validate_resource_bindings(
     for name, raw in value.items():
         if not isinstance(name, str) or not _NAME.fullmatch(name):
             raise ResourceContractError(f"invalid resource binding name {name!r}")
-        if not isinstance(raw, Mapping) or set(raw) != _BINDING_KEYS:
+        if (
+            not isinstance(raw, Mapping)
+            or not _BINDING_KEYS <= set(raw)
+            or not set(raw) <= _BINDING_KEYS | _BINDING_OPTIONAL_KEYS
+        ):
             raise ResourceContractError(
                 f"resource binding {name!r} must contain exactly "
-                "backend, kind, mode, and unit"
+                "backend, kind, mode, and unit, plus an optional exec"
             )
         kind = raw["kind"]
         unit = raw["unit"]
         mode = raw["mode"]
         backend = raw["backend"]
+        exec_scratch = raw.get("exec", False)
+        if not isinstance(exec_scratch, bool):
+            raise ResourceContractError(
+                f"resource binding {name!r} exec must be true or false"
+            )
+        if exec_scratch and kind != "tmpfs":
+            raise ResourceContractError(
+                f"resource binding {name!r} sets exec, which only a tmpfs binding may"
+            )
         if not isinstance(kind, str) or kind not in RESOURCE_UNITS_BY_KIND:
             raise ResourceContractError(
                 f"resource binding {name!r} has unknown kind {kind!r}"
@@ -249,6 +263,8 @@ def validate_resource_bindings(
             "mode": mode,
             "unit": unit,
         }
+        if exec_scratch:
+            selected[name]["exec"] = True
     return dict(sorted(selected.items()))
 
 
