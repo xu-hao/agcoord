@@ -14,12 +14,19 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from io import StringIO
 from typing import Any, Callable, Mapping, Protocol, TextIO
 from uuid import uuid4
 
 
 RUN_ID_ENV = "AGCOORD_RUN_ID"
+# After the coordinator's own lease-protected push, the forge can briefly keep reporting the
+# head that push replaced. Exactly that head is re-read for a short bounded wait; every other
+# head is a real source change.
+PROPAGATION_WAIT_SECONDS = 30.0
+PROPAGATION_POLL_SECONDS = 2.0
+Wait = Callable[[float], None]
 EXIT_STALE_MAIN = 75
 EXIT_HEAD_CHANGED = 76
 EXIT_PR_NOT_READY = 77
@@ -185,6 +192,50 @@ def _metadata(record: dict[str, object], pull_request: int) -> dict[str, object]
     normalized = dict(record)
     normalized["head_sha"] = _sha(record["head_sha"], field="pull-request head")
     return normalized
+
+
+def _read_pull_request(
+    metadata_client: PullRequestMetadataClient,
+    pull_request: int,
+    *,
+    expected_head: str,
+    replaced_head: str | None,
+    wait: Wait,
+    out: TextIO,
+) -> dict[str, object]:
+    """Read strict metadata, waiting briefly while the forge still reports a replaced head.
+
+    Only the exact head that the coordinator's own push replaced counts as read-after-write
+    lag. The caller still compares the returned head, so a replaced head that outlives the
+    bounded wait, or any other head, remains a refusal.
+    """
+    waited = 0.0
+    while True:
+        try:
+            record = metadata_client.pull_request(pull_request)
+        except _MergeRefusal:
+            raise
+        except Exception as exc:
+            raise _MergeRefusal(
+                EXIT_MERGE_ERROR,
+                f"cannot read pull request #{pull_request}: {exc}",
+            ) from exc
+        pr = _metadata(record, pull_request)
+        if (
+            replaced_head is None
+            or pr["head_sha"] != replaced_head
+            or waited >= PROPAGATION_WAIT_SECONDS
+        ):
+            return pr
+        if waited == 0.0:
+            print(
+                f"Merge coordinator: forge still reports replaced head {replaced_head}; "
+                f"waiting up to {PROPAGATION_WAIT_SECONDS:g}s for {expected_head} to propagate",
+                file=out,
+                flush=True,
+            )
+        wait(PROPAGATION_POLL_SECONDS)
+        waited += PROPAGATION_POLL_SECONDS
 
 
 def _remote_refs(
@@ -578,12 +629,16 @@ def execute(
     publisher: MergePublisher,
     out: TextIO,
     err: TextIO,
+    replaced_head: str | None = None,
+    wait: Wait | None = None,
 ) -> int:
     """Validate and conditionally publish one exact gated head.
 
     All expected values are copied into the durable merge row before this process starts.
     The forge's atomic before-OID checks are the final authority, so a race cannot turn
-    stale evidence into a successful merge.
+    stale evidence into a successful merge. ``replaced_head`` names the head that the
+    coordinator's own target-sync push replaced, so a forge that still reports it is
+    re-read for a bounded wait instead of being refused outright.
     """
     try:
         if (
@@ -607,6 +662,14 @@ def execute(
         if checked_ref.returncode != 0:
             raise _MergeRefusal(EXIT_MERGE_ERROR, f"invalid merge branch {branch!r}")
         expected_head = _sha(head_sha, field="gated head")
+        superseded_head = (
+            None if replaced_head is None else _sha(replaced_head, field="replaced head")
+        )
+        if superseded_head == expected_head:
+            raise _MergeRefusal(
+                EXIT_MERGE_ERROR,
+                "replaced head must differ from the gated head",
+            )
 
         repository_root = _git(
             selected,
@@ -654,16 +717,14 @@ def execute(
                 "merge checkout is not clean; commit or remove local changes before merging",
             )
 
-        try:
-            record = metadata_client.pull_request(pull_request)
-        except _MergeRefusal:
-            raise
-        except Exception as exc:
-            raise _MergeRefusal(
-                EXIT_MERGE_ERROR,
-                f"cannot read pull request #{pull_request}: {exc}",
-            ) from exc
-        pr = _metadata(record, pull_request)
+        pr = _read_pull_request(
+            metadata_client,
+            pull_request,
+            expected_head=expected_head,
+            replaced_head=superseded_head,
+            wait=wait or time.sleep,
+            out=out,
+        )
         if not pr["same_repository"]:
             raise _MergeRefusal(
                 EXIT_PR_NOT_READY,
@@ -683,6 +744,13 @@ def execute(
             raise _MergeRefusal(
                 EXIT_PR_NOT_READY,
                 f"pull-request branch is {pr['head_ref']!r}, expected {branch!r}",
+            )
+        if pr["head_sha"] == superseded_head:
+            raise _MergeRefusal(
+                EXIT_HEAD_CHANGED,
+                f"pull-request head still reports replaced {superseded_head} instead of "
+                f"gated {expected_head} after waiting {PROPAGATION_WAIT_SECONDS:g}s for "
+                "forge propagation",
             )
         if pr["head_sha"] != expected_head:
             raise _MergeRefusal(
@@ -864,6 +932,8 @@ def preflight(
     publisher: MergePublisher,
     out: TextIO,
     err: TextIO,
+    replaced_head: str | None = None,
+    wait: Wait | None = None,
 ) -> int:
     """Run exact publication validation without creating a forge object.
 
@@ -881,6 +951,8 @@ def preflight(
             publisher=_PreflightPublisher(publisher),
             out=out,
             err=err,
+            replaced_head=replaced_head,
+            wait=wait,
         )
     except _PreflightComplete:
         print(
@@ -903,11 +975,13 @@ def prepare(
     err: TextIO,
     synchronize_target: bool = True,
     head_changed: Callable[[str, str], None] | None = None,
+    wait: Wait | None = None,
     avoid_commits: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
     """Reach one exact preflight head, synchronizing an advanced target by default."""
     effective_head = _sha(head_sha, field="submitted head")
     changed = head_changed or (lambda _old, _new: None)
+    replaced_head: str | None = None
     for attempt in range(5):
         captured_out = StringIO()
         captured_err = StringIO()
@@ -920,6 +994,8 @@ def prepare(
             publisher=publisher,
             out=captured_out,
             err=captured_err,
+            replaced_head=replaced_head,
+            wait=wait,
         )
         if status == 0:
             _copy_output(captured_out, out)
@@ -956,6 +1032,7 @@ def prepare(
                 flush=True,
             )
             return EXIT_MERGE_ERROR, effective_head
+        replaced_head = effective_head
         effective_head = synchronized_head
 
     print(
