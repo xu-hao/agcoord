@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Make conformance single-implementation. Manifest version 3 names native test selectors only,
+  drops the Python-reference owner-eligibility difference, and `scripts/check-conformance`
+  validates and collects one implementation while still running the complete Python and Rust
+  suites. The protocol-4 Python broker is no longer a conformance oracle; this is the first stage
+  of retiring it (#165).
+
 - Let a `full` or `land` worker that declared a tmpfs or project-quota scratch policy verify its
   admission. Under such a policy both brokers start the command as the direct child of a
   launcher and record the launcher as the worker, so the command's own PID never matched;
