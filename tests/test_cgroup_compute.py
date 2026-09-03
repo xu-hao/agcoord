@@ -11,7 +11,7 @@ import pytest
 
 from agcoord.cgroup import CgroupProbe, CgroupV2Backend
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningReferenceBroker, caller_environment, wait_for
 from test_cgroup import FakeCgroupV2System, _repository, _terminal
 
 
@@ -123,7 +123,7 @@ def test_cpu_and_pid_limits_apply_before_user_code_and_report_terminal_usage(
     system = ControllerFakeCgroupV2System(root, controllers={"cpu", "pids"})
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 2, "pids": 5},
         resource_bindings=COMPUTE_BINDINGS,
@@ -212,7 +212,7 @@ def test_sibling_runs_keep_independent_limits_metrics_and_violations(tmp_path: P
     system = ControllerFakeCgroupV2System(root, controllers={"cpu", "pids"})
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 2, "cpu": 3, "pids": 10},
         resource_bindings=COMPUTE_BINDINGS,
@@ -340,7 +340,7 @@ def test_real_cpu_bandwidth_and_pid_limit_cover_the_complete_process_tree(
     capability = backend.probe()
     assert capability["available"] is True
     assert {"cpu", "processes"} <= set(capability["kinds"])
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1, "pids": 8},
         resource_bindings=COMPUTE_BINDINGS,
@@ -450,7 +450,7 @@ def test_missing_required_cpu_controller_refuses_before_user_code(tmp_path: Path
     system = ControllerFakeCgroupV2System(root, controllers={"pids"})
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings={"cpu": COMPUTE_BINDINGS["cpu"]},
@@ -509,7 +509,7 @@ def test_controller_write_failure_obeys_mode_and_cleans_partial_groups(
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
     binding = {"cpu": {**COMPUTE_BINDINGS["cpu"], "mode": mode}}
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1},
         resource_bindings=binding,
@@ -561,7 +561,7 @@ def test_terminal_paths_capture_pid_peak_and_limit_event_before_cleanup(
     system = ControllerFakeCgroupV2System(root, controllers={"pids"})
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "pids": 5},
         resource_bindings={"pids": COMPUTE_BINDINGS["pids"]},

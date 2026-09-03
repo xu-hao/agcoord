@@ -50,9 +50,10 @@ Run the canonical checker from a dependency-complete checkout:
 ```
 
 Validation is a fast strict JSON/schema check. Coverage mode asks Cargo to list the named native
-tests and refuses any missing selector. The default mode then runs the complete Python and Rust
-workspace suites; CI and the tag workflow use this mode, so a native artifact cannot be released
-after deleting or renaming declared coverage.
+tests and refuses any missing selector. The default mode builds the development broker with the
+declared Rust build jobs, then runs the complete Python and Rust workspace suites; CI and the tag
+workflow use this mode, so a native artifact cannot be released after deleting or renaming
+declared coverage.
 
 The process-lifecycle suites are deliberately serial: pytest uses one worker and the Rust test
 harness uses one test thread. Their individual scenarios still create real concurrent clients,

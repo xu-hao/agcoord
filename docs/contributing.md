@@ -47,6 +47,12 @@ agc full \
   -- python -m pytest -q
 ```
 
+The Python suite drives a test-owned native broker rather than an in-process reference.
+`tests/conftest.py` builds it on first use with `cargo build --locked -p agcoord-broker` and
+stages one private mode-0755 copy for the session, so a fresh checkout needs the pinned Rust
+toolchain; set `AGCOORD_TEST_NATIVE_BROKER` to an absolute prebuilt executable to skip the
+build. Every test starts and stops the brokers it creates.
+
 When one admitted gate starts multiple worker-owning tools concurrently, each controller
 must acquire a [child CPU lease](coordinator.md#child-cpu-leases-for-parallel-tools) and use
 the granted count. Do not give every tool the gate's complete CPU allocation through one
@@ -107,10 +113,10 @@ agc land <request> \
   -- ./scripts/check-conformance
 ```
 
-The checker validates collected Python/native selectors before running both complete suites.
-It uses four Rust build jobs, then one pytest worker and one Rust test thread so process-lifecycle
-tests retain exclusive ownership of every broker and child they create. Do not replace it in a
-native release path with an unversioned `cargo test` invocation.
+The checker validates collected native selectors, builds the development broker with four
+Rust build jobs, then runs both complete suites with one pytest worker and one Rust test thread
+so process-lifecycle tests retain exclusive ownership of every broker and child they create. Do
+not replace it in a native release path with an unversioned `cargo test` invocation.
 
 The final release-artifact boundary is `scripts/verify-release-candidate`. It accepts only the
 two clean Python distributions, the exact five-file native artifact set, and the exact
