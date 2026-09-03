@@ -15,7 +15,7 @@ import pytest
 from agcoord import cli
 from agcoord.queue import PROTOCOL, CoordinatorError
 
-from conftest import RunningCoordinator
+from conftest import RunningCoordinator, caller_environment, wait_for
 
 
 def _row(
@@ -883,3 +883,86 @@ def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: 
             "broker_sha256": None,
         }
     ]
+
+
+def _clean_repository(path: Path) -> str:
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    for key, value in (("user.name", "AGCoord test"), ("user.email", "agcoord@example.invalid")):
+        subprocess.run(["git", "-C", str(path), "config", key, value], check=True)
+    (path / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "clean head"], check=True)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _verify_from_inside_a_worker(
+    tmp_path: Path,
+    *,
+    head_sha: str | None = None,
+) -> tuple[str, str, str]:
+    """Run `agc verify-admission` from inside an admitted full worker.
+
+    Returns the subcommand's exit status, its standard error, and the row's terminal status.
+    `$$` is the admitted worker itself; the public command runs as its child and names that PID.
+    """
+    import sys
+
+    running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 1})
+    client = running.start()
+    checkout = tmp_path / "checkout"
+    exact_head = _clean_repository(checkout)
+    report = tmp_path / "report.txt"
+    stderr_log = tmp_path / "stderr.txt"
+    try:
+        run_id = client.submit(
+            [
+                "/bin/sh",
+                "-c",
+                '"$1" -m agcoord verify-admission --state-dir "$AGCOORD_STATE_DIR" '
+                '--checkout "$2" --run-id "$AGCOORD_RUN_ID" --kind "$AGCOORD_RUN_KIND" '
+                '--head-sha "$3" --worker-pid $$ 2>"$4"; printf %s $? >"$5"',
+                "agcoord-test",
+                sys.executable,
+                str(checkout),
+                head_sha or exact_head,
+                str(stderr_log),
+                str(report),
+            ],
+            checkout=str(checkout),
+            kind="full",
+            label="public admission proof",
+            environment=caller_environment(),
+        )
+        wait_for(
+            lambda: client.status(run_id)["status"] in {"passed", "failed", "cancelled"},
+            "the admitted worker never reached a terminal status",
+        )
+        return (
+            report.read_text(encoding="utf-8"),
+            stderr_log.read_text(encoding="utf-8"),
+            client.status(run_id)["status"],
+        )
+    finally:
+        running.stop()
+
+
+def test_verify_admission_is_a_public_subcommand_for_an_admitted_worker(tmp_path: Path):
+    exit_code, stderr, status = _verify_from_inside_a_worker(tmp_path)
+
+    assert exit_code == "0", stderr
+    assert status == "passed"
+    assert "invalid choice" not in stderr
+
+
+def test_verify_admission_refuses_a_wrong_head_with_the_verifier_s_message(tmp_path: Path):
+    exit_code, stderr, status = _verify_from_inside_a_worker(tmp_path, head_sha="f" * 40)
+
+    assert exit_code == "2", stderr
+    assert status == "passed"  # the wrapper decides what a refusal means; the row itself ran
+    assert "invalid choice" not in stderr
+    assert "error:" in stderr
