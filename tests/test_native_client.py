@@ -26,12 +26,10 @@ from agcoord.native_client import (
 from agcoord.queue import (
     NATIVE_IMPLEMENTATION,
     NATIVE_PROTOCOL,
-    CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
 )
 
-from conftest import RunningReferenceBroker
 
 
 def _identity_executable(
@@ -570,43 +568,44 @@ def test_unsupported_platform_refusal_precedes_executable_discovery(
         )
 
 
-def test_default_client_refuses_a_live_protocol_four_owner_as_actionable_mixed_version(
-    tmp_path: Path,
-):
-    running = RunningReferenceBroker(tmp_path / "state", capacities={"jobs": 1})
-    explicit_legacy_client = running.start()
-    try:
-        with pytest.raises(CoordinatorError, match="protocol-4|migrate"):
-            CoordinatorClient(
-                state_dir=running.broker.paths.state_dir,
-                autostart=True,
-            ).ping()
-        with pytest.raises(CoordinatorError, match="protocol-4|migrate"):
-            CoordinatorClient(
-                state_dir=running.broker.paths.state_dir,
-                autostart=True,
-            ).snapshot()
-        assert explicit_legacy_client.snapshot()["protocol"] == 4
-    finally:
-        running.stop()
+def _write_pre_native_spool(state_dir: Path, protocol: int) -> None:
+    """Synthesise one idle spool at a retired protocol without a Python broker."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(state_dir / "queue.sqlite3") as database:
+        database.execute(
+            "CREATE TABLE coordinator_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        database.execute(
+            "INSERT INTO coordinator_meta(key, value) VALUES ('protocol', ?)",
+            (str(protocol),),
+        )
+        database.commit()
 
 
-def test_idle_protocol_four_spool_requires_explicit_migration_before_autostart(
+@pytest.mark.parametrize("protocol", [1, 2, 3, 4])
+def test_client_refuses_a_pre_native_spool_and_names_the_migrating_release(
     tmp_path: Path,
+    protocol: int,
 ):
     state_dir = tmp_path / "state"
-    CoordinatorBroker(state_dir, capacities={"jobs": 1}, idle_timeout=None).close()
+    _write_pre_native_spool(state_dir, protocol)
 
-    with pytest.raises(CoordinatorError, match="uses protocol 4|agc migrate"):
+    with pytest.raises(CoordinatorError) as raised:
         CoordinatorClient(state_dir=state_dir, autostart=True).snapshot()
 
-    with sqlite3.connect(state_dir / "queue.sqlite3") as database:
-        protocol = database.execute(
-            "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-        ).fetchone()[0]
-    assert protocol == "4"
+    message = str(raised.value)
+    assert str(protocol) in message
+    assert "0.5.2" in message
+    assert "migrate" in message.lower()
+
+    # The refusal never started or claimed a broker.
     owner_lock = state_dir / "broker.lock"
     assert not owner_lock.exists() or not owner_lock.read_text(encoding="utf-8")
+    with sqlite3.connect(state_dir / "queue.sqlite3") as database:
+        stored = database.execute(
+            "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
+        ).fetchone()[0]
+    assert stored == str(protocol)
 
 
 def test_managed_native_autostart_uses_the_user_service_and_never_spawns_directly(

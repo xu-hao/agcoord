@@ -18,8 +18,8 @@ procedure is in [the contributor workflow](contributing.md).
   service, AppArmor boundary, enforced-host proof, upgrades, recovery, and rollback.
 - [Conformance](conformance.md) — the versioned native behavior contract, failure-injection
   coverage, execution-mode opt-ins, and the executable release gate.
-- [Native migration and rollback](native_migration.md) — compatibility matrix, drain,
-  backup rehearsal, explicit transition, mixed-version refusal, rollback, and retirement.
+- [Migrating a pre-native spool](native_migration.md) — how a spool left below protocol 5 by a
+  pre-0.6.0 release is refused and migrated through AGCoord 0.5.2.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
   publication, optional adapters, and release posture.
 - [Session handoff format](session_handoff_format.md) — closing changed work with concise

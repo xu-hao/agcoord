@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from agcoord.queue import CoordinatorError, PROTOCOL
+from agcoord.queue import CoordinatorError, NATIVE_PROTOCOL
 
 
 textual = pytest.importorskip("textual", reason="the TUI dependency is not installed")
@@ -102,7 +102,7 @@ def _row(
 
 def _snapshot() -> dict[str, object]:
     return {
-        "protocol": PROTOCOL,
+        "protocol": NATIVE_PROTOCOL,
         "broker_pid": 4001,
         "captured_at": "2026-08-30T12:00:45+00:00",
         "capacities": {"jobs": 2, "cpu": 4, "browser": 1},
@@ -149,7 +149,7 @@ async def test_durable_maintenance_state_is_visible_without_a_broker():
         "drain_id": "drain-0123456789ab",
         "reason": "native host upgrade",
         "started_at": "2026-08-30T12:00:40+00:00",
-        "protocol": PROTOCOL,
+        "protocol": NATIVE_PROTOCOL,
         "live": 0,
         "broker_pid": None,
     }

@@ -198,7 +198,6 @@ def _sdist_metadata(sdist: Path, version: str) -> None:
     required = {
         f"{prefix}PKG-INFO",
         f"{prefix}docs/native_migration.md",
-        f"{prefix}scripts/rehearse-native-migration",
         f"{prefix}scripts/verify-release-candidate",
     }
     with tarfile.open(sdist, "r:gz") as archive:
@@ -236,7 +235,7 @@ def _sdist_metadata(sdist: Path, version: str) -> None:
         message = _metadata(package_info.read(), "sdist")
         if message.get("Version") != version:
             raise CandidateError("sdist version does not match the source release version")
-        for script in ("rehearse-native-migration", "verify-release-candidate"):
+        for script in ("verify-release-candidate",):
             member = archive.getmember(f"{prefix}scripts/{script}")
             if member.mode & 0o111 == 0:
                 raise CandidateError(f"sdist release script is not executable: {script}")
@@ -385,9 +384,8 @@ def _clean_install_artifacts(
     python: Path,
     wheel: Path,
     sdist: Path,
-    broker: Path,
     version: str,
-) -> dict[str, Any]:
+) -> None:
     environment = _clean_environment()
     with tempfile.TemporaryDirectory(prefix="agcoord-release-install-") as raw:
         root = Path(raw)
@@ -414,26 +412,7 @@ def _clean_install_artifacts(
         ).stdout.strip()
         if entry_points != "1":
             raise CandidateError("clean wheel install did not expose one xdist entry point")
-        rehearsal = _run(
-            [
-                ROOT / "scripts/rehearse-native-migration",
-                "--python",
-                wheel_python,
-                "--agc",
-                wheel_agc,
-                "--broker",
-                broker,
-            ],
-            environment=environment,
-        )
-        try:
-            receipt = json.loads(rehearsal.stdout)
-        except json.JSONDecodeError as exc:
-            raise CandidateError("clean-install migration rehearsal emitted invalid JSON") from exc
-        if receipt.get("final_protocol") != 5 or receipt.get("rollback_protocol") != 4:
-            raise CandidateError("clean-install migration rehearsal did not round-trip")
         _installed_smoke(python, staged_sdist, version, environment)
-        return receipt
 
 
 def _python_artifacts(directory: Path, version: str) -> tuple[Path, Path]:
@@ -470,7 +449,6 @@ def _assemble(
     version: str,
     native_identity: dict[str, Any],
     host_manifest: dict[str, Any],
-    migration_receipt: dict[str, Any],
 ) -> Path:
     if host_manifest.get("identity") != native_identity:
         raise CandidateError("native and host-package identities differ")
@@ -495,12 +473,10 @@ def _assemble(
             "client": f"{version}",
             "native_broker": f"{version}",
             "protocol": 5,
-            "python_rollback_protocol": 4,
             "target": TARGET,
         },
         "format": 1,
         "host_package_sha256": _sha256(output / HOST_NAME),
-        "migration_rehearsal": migration_receipt,
         "native_identity": native_identity,
         "version": version,
     }
@@ -547,11 +523,10 @@ def verify_candidate(
     native_identity = _native_artifacts(native_dir, version)
     host_manifest = _host_artifacts(host_dir, version)
     pinned_broker = _shipped_pin(native_dir / NATIVE_NAME, host_dir / HOST_NAME, version)
-    migration_receipt = _clean_install_artifacts(
+    _clean_install_artifacts(
         python,
         wheel,
         sdist,
-        native_dir / NATIVE_NAME,
         version,
     )
     sources = [
@@ -566,13 +541,11 @@ def verify_candidate(
         version,
         native_identity,
         host_manifest,
-        migration_receipt,
     )
     return {
         "artifact_count": len(sources),
         "bundle": os.fspath(output),
         "manifest_sha256": _sha256(manifest_path),
-        "migration_backup_sha256": migration_receipt["backup_sha256"],
         "pinned_broker_sha256": pinned_broker,
         "protocol": 5,
         "version": version,
