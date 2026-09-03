@@ -402,6 +402,59 @@ def _validate_head_sha(value: Any, *, required: bool) -> str | None:
     return lowered
 
 
+def _parent_pid(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    closing = stat.rfind(")")
+    if closing < 0:
+        return None
+    fields = stat[closing + 2 :].split()
+    try:
+        return int(fields[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _scratch_policy_declared(contract_json: object) -> bool:
+    """Whether a run's resource contract carries a tmpfs or project-quota scratch provider."""
+    try:
+        contract = json.loads(contract_json) if isinstance(contract_json, str) else contract_json
+    except ValueError:
+        return False
+    if not isinstance(contract, dict):
+        return False
+    return any(
+        isinstance(entry, dict)
+        and (entry.get("kind") == "tmpfs" or entry.get("backend") == "project-quota")
+        for entry in contract.values()
+    )
+
+
+def _admitted_worker_mismatch(row: Mapping[str, Any], worker_pid: int) -> str | None:
+    """Explain why ``worker_pid`` is not this row's admitted worker, or return None.
+
+    Without a scratch policy the recorded worker is the command itself. Under a tmpfs or
+    project-quota policy the recorded worker is the coordinator's launcher, which keeps the
+    command as its direct child, so the command presents its own PID and is accepted when
+    it is the live direct child of the live recorded launcher.
+    """
+    recorded = row["worker_pid"]
+    token = row["worker_start_token"]
+    if recorded == worker_pid:
+        if not _same_process(worker_pid, token):
+            return "worker process identity is no longer live"
+        return None
+    if not _scratch_policy_declared(row["resource_contract_json"]):
+        return "worker PID does not match"
+    if _parent_pid(worker_pid) != recorded or not _same_process(recorded, token):
+        return "worker PID is neither the admitted launcher nor its live direct child"
+    if _process_start_token(worker_pid) is None:
+        return "worker process identity is no longer live"
+    return None
+
+
 def _validate_avoid_commits(value: object) -> tuple[str, ...]:
     """Normalize the commits one landing must refuse to publish."""
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
@@ -2810,10 +2863,9 @@ class CoordinatorBroker:
                 mismatches.append("checkout does not match")
             if row["head_sha"] != selected_head:
                 mismatches.append("head does not match")
-            if row["worker_pid"] != worker_pid:
-                mismatches.append("worker PID does not match")
-            elif not _same_process(worker_pid, row["worker_start_token"]):
-                mismatches.append("worker process identity is no longer live")
+            identity_mismatch = _admitted_worker_mismatch(row, worker_pid)
+            if identity_mismatch is not None:
+                mismatches.append(identity_mismatch)
         if mismatches:
             raise CoordinatorError(
                 f"run {run_id!r} has no exact broker admission: "
@@ -2860,10 +2912,9 @@ class CoordinatorBroker:
                     mismatches.append(f"kind is {row['kind']!r}, not 'land'")
                 if row["status"] != "running":
                     mismatches.append(f"status is {row['status']!r}, not 'running'")
-                if row["worker_pid"] != worker_pid:
-                    mismatches.append("worker PID does not match")
-                elif not _same_process(worker_pid, row["worker_start_token"]):
-                    mismatches.append("worker process identity is no longer live")
+                identity_mismatch = _admitted_worker_mismatch(row, worker_pid)
+                if identity_mismatch is not None:
+                    mismatches.append(identity_mismatch)
                 current_phase = row["phase"]
                 if current_phase not in order:
                     mismatches.append(f"phase is {current_phase!r}, not a live land phase")
@@ -2942,10 +2993,9 @@ class CoordinatorBroker:
                     mismatches.append(f"kind is {row['kind']!r}, not 'land'")
                 if row["status"] != "running":
                     mismatches.append(f"status is {row['status']!r}, not 'running'")
-                if row["worker_pid"] != worker_pid:
-                    mismatches.append("worker PID does not match")
-                elif not _same_process(worker_pid, row["worker_start_token"]):
-                    mismatches.append("worker process identity is no longer live")
+                identity_mismatch = _admitted_worker_mismatch(row, worker_pid)
+                if identity_mismatch is not None:
+                    mismatches.append(identity_mismatch)
                 if row["reported_exit_status"] is not None:
                     mismatches.append("land result was already reported")
                 if row["phase"] == "gating" and row["gate_exit_status"] is None:
