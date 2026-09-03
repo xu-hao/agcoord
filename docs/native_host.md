@@ -166,6 +166,20 @@ expectation. Such a client still installs a bundle passed by path, exactly as be
 release gate refuses to publish a version whose pin is absent or does not match the released
 broker, so a released client always carries a usable one.
 
+`--broker-sha256 <digest>` supplies the expected digest for one operation, which is how a
+maintainer running a development client exercises the download path against a host bundle they
+built themselves:
+
+```bash
+agc host install --download --broker-sha256 "$(sha256sum \
+  dist/native/agcoord-broker-x86_64-unknown-linux-musl | awk '{print $1}')"
+```
+
+It applies to a bundle path too, so an operator can demand the comparison an unpinned client
+would otherwise skip. It only ever adds an expectation. A supplied digest that disagrees with a
+shipped pin is `native-host-pin-conflict`, and one that is not 64 lowercase hexadecimal digits is
+`native-host-digest-invalid`; both refuse before any download begins.
+
 ### Downloaded bundles
 
 The download adapter is deliberately narrow. It fetches only the eight published assets for one
