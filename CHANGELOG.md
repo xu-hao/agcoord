@@ -9,6 +9,20 @@ versioning; dates use ISO 8601.
   `agc land`'s own target-sync push replaced. The repeated preflight now treats exactly that head
   as read-after-write lag and re-reads for a bounded wait (every 2 seconds, at most 30 seconds)
   before deciding; any other head, or the replaced head outliving the wait, is still refused.
+- Accept `--broker-sha256` on `agc host install` and `agc host upgrade`, so a client that ships
+  no native-host pin can still download and install a bundle it can actually check, and so an
+  operator can demand a digest comparison on a bundle path that an unpinned client would
+  otherwise skip. A supplied digest never weakens a released client: one that disagrees with the
+  shipped pin is a refusal rather than an override.
+- Add `agc avoid SHA [--reason TEXT]`, with `--list` and `--remove SHA`, storing commits that no
+  landing on this machine may publish again. Every `agc land` now refuses before any push when a
+  stored commit — or one passed with `--avoid SHA` for that landing — is reachable from the
+  request head, from the current target, or from the head that target synchronization would
+  push, and checks the target once more before publishing. The set lives in an owner-only
+  `avoid.json` beside `config.json`, needs no broker, survives `agc clear` and broker restarts,
+  and travels with the state directory through migration and rollback. The refusal code is
+  `avoided-commit`; the recovery is a fresh request branch from the current target.
+
 - Decide every shared caller-side refusal before starting a broker. `agc run`, `agc full`, and
   the land and merge submissions now settle repository discovery, the exact clean head, the
   caller PID, and the no-nesting rule before selection or autostart, so a refused submission

@@ -8,7 +8,7 @@ Transport digests prove only that a download was not corrupted. A bundle's own
 ``.sha256`` sidecars travel with the files they describe, so they cannot establish that
 a download is the artifact this client was released against. That check belongs to the
 native-host pin shipped inside the client itself, and this adapter refuses to fetch
-anything for a client that carries no pin.
+anything for a client that carries neither a pin nor an operator-supplied digest.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from .native_host import (
     INSTALLER_NAME,
     PACKAGE_NAME,
     PROBE_NAME,
-    require_pinned_broker_digest,
+    require_expected_broker_digest,
 )
 from .queue import CoordinatorError
 
@@ -159,14 +159,16 @@ def fetch_native_host_bundle(
     version: str | None = None,
     *,
     destination: str | os.PathLike[str] | None = None,
+    expected_broker: str | None = None,
 ) -> Path:
     """Materialize one owner-only bundle directory and return its package path.
 
     A cached directory that is already complete and intact is reused, so repeated
     installs of one version do not refetch. The caller still runs the package checker
-    and the pin comparison against these bytes.
+    and the digest comparison against these bytes; this refuses up front when no digest
+    could establish what the download should be.
     """
-    require_pinned_broker_digest()
+    require_expected_broker_digest(expected_broker)
     selected = version or __version__
     target = (
         Path(destination).expanduser().resolve()

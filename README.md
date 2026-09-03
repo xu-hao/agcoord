@@ -201,6 +201,8 @@ agc clear
 agc drain --reason "native host upgrade"
 agc migrate
 agc resume drain-0123456789ab
+# After deliberately rewriting main to remove a commit:
+agc avoid 0123456789abcdef0123456789abcdef01234567 --reason "removed from main"
 ```
 
 `clear` removes terminal history and its logs only. It refuses while queued or running work
@@ -209,6 +211,11 @@ exists and never removes the spool, broker ownership, or migration history.
 It waits for those rows—including an authoritative land publication—to become terminal and for
 the broker to yield ownership. `list`, `show`, `log`, the TUI, and explicit cancellation remain
 available. Save the returned `drain-…` ID: only `resume` with that exact ID reopens submissions.
+`avoid` stores a commit that no landing on this machine may publish again: every later
+`agc land` refuses before any push if the request, the current target, or the head target
+synchronization would push reaches it, so a request branch that still carries a commit removed
+from `main` cannot bring it back. Rebuild such a request as a fresh branch from the current
+`main`.
 `migrate` is the explicit, out-of-band protocol transition for an older spool; ordinary commands
 fail closed on one and name it rather than upgrading a schema on a hot path. Run it only while
 the retained receipt says `drained`, and follow the
