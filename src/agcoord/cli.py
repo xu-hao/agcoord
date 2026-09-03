@@ -142,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
             default="github",
             help="release-download adapter used by --download",
         )
+        command.add_argument(
+            "--broker-sha256",
+            help="broker digest this bundle must carry; required to download with a "
+            "client that ships no pin, and never overrides one that does",
+        )
 
     host = commands.add_parser("host", help="manage the installed native host")
     host_commands = host.add_subparsers(dest="host_command", required=True)
@@ -305,7 +310,7 @@ def _bundle_path(args: argparse.Namespace) -> Path:
         )
     from .github_release import fetch_native_host_bundle
 
-    return fetch_native_host_bundle()
+    return fetch_native_host_bundle(expected_broker=args.broker_sha256)
 
 
 def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
@@ -326,6 +331,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             state_dir=args.state_dir,
             checkout=checkout,
             require_pin=args.download,
+            broker_sha256=args.broker_sha256,
         )
         if emit:
             emit(result)

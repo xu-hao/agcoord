@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Accept `--broker-sha256` on `agc host install` and `agc host upgrade`, so a client that ships
+  no native-host pin can still download and install a bundle it can actually check, and so an
+  operator can demand a digest comparison on a bundle path that an unpinned client would
+  otherwise skip. A supplied digest never weakens a released client: one that disagrees with the
+  shipped pin is a refusal rather than an override.
 - Add `agc avoid SHA [--reason TEXT]`, with `--list` and `--remove SHA`, storing commits that no
   landing on this machine may publish again. Every `agc land` now refuses before any push when a
   stored commit — or one passed with `--avoid SHA` for that landing — is reachable from the

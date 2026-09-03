@@ -694,13 +694,14 @@ def test_native_host_upgrade_is_one_public_cli_operation(monkeypatch, tmp_path: 
         "proof_run_id": "check-native-host-proof",
     }
 
-    def fake_upgrade(package_path, *, state_dir, checkout, require_pin):
+    def fake_upgrade(package_path, *, state_dir, checkout, require_pin, broker_sha256):
         observed.append(
             {
                 "package": package_path,
                 "state_dir": state_dir,
                 "checkout": checkout,
                 "require_pin": require_pin,
+                "broker_sha256": broker_sha256,
             }
         )
         return result
@@ -726,6 +727,7 @@ def test_native_host_upgrade_is_one_public_cli_operation(monkeypatch, tmp_path: 
             "state_dir": str(state_dir),
             "checkout": Path.cwd(),
             "require_pin": False,
+            "broker_sha256": None,
         }
     ]
 
@@ -751,12 +753,18 @@ def test_native_host_install_downloads_this_client_s_matching_bundle(
     fetched.write_bytes(b"downloaded release package")
     observed: list[dict[str, object]] = []
 
-    def fake_fetch():
-        observed.append({"fetched": True})
+    def fake_fetch(*, expected_broker):
+        observed.append({"fetched": expected_broker})
         return fetched
 
-    def fake_install(package_path, *, state_dir, checkout, require_pin):
-        observed.append({"package": package_path, "require_pin": require_pin})
+    def fake_install(package_path, *, state_dir, checkout, require_pin, broker_sha256):
+        observed.append(
+            {
+                "package": package_path,
+                "require_pin": require_pin,
+                "broker_sha256": broker_sha256,
+            }
+        )
         return _install_result()
 
     monkeypatch.setattr(github_release, "fetch_native_host_bundle", fake_fetch)
@@ -766,9 +774,40 @@ def test_native_host_install_downloads_this_client_s_matching_bundle(
     assert cli.run(_args("--json", "host", "install", "--download"), out=output) == 0
     assert json.loads(output.getvalue()) == _install_result()
     assert observed == [
-        {"fetched": True},
-        {"package": fetched, "require_pin": True},
+        {"fetched": None},
+        {"package": fetched, "require_pin": True, "broker_sha256": None},
     ]
+
+
+def test_native_host_install_carries_an_operator_digest_to_both_boundaries(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord import github_release
+
+    fetched = tmp_path / "cache/agcoord-native-host-x86_64-linux.tar.gz"
+    fetched.parent.mkdir(parents=True)
+    fetched.write_bytes(b"downloaded release package")
+    supplied = "d" * 64
+    observed: list[dict[str, object]] = []
+
+    def fake_fetch(*, expected_broker):
+        observed.append({"fetched": expected_broker})
+        return fetched
+
+    def fake_install(package_path, *, state_dir, checkout, require_pin, broker_sha256):
+        observed.append({"broker_sha256": broker_sha256})
+        return _install_result()
+
+    monkeypatch.setattr(github_release, "fetch_native_host_bundle", fake_fetch)
+    monkeypatch.setattr(cli, "install_native_host", fake_install, raising=False)
+    output = StringIO()
+
+    assert cli.run(
+        _args("--json", "host", "install", "--download", "--broker-sha256", supplied),
+        out=output,
+    ) == 0
+    assert observed == [{"fetched": supplied}, {"broker_sha256": supplied}]
 
 
 def test_native_host_install_refuses_two_bundle_sources(tmp_path: Path):
@@ -808,13 +847,14 @@ def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: 
         "proof_run_id": "check-native-host-proof",
     }
 
-    def fake_install(package_path, *, state_dir, checkout, require_pin):
+    def fake_install(package_path, *, state_dir, checkout, require_pin, broker_sha256):
         observed.append(
             {
                 "package": package_path,
                 "state_dir": state_dir,
                 "checkout": checkout,
                 "require_pin": require_pin,
+                "broker_sha256": broker_sha256,
             }
         )
         return result
@@ -840,5 +880,6 @@ def test_native_host_install_is_one_public_cli_operation(monkeypatch, tmp_path: 
             "state_dir": str(state_dir),
             "checkout": Path.cwd(),
             "require_pin": False,
+            "broker_sha256": None,
         }
     ]
