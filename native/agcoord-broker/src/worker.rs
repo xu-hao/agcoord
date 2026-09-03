@@ -908,9 +908,9 @@ fn supervise_tmpfs(plan: &ExecPlan, setup: &TmpfsSetup, baseline: TmpfsBaseline)
         thread::sleep(Duration::from_millis(50));
     };
     cleanup_emulated_tmpfs(setup);
-    if unmount_current_tmpfs(setup).is_err() {
-        unsafe { libc::_exit(125) }
-    }
+    // #181: the launcher dropped every capability before the final release, so it can no
+    // longer unmount the scratch it supervised, and the run's status must be the command's
+    // own. The kernel tears the private mount namespace down with this process tree.
     if libc::WIFEXITED(status) {
         unsafe { libc::_exit(libc::WEXITSTATUS(status)) }
     }
@@ -1051,9 +1051,6 @@ fn child_main(
         token
     };
     if !write_all_fd(setup_write, &setup_message(&setup_token, code)) {
-        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
-            let _ = unmount_current_tmpfs(setup);
-        }
         unsafe { libc::_exit(125) }
     }
     let mut final_release = [0_u8; CONTROL_BYTES];
@@ -1062,15 +1059,12 @@ fn child_main(
         || final_release[4] != FINAL_RELEASE
         || final_release[5..] != token[..]
     {
-        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
-            let _ = unmount_current_tmpfs(setup);
-        }
         unsafe { libc::_exit(125) }
     }
     if code != SetupCode::Ok {
-        if let (Some(setup), Some(_baseline)) = (&plan.setup.tmpfs, tmpfs_baseline) {
-            let _ = unmount_current_tmpfs(setup);
-        }
+        // A best-effort scratch that was mounted before a later setup step failed stays in
+        // this private namespace, unreferenced by the environment, until the tree ends;
+        // the launcher holds no capability to unmount it once privileges are dropped.
         exec_plan(plan, false);
     }
     if let (Some(setup), Some(baseline)) = (&plan.setup.tmpfs, tmpfs_baseline)
@@ -1367,10 +1361,14 @@ impl Drop for PendingWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::{SetupCode, enter_admitted_profile_with};
+    use super::{ExecPlan, SetupCode, WorkerSetup, enter_admitted_profile_with, supervise_tmpfs};
+    use crate::cgroup::{TmpfsBaseline, TmpfsSetup};
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::fs::{self, File};
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn cgroup_mount_errno_remains_a_stable_worker_mount_failure() {
@@ -1435,5 +1433,94 @@ mod tests {
             enter_admitted_profile_with(true, || Ok("unconfined\n".to_owned()), || Ok(()),),
             SetupCode::ProfileTransitionUnverified,
         );
+    }
+
+    /// A tmpfs-backed command runs below a supervising launcher that has already dropped
+    /// every capability, so the kernel refuses whatever the launcher tries against the mount
+    /// once the command ends (#181). The run's status must stay the command's own exit status
+    /// or termination signal.
+    #[test]
+    fn tmpfs_supervisor_relays_the_command_status_after_user_code() {
+        let scratch = std::env::temp_dir().join(format!(
+            "agcoord-worker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = scratch.join("scratch");
+        let checkout = scratch.join("checkout");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir(&checkout).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let log = File::create(scratch.join("log")).unwrap();
+        let setup = TmpfsSetup {
+            target,
+            size: 1 << 20,
+            inodes: 64,
+            report: scratch.join("tmpfs.json"),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            emulate: false,
+            exec: false,
+        };
+        let baseline = TmpfsBaseline {
+            blocks: 0,
+            blocks_free: 0,
+            fragment_size: 1,
+            files: 0,
+            files_free: 0,
+        };
+        let environment = BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]);
+        for (script, expected_exit, expected_signal) in [
+            ("exit 0", Some(0), None),
+            ("exit 7", Some(7), None),
+            ("kill -TERM $$", None, Some(libc::SIGTERM)),
+        ] {
+            let plan = ExecPlan::new(
+                &["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                &environment,
+                &checkout,
+                &log,
+                None,
+                WorkerSetup {
+                    isolate_cgroup: false,
+                    tmpfs: Some(setup.clone()),
+                    project_quota: None,
+                    apparmor_admitted: false,
+                },
+            )
+            .unwrap();
+            // SAFETY: the fork child only runs the launcher's supervision path, which execs
+            // the command below itself and then exits without returning here.
+            let launcher = unsafe { libc::fork() };
+            assert!(launcher >= 0, "{script}: fork failed");
+            if launcher == 0 {
+                supervise_tmpfs(&plan, &setup, baseline);
+            }
+            let mut status = 0;
+            // SAFETY: launcher is this test's exact fork child and status is writable.
+            let observed = unsafe { libc::waitpid(launcher, &mut status, 0) };
+            assert_eq!(observed, launcher, "{script}: waitpid failed");
+            match (expected_exit, expected_signal) {
+                (Some(code), _) => {
+                    assert!(
+                        libc::WIFEXITED(status),
+                        "{script}: launcher did not exit normally (status {status:#x})"
+                    );
+                    assert_eq!(libc::WEXITSTATUS(status), code, "{script}");
+                }
+                (None, Some(signal)) => {
+                    assert!(
+                        libc::WIFSIGNALED(status),
+                        "{script}: launcher did not re-raise the signal (status {status:#x})"
+                    );
+                    assert_eq!(libc::WTERMSIG(status), signal, "{script}");
+                }
+                (None, None) => unreachable!(),
+            }
+            assert!(setup.report.exists(), "{script}: usage report missing");
+        }
+        fs::remove_dir_all(&scratch).unwrap();
     }
 }
