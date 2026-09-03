@@ -93,7 +93,7 @@ exhaustion, parallel project identity, cleanup, and replacement-broker crash rec
 unmounts only its test-owned filesystem.
 
 Use `agc full` from a clean checkout when an exact-head verdict is useful
-independently of publication. It is a barrier for its repository, not an undeclared
+independently of publication. It is ordinary lane work, not a barrier or an undeclared
 machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside
 an admitted AGCoord job; nested submissions are rejected to prevent self-deadlock.
 

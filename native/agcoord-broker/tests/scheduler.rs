@@ -577,6 +577,19 @@ fn submit_with_resources_and_environment(
     resources: &[(&str, u64)],
     environment: &[(&str, &str)],
 ) -> Output {
+    submit_in_worktree(state_dir, submission, resources, environment, None)
+}
+
+fn submit_in_worktree(
+    state_dir: &Path,
+    submission: &Submission<'_>,
+    resources: &[(&str, u64)],
+    environment: &[(&str, &str)],
+    worktree_id: Option<&str>,
+) -> Output {
+    let selected_worktree = worktree_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("worktree-{}", submission.repository));
     let mut arguments = vec![
         "submit".to_owned(),
         "--state-dir".to_owned(),
@@ -592,7 +605,7 @@ fn submit_with_resources_and_environment(
         "--repository".to_owned(),
         submission.repository.to_owned(),
         "--worktree-id".to_owned(),
-        format!("worktree-{}", submission.repository),
+        selected_worktree,
         "--checkout".to_owned(),
         submission.checkout.to_str().unwrap().to_owned(),
         "--branch".to_owned(),
@@ -640,7 +653,22 @@ fn submit_with_resources_and_environment(
 }
 
 fn submit_ok(state_dir: &Path, submission: &Submission<'_>) {
-    let result = submit(state_dir, submission);
+    assert_submitted(submission, submit(state_dir, submission));
+}
+
+fn submit_ok_in_worktree(
+    state_dir: &Path,
+    submission: &Submission<'_>,
+    resources: &[(&str, u64)],
+    worktree_id: Option<&str>,
+) {
+    assert_submitted(
+        submission,
+        submit_in_worktree(state_dir, submission, resources, &[], worktree_id),
+    );
+}
+
+fn assert_submitted(submission: &Submission<'_>, result: Output) {
     assert!(
         result.status.success(),
         "{}",
@@ -862,54 +890,80 @@ fn create_legacy_database(state: &Path, checkout: &Path, selected_protocol: u64)
 }
 
 #[test]
-fn repository_barriers_and_machine_capacity_preserve_order() {
-    let temporary = TestDirectory::new("barriers");
+fn full_is_not_a_lane_barrier_and_lane_work_packs_by_capacity() {
+    let temporary = TestDirectory::new("lane-packing");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
-    let mut broker = RunningBroker::start(&state, &[("jobs", 2)]);
-    let check_entered = temporary.path().join("check-entered");
-    let check_release = temporary.path().join("check-release");
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 3)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
     let full_entered = temporary.path().join("full-entered");
     let full_release = temporary.path().join("full-release");
-    let after = temporary.path().join("after");
+    let large = temporary.path().join("large");
+    let small = temporary.path().join("small");
     let other = temporary.path().join("other");
 
-    submit_ok(
+    submit_ok_in_worktree(
         &state,
         &Submission {
             run_id: "check-first",
             kind: "check",
             repository: "repo-a",
             checkout: &checkout,
-            command: blocking_command(&check_entered, &check_release, None),
+            command: blocking_command(&first_entered, &first_release, None),
             gate_run_id: None,
         },
+        &[("cpu", 1)],
+        None,
     );
-    wait_for(Duration::from_secs(5), || check_entered.exists());
-    submit_ok(
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+    submit_ok_in_worktree(
         &state,
         &Submission {
-            run_id: "full-barrier",
+            run_id: "full-receipt",
             kind: "full",
             repository: "repo-a",
             checkout: &checkout,
             command: blocking_command(&full_entered, &full_release, None),
             gate_run_id: None,
         },
+        &[("cpu", 1)],
+        None,
     );
-    submit_ok(
+    // A full is ordinary lane work: it overlaps the running check in its own worktree.
+    wait_for(Duration::from_secs(5), || full_entered.exists());
+    let full = status(&state, "full-receipt");
+    assert_eq!(full["status"], "running");
+    assert_eq!(full["barrier"], false);
+
+    submit_ok_in_worktree(
         &state,
         &Submission {
-            run_id: "check-after",
+            run_id: "check-large",
             kind: "check",
             repository: "repo-a",
             checkout: &checkout,
-            command: touch_command(&after),
+            command: touch_command(&large),
             gate_run_id: None,
         },
+        &[("cpu", 2)],
+        None,
     );
-    submit_ok(
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-small",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&small),
+            gate_run_id: None,
+        },
+        &[("cpu", 1)],
+        None,
+    );
+    submit_ok_in_worktree(
         &state,
         &Submission {
             run_id: "check-other",
@@ -919,32 +973,146 @@ fn repository_barriers_and_machine_capacity_preserve_order() {
             command: touch_command(&other),
             gate_run_id: None,
         },
+        &[("cpu", 1)],
+        None,
     );
 
+    // The large request waits for capacity while smaller lane and cross-repository work
+    // packs into the free CPU behind it.
+    wait_status(&state, "check-small", "passed");
     wait_status(&state, "check-other", "passed");
-    assert!(!full_entered.exists());
-    assert!(!after.exists());
-    let barrier = status(&state, "full-barrier");
-    assert!(
-        barrier["blocked_by"][0]
-            .as_str()
-            .unwrap()
-            .contains("check-first")
-    );
-    assert!(
-        status(&state, "check-after")["blocked_by"][0]
-            .as_str()
-            .unwrap()
-            .contains("full-barrier")
+    assert!(!large.exists());
+    let blocked = status(&state, "check-large");
+    assert_eq!(blocked["status"], "queued");
+    assert_eq!(blocked["blocked_by"], json!(["resource:cpu"]));
+    assert_eq!(
+        snapshot(&state).unwrap()["allocations"],
+        json!({"cpu": 2, "jobs": 2})
     );
 
-    fs::write(&check_release, "release").unwrap();
-    wait_for(Duration::from_secs(5), || full_entered.exists());
-    assert!(!after.exists());
+    fs::write(&first_release, "release").unwrap();
+    wait_status(&state, "check-first", "passed");
     fs::write(&full_release, "release").unwrap();
-    wait_status(&state, "full-barrier", "passed");
-    wait_status(&state, "check-after", "passed");
-    assert!(after.exists());
+    wait_status(&state, "full-receipt", "passed");
+    wait_status(&state, "check-large", "passed");
+    assert!(large.exists());
+    assert_eq!(
+        snapshot(&state).unwrap()["allocations"],
+        json!({"cpu": 0, "jobs": 0})
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn land_barrier_excludes_only_lane_work_in_its_own_worktree() {
+    let temporary = TestDirectory::new("worktree-barrier");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
+    let second_entered = temporary.path().join("second-entered");
+    let second_release = temporary.path().join("second-release");
+    let same = temporary.path().join("same");
+    let other = temporary.path().join("other");
+    let full_done = temporary.path().join("full-done");
+
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "land-first",
+            kind: "land",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&first_entered, &first_release, None),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+    assert_eq!(status(&state, "land-first")["barrier"], true);
+
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "check-same-worktree",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&same),
+            gate_run_id: None,
+        },
+    );
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-other-worktree",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&other),
+            gate_run_id: None,
+        },
+        &[],
+        Some("worktree-repo-a-second"),
+    );
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "full-other-worktree",
+            kind: "full",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&full_done),
+            gate_run_id: None,
+        },
+        &[],
+        Some("worktree-repo-a-second"),
+    );
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "land-second",
+            kind: "land",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&second_entered, &second_release, None),
+            gate_run_id: None,
+        },
+        &[],
+        Some("worktree-repo-a-second"),
+    );
+
+    // Work in another worktree of the same repository passes the running land, even
+    // though a same-worktree check queued ahead of it; that check and the second land
+    // stay behind the barrier.
+    wait_status(&state, "check-other-worktree", "passed");
+    wait_status(&state, "full-other-worktree", "passed");
+    assert!(!same.exists());
+    assert!(!second_entered.exists());
+    let same_worktree = status(&state, "check-same-worktree");
+    assert_eq!(same_worktree["status"], "queued");
+    assert_eq!(
+        same_worktree["blocked_by"],
+        json!(["repository:repo-a:barrier:land-first"])
+    );
+    let second = status(&state, "land-second");
+    assert_eq!(second["status"], "queued");
+    assert_eq!(
+        second["blocked_by"],
+        json!(["repository:repo-a:active:land-first"])
+    );
+    assert_eq!(status(&state, "land-first")["status"], "running");
+
+    // Once the first land finishes, the same-worktree check and the second land (in the
+    // other worktree) overlap: two lands never do.
+    fs::write(&first_release, "release").unwrap();
+    wait_status(&state, "land-first", "passed");
+    wait_status(&state, "check-same-worktree", "passed");
+    wait_for(Duration::from_secs(5), || second_entered.exists());
+    assert_eq!(status(&state, "land-second")["status"], "running");
+    fs::write(&second_release, "release").unwrap();
+    wait_status(&state, "land-second", "passed");
     assert_eq!(snapshot(&state).unwrap()["allocations"], json!({"jobs": 0}));
     assert!(broker.terminate().success());
 }
