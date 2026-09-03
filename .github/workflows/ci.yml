@@ -220,6 +220,10 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[test]'
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --target x86_64-unknown-linux-musl
+      - name: Build the development broker the Python suite drives
+        run: cargo build --locked -p agcoord-broker
       - run: python -m pytest
 
   artifacts:

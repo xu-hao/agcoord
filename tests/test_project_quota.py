@@ -28,7 +28,7 @@ from agcoord.resources import (
     resource_contract,
 )
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningReferenceBroker, caller_environment, wait_for
 from test_cgroup import _repository, _terminal
 
 
@@ -341,7 +341,7 @@ def test_coordinator_exposes_only_the_quota_tree_and_cleans_it_after_descendants
         system=system,
         project_id_source=iter((1_500_000_003,)).__next__,
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "disk": 8 * MIB, "disk_inodes": 64},
         resource_bindings=QUOTA_BINDINGS,
@@ -441,7 +441,7 @@ def test_post_allocation_refusal_fails_required_or_runs_without_scratch(
         name: {**binding, "mode": mode}
         for name, binding in QUOTA_BINDINGS.items()
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "disk": 8 * MIB, "disk_inodes": 64},
         resource_bindings=bindings,
@@ -513,7 +513,7 @@ def test_worker_privilege_drop_refusal_never_releases_user_code(
         name: {**binding, "mode": mode}
         for name, binding in QUOTA_BINDINGS.items()
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "disk": 8 * MIB, "disk_inodes": 64},
         resource_bindings=bindings,
@@ -636,7 +636,7 @@ def test_unavailable_quota_backend_obeys_required_or_no_scratch_mode(
         name: {**binding, "mode": mode}
         for name, binding in QUOTA_BINDINGS.items()
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "disk": 8 * MIB, "disk_inodes": 64},
         resource_bindings=bindings,
@@ -727,7 +727,7 @@ def test_cancellation_records_terminal_quota_usage_before_owned_cleanup(
         system=system,
         project_id_source=iter((1_500_000_009,)).__next__,
     )
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "disk": 8 * MIB, "disk_inodes": 64},
         resource_bindings=QUOTA_BINDINGS,
@@ -892,7 +892,7 @@ def test_real_ext4_project_quotas_enforce_bytes_inodes_and_parallel_identity(
         check=True,
     )
     mounted = False
-    running: RunningCoordinator | None = None
+    running: RunningReferenceBroker | None = None
     try:
         subprocess.run(
             ["mount", "-o", "loop,prjquota", str(image), str(mountpoint)],
@@ -915,7 +915,7 @@ def test_real_ext4_project_quotas_enforce_bytes_inodes_and_parallel_identity(
             ],
             "reason": None,
         }
-        running = RunningCoordinator(
+        running = RunningReferenceBroker(
             state_dir,
             capacities={
                 "jobs": 2,

@@ -20,7 +20,7 @@ from agcoord.queue import (
     migrate_queue,
 )
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningCoordinator, RunningReferenceBroker, caller_environment, wait_for
 
 
 def _git(path: Path, *arguments: str) -> str:
@@ -54,7 +54,7 @@ def test_protocol_three_history_requires_migration_before_child_leases(
 ):
     state_dir = tmp_path / "state"
     repository = _repository(tmp_path / "repository")
-    original = RunningCoordinator(
+    original = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1},
     )
@@ -92,7 +92,7 @@ def test_protocol_three_history_requires_migration_before_child_leases(
         "to_protocol": PROTOCOL,
     }
 
-    migrated = RunningCoordinator(
+    migrated = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "cpu": 1},
     )
@@ -498,7 +498,7 @@ while not release.exists():
         )
         wait_for(entered.exists, "the parent worker did not start")
         monkeypatch.setenv("AGCOORD_RUN_ID", run_id)
-        monkeypatch.setenv("AGCOORD_STATE_DIR", str(running.broker.paths.state_dir))
+        monkeypatch.setenv("AGCOORD_STATE_DIR", str(running.paths.state_dir))
 
         with pytest.raises(CoordinatorError, match="descendant|admitted"):
             client.acquire_child_cpu_lease(1, timeout=0)
@@ -774,31 +774,12 @@ def test_replacement_broker_preserves_live_lease_without_minting_tokens(tmp_path
     repository = _repository(tmp_path / "repository")
     report = tmp_path / "lease.json"
     release = tmp_path / "release"
-    owner = subprocess.Popen(
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            """
-import sys
-from agcoord.queue import CoordinatorBroker
-
-CoordinatorBroker(
-    state_dir=sys.argv[1],
-    capacities={"jobs": 1, "cpu": 2},
-    idle_timeout=None,
-).serve_forever()
-""",
-            str(state_dir),
-        ],
-        env=caller_environment(),
-    )
-    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    original = RunningCoordinator(state_dir, capacities={"jobs": 1, "cpu": 2})
+    client = original.start()
     replacement: RunningCoordinator | None = None
     worker_pid: int | None = None
 
     try:
-        wait_for(client.snapshot, "the original broker did not start")
         run_id = client.submit(
             [
                 sys.executable,
@@ -822,8 +803,7 @@ CoordinatorBroker(
         before = client.child_cpu_leases(run_id)
         assert len(before) == 1 and before[0]["granted"] == 2
 
-        os.kill(owner.pid, signal.SIGKILL)
-        owner.wait(timeout=5)
+        original.kill()
         replacement = RunningCoordinator(
             state_dir,
             capacities={"jobs": 1, "cpu": 2},
@@ -842,9 +822,8 @@ CoordinatorBroker(
         assert recovered_client.child_cpu_leases(run_id) == []
     finally:
         release.touch()
-        if owner.poll() is None:
-            owner.terminate()
-            owner.wait(timeout=5)
+        if original.is_running():
+            original.kill()
         if replacement is not None:
             replacement.stop()
         elif worker_pid is not None:

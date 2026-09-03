@@ -75,6 +75,26 @@
       }
     },
     {
+      "id": "publication.land-request-options",
+      "domain": "publication",
+      "description": "A land request's target-sync opt-out and per-request avoided commits reach the land worker as arguments, an invalid setting is refused at submission, and the coordinator-reserved environment names never reach a worker.",
+      "tests": {
+        "rust_native": [
+          "scheduler::land_request_options_reach_the_worker_as_arguments"
+        ]
+      }
+    },
+    {
+      "id": "publication.land-failure-reasons",
+      "domain": "publication",
+      "description": "A failed land records its documented failure reason: gate-failed for a red gate and otherwise the stable code of the land worker's reported exit status, with merge-error for an unknown status.",
+      "tests": {
+        "rust_native": [
+          "scheduler::failed_lands_record_their_documented_failure_reason"
+        ]
+      }
+    },
+    {
       "id": "tui.real-snapshot-refresh",
       "domain": "tui",
       "description": "The real Textual application renders public queue identity and refreshes a live native snapshot.",

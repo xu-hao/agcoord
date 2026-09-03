@@ -14,7 +14,7 @@ from agcoord import worker as worker_module
 from agcoord.cgroup import CgroupIsolationError, CgroupV2Backend
 from agcoord.resources import ResourceMeasurement, ResourceRequest
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import RunningReferenceBroker, caller_environment, wait_for
 from test_cgroup import _repository, _terminal
 from test_cgroup_memory import MIB, MEMORY_BINDINGS, MemoryFakeCgroupV2System
 
@@ -199,7 +199,7 @@ def test_invalid_tmpfs_policy_refuses_before_user_code(
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
     bindings = {name: TMPFS_BINDINGS[name] for name in resources}
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, **resources},
         resource_bindings=bindings,
@@ -243,7 +243,7 @@ def test_successful_launcher_setup_is_durable_before_user_code_and_reports_usage
     system = MemoryFakeCgroupV2System(root)
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={
             "jobs": 1,
@@ -352,7 +352,7 @@ def test_mount_capability_failure_obeys_required_or_no_scratch_mode(
         )
         for name, binding in TMPFS_BINDINGS.items()
     }
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={
             "jobs": 1,
@@ -475,7 +475,7 @@ def test_cancellation_retains_last_tmpfs_report_and_removes_owned_state(
     system = MemoryFakeCgroupV2System(root)
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={
             "jobs": 1,
@@ -549,7 +549,7 @@ def test_real_tmpfs_enforces_bytes_inodes_and_the_shared_memory_envelope(
     capability = backend.probe()
     assert capability["available"] is True
     assert {"inodes", "memory", "tmpfs"} <= set(capability["kinds"])
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={
             "jobs": 1,
@@ -716,7 +716,7 @@ def test_real_parallel_tmpfs_mounts_are_private_and_cancel_cleanly(tmp_path: Pat
     root = Path(os.environ["AGCOORD_TEST_CGROUP_ROOT"]).resolve(strict=True)
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={
             "jobs": 2,
@@ -876,7 +876,7 @@ def test_full_worker_under_a_tmpfs_policy_verifies_its_admission(
     system = MemoryFakeCgroupV2System(root)
     state_dir = tmp_path / "state"
     backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
-    running = RunningCoordinator(
+    running = RunningReferenceBroker(
         state_dir,
         capacities={"jobs": 1, "ram": 64 * MIB, "scratch": 16 * MIB, "scratch_inodes": 128},
         resource_bindings=TMPFS_BINDINGS,

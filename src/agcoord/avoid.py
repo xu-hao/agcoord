@@ -136,14 +136,20 @@ def remove_avoided(state_dir: str | os.PathLike[str], sha: object) -> dict[str, 
 def resolve_avoid_commits(
     state_dir: str | os.PathLike[str] | None,
     environment: Mapping[str, str],
+    *,
+    requested: Sequence[str] = (),
 ) -> dict[str, str]:
-    """Union the stored set with one-off commits carried in the admitted environment."""
+    """Union the stored set with the one-off commits requested for this landing.
+
+    The native broker hands those commits to the worker as ``--avoid`` arguments; the
+    reserved environment name is the protocol-4 reference broker's channel.
+    """
     selected: dict[str, str] = {}
     if state_dir is not None:
         for entry in load_avoided(state_dir):
             selected[entry["sha"]] = entry["reason"] or "stored"
     raw = environment.get(LAND_AVOID_ENV, "")
-    for item in filter(None, raw.split(",")):
+    for item in (*filter(None, raw.split(",")), *requested):
         selected.setdefault(validate_sha(item), "requested for this landing")
     return dict(sorted(selected.items()))
 

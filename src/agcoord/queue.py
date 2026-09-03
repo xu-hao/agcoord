@@ -263,7 +263,6 @@ def discover_repository(
         if not isinstance(repository, str) or not repository.strip():
             raise CoordinatorError("repository must be a non-empty string")
         name = repository.strip()
-        repository_id = name
     else:
         remote = _git_value(root, "config", "--get", "remote.origin.url", required=False)
         if remote:
@@ -276,7 +275,7 @@ def discover_repository(
                 "--git-common-dir",
             )
             name = str(_absolute(common or root))
-        repository_id = "repo-" + hashlib.sha256(name.encode()).hexdigest()[:16]
+    repository_id = "repo-" + hashlib.sha256(name.encode()).hexdigest()[:16]
     worktree_id = "worktree-" + hashlib.sha256(os.fsencode(str(root))).hexdigest()[:16]
     return RepositoryIdentity(repository_id, name, worktree_id, root)
 

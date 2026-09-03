@@ -5,9 +5,9 @@ use crate::platform::{
     worker_identity_conflicts,
 };
 use crate::store::{
-    Paths, RunRecord, allocations, blocked_by, connect, initialize_native, load_run, load_runs,
-    maintain_child_cpu_leases, maintenance_record, map_database_error, mark_maintenance_drained,
-    now, validate_child_cpu_leases,
+    Paths, RunRecord, allocations, blocked_by, commit_sha_valid, connect, initialize_native,
+    load_run, load_runs, maintain_child_cpu_leases, maintenance_record, map_database_error,
+    mark_maintenance_drained, now, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
 use crate::{cgroup, project_quota, resources};
@@ -57,6 +57,57 @@ pub struct Broker {
     last_repository: Option<String>,
     stopped: Arc<AtomicBool>,
     idle_since: Option<Instant>,
+}
+
+/// The documented reason for one failed publication run: a red gate keeps its shell status
+/// under `gate-failed`; every other handback carries the stable code of its exit status.
+fn publication_failure_reason(run: &RunRecord, exit_status: i64) -> Option<&'static str> {
+    if !matches!(run.kind.as_str(), "merge" | "land") {
+        return None;
+    }
+    if run.kind == "land" && run.phase == "gating" && run.gate_exit_status.is_some() {
+        return Some("gate-failed");
+    }
+    Some(match exit_status {
+        75 => "stale-main",
+        76 => "head-changed",
+        77 => "pr-not-ready",
+        78 => "publish-failed",
+        80 => "avoided-commit",
+        _ => "merge-error",
+    })
+}
+
+/// The coordinator-reserved land facts travel to the worker as arguments: every
+/// `_AGCOORD_` name is removed from worker environments before launch.
+fn land_request_options(run: &RunRecord) -> Result<Vec<String>> {
+    let mut options = Vec::new();
+    match run
+        .environment
+        .get("_AGCOORD_LAND_TARGET_SYNC")
+        .map(String::as_str)
+    {
+        None | Some("1") => {}
+        Some("0") => options.push("--no-target-sync".to_owned()),
+        Some(_) => {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "land run has an invalid target-sync setting",
+            ));
+        }
+    }
+    if let Some(avoided) = run.environment.get("_AGCOORD_LAND_AVOID") {
+        for sha in avoided.split(',') {
+            if !commit_sha_valid(sha) {
+                return Err(AppError::new(
+                    "broker-row-invalid",
+                    "land run names an invalid avoided commit",
+                ));
+            }
+            options.extend(["--avoid".to_owned(), sha.to_owned()]);
+        }
+    }
+    Ok(options)
 }
 
 impl Broker {
@@ -109,8 +160,9 @@ impl Broker {
                     format!("cannot encode land publication request: {error}"),
                 )
             })?,
-            "--".to_owned(),
         ]);
+        command.extend(land_request_options(run)?);
+        command.push("--".to_owned());
         command.extend(run.command.clone());
         Ok(command)
     }
@@ -562,7 +614,11 @@ impl Broker {
             } else if Self::has_resource_observation(&run, "memory-oom") {
                 ("failed", observed_exit, Some("memory-oom"))
             } else {
-                ("failed", observed_exit, None)
+                (
+                    "failed",
+                    observed_exit,
+                    publication_failure_reason(&run, observed_exit),
+                )
             };
             self.finish_run(connection, &run, status, selected_exit, failure_reason)?;
             self.crash("terminal-commit");
@@ -602,7 +658,11 @@ impl Broker {
         } else if run.kind == "land" && run.reported_exit_status == Some(0) {
             ("passed", 0, None)
         } else if let ("land", Some(exit_status)) = (run.kind.as_str(), run.reported_exit_status) {
-            ("failed", exit_status, None)
+            (
+                "failed",
+                exit_status,
+                publication_failure_reason(&run, exit_status),
+            )
         } else {
             ("interrupted", 125, Some("worker-result-lost"))
         };
