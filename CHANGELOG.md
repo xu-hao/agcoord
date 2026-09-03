@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.5.2 — 2026-09-03
+
 - Add `agc verify-admission` as a public subcommand with the same arguments and exit codes as the
   hidden `python -m agcoord.queue verify-admission` entry point, so an admitted worker whose own
   interpreter has no `agcoord` installed can prove its exact admission through the machine's `agc`.
