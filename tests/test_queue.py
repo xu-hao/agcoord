@@ -1349,10 +1349,10 @@ def test_impossible_or_nonpositive_resource_requests_are_never_queued(
         running.stop()
 
 
-def test_resources_allow_cross_repo_overlap_but_full_is_a_lane_barrier(tmp_path: Path):
+def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: Path):
     running = RunningCoordinator(
         tmp_path / "state",
-        capacities={"jobs": 4, "cpu": 2},
+        capacities={"jobs": 4, "cpu": 3},
     )
     client = running.start()
     first = _repository(tmp_path / "first")
@@ -1361,10 +1361,15 @@ def test_resources_allow_cross_repo_overlap_but_full_is_a_lane_barrier(tmp_path:
     release_first = tmp_path / "release-first"
     entered_full = tmp_path / "entered-full"
     release_full = tmp_path / "release-full"
-    entered_later = tmp_path / "entered-later"
-    release_later = tmp_path / "release-later"
+    entered_large = tmp_path / "entered-large"
+    release_large = tmp_path / "release-large"
+    entered_small = tmp_path / "entered-small"
+    release_small = tmp_path / "release-small"
     entered_other = tmp_path / "entered-other"
     release_other = tmp_path / "release-other"
+    releases = (
+        release_first, release_full, release_large, release_small, release_other,
+    )
 
     try:
         first_id = _submit(
@@ -1373,55 +1378,221 @@ def test_resources_allow_cross_repo_overlap_but_full_is_a_lane_barrier(tmp_path:
             first,
             resources={"cpu": 1},
         )
+        wait_for(entered_first.exists, "the first lane job did not start")
         full_id = _submit(
             client,
-            _blocking_command(entered_full, release_full, "full barrier"),
+            _blocking_command(entered_full, release_full, "full receipt"),
             first,
             kind="full",
             label="full gate",
             resources={"cpu": 1},
         )
-        later_id = _submit(
+        # A full is ordinary lane work: it overlaps the running check in its own worktree.
+        wait_for(entered_full.exists, "the full did not overlap earlier lane work")
+        assert client.status(full_id)["status"] == "running"
+        assert client.status(full_id)["barrier"] is False
+
+        large_id = _submit(
             client,
-            _blocking_command(entered_later, release_later, "later check"),
+            _blocking_command(entered_large, release_large, "large check"),
+            first,
+            resources={"cpu": 2},
+        )
+        small_id = _submit(
+            client,
+            _blocking_command(entered_small, release_small, "small check"),
             first,
             resources={"cpu": 1},
         )
+
+        # The large request waits for capacity while the smaller lane request behind it
+        # packs into the free CPU.
+        wait_for(entered_small.exists, "later lane work did not pack around a blocked request")
         other_id = _submit(
             client,
             _blocking_command(entered_other, release_other, "other repository"),
             second,
             resources={"cpu": 1},
         )
-
-        wait_for(entered_first.exists, "the first lane job did not start")
-        wait_for(entered_other.exists, "compatible cross-repository work did not overlap")
-        assert client.snapshot()["allocations"] == {"jobs": 2, "cpu": 2}
-        assert client.status(full_id)["status"] == "queued"
-        assert client.status(full_id)["barrier"] is True
-        assert any(first_id in blocker for blocker in client.status(full_id)["blocked_by"])
-        assert client.status(later_id)["status"] == "queued"
-        assert any(full_id in blocker for blocker in client.status(later_id)["blocked_by"])
-        assert not entered_later.exists()
+        # Unrelated repository work waits only for capacity.
+        assert client.status(large_id)["status"] == "queued"
+        assert client.status(large_id)["blocked_by"] == ["resource:cpu"]
+        assert client.status(other_id)["status"] == "queued"
+        assert client.status(other_id)["blocked_by"] == ["resource:cpu"]
+        assert not entered_large.exists()
+        assert client.snapshot()["allocations"] == {"jobs": 3, "cpu": 3}
 
         release_first.touch()
         _row(client, first_id, "passed")
-        wait_for(entered_full.exists, "the full barrier did not start after earlier lane work")
-        assert client.status(later_id)["status"] == "queued"
-        assert not entered_later.exists()
-        assert client.status(other_id)["status"] == "running"
+        wait_for(entered_other.exists, "cross-repository work did not use the freed CPU")
+        assert client.status(large_id)["status"] == "queued"
+        assert not entered_large.exists()
 
         release_full.touch()
+        release_small.touch()
         _row(client, full_id, "passed")
-        wait_for(entered_later.exists, "later lane work did not start after the full barrier")
-        release_later.touch()
+        _row(client, small_id, "passed")
+        wait_for(entered_large.exists, "the large request never fit")
+        release_large.touch()
         release_other.touch()
-        assert _row(client, later_id, "passed")["repository_id"] == client.status(full_id)[
+        assert _row(client, large_id, "passed")["repository_id"] == client.status(full_id)[
             "repository_id"
         ]
         _row(client, other_id, "passed")
+        assert client.snapshot()["allocations"] == {"jobs": 0, "cpu": 0}
     finally:
-        for path in (release_first, release_full, release_later, release_other):
+        for path in releases:
+            path.touch()
+        running.stop()
+
+
+def test_land_barrier_excludes_only_lane_work_in_its_own_worktree(tmp_path: Path):
+    running = RunningCoordinator(
+        tmp_path / "state",
+        capacities={"jobs": 4, "cpu": 4},
+    )
+    client = running.start()
+    checkout, remote, branch, head_sha = _publication_repository(tmp_path / "repository")
+    other_worktree = tmp_path / "other-worktree"
+    subprocess.run(
+        [GIT, "clone", "--quiet", "--branch", branch, str(remote), str(other_worktree)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(other_worktree, "config", "user.name", "AGCoord test")
+    _git(other_worktree, "config", "user.email", "agcoord@example.invalid")
+    assert _head(other_worktree) == head_sha
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    first_gate_entered = tmp_path / "first-gate-entered"
+    first_gate_release = tmp_path / "first-gate-release"
+    second_gate_entered = tmp_path / "second-gate-entered"
+    second_gate_release = tmp_path / "second-gate-release"
+    entered_same = tmp_path / "entered-same"
+    release_same = tmp_path / "release-same"
+    entered_other = tmp_path / "entered-other"
+    release_other = tmp_path / "release-other"
+    releases = (first_gate_release, second_gate_release, release_same, release_other)
+
+    try:
+        first_id = client.submit_land(
+            "github",
+            101,
+            _land_gate_command(
+                events, "first", entered=first_gate_entered, release=first_gate_release
+            ),
+            checkout=str(checkout),
+            label="first land",
+            resources={"cpu": 1},
+            caller_pid=os.getpid(),
+            environment=_land_environment(
+                bin_dir,
+                branch=branch,
+                head_sha=head_sha,
+                tag="first",
+                event_log=events,
+            ),
+        )
+        wait_for(first_gate_entered.exists, "the first land never reached its gate")
+        assert client.status(first_id)["barrier"] is True
+
+        same_id = _submit(
+            client,
+            _blocking_command(entered_same, release_same, "same worktree check"),
+            checkout,
+            resources={"cpu": 1},
+        )
+        other_id = _submit(
+            client,
+            _blocking_command(entered_other, release_other, "other worktree check"),
+            other_worktree,
+            resources={"cpu": 1},
+        )
+        full_id = _submit(
+            client,
+            _python("print('full receipt')"),
+            other_worktree,
+            kind="full",
+            label="other worktree full",
+            resources={"cpu": 1},
+        )
+        second_id = client.submit_land(
+            "github",
+            102,
+            _land_gate_command(
+                events, "second", entered=second_gate_entered, release=second_gate_release
+            ),
+            checkout=str(other_worktree),
+            label="second land",
+            resources={"cpu": 1},
+            caller_pid=os.getpid(),
+            environment=_land_environment(
+                bin_dir,
+                branch=branch,
+                head_sha=head_sha,
+                tag="second",
+                event_log=events,
+            ),
+        )
+        rows = {run_id: client.status(run_id) for run_id in (first_id, same_id, other_id)}
+        assert rows[first_id]["repository_id"] == rows[other_id]["repository_id"]
+        assert rows[first_id]["worktree_id"] == rows[same_id]["worktree_id"]
+        assert rows[first_id]["worktree_id"] != rows[other_id]["worktree_id"]
+
+        # Work in another worktree of the same repository passes the running land, even
+        # though a same-worktree check queued ahead of it; that check and the second land
+        # stay behind the barrier.
+        wait_for(entered_other.exists, "other-worktree work did not overlap the land")
+        full = _row(client, full_id, "passed")
+        assert full["barrier"] is False
+        assert client.status(first_id)["status"] == "running"
+        assert not entered_same.exists()
+        same = client.status(same_id)
+        assert same["status"] == "queued"
+        assert same["blocked_by"] == [f"repository:{same['repository_id']}:barrier:{first_id}"]
+        # The second land waits for the running land and for the check that shares its
+        # own worktree, but not for the same-worktree check queued behind the first land.
+        second = client.status(second_id)
+        assert second["status"] == "queued"
+        assert second["blocked_by"] == [
+            f"repository:{second['repository_id']}:active:{first_id}",
+            f"repository:{second['repository_id']}:active:{other_id}",
+        ]
+        assert client.snapshot()["allocations"] == {"jobs": 2, "cpu": 2}
+
+        release_other.touch()
+        _row(client, other_id, "passed")
+        second = client.status(second_id)
+        assert second["status"] == "queued"
+        assert second["blocked_by"] == [
+            f"repository:{second['repository_id']}:active:{first_id}"
+        ]
+
+        # Once the first land publishes, the same-worktree check and the second land (in
+        # the other worktree) overlap; two lands never do.
+        first_gate_release.touch()
+        first = _row(client, first_id, "passed")
+        assert first["phase"] == "complete"
+        wait_for(entered_same.exists, "the same-worktree check never started after the land")
+        wait_for(second_gate_entered.exists, "the second land never overlapped other-worktree work")
+        assert client.status(same_id)["status"] == "running"
+        assert client.status(second_id)["status"] == "running"
+        assert client.snapshot()["allocations"] == {"jobs": 2, "cpu": 2}
+
+        release_same.touch()
+        second_gate_release.touch()
+        _row(client, same_id, "passed")
+        second = _row(client, second_id, "passed")
+        assert second["phase"] == "complete"
+        assert events.read_text(encoding="utf-8").splitlines() == [
+            "gate:first",
+            "publish:first",
+            "gate:second",
+            "publish:second",
+        ]
+    finally:
+        for path in releases:
             path.touch()
         running.stop()
 
@@ -1442,7 +1613,7 @@ def test_full_derives_a_clean_exact_head_and_dirty_checkout_accepts_no_row(
     receipt = _row(client, receipt_id, "passed")
 
     assert receipt["kind"] == "full"
-    assert receipt["barrier"] is True
+    assert receipt["barrier"] is False
     assert receipt["head_sha"] == _head(repository)
     assert receipt["branch"] == "main"
     assert receipt["phase"] == "complete"

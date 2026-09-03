@@ -1538,14 +1538,27 @@ pub fn blocked_by(
         })
         .collect();
     let mut reasons = Vec::new();
+    // A barrier (land or retained merge) excludes every other barrier in its lane and
+    // every job that shares its worktree.  Ordinary work in another worktree of the same
+    // repository only competes for capacity.
+    let conflicts_with_barrier =
+        |candidate: &RunRecord| candidate.barrier || candidate.worktree_id == run.worktree_id;
     if run.barrier {
-        reasons.extend(same_active.iter().map(|candidate| {
-            format!(
-                "repository:{}:active:{}",
-                run.repository_id, candidate.run_id
-            )
-        }));
-        if let Some(candidate) = earlier.first() {
+        reasons.extend(
+            same_active
+                .iter()
+                .filter(|candidate| conflicts_with_barrier(candidate))
+                .map(|candidate| {
+                    format!(
+                        "repository:{}:active:{}",
+                        run.repository_id, candidate.run_id
+                    )
+                }),
+        );
+        if let Some(candidate) = earlier
+            .iter()
+            .find(|candidate| conflicts_with_barrier(candidate))
+        {
             reasons.push(format!(
                 "repository:{}:fifo:{}",
                 run.repository_id, candidate.run_id
@@ -1555,7 +1568,7 @@ pub fn blocked_by(
         .iter()
         .copied()
         .chain(earlier.iter().copied())
-        .find(|candidate| candidate.barrier)
+        .find(|candidate| candidate.barrier && candidate.worktree_id == run.worktree_id)
     {
         reasons.push(format!(
             "repository:{}:barrier:{}",
@@ -2434,7 +2447,7 @@ fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
     {
         return Err(AppError::new(
             "broker-submission-invalid",
-            "barrier submissions require a lowercase 40-character head",
+            "full, merge, and land submissions require a lowercase 40-character head",
         ));
     }
     for (name, units) in &request.resources {
@@ -2567,7 +2580,7 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
                 request.checkout.to_string_lossy(),
                 request.branch,
                 request.head_sha,
-                i64::from(matches!(request.kind.as_str(), "full" | "merge" | "land")),
+                i64::from(matches!(request.kind.as_str(), "merge" | "land")),
                 serde_json::to_string(&request.resources).unwrap(),
                 serde_json::to_string(&contract).unwrap(),
                 serde_json::to_string(&receipt).unwrap(),
