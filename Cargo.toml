@@ -3,7 +3,7 @@ members = ["native/agcoord-broker"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
