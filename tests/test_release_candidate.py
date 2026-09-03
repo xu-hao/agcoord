@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -152,6 +153,74 @@ def test_checksum_sidecar_binds_one_exact_basename(tmp_path: Path):
     sidecar.write_text(f"{digest}  ../artifact\n", encoding="ascii")
     with pytest.raises(CandidateError, match="canonical"):
         RELEASE["_sidecar"](sidecar, "artifact")
+
+
+def _pin_inputs(tmp_path: Path, broker: bytes = b"reproducible broker\n"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    artifact = tmp_path / "agcoord-broker-x86_64-unknown-linux-musl"
+    artifact.write_bytes(broker)
+    package = tmp_path / "agcoord-native-host-x86_64-linux.tar.gz"
+    with tarfile.open(package, "w:gz") as archive:
+        entry = tarfile.TarInfo("./usr/libexec/agcoord/agcoord-broker")
+        entry.size = len(broker)
+        entry.mode = 0o755
+        archive.addfile(entry, io.BytesIO(broker))
+    return artifact, package, hashlib.sha256(broker).hexdigest()
+
+
+def _write_pin(path: Path, digest, *, version: str = "0.5.0") -> Path:
+    path.write_text(
+        json.dumps({"format": 1, "version": version, "broker_sha256": digest}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _redirect_pin(monkeypatch: pytest.MonkeyPatch, pin: Path) -> None:
+    monkeypatch.setitem(RELEASE["_shipped_pin"].__globals__, "PIN_SOURCE", pin)
+
+
+def test_a_release_must_pin_the_broker_its_clients_will_download(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    artifact, package, digest = _pin_inputs(tmp_path)
+    pin = _write_pin(tmp_path / "native_host_pin.json", None)
+    _redirect_pin(monkeypatch, pin)
+
+    with pytest.raises(CandidateError, match="carries no broker digest"):
+        RELEASE["_shipped_pin"](artifact, package, "0.5.0")
+
+    _write_pin(pin, digest)
+    assert RELEASE["_shipped_pin"](artifact, package, "0.5.0") == digest
+
+
+def test_a_pin_that_names_another_broker_closes_the_release_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    artifact, package, _ = _pin_inputs(tmp_path)
+    pin = _write_pin(tmp_path / "native_host_pin.json", "b" * 64)
+    _redirect_pin(monkeypatch, pin)
+
+    with pytest.raises(CandidateError, match="does not match the released broker"):
+        RELEASE["_shipped_pin"](artifact, package, "0.5.0")
+
+    _write_pin(pin, hashlib.sha256(b"reproducible broker\n").hexdigest(), version="0.4.9")
+    with pytest.raises(CandidateError, match="does not name this release version"):
+        RELEASE["_shipped_pin"](artifact, package, "0.5.0")
+
+
+def test_a_host_package_carrying_another_broker_closes_the_release_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    artifact, _, digest = _pin_inputs(tmp_path)
+    _, other_package, _ = _pin_inputs(tmp_path / "other", b"a different broker\n")
+    _redirect_pin(monkeypatch, _write_pin(tmp_path / "native_host_pin.json", digest))
+
+    with pytest.raises(CandidateError, match="host package broker"):
+        RELEASE["_shipped_pin"](artifact, other_package, "0.5.0")
 
 
 def test_release_artifact_modes_are_exact_not_umask_dependent(tmp_path: Path):

@@ -100,9 +100,25 @@ kernel's dotted field names, including Linux 6.17's `core_sched.force_idle_usec`
 
 ## First install
 
-Install the exact matching Python client first. Download the package, all four `.sha256`
-sidecars, and the three helpers into one owner-only directory, then run the public installation
-operation:
+Install the exact matching Python client first, then let the client fetch its own bundle:
+
+```bash
+version=RELEASE_VERSION
+python -m pip install "agcoord==$version"
+agc host install --download
+```
+
+`--download` resolves the eight release files for the installed client's exact version through
+the optional GitHub adapter, caches them in an owner-only
+`${XDG_CACHE_HOME:-~/.cache}/agcoord/native-host/v<version>` directory, and installs from that
+directory. A complete, intact cache is reused rather than refetched. The coordinator core never
+learns where a bundle came from; see [the pin contract](#the-native-host-pin) for what makes a
+downloaded bundle trustworthy, and [downloaded bundles](#downloaded-bundles) for the adapter's
+transport rules.
+
+A host without network access, or an operator mirroring releases deliberately, downloads the
+package, all four `.sha256` sidecars, and the three helpers into one owner-only directory and
+passes that path instead:
 
 ```bash
 version=RELEASE_VERSION
@@ -110,6 +126,9 @@ python -m pip install "agcoord==$version"
 chmod 0700 /path/to/native-host-bundle
 agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
 ```
+
+The two forms are mutually exclusive: passing both a path and `--download`, or neither, is a
+refusal rather than a guess.
 
 The command refuses an ambient `AGCOORD_STATE_DIR`, any nondefault spool, an admitted AGCoord
 job, an existing queue, a mismatched client/package version, or an unsafe or incomplete bundle
@@ -121,6 +140,43 @@ proof. An existing safe configuration without a
 queue is preserved. Use `agc host upgrade`, not install, when a queue already exists.
 If activation succeeds but service verification or the enforcement proof fails, the command
 disables and stops the unproved fresh service before reporting recovery instructions.
+
+### The native host pin
+
+Every client ships `native_host_pin.json`, which records the SHA-256 digest of the broker
+executable that client release was built against. `scripts/build-native-broker` is byte-for-byte
+reproducible from the source tree — `scripts/check-native-reproducible` builds it twice, compares
+the results, and prints the digest — and `scripts/build-native-host-package` installs that exact
+binary into the archive, so the digest is a property of the release commit rather than of any
+particular build machine.
+
+Before staging, `agc host` digests the broker the package actually carries and compares it to the
+pin. A mismatch is `native-host-pin-mismatch` and stops the operation before the privileged
+staging step.
+
+The pin is what makes a download meaningful. A package's embedded manifest and the `.sha256`
+sidecars beside it travel with the files they describe, so a source serving a substituted bundle
+can serve matching sidecars and a matching manifest just as easily. Only the pin reaches the host
+through a different channel — the Python distribution — so only the pin can establish that a
+bundle is the artifact its client was released against.
+
+A development checkout, or a client whose pin names another version, carries no enforceable
+expectation. Such a client still installs a bundle passed by path, exactly as before, but refuses
+`--download` with `native-host-unpinned-client` rather than fetching bytes it cannot check. The
+release gate refuses to publish a version whose pin is absent or does not match the released
+broker, so a released client always carries a usable one.
+
+### Downloaded bundles
+
+The download adapter is deliberately narrow. It fetches only the eight published assets for one
+tag, requires an `https` source (loopback `http` is permitted so tests can serve a release without
+a certificate), refuses a redirect target it cannot digest, and verifies each file against its
+published sidecar before the bundle is used at all — that catches a corrupt transfer, while the
+pin catches a substituted one. A failed or interrupted fetch leaves no partial bundle behind: the
+download assembles a `.partial` directory and replaces the cache only once every file verifies.
+
+`AGCOORD_HOST_RELEASE_REPOSITORY` and `AGCOORD_HOST_RELEASE_BASE_URL` redirect the adapter at a
+mirror or a test origin. Neither relaxes the pin.
 
 ### Manual activation and recovery
 
@@ -250,6 +306,12 @@ operation:
 ```bash
 version=RELEASE_VERSION
 python -m pip install --upgrade "agcoord==$version"
+agc host upgrade --download
+```
+
+`agc host upgrade` accepts the same two bundle sources as install, under the same pin contract:
+
+```bash
 chmod 0700 /path/to/native-host-bundle
 agc host upgrade /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
 ```

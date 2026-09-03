@@ -125,6 +125,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("drain_id", help="exact drain identifier returned by agc drain")
 
+    def _bundle_source(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "package",
+            nargs="?",
+            type=Path,
+            help="agcoord-native-host-x86_64-linux.tar.gz release package",
+        )
+        command.add_argument(
+            "--download",
+            action="store_true",
+            help="fetch this client's matching release bundle instead of using a path",
+        )
+        command.add_argument(
+            "--adapter",
+            default="github",
+            help="release-download adapter used by --download",
+        )
+
     host = commands.add_parser("host", help="manage the installed native host")
     host_commands = host.add_subparsers(dest="host_command", required=True)
     host_install = state(
@@ -133,22 +151,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="install and prove a native host matching this agc client",
         )
     )
-    host_install.add_argument(
-        "package",
-        type=Path,
-        help="agcoord-native-host-x86_64-linux.tar.gz release package",
-    )
+    _bundle_source(host_install)
     host_upgrade = state(
         host_commands.add_parser(
             "upgrade",
             help="verify, activate, and prove one native-host release package",
         )
     )
-    host_upgrade.add_argument(
-        "package",
-        type=Path,
-        help="agcoord-native-host-x86_64-linux.tar.gz release package",
-    )
+    _bundle_source(host_upgrade)
 
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
         command = state(commands.add_parser(name, help=help_text))
@@ -273,6 +283,31 @@ def _avoid(
     return 0
 
 
+def _bundle_path(args: argparse.Namespace) -> Path:
+    """Resolve one native-host bundle from an explicit path or a release download."""
+    if args.download and args.package is not None:
+        raise CoordinatorError(
+            "agc host accepts either a bundle path or --download, not both",
+            code="native-host-bundle-source-conflict",
+        )
+    if not args.download:
+        if args.package is None:
+            raise CoordinatorError(
+                "agc host needs a bundle path or --download to fetch this client's "
+                "matching release bundle",
+                code="native-host-bundle-source-missing",
+            )
+        return args.package.expanduser().resolve()
+    if args.adapter != "github":
+        raise CoordinatorError(
+            f"unknown native-host download adapter {args.adapter!r}",
+            code="native-host-download-unknown-adapter",
+        )
+    from .github_release import fetch_native_host_bundle
+
+    return fetch_native_host_bundle()
+
+
 def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
     checkout = Path(getattr(args, "checkout", ".")).expanduser().resolve()
     emit = (
@@ -285,10 +320,12 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         operation = (
             install_native_host if args.host_command == "install" else upgrade_native_host
         )
+        package = _bundle_path(args)
         result = operation(
-            args.package.expanduser().resolve(),
+            package,
             state_dir=args.state_dir,
             checkout=checkout,
+            require_pin=args.download,
         )
         if emit:
             emit(result)
