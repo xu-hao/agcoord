@@ -379,3 +379,151 @@ def test_the_shipped_pin_is_well_formed():
         "commit"
     )
     assert pin["broker_sha256"] is None or len(pin["broker_sha256"]) == 64
+
+
+def test_an_operator_digest_lets_a_development_client_download(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    from agcoord import github_release
+
+    pinned(None)
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    cache = _cache(monkeypatch, tmp_path)
+    native_host, timeline, state_dir = _install_fakes(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    package = github_release.fetch_native_host_bundle(
+        expected_broker=_served_broker_digest(),
+    )
+    result = native_host.install_native_host(
+        package,
+        state_dir=state_dir,
+        checkout=checkout,
+        require_pin=True,
+        broker_sha256=_served_broker_digest(),
+    )
+
+    assert package == cache / PACKAGE_NAME
+    assert result["state"] == "complete"
+    commands = [entry[1] for entry in timeline if entry[0] == "command"]
+    assert any("stage" in command for command in commands)
+
+
+def test_an_operator_digest_that_the_package_does_not_carry_is_refused(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    from agcoord import github_release
+
+    pinned(None)
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    _cache(monkeypatch, tmp_path)
+    native_host, timeline, state_dir = _install_fakes(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    supplied = hashlib.sha256(b"a broker this bundle does not carry\n").hexdigest()
+
+    package = github_release.fetch_native_host_bundle(expected_broker=supplied)
+    with pytest.raises(CoordinatorError) as failure:
+        native_host.install_native_host(
+            package,
+            state_dir=state_dir,
+            checkout=checkout,
+            require_pin=True,
+            broker_sha256=supplied,
+        )
+
+    assert failure.value.code == "native-host-pin-mismatch"
+    commands = [entry[1] for entry in timeline if entry[0] == "command"]
+    assert not any("stage" in command for command in commands)
+
+
+def test_an_operator_digest_never_overrides_a_released_client_s_pin(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    from agcoord import github_release
+
+    pinned(_served_broker_digest())
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    cache = _cache(monkeypatch, tmp_path)
+
+    with pytest.raises(CoordinatorError) as failure:
+        github_release.fetch_native_host_bundle(expected_broker="c" * 64)
+
+    assert failure.value.code == "native-host-pin-conflict"
+    assert forge.requests == []
+    assert not cache.exists()
+
+
+def test_an_operator_digest_that_agrees_with_the_shipped_pin_is_accepted(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    from agcoord import github_release
+
+    pinned(_served_broker_digest())
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    cache = _cache(monkeypatch, tmp_path)
+
+    package = github_release.fetch_native_host_bundle(
+        expected_broker=_served_broker_digest(),
+    )
+
+    assert package == cache / PACKAGE_NAME
+
+
+def test_a_malformed_operator_digest_is_refused_before_any_request(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    from agcoord import github_release
+
+    pinned(None)
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    cache = _cache(monkeypatch, tmp_path)
+
+    with pytest.raises(CoordinatorError) as failure:
+        github_release.fetch_native_host_bundle(expected_broker="not-a-digest")
+
+    assert failure.value.code == "native-host-digest-invalid"
+    assert forge.requests == []
+    assert not cache.exists()
+
+
+def test_an_operator_digest_enforces_a_comparison_an_unpinned_client_would_skip(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    """A bundle path is checked too, so a supplied digest is not download-only."""
+    pinned(None)
+    native_host, timeline, state_dir = _install_fakes(monkeypatch, tmp_path)
+    bundle = _release(tmp_path / "bundle")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(CoordinatorError) as failure:
+        native_host.install_native_host(
+            bundle / PACKAGE_NAME,
+            state_dir=state_dir,
+            checkout=checkout,
+            broker_sha256=hashlib.sha256(b"another broker\n").hexdigest(),
+        )
+
+    assert failure.value.code == "native-host-pin-mismatch"
+    commands = [entry[1] for entry in timeline if entry[0] == "command"]
+    assert not any("stage" in command for command in commands)
