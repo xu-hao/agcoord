@@ -6783,6 +6783,11 @@ fn full_worker_under_a_tmpfs_policy_verifies_its_admission() {
     for path in [&state, &root, &checkout] {
         fs::create_dir(path).unwrap();
     }
+    // Stage a mode-0755 copy so the Python admission client accepts the broker regardless of
+    // the umask the cargo build ran under; the raw target binary can be group-writable.
+    let staged_broker = temporary.path().join("agcoord-broker");
+    fs::copy(BROKER, &staged_broker).unwrap();
+    fs::set_permissions(&staged_broker, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
         state.join("config.json"),
         serde_json::to_vec(&json!({
@@ -6792,7 +6797,7 @@ fn full_worker_under_a_tmpfs_policy_verifies_its_admission() {
                 "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
             },
             "cgroup_root": root,
-            "native_broker": {"path": BROKER, "allow_development": true}
+            "native_broker": {"path": staged_broker, "allow_development": true}
         }))
         .unwrap(),
     )
