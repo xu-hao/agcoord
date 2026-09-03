@@ -816,3 +816,111 @@ while not release.exists():
         first[4].touch()
         second[4].touch()
         running.stop()
+
+
+_FAKE_FORKING_TMPFS_LAUNCHER = r"""
+import json
+import os
+from pathlib import Path
+import sys
+release_fd = int(sys.argv[1])
+setup_fd = int(sys.argv[2])
+if os.read(release_fd, 1) != b"1":
+    raise SystemExit(125)
+raw_spec = os.environ.pop("_AGCOORD_TMPFS_SETUP", None)
+if raw_spec is None:
+    # No scratch policy: like the real launcher, become the command in place.
+    os.close(release_fd)
+    os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
+spec = json.loads(raw_spec)
+Path(spec["report"]).write_text(json.dumps({
+    "version": 1, "token": spec["token"], "peak_bytes": 1024, "peak_inodes": 2,
+    "terminal_bytes": 0, "terminal_inodes": 0, "byte_limit_hit": False,
+    "inode_limit_hit": False,
+}), encoding="ascii")
+os.write(setup_fd, b"ok")
+os.close(setup_fd)
+if os.read(release_fd, 1) != b"1":
+    raise SystemExit(125)
+os.close(release_fd)
+# With a policy the real launcher keeps the command as its child and stays as its parent.
+child = os.fork()
+if child == 0:
+    os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
+    os._exit(127)
+_waited, status = os.waitpid(child, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+"""
+
+
+def _admission_probe(checkout: Path, report: Path, depth: int) -> list[str]:
+    """Verify admission from `depth` real child processes below the command, presenting $$."""
+    script = (
+        '"$1" -m agcoord verify-admission --state-dir "$AGCOORD_STATE_DIR" '
+        '--checkout "$2" --run-id "$AGCOORD_RUN_ID" --kind "$AGCOORD_RUN_KIND" '
+        '--head-sha "$(git -C "$2" rev-parse HEAD)" --worker-pid $$ 2>"$3.err"; '
+        'printf "%s %s" $? $$ >"$3"'
+    )
+    for _ in range(depth):
+        inner = script.replace("'", "'\\''")
+        script = f"/bin/sh -c '{inner}' agcoord-test \"$1\" \"$2\" \"$3\""
+    return ["/bin/sh", "-c", script, "agcoord-test", sys.executable, str(checkout), str(report)]
+
+
+def test_full_worker_under_a_tmpfs_policy_verifies_its_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(queue_module, "_WORKER_LAUNCHER", _FAKE_FORKING_TMPFS_LAUNCHER)
+    root = tmp_path / "delegated"
+    system = MemoryFakeCgroupV2System(root)
+    state_dir = tmp_path / "state"
+    backend = CgroupV2Backend(root, state_dir=state_dir, system=system)
+    running = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 1, "ram": 64 * MIB, "scratch": 16 * MIB, "scratch_inodes": 128},
+        resource_bindings=TMPFS_BINDINGS,
+        resource_backends={"cgroup-v2": backend},
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    policy = {"ram": 32 * MIB, "scratch": 8 * MIB, "scratch_inodes": 64}
+    # (name, resources, depth below the command, expected verifier exit, command is the
+    # recorded worker?). Under a policy the command is already the launcher's direct child.
+    cases = [
+        ("policy-command", policy, 0, "0", False),
+        ("policy-child", policy, 1, "2", False),
+        ("plain-command", {}, 0, "0", True),
+        ("plain-child", {}, 1, "2", True),
+    ]
+    results = {}
+    try:
+        for name, resources, depth, _expected, _same in cases:
+            report = tmp_path / f"{name}.txt"
+            run_id = client.submit(
+                _admission_probe(repository, report, depth),
+                checkout=str(repository),
+                kind="full",
+                label=name,
+                resources=resources,
+                environment=caller_environment(),
+            )
+            row = wait_for(lambda: _terminal(client, run_id), f"{name} never finished", timeout=30)
+            results[name] = (row, report)
+    finally:
+        running.stop()
+
+    for name, _resources, depth, expected, same in cases:
+        row, report = results[name]
+        log = state_dir / "logs" / f"{row['run_id']}.log"
+        detail = {
+            "status": row["status"],
+            "exit_status": row.get("exit_status"),
+            "log": log.read_text(encoding="utf-8", errors="replace")[-800:] if log.exists() else None,
+        }
+        assert row["status"] == "passed", (name, detail)
+        exit_code, presented = report.read_text(encoding="utf-8").split()
+        err = report.with_name(report.name + ".err")
+        assert exit_code == expected, (name, err.read_text(encoding="utf-8") if err.exists() else None)
+        if depth == 0:
+            assert (row["worker_pid"] == int(presented)) is same, (name, row["worker_pid"], presented)

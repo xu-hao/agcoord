@@ -202,6 +202,20 @@ pub fn same_process(pid: u32, token: &str) -> bool {
     })
 }
 
+/// Whether `pid` (proven by `token`) is a live direct child of the live process
+/// `parent_pid` (proven by `parent_token`). Unlike `same_worker_process`, the child need
+/// not lead its own process group: a command started by a scratch launcher shares the
+/// launcher's group.
+pub fn direct_child_of(pid: u32, token: &str, parent_pid: u32, parent_token: &str) -> bool {
+    let Some((state, observed_parent, _group, observed)) = process_identity(pid) else {
+        return false;
+    };
+    if matches!(state.as_str(), "Z" | "X") || observed != token || observed_parent != parent_pid {
+        return false;
+    }
+    same_process(parent_pid, parent_token)
+}
+
 pub fn is_descendant_process(
     pid: u32,
     token: &str,

@@ -35,7 +35,7 @@ def test_versioned_conformance_manifest_passes_its_public_validator():
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == (
-        "conformance manifest v2 passed: 26 behaviors, 2 intentional differences"
+        "conformance manifest v2 passed: 27 behaviors, 2 intentional differences"
     )
     assert completed.stderr == ""
 
@@ -46,8 +46,8 @@ def test_public_checker_lists_both_implementation_selector_sets():
     assert completed.returncode == 0, completed.stderr
     selectors = json.loads(completed.stdout)
     assert set(selectors) == {"python_reference", "rust_native"}
-    assert len(selectors["python_reference"]) == 34
-    assert len(selectors["rust_native"]) == 30
+    assert len(selectors["python_reference"]) == 35
+    assert len(selectors["rust_native"]) == 31
     assert (
         "tests/test_queue.py::test_submit_and_snapshot_have_the_strict_generic_schema"
         in selectors["python_reference"]

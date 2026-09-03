@@ -758,6 +758,14 @@ its own PID. A `land` gate is a child of the admitted land worker and verifies w
 PID. Checks receive the same context for diagnostics and nested-run protection, but
 admission verification accepts only `full`, `merge`, and `land` rows and therefore rejects them.
 
+A worker that declared a scratch policy presents exactly the same thing. Under a tmpfs or
+project-quota policy the coordinator starts a launcher that enters the namespace, mounts the
+scratch, and only then starts the command as its direct child; the durable row records the
+launcher as the worker. Verification therefore also accepts the live direct child of the live
+recorded launcher, proven by the child's own start identity, so `$$` in a `full` wrapper and
+`$PPID` in a `land` gate keep working unchanged. A grandchild, or any process once the launcher
+has gone, is still refused.
+
 Verification fails closed when the state directory has no matching live owner or when the
 run ID, kind, checkout, head, PID, or process start identity differs from the durable active
 row. Repository wrappers should verify immediately before protected gate work and treat a

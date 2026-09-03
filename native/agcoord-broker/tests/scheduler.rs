@@ -6509,3 +6509,149 @@ fn migration_requires_a_complete_wal_checkpoint_before_backup() {
         "4"
     );
 }
+
+/// Run the public verifier from a process at `depth` below the recorded worker and write
+/// "<exit> <that process's pid>" to `report`. Depth 0 is the worker itself; depth 1 is its
+/// direct child, which is what a command under a scratch launcher is; depth 2 a grandchild.
+fn admission_probe(checkout: &Path, report: &Path, depth: usize) -> Vec<String> {
+    let verify = concat!(
+        "python3 -m agcoord verify-admission --state-dir \"$AGCOORD_STATE_DIR\" ",
+        "--checkout \"$1\" --run-id \"$AGCOORD_RUN_ID\" --kind \"$AGCOORD_RUN_KIND\" ",
+        "--head-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --worker-pid $$ 2>\"$2.err\"; ",
+        "printf '%s %s' $? $$ >\"$2\"",
+    );
+    // Each nesting level is one more real child process presenting its own `$$`.
+    let mut script = verify.to_owned();
+    for _ in 0..depth {
+        script = format!(
+            "/bin/sh -c '{}' agcoord-test \"$1\" \"$2\"",
+            script.replace('\'', "'\\''")
+        );
+    }
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        script,
+        "agcoord-test".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        report.to_string_lossy().into_owned(),
+    ]
+}
+
+fn probe_result(report: &Path) -> (String, i64) {
+    let observed =
+        String::from_utf8(wait_for_nonempty_file(report, Duration::from_secs(30))).unwrap();
+    let (exit, pid) = observed.trim().split_once(' ').unwrap();
+    (exit.to_owned(), pid.parse().unwrap())
+}
+
+fn probe_stderr(report: &Path) -> String {
+    fs::read_to_string(report.with_extension("txt.err")).unwrap_or_default()
+}
+
+fn wait_terminal(state: &Path, run_id: &str) {
+    wait_for(Duration::from_secs(30), || {
+        snapshot(state).is_some_and(|value| {
+            value["recent"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["run_id"] == run_id))
+        })
+    });
+}
+
+fn recorded_worker_pid(state: &Path, run_id: &str) -> Option<i64> {
+    let db = Connection::open(state.join("queue.sqlite3")).unwrap();
+    db.query_row(
+        "SELECT worker_pid FROM runs WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn full_worker_under_a_tmpfs_policy_verifies_its_admission() {
+    let temporary = TestDirectory::new("tmpfs-admission");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            },
+            "cgroup_root": root,
+            "native_broker": {"path": BROKER, "allow_development": true}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let requested = [
+        ("ram", 64 * 1024 * 1024),
+        ("scratch", 16 * 1024 * 1024),
+        ("scratch_inodes", 128),
+    ];
+    let mut capacities = vec![("jobs", 1)];
+    capacities.extend(requested);
+    let broker = RunningBroker::start_with_options(
+        &state,
+        &capacities,
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src");
+    let environment = [("PYTHONPATH", source.to_str().unwrap())];
+
+    // (run id, scratch policy?, depth below the recorded worker, expected verifier exit)
+    let cases = [
+        ("policy-self", true, 0, "0"),
+        ("policy-child", true, 1, "0"),
+        ("policy-grandchild", true, 2, "2"),
+        ("plain-self", false, 0, "0"),
+        ("plain-child", false, 1, "2"),
+    ];
+    for (run_id, policy, depth, expected) in cases {
+        let report = temporary.path().join(format!("{run_id}.txt"));
+        let submission = Submission {
+            run_id,
+            kind: "full",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: admission_probe(&checkout, &report, depth),
+            gate_run_id: None,
+        };
+        let resources: &[(&str, u64)] = if policy { &requested } else { &[] };
+        assert!(
+            submit_with_resources_and_environment(&state, &submission, resources, &environment)
+                .status
+                .success(),
+            "{run_id}: submission refused"
+        );
+        let (exit, pid) = probe_result(&report);
+        wait_terminal(&state, run_id);
+        let recorded = recorded_worker_pid(&state, run_id).unwrap();
+        assert_eq!(
+            exit,
+            expected,
+            "{run_id}: verifier exit (presented pid {pid}, recorded worker {recorded}): {}",
+            probe_stderr(&report)
+        );
+        if depth == 0 {
+            assert_eq!(
+                recorded, pid,
+                "{run_id}: depth 0 must be the recorded worker"
+            );
+        } else {
+            assert_ne!(
+                recorded, pid,
+                "{run_id}: a descendant must present its own pid"
+            );
+        }
+    }
+    drop(broker);
+}

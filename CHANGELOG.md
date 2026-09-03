@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Let a `full` or `land` worker that declared a tmpfs or project-quota scratch policy verify its
+  admission. Under such a policy both brokers start the command as the direct child of a
+  launcher and record the launcher as the worker, so the command's own PID never matched;
+  admission verification and land phase reporting now accept the live direct child of the live
+  recorded launcher, proven by its start identity. Rows without a scratch policy are unchanged.
+
 ## 0.5.2 — 2026-09-03
 
 - Add `agc verify-admission` as a public subcommand with the same arguments and exit codes as the
