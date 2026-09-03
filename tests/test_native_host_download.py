@@ -527,3 +527,84 @@ def test_an_operator_digest_enforces_a_comparison_an_unpinned_client_would_skip(
     assert failure.value.code == "native-host-pin-mismatch"
     commands = [entry[1] for entry in timeline if entry[0] == "command"]
     assert not any("stage" in command for command in commands)
+
+
+@pytest.fixture
+def permissive_umask():
+    """Run one test the way a stock Ubuntu account with a private group does."""
+    import os
+
+    previous = os.umask(0o002)
+    try:
+        yield 0o002
+    finally:
+        os.umask(previous)
+
+
+def _writable_by_others(path: Path) -> bool:
+    return bool(path.stat().st_mode & 0o022)
+
+
+def test_downloaded_assets_are_owner_only_regardless_of_umask(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+    permissive_umask,
+):
+    from agcoord import github_release, native_host
+    from agcoord.github_release import ASSET_NAMES
+
+    pinned(_served_broker_digest())
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    cache = _cache(monkeypatch, tmp_path)
+
+    package = github_release.fetch_native_host_bundle()
+
+    assert package == cache / PACKAGE_NAME
+    offenders = [
+        str(path.relative_to(cache))
+        for name in ASSET_NAMES
+        for path in (cache / name, cache / f"{name}.sha256")
+        if _writable_by_others(path)
+    ]
+    assert offenders == [], f"group- or world-writable assets: {offenders}"
+    for directory in (cache, cache.parent, cache.parent.parent):
+        assert directory.stat().st_mode & 0o077 == 0, f"{directory} is not owner-only"
+    # The client's own verifier must accept exactly what the downloader produced.
+    selected, installer, probe = native_host._verified_bundle(package)
+    assert (selected, installer.name, probe.name) == (
+        package,
+        "install-native-host",
+        "test-native-host-enforcement",
+    )
+    native_host._verify_pinned_broker(selected, require_pin=True, supplied=None)
+
+
+def test_a_cache_left_group_writable_by_an_older_client_is_repaired_on_reuse(
+    monkeypatch,
+    tmp_path: Path,
+    forge,
+    pinned,
+):
+    from agcoord import github_release, native_host
+    from agcoord.github_release import ASSET_NAMES
+
+    pinned(_served_broker_digest())
+    monkeypatch.setenv(github_release.BASE_URL_ENV, forge.base_url)
+    cache = _cache(monkeypatch, tmp_path)
+    github_release.fetch_native_host_bundle()
+    for name in ASSET_NAMES:
+        (cache / name).chmod(0o664)
+        (cache / f"{name}.sha256").chmod(0o664)
+    requests_before = len(forge.requests)
+
+    package = github_release.fetch_native_host_bundle()
+
+    assert len(forge.requests) == requests_before, "an intact cache must not refetch"
+    assert not any(
+        _writable_by_others(cache / entry)
+        for name in ASSET_NAMES
+        for entry in (name, f"{name}.sha256")
+    )
+    native_host._verified_bundle(package)
