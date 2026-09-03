@@ -88,7 +88,9 @@ interface and must be smoke-tested from the built wheel.
 
 1. Start from one clean release commit. Set the same stable version in
    `src/agcoord/__init__.py`, the Cargo workspace, and `Cargo.lock`; development suffixes are
-   release refusals. Add a dated matching section to [the changelog](../CHANGELOG.md).
+   release refusals. Add a dated matching section to [the changelog](../CHANGELOG.md). Record the
+   release's broker digest in `src/agcoord/native_host_pin.json` in that same commit; step 5
+   explains where the digest comes from and step 6 refuses a candidate without it.
 2. Land that exact commit through `agc land` with `./scripts/check-conformance`. The checker
    validates the version-2 manifest and collected Python/native selectors before running both
    complete suites serially at their process boundary. It includes generic scheduling, atomic
@@ -115,7 +117,21 @@ interface and must be smoke-tested from the built wheel.
      dist/native/agcoord-broker-x86_64-unknown-linux-musl dist/host
    ```
 
-5. From that still-clean source commit, assemble the candidate through the single artifact
+5. Confirm the release commit's native-host pin names the broker just built:
+
+   ```json
+   {"format": 1, "version": "<release version>", "broker_sha256": "<broker digest>"}
+   ```
+
+   The digest is the reproducible checksum `./scripts/check-native-reproducible` prints, which
+   equals `sha256sum dist/native/agcoord-broker-x86_64-unknown-linux-musl`. Because that build is
+   reproducible and the pin file is not an input to `scripts/native-source-id`, the digest can be
+   computed before the release commit exists and recording it does not change the broker it
+   names. Between releases `broker_sha256` stays `null`; such a client refuses
+   `agc host install --download` instead of fetching bytes it cannot check. The
+   [pin contract](native_host.md#the-native-host-pin) explains what the pin establishes.
+
+6. From that still-clean source commit, assemble the candidate through the single artifact
    boundary:
 
    ```bash
@@ -130,7 +146,9 @@ interface and must be smoke-tested from the built wheel.
    The verifier requires exactly two Python files, five native files, and eight host files. It
    rejects symlinks, extras, missing helpers, unsafe archive paths/modes, dirty source, unstable
    or unequal versions, a wrong wheel name/entry point, a copied broker in the wheel, changed
-   sidecars, non-static ELF, unreviewed dependencies, and differing raw/host identities. It then
+   sidecars, non-static ELF, unreviewed dependencies, differing raw/host identities, and a
+   native-host pin that is absent, names another version, or does not match both the released
+   broker and the broker inside the host package. It then
    installs the wheel with `xdist` and the sdist into separate fresh environments outside the
    checkout, verifies `agc`/module entry points and the pytest plugin, and runs the complete
    protocol-4 backup/migrate/rollback/remigrate rehearsal against the exact release ELF. Only
@@ -138,7 +156,7 @@ interface and must be smoke-tested from the built wheel.
    GitHub's zipped workflow-artifact transport normalizes file modes, so the workflow restores
    `0755` on only the fixed broker and three fixed helper names before running this verifier;
    content sidecars and the host archive's internal modes remain independently checked.
-6. Install the host bundle on the supported Ubuntu configuration through the staged runbook.
+7. Install the host bundle on the supported Ubuntu configuration through the staged runbook.
    For an existing spool, retain the exact durable drain receipt, require activation to match its
    ID, preserve it through migration, and resume only after owner-locked maintenance completes.
    Keep `kernel.apparmor_restrict_unprivileged_userns=1`, start the ordinary unprivileged managed
@@ -146,16 +164,16 @@ interface and must be smoke-tested from the built wheel.
    namespace root, exact CPU control, and durable applied/peak evidence. Rehearse the operator
    backup and rollback steps in the [migration runbook](native_migration.md) before making the
    native owner the default for an existing spool.
-7. A PyPI upload is a separate, explicit maintainer action. Only after the user explicitly asks
+8. A PyPI upload is a separate, explicit maintainer action. Only after the user explicitly asks
    for it, upload the exact wheel and sdist already named in `release-manifest.json` with Twine.
    Twine reads an owner-only `~/.pypirc` and a project-scoped token; never put credentials in the
    repository, command line, workflow, or long-lived environment. No permission to implement,
    land, tag, or create a GitHub release implies PyPI authorization.
-8. Read production PyPI JSON for the uploaded version, require exactly that wheel and sdist,
+9. Read production PyPI JSON for the uploaded version, require exactly that wheel and sdist,
    compare their hashes to `SHA256SUMS`, and install `agcoord==<version>` from the production
    simple index into one more clean environment. If no PyPI upload was authorized, skip this
    step and state that the release is not on PyPI; never substitute TestPyPI evidence.
-9. Tag the exact release commit as `v<version>`. The tag workflow independently rebuilds the
+10. Tag the exact release commit as `v<version>`. The tag workflow independently rebuilds the
    Python, native, and host inputs, reruns conformance and the candidate verifier with the tag
    check enabled, and uploads one credential-free workflow artifact. After it passes and the
    supported-host receipt is retained, create the GitHub release and attach every file from the
