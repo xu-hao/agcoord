@@ -741,18 +741,28 @@ user-scoped default. These values are private process context, not public job fi
 not add rows or keys to the snapshot, `show`, or TUI, and they do not contain or grant forge
 credentials.
 
-The values are claims, not admission by themselves. An internal repository gate wrapper can
-pass them to the existing internal admission verifier together with its resolved checkout,
-fresh exact head, and process identity. A `full` wrapper is the admitted worker and verifies
-with its own PID. A `land` gate is a child of the admitted land worker and verifies with its
-parent PID. Checks receive the same context for diagnostics and nested-run protection, but
+The values are claims, not admission by themselves. A repository gate wrapper proves them with
+the public verifier, passing its resolved checkout, fresh exact head, and process identity:
+
+```bash
+agc verify-admission --state-dir "$AGCOORD_STATE_DIR" --checkout "$root" \
+  --run-id "$AGCOORD_RUN_ID" --kind "$AGCOORD_RUN_KIND" --head-sha "$head" --worker-pid "$pid"
+```
+
+It exits 0 when the process is the exact durable admission and 2 with an `error:` line when it
+is not. It needs no `agcoord` in the wrapper's own interpreter: a machine that installs one `agc`
+beside its one native broker resolves it from `PATH` like `run`, `full`, and `land`. The hidden
+`python -m agcoord.queue verify-admission` entry point keeps the same arguments and exit codes for
+wrappers that still import the package. A `full` wrapper is the admitted worker and verifies with
+its own PID. A `land` gate is a child of the admitted land worker and verifies with its parent
+PID. Checks receive the same context for diagnostics and nested-run protection, but
 admission verification accepts only `full`, `merge`, and `land` rows and therefore rejects them.
 
 Verification fails closed when the state directory has no matching live owner or when the
 run ID, kind, checkout, head, PID, or process start identity differs from the durable active
 row. Repository wrappers should verify immediately before protected gate work and treat a
-refusal as a failed gate. The verifier remains an internal seam for wrappers, not a second
-submission or user-facing workflow.
+refusal as a failed gate. Verification is a proof about the calling process, not a second
+submission: it never creates a row or starts a broker.
 
 On a managed native host, these verifier calls and the other run-scoped operations below use an
 explicit admitted callback path. The path accepts only the exact current run and state context,
