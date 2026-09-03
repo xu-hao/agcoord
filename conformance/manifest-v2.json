@@ -47,10 +47,19 @@
     {
       "id": "repositories.lanes-and-capacity",
       "domain": "repositories",
-      "description": "Repository lanes preserve barriers while unrelated repositories may share available capacity.",
+      "description": "A full is ordinary lane work rather than a barrier, and queued lane work packs by declared resources while unrelated repositories share available capacity.",
       "tests": {
-        "python_reference": ["tests/test_queue.py::test_resources_allow_cross_repo_overlap_but_full_is_a_lane_barrier"],
-        "rust_native": ["scheduler::repository_barriers_and_machine_capacity_preserve_order"]
+        "python_reference": ["tests/test_queue.py::test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources"],
+        "rust_native": ["scheduler::full_is_not_a_lane_barrier_and_lane_work_packs_by_capacity"]
+      }
+    },
+    {
+      "id": "repositories.worktree-scoped-land-barrier",
+      "domain": "repositories",
+      "description": "A land excludes other lands in its repository lane and jobs from its own worktree, while work from other worktrees of the same repository overlaps it when capacity allows.",
+      "tests": {
+        "python_reference": ["tests/test_queue.py::test_land_barrier_excludes_only_lane_work_in_its_own_worktree"],
+        "rust_native": ["scheduler::land_barrier_excludes_only_lane_work_in_its_own_worktree"]
       }
     },
     {

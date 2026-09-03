@@ -49,7 +49,7 @@ def _row(
         "checkout": "/worktrees/example",
         "branch": "feature/example",
         "head_sha": head_sha,
-        "barrier": kind in {"full", "merge", "land"},
+        "barrier": kind in {"merge", "land"},
         "resources": {"jobs": 1, "cpu": 1},
         "resource_contract": {
             name: {

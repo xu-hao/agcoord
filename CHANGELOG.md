@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Make `land` the only repository-lane barrier and scope it to its worktree. A `full` keeps its
+  clean exact-head submission requirement and receipt but is admitted like a check, and a running
+  or earlier-queued land now excludes only other lands in its repository and jobs submitted from
+  its own worktree; checks and fulls from other worktrees of the same repository overlap it when
+  their declared resources fit. Within one lane, a queued job that is blocked by a land, by its
+  worktree, or by capacity lets later admissible lane work pass it, so lane work packs by declared
+  resources the way unrelated repositories already did. Both brokers apply the same rule, and the
+  conformance manifest pairs the new lane-packing and worktree-scoped-barrier tests.
 - Stop refusing a landing as `head-changed` when the forge briefly still reports the head that
   `agc land`'s own target-sync push replaced. The repeated preflight now treats exactly that head
   as read-after-write lag and re-reads for a bounded wait (every 2 seconds, at most 30 seconds)

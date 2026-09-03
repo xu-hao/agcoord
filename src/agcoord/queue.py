@@ -1929,7 +1929,7 @@ class CoordinatorBroker:
                     selected_checkout,
                     selected_branch,
                     selected_head,
-                    int(kind == "full"),
+                    0,  # only merge and land rows are lane barriers
                     json.dumps(selected_resources, separators=(",", ":")),
                     json.dumps(selected_contract, separators=(",", ":")),
                     json.dumps(selected_resource_receipt, separators=(",", ":")),
@@ -2804,8 +2804,6 @@ class CoordinatorBroker:
         else:
             if row["status"] != "running":
                 mismatches.append(f"status is {row['status']!r}, not 'running'")
-            if not row["barrier"]:
-                mismatches.append("run is not a repository barrier")
             if row["kind"] != kind:
                 mismatches.append(f"kind is {row['kind']!r}, not {kind!r}")
             if row["checkout"] != selected_checkout:
@@ -3080,17 +3078,28 @@ class CoordinatorBroker:
             if candidate["repository_id"] == row["repository_id"]
             and candidate["sequence"] < row["sequence"]
         ]
+        # A barrier (land or retained merge) excludes every other barrier in its lane and
+        # every job that shares its worktree.  Ordinary work in another worktree of the
+        # same repository only competes for capacity.
         if row["barrier"]:
             reasons.extend(
                 f"repository:{row['repository_id']}:active:{candidate['run_id']}"
                 for candidate in same_active
+                if candidate["barrier"] or candidate["worktree_id"] == row["worktree_id"]
             )
-            if earlier:
+            fifo = [
+                candidate for candidate in earlier
+                if candidate["barrier"] or candidate["worktree_id"] == row["worktree_id"]
+            ]
+            if fifo:
                 reasons.append(
-                    f"repository:{row['repository_id']}:fifo:{earlier[0]['run_id']}"
+                    f"repository:{row['repository_id']}:fifo:{fifo[0]['run_id']}"
                 )
         else:
-            barriers = [candidate for candidate in [*same_active, *earlier] if candidate["barrier"]]
+            barriers = [
+                candidate for candidate in [*same_active, *earlier]
+                if candidate["barrier"] and candidate["worktree_id"] == row["worktree_id"]
+            ]
             if barriers:
                 reasons.append(
                     f"repository:{row['repository_id']}:barrier:{barriers[0]['run_id']}"
@@ -3335,27 +3344,31 @@ class CoordinatorBroker:
         active: Sequence[sqlite3.Row],
         queued: Sequence[sqlite3.Row],
     ) -> sqlite3.Row | None:
-        """Choose one repository-lane head in round-robin order."""
+        """Choose one repository lane's first admissible job in round-robin order.
+
+        Within a lane, a queued job that is blocked by a barrier, by its worktree, or by
+        capacity lets later admissible lane work pass it; the blockers themselves keep
+        barriers in submission order.
+        """
         heads: list[sqlite3.Row] = []
         seen: set[str] = set()
         for row in queued:
             repository_id = row["repository_id"]
-            if repository_id not in seen:
-                seen.add(repository_id)
-                heads.append(row)
-        if self._last_repository is not None:
-            after = [row for row in heads if row["repository_id"] > self._last_repository]
-            before = [row for row in heads if row["repository_id"] <= self._last_repository]
-            heads = [*after, *before]
-        for row in heads:
+            if repository_id in seen:
+                continue
             if not self._blocked_by(
                 row,
                 active=active,
                 queued=queued,
                 capacities=self.capacities,
             ):
-                return row
-        return None
+                seen.add(repository_id)
+                heads.append(row)
+        if self._last_repository is not None:
+            after = [row for row in heads if row["repository_id"] > self._last_repository]
+            before = [row for row in heads if row["repository_id"] <= self._last_repository]
+            heads = [*after, *before]
+        return heads[0] if heads else None
 
     def _validate_active_set(self, active: Sequence[sqlite3.Row]) -> None:
         allocations = self._allocations(active)
@@ -3369,7 +3382,14 @@ class CoordinatorBroker:
         for row in active:
             repositories.setdefault(row["repository_id"], []).append(row)
         for repository_id, rows in repositories.items():
-            if any(row["barrier"] for row in rows) and len(rows) != 1:
+            barriers = [row for row in rows if row["barrier"]]
+            if not barriers:
+                continue
+            overlap = len(barriers) > 1 or any(
+                not row["barrier"] and row["worktree_id"] == barriers[0]["worktree_id"]
+                for row in rows
+            )
+            if overlap:
                 identities = ", ".join(row["run_id"] for row in rows)
                 raise CoordinatorError(
                     f"repository {repository_id} has a barrier overlap: {identities}"
