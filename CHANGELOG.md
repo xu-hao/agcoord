@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Stop refusing a landing as `head-changed` when the forge briefly still reports the head that
+  `agc land`'s own target-sync push replaced. The repeated preflight now treats exactly that head
+  as read-after-write lag and re-reads for a bounded wait (every 2 seconds, at most 30 seconds)
+  before deciding; any other head, or the replaced head outliving the wait, is still refused.
 - Accept `--broker-sha256` on `agc host install` and `agc host upgrade`, so a client that ships
   no native-host pin can still download and install a bundle it can actually check, and so an
   operator can demand a digest comparison on a bundle path that an unpinned client would
