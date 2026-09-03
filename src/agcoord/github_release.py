@@ -132,6 +132,35 @@ def _complete(directory: Path) -> bool:
     )
 
 
+def _owner_only_mkdir(path: Path) -> None:
+    """Create ``path`` and any missing ancestors owner-only, whatever the umask says.
+
+    ``Path.mkdir(parents=True)`` applies its mode to the leaf only and lets the process
+    umask shape every intermediate directory; the cache chain is a trust boundary for the
+    bundle the client later stages as root, so each level is created explicitly.
+    """
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        os.mkdir(directory, 0o700)
+        os.chmod(directory, 0o700)
+
+
+def _normalize_modes(directory: Path) -> None:
+    """Leave one complete bundle directory owner-only and its assets non-writable by others.
+
+    Also repairs a cache written by a client that inherited a permissive umask, so an intact
+    download is reusable instead of being refused by the verifier it is about to feed.
+    """
+    os.chmod(directory, 0o700)
+    for name in ASSET_NAMES:
+        for asset in (name, f"{name}.sha256"):
+            os.chmod(directory / asset, 0o600)
+
+
 def _fetch(url: str, target: Path) -> None:
     request = urllib.request.Request(
         url,
@@ -139,7 +168,8 @@ def _fetch(url: str, target: Path) -> None:
     )
     try:
         with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
-            with target.open("wb") as sink:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as sink:
                 remaining = MAX_ASSET_BYTES
                 while remaining > 0:
                     block = response.read(min(DOWNLOAD_READ_SIZE, remaining))
@@ -177,6 +207,7 @@ def fetch_native_host_bundle(
     )
     if _complete(target):
         _verify_transport(target)
+        _normalize_modes(target)
         return target / PACKAGE_NAME
 
     base = _base_url()
@@ -185,7 +216,7 @@ def fetch_native_host_bundle(
     if staging.exists():
         shutil.rmtree(staging)
     try:
-        staging.mkdir(mode=0o700, parents=True)
+        _owner_only_mkdir(staging)
     except OSError as exc:
         raise _download_error(f"cannot create {staging}: {exc}") from exc
     try:
@@ -199,5 +230,5 @@ def fetch_native_host_bundle(
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    target.chmod(0o700)
+    _normalize_modes(target)
     return target / PACKAGE_NAME

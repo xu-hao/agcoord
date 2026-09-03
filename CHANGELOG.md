@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Create every downloaded native-host asset and cache directory owner-only regardless of the
+  invoking umask. On accounts with a permissive umask, `agc host install --download` and
+  `agc host upgrade --download` wrote group-writable assets and then refused the bundle they had
+  just fetched; the downloader now sets explicit modes, and an intact cache left in that state
+  by an earlier client is repaired on reuse instead of refused.
+
 ## 0.5.0 — 2026-09-03
 
 - Move the client's supported native broker line to 0.5.x. A 0.5.0 Python client selects and

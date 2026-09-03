@@ -111,7 +111,8 @@ agc host install --download
 `--download` resolves the eight release files for the installed client's exact version through
 the optional GitHub adapter, caches them in an owner-only
 `${XDG_CACHE_HOME:-~/.cache}/agcoord/native-host/v<version>` directory, and installs from that
-directory. A complete, intact cache is reused rather than refetched. The coordinator core never
+directory, creating each directory and asset owner-only regardless of the invoking umask.
+A complete, intact cache is reused rather than refetched, with its modes normalized first. The coordinator core never
 learns where a bundle came from; see [the pin contract](#the-native-host-pin) for what makes a
 downloaded bundle trustworthy, and [downloaded bundles](#downloaded-bundles) for the adapter's
 transport rules.
