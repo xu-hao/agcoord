@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.6.0 — 2026-09-03
 
 - **Breaking:** retire the Python reference broker. `CoordinatorBroker`, the hidden `serve`
   entry point, protocol-4 owner discovery, the legacy drain/resume/maintenance helpers,
