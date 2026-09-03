@@ -6907,7 +6907,7 @@ fn cgroup_fixture_records_an_exec_tmpfs_binding_in_the_contract_only_when_set() 
         ];
         let mut capacities = vec![("jobs", 1)];
         capacities.extend(requested);
-        let mut broker = RunningBroker::start_with_options(
+        let broker = RunningBroker::start_with_options(
             &state,
             &capacities,
             &["--cgroup-fixture", root.to_str().unwrap()],
@@ -6968,7 +6968,7 @@ fn real_cgroup_exec_tmpfs_binding_mounts_without_noexec_and_runs_a_program() {
         .unwrap(),
     )
     .unwrap();
-    let mut broker = RunningBroker::start(
+    let broker = RunningBroker::start(
         &state,
         &[
             ("jobs", 1),
