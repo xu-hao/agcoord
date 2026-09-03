@@ -1,48 +1,43 @@
-# Cross-implementation conformance
+# Conformance
 
-AGCoord keeps the protocol-4 Python broker as an executable reference oracle while the
-protocol-5 Rust broker is the only production owner selected by installed clients. The strict
-versioned contract in `conformance/manifest-v2.json` pairs public black-box tests for those two
-implementations. A release is not conformant merely because both test suites happen to pass:
-every required domain and every intentional difference must also remain named in the manifest
-and backed by collected tests.
+The protocol-5 Rust broker is AGCoord's only implementation. The strict versioned contract in
+`conformance/manifest-v3.json` names the public black-box tests that prove its required
+behavior. A release is not conformant merely because the test suites happen to pass: every
+required domain must remain named in the manifest and backed by collected tests, and a selector
+that is renamed or no longer collected fails the gate before any suite runs.
 
-## Version 2 contract
+## Version 3 contract
 
-Version 2 retains the version-1 domains and requires paired coverage for public commands,
-repository lanes, atomic publication,
-the real TUI, protocol handling, typed resources and receipts, migrations, contention,
-cancellation, and replacement recovery. It separately names crash boundaries around database
-transactions, launcher release, cgroup attachment, publication authority, terminal cleanup,
-and replacement ownership. Its client and stored-state corpora cover malformed values, and its
-safety properties prove no duplicate execution, stale publication, unrelated process kill, or
-unverified enforcement claim.
+Version 3 keeps the version-2 domains for a single implementation: public commands, repository
+lanes, atomic publication, the real TUI, protocol handling, typed resources and receipts,
+migrations, contention, cancellation, and replacement recovery. It separately names crash
+boundaries around database transactions, launcher release, cgroup attachment, publication
+authority, terminal cleanup, and replacement ownership. Its client and stored-state corpora cover
+malformed values, and its safety properties prove no duplicate execution, stale publication,
+unrelated process kill, or unverified enforcement claim.
 
-Resource coverage also proves the zero-scratch default at the worker boundary: both owners remove
-caller temporary-directory variables and create no managed run scratch path unless a provider is
-declared.
+Resource coverage proves the zero-scratch default at the worker boundary — the broker removes
+caller temporary-directory variables and creates no managed run scratch path unless a provider is
+declared — and that a worker under a declared scratch policy still verifies its admission.
 
 Contention coverage includes durable maintenance draining: competing submissions linearize
 entirely before or after the guard, accepted work and authoritative publication complete, a
 crashed owner is replaced only to recover live work, migration preserves the marker, host
 activation requires its exact ID, and only exact-ID resume reopens submissions.
 
-Each behavior contains one or more pytest node IDs for the Python reference and Rust integration
-test selectors for the native owner. Selectors exercise clients, commands, repositories,
-subprocesses, the Textual application, and test-owned kernel seams; documentation or source-text
-assertions are not conformance evidence. A selector that is renamed or no longer collected makes
-the gate fail before either complete suite runs.
+Each behavior lists one or more Rust integration test selectors. Selectors exercise clients,
+commands, repositories, subprocesses, the Textual application, and test-owned kernel seams;
+documentation or source-text assertions are not conformance evidence.
 
-The manifest also records two intentional differences:
+The manifest records one intentional difference in execution mode: ordinary tests use
+deterministic, test-owned cgroup and project-quota seams, while real kernel enforcement remains
+an explicit dedicated-host proof.
 
-- the Python owner remains a protocol-4 conformance fixture and is never an automatic production
-  fallback, while the Rust executable publishes the audited protocol-5 release identity;
-- ordinary tests use deterministic, test-owned cgroup and project-quota seams, while real kernel
-  enforcement remains an explicit dedicated-host proof.
-
-Changing a required domain, implementation identity, or execution contract requires a new
-manifest version. Adding behavior within version 2 requires paired public tests and a manifest
-entry in the same change.
+Version 3 replaced the paired Python-reference selectors of version 2. The protocol-4 Python
+broker is no longer a conformance oracle; the Python package is the client, and its own suite
+still runs in full as part of the gate. Changing a required domain, the implementation identity,
+or the execution contract requires a new manifest version. Adding behavior within version 3
+requires a public native test and a manifest entry in the same change.
 
 ## Executable gate
 
@@ -54,10 +49,10 @@ Run the canonical checker from a dependency-complete checkout:
 ./scripts/check-conformance
 ```
 
-Validation is a fast strict JSON/schema check. Coverage mode asks pytest and Cargo to collect the
-named tests and refuses any missing selector. The default mode then runs the complete Python and
-Rust workspace suites; CI and the tag workflow use this mode, so a native artifact cannot be
-released after deleting or renaming declared coverage.
+Validation is a fast strict JSON/schema check. Coverage mode asks Cargo to list the named native
+tests and refuses any missing selector. The default mode then runs the complete Python and Rust
+workspace suites; CI and the tag workflow use this mode, so a native artifact cannot be released
+after deleting or renaming declared coverage.
 
 The process-lifecycle suites are deliberately serial: pytest uses one worker and the Rust test
 harness uses one test thread. Their individual scenarios still create real concurrent clients,
