@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Decide every shared caller-side refusal before starting a broker. `agc run`, `agc full`, and
+  the land and merge submissions now settle repository discovery, the exact clean head, the
+  caller PID, and the no-nesting rule before selection or autostart, so a refused submission
+  can no longer leave a new owner and queue behind in the target state directory. Only the
+  owner's declared capacities are checked after a broker exists, and a dirty checkout is still
+  refused before a nested submission is.
 - Fetch the matching native-host bundle with `agc host install --download` and
   `agc host upgrade --download` instead of requiring an operator to assemble the eight release
   files by hand. The download is an optional GitHub adapter; the coordinator core still accepts
