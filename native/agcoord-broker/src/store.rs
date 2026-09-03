@@ -1,7 +1,7 @@
 use crate::error::{AppError, Result};
 use crate::platform::{
-    OwnerLock, is_descendant_process, live_owner_metadata, prepare_private_directory, same_process,
-    same_worker_process, sync_file,
+    OwnerLock, direct_child_of, is_descendant_process, live_owner_metadata,
+    prepare_private_directory, same_process, same_worker_process, sync_file,
 };
 use crate::resources::{
     BackendState, Binding, initial_receipt, parse_backend_state, parse_bindings,
@@ -2724,6 +2724,34 @@ pub fn clear(paths: &Paths) -> Result<Value> {
     Ok(json!({"cleared": terminal.len()}))
 }
 
+/// Whether the run declared a tmpfs or project-quota scratch provider, in which case the
+/// recorded worker is the coordinator's launcher and the command is its direct child.
+fn scratch_policy_declared(run: &RunRecord) -> bool {
+    run.resource_contract.as_object().is_some_and(|entries| {
+        entries.values().any(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("tmpfs")
+                || entry.get("backend").and_then(Value::as_str)
+                    == Some(crate::project_quota::PROJECT_QUOTA_BACKEND)
+        })
+    })
+}
+
+/// Whether `pid`, proven by `token`, is this run's admitted worker as the command sees it:
+/// the recorded worker itself, or — under a scratch policy — the live direct child of the
+/// live recorded launcher.
+fn admitted_worker_presents(run: &RunRecord, pid: u32, token: &str) -> bool {
+    if run.worker_pid == Some(pid) {
+        return run.worker_start_token.as_deref() == Some(token)
+            && same_worker_process(Some(pid), Some(token));
+    }
+    let (Some(recorded), Some(recorded_token)) =
+        (run.worker_pid, run.worker_start_token.as_deref())
+    else {
+        return false;
+    };
+    scratch_policy_declared(run) && direct_child_of(pid, token, recorded, recorded_token)
+}
+
 pub fn verify_admission(paths: &Paths, request: &AdmissionRequest) -> Result<Value> {
     let _owner = owner_info(paths)?;
     if !matches!(request.kind.as_str(), "full" | "merge" | "land") {
@@ -2738,9 +2766,7 @@ pub fn verify_admission(paths: &Paths, request: &AdmissionRequest) -> Result<Val
         && run.kind == request.kind
         && run.checkout == request.checkout
         && run.head_sha.as_deref() == Some(&request.head_sha)
-        && run.worker_pid == Some(request.worker_pid)
-        && run.worker_start_token.as_deref() == Some(&request.worker_start_token)
-        && same_worker_process(Some(request.worker_pid), Some(&request.worker_start_token));
+        && admitted_worker_presents(&run, request.worker_pid, &request.worker_start_token);
     if !matches {
         return Err(AppError::new(
             "broker-admission-mismatch",
@@ -2763,9 +2789,7 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
             "only a running land may report a publication phase",
         ));
     }
-    if run.worker_pid != Some(request.worker_pid)
-        || run.worker_start_token.as_deref() != Some(&request.worker_start_token)
-        || !same_worker_process(Some(request.worker_pid), Some(&request.worker_start_token))
+    if !admitted_worker_presents(&run, request.worker_pid, &request.worker_start_token)
         || run.checkout != request.checkout
         || run.head_sha.as_deref() != Some(&request.head_sha)
     {
@@ -2845,9 +2869,8 @@ pub fn report_land_result(paths: &Paths, request: &LandResultRequest) -> Result<
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(map_database_error)?;
     let run = load_run(&connection, &request.run_id)?;
-    let identity_matches = run.worker_pid == Some(request.worker_pid)
-        && run.worker_start_token.as_deref() == Some(&request.worker_start_token)
-        && same_worker_process(Some(request.worker_pid), Some(&request.worker_start_token));
+    let identity_matches =
+        admitted_worker_presents(&run, request.worker_pid, &request.worker_start_token);
     let phase_valid = (run.phase == "gating" && run.gate_exit_status.is_some())
         || (run.phase == "publishing" && run.gate_exit_status == Some(0))
         || run.phase == "preflight";
