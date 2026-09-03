@@ -500,6 +500,7 @@ def _land_execute(
     synchronize_target: bool = True,
     head_updates: list[tuple[str, str]] | None = None,
     branch: str = BRANCH,
+    avoid_commits: dict[str, str] | None = None,
 ) -> tuple[int, str, str, list[tuple[str, int | None]]]:
     from agcoord.land import execute
 
@@ -526,6 +527,7 @@ def _land_execute(
         phase_changed=lambda phase, gate_status: phases.append((phase, gate_status)),
         head_changed=head_changed,
         synchronize_target=synchronize_target,
+        avoid_commits=avoid_commits,
     )
     return status, out.getvalue(), err.getvalue(), phases
 
@@ -1575,3 +1577,163 @@ def test_land_remote_movement_during_gate_is_a_typed_refusal_without_publication
     assert _remote_sha(repository, "refs/heads/main") == (
         advanced if moved_ref == "base" else repository.main_sha
     )
+
+
+def _dangling_commit(checkout: Path) -> str:
+    tree = _sha(checkout, "HEAD^{tree}")
+    return subprocess.run(
+        [GIT, "-C", str(checkout), "commit-tree", tree, "-m", "dangling"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _side_commit_on_remote(repository: Repository, checkout: Path) -> str:
+    """Create one commit on top of main that only a side ref reaches."""
+    subprocess.run(
+        [GIT, "clone", "--branch", "main", str(repository.remote), str(checkout)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    _git(checkout, "config", "user.name", "AGCoord side test")
+    _git(checkout, "config", "user.email", "side@example.invalid")
+    (checkout / "side.txt").write_text("side\n", encoding="utf-8")
+    _git(checkout, "add", "side.txt")
+    _git(checkout, "commit", "-m", "side commit")
+    _git(checkout, "push", "origin", "HEAD:refs/heads/side")
+    return _sha(checkout, "HEAD")
+
+
+def test_land_refuses_a_request_head_that_reaches_an_avoided_commit(repository: Repository):
+    publisher = Publisher(repository)
+    avoided = _sha(repository.checkout, "HEAD")
+
+    status, out, err, phases = _land_execute(
+        repository,
+        [sys.executable, "-c", "raise SystemExit('must not run')"],
+        _metadata(repository),
+        publisher,
+        avoid_commits={avoided: "removed from main"},
+    )
+
+    assert status == 80
+    assert "REFUSED (avoided-commit)" in err
+    assert f"request head reaches avoided commit {avoided} (removed from main)" in err
+    assert "fresh branch" in err
+    assert f"avoiding 1 commit(s): {avoided}" in out
+    assert phases == [("preflight", None)]
+    assert publisher.create_calls == [] and publisher.update_calls == []
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == repository.head_sha
+    assert _remote_sha(repository, "refs/heads/main") == repository.main_sha
+
+
+def test_land_refuses_when_the_current_target_reaches_an_avoided_commit(
+    repository: Repository,
+    tmp_path: Path,
+):
+    reimported = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "reimported\n"},
+    )
+    publisher = Publisher(repository)
+
+    status, _out, err, phases = _land_execute(
+        repository,
+        [sys.executable, "-c", "raise SystemExit('must not run')"],
+        _metadata(repository),
+        publisher,
+        avoid_commits={reimported: "removed from main"},
+    )
+
+    assert status == 80
+    assert f"current main reaches avoided commit {reimported}" in err
+    assert phases == [("preflight", None)]
+    assert publisher.create_calls == [] and publisher.update_calls == []
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == repository.head_sha
+    assert _sha(repository.checkout, "HEAD") == repository.head_sha
+
+
+def test_target_sync_refuses_before_pushing_a_head_that_would_reach_an_avoided_commit(
+    repository: Repository,
+    tmp_path: Path,
+):
+    from agcoord.merge import prepare
+
+    advanced = _advance_remote_main(
+        repository,
+        tmp_path / "target-checkout",
+        {"target.txt": "advanced\n"},
+    )
+    out = StringIO()
+    err = StringIO()
+
+    status, head = prepare(
+        PR_NUMBER,
+        checkout=str(repository.checkout),
+        branch=BRANCH,
+        head_sha=repository.head_sha,
+        metadata_client=_metadata(repository),
+        publisher=Publisher(repository),
+        out=out,
+        err=err,
+        synchronize_target=True,
+        avoid_commits={advanced: "removed from main"},
+    )
+
+    assert status == 80
+    assert head == repository.head_sha
+    assert "synchronized head" in err.getvalue()
+    assert f"avoided commit {advanced} (removed from main)" in err.getvalue()
+    assert "synchronized head:" not in out.getvalue()
+    assert _sha(repository.checkout, "HEAD") == repository.head_sha
+    assert _remote_sha(repository, f"refs/heads/{BRANCH}") == repository.head_sha
+    assert _remote_sha(repository, "refs/heads/main") == advanced
+
+
+def test_land_rechecks_the_target_after_the_gate_and_refuses_a_reimported_commit(
+    repository: Repository,
+    tmp_path: Path,
+):
+    side_checkout = tmp_path / "side-checkout"
+    reimported = _side_commit_on_remote(repository, side_checkout)
+    publisher = Publisher(repository)
+
+    status, out, err, phases = _land_execute(
+        repository,
+        [GIT, "-C", str(side_checkout), "push", "origin", "HEAD:refs/heads/main"],
+        _metadata(repository),
+        publisher,
+        avoid_commits={reimported: "removed from main"},
+    )
+
+    assert status == 80
+    assert f"current main reaches avoided commit {reimported}" in err
+    assert "gate passed; publishing" not in out
+    assert phases == [("preflight", None), ("gating", None)]
+    assert publisher.create_calls == [] and publisher.update_calls == []
+    assert _remote_sha(repository, "refs/heads/main") == reimported
+
+
+def test_land_publishes_normally_when_no_avoided_commit_is_reachable(
+    repository: Repository,
+):
+    dangling = _dangling_commit(repository.checkout)
+    unknown = "f" * 40
+    publisher = Publisher(repository)
+
+    status, out, _err, phases = _land_execute(
+        repository,
+        [sys.executable, "-c", "print('gate ok')"],
+        _metadata(repository),
+        publisher,
+        avoid_commits={dangling: "never merged", unknown: "not in this repository"},
+    )
+
+    assert status == 0
+    assert "avoiding 2 commit(s)" in out
+    assert f"unknown to this repository, treated as unreachable: {unknown}" in out
+    assert phases == [("preflight", None), ("gating", None), ("publishing", 0)]
+    assert len(publisher.update_calls) == 1

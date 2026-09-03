@@ -6,6 +6,7 @@ merge an advanced target into the source; publication never rewrites the gated c
 
 from .github import (
     EXIT_HEAD_CHANGED,
+    EXIT_AVOIDED,
     EXIT_MERGE_ERROR,
     EXIT_PR_NOT_READY,
     EXIT_PUBLISH_FAILED,
@@ -21,6 +22,7 @@ from .github import (
 
 __all__ = [
     "EXIT_HEAD_CHANGED",
+    "EXIT_AVOIDED",
     "EXIT_MERGE_ERROR",
     "EXIT_PR_NOT_READY",
     "EXIT_PUBLISH_FAILED",

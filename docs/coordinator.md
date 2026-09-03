@@ -917,6 +917,33 @@ is `publishing`, cancellation is refused because killing a client during an auth
 atomic mutation would leave the outcome indeterminate. Graceful broker stop cancels safe
 earlier phases but waits for publishing and records its authoritative result.
 
+### Avoided commits after a target rewrite
+
+A deliberately rewritten target — `main` force-pushed to replace a commit — cannot be merged
+safely by any request branch that still reaches the replaced commit, whether the branch was
+created from the old target or received it through target synchronization. Git cannot know the
+commit was removed on purpose, so the operator who performed the rewrite records it once:
+
+```bash
+agc avoid 0123456789abcdef0123456789abcdef01234567 --reason "removed from main"
+agc avoid --list
+agc avoid --remove 0123456789abcdef0123456789abcdef01234567
+```
+
+The set is an owner-only `avoid.json` beside `config.json`. It needs no broker, is untouched by
+`agc clear` (which removes terminal history only), survives broker restarts, and travels with the
+state directory through migration and rollback. It is machine-local: a coordinator elsewhere does
+not know about it.
+
+Every `agc land` applies the stored set, unioned with any `--avoid SHA` given for that landing.
+Before any push it refuses with the stable code `avoided-commit` when an avoided commit is
+reachable from the request head or from the current target; target synchronization refuses
+before pushing a synchronized head that would reach one, restoring the checkout; and the target
+is read again after a green gate so a commit re-imported during the gate is still caught before
+publication. The run log names the avoided commits that were checked and any the repository does
+not have, which are trivially unreachable. The recovery is always the same: rebuild the request
+as a fresh branch from the current target and rerun the full gate.
+
 ## Observation and cancellation
 
 Every accepted job has one stable ID, durable row, and combined stdout/stderr log. Use:
