@@ -3,6 +3,16 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Fix a tmpfs-backed `check` or `full` run whose command exited 0 being recorded as failed with
+  exit status 125 and no `failure_reason`. The native launcher that supervises a tmpfs-backed
+  command tried to unmount the scratch after the command finished, which the kernel refuses once
+  the launcher's capabilities are dropped, and it reported that refusal in place of the command's
+  status; `land` rows hid the defect because the broker prefers the land worker's own reported
+  status. The launcher now relays the command's exit status or termination signal unchanged and
+  leaves the private mount namespace to the kernel's teardown (#181).
+
 ## 0.6.1 — 2026-09-03
 
 - Let a `tmpfs` binding opt in to executable scratch with `"exec": true` in the broker's

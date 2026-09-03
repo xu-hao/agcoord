@@ -262,7 +262,11 @@ one-way transition into `agcoord-admitted` and verifies that domain before clear
 permitted, inheritable, and ambient capabilities, setting `no_new_privs`, and verifying those
 values from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the
 two private channels, reports the token-bound setup result, waits for final release, closes those
-channels, verifies the final descriptor set, and calls `execve`. Submitted `_AGCOORD_*` variables
+channels, verifies the final descriptor set, and calls `execve`. Under an applied tmpfs policy it
+instead forks once more, supervises the command from those namespaces while sampling the mount for
+the receipt, and when the command ends exits with that command's status or re-raises its
+termination signal; having dropped every capability, it never unmounts the scratch, whose private
+mount namespace ends with the worker tree. Submitted `_AGCOORD_*` variables
 are removed; the broker supplies only the public admission context itself. A land request's
 reserved facts — the target-sync opt-out and the commits avoided for that landing — are
 translated into the land worker's `--no-target-sync` and `--avoid` arguments before that removal,

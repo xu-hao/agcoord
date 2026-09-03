@@ -444,6 +444,11 @@ visible. A required tmpfs mount failure has the same outcome. If both tmpfs bind
 `TMPDIR`, `TMP`, and `TEMP` absent; the verified namespace and hard memory control remain applied.
 AGCoord does not substitute an unbounded disk directory for the unavailable request.
 
+Exit status 125 belongs only to a setup or release that fails before user code. Once a
+tmpfs-backed command has started, the supervising launcher relays that command's own exit status
+or termination signal as the run's result and never replaces it with 125. It has already dropped
+every capability by then, so it does not unmount the scratch itself.
+
 Every successfully applied tmpfs request gets a distinct mount namespace and target. The mount
 remains alive while any process in that worker tree retains the namespace, then the kernel tears
 it down when the tree is gone; only afterward does the broker remove the owned underlying
