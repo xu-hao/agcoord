@@ -151,11 +151,12 @@ the request:
 agc full --label "release gate" --resource cpu=4 -- ./scripts/test.sh
 ```
 
-`full` records the checkout's full 40-character `HEAD`, checks that the worktree is clean,
-and establishes a barrier in that repository's lane. It remains useful for validation and
-release preparation, but normal landing does not compose a full row with a later publication
-row. It is not a machine-global lock: compatible work in other repositories can overlap when
-configured resource capacities allow it.
+`full` records the checkout's full 40-character `HEAD` and checks that the worktree is clean.
+It remains useful for validation and release preparation, but normal landing does not compose
+a full row with a later publication row. It is not a barrier or a machine-global lock:
+compatible work in any repository or worktree can overlap it when configured resource
+capacities allow it. Only `land` is a lane barrier, and it excludes just other lands in its
+repository and jobs from its own worktree.
 
 After pushing the exact clean head and opening a pull request, gate and publish it as one
 indivisible request:

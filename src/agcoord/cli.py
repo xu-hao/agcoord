@@ -185,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
         return command
 
     submission("run", "submit a compatible check")
-    submission("full", "submit a clean exact-head repository barrier")
+    submission("full", "submit a clean exact-head receipt without a lane barrier")
 
     land = state(commands.add_parser(
         "land",

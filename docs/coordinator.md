@@ -94,12 +94,16 @@ Each submission belongs to a stable repository lane and records its resolved wor
 lane preserves publication order without turning one repository's full gate into a lock on
 the entire machine:
 
-- `check` is ordinary work. Compatible checks from unrelated repositories may overlap.
-- `full` is a barrier in its repository lane. Earlier lane work finishes first; later lane
-  work cannot pass it. Other repositories may continue when their declared resources fit.
-- `land` is one gate-and-publication barrier in the same lane. No later lane job can begin
-  between its preflight, gate, and atomic publication. Retained legacy `merge` rows remain
-  identifiable in migrated history but are not the normal public landing workflow.
+- `check` is ordinary work. Compatible work overlaps across repositories, worktrees, and
+  kinds whenever the declared resources fit.
+- `full` is ordinary lane work with a clean exact-head submission requirement and a durable
+  receipt. It is not a barrier: checks, other fulls, and lands in other worktrees overlap it
+  when their resources fit.
+- `land` is the only barrier. It is one gate-and-publication barrier in its lane: no other
+  land in the lane, and no job from the same worktree, can begin between its preflight, gate,
+  and atomic publication. Work from other worktrees of the same repository only competes for
+  capacity. Retained legacy `merge` rows are barriers of the same shape, remain identifiable
+  in migrated history, and are not the normal public landing workflow.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
@@ -161,9 +165,11 @@ fit is rejected rather than left queued forever. Scheduling does not infer resou
 labels or commands.
 
 Admission greedily packs the complete declared resource vectors rather than assigning fixed
-per-job shares. On each pass the scheduler takes one repository-lane head, rotates fairly among
-repositories, admits the first head whose every requested resource fits the currently free
-capacities, and repeats until no head fits. Thus an eight-CPU host can overlap requests for six
+per-job shares. On each pass the scheduler takes each repository lane's first queued job whose
+blockers are empty, rotates fairly among repositories, admits one, and repeats until no lane has
+an admissible job. A blocked lane job—waiting for a land, for its worktree, or for capacity—lets
+later admissible lane work pass it; only lands keep submission order among themselves and behind
+earlier same-worktree work. Thus an eight-CPU host can overlap requests for six
 and two CPUs, or four requests for two CPUs, without a preselected “two jobs at four CPUs each”
 partition. `jobs` remains an independent concurrency ceiling and does not replace CPU, memory,
 temporary-storage, or disk claims. Greedy backfill can delay a large request while smaller
@@ -616,9 +622,10 @@ stale leaf is refused and never removed as if it were owned.
 Optional tmpfs and project-quota trees plus block-I/O policies are resource controls rather than
 credential, network, or general security sandboxes.
 
-Fairness applies across lane barriers and capacity: a compatible check can overlap work in
-another repository, but it cannot leapfrog an earlier barrier in its own lane or starve an
-older request indefinitely.
+Fairness applies across lanes and capacity: a compatible check can overlap work in another
+repository or in another worktree of its own, but it cannot leapfrog an earlier land in its own
+worktree, and lane rotation keeps one repository from monopolizing admission. Greedy backfill
+remains: a smaller request can pass a larger one that does not yet fit.
 
 ## Durable job shape
 
@@ -709,9 +716,9 @@ branch, and head. It remains useful for standalone release preparation and audit
 publication uses the gate embedded in one `land` row rather than treating a prior full
 receipt as a separate authorization step.
 
-`full` is a repository-lane barrier, not machine-wide exclusivity. Declare every scarce
-machine resource it requires. Capacities—not the fact that the job is named “full”—decide
-whether work from another repository can overlap.
+`full` is neither a lane barrier nor machine-wide exclusivity. Declare every scarce machine
+resource it requires. Capacities—not the fact that the job is named “full”—decide whether
+other work can overlap it.
 
 The coordinator snapshots the submitting client's execution environment for its worker, but
 does not expose it through rows, CLI output, or the TUI, and clears it when the job starts or
@@ -739,7 +746,7 @@ pass them to the existing internal admission verifier together with its resolved
 fresh exact head, and process identity. A `full` wrapper is the admitted worker and verifies
 with its own PID. A `land` gate is a child of the admitted land worker and verifies with its
 parent PID. Checks receive the same context for diagnostics and nested-run protection, but
-are not repository barriers and therefore cannot pass barrier admission verification.
+admission verification accepts only `full`, `merge`, and `land` rows and therefore rejects them.
 
 Verification fails closed when the state directory has no matching live owner or when the
 run ID, kind, checkout, head, PID, or process start identity differs from the durable active
@@ -878,8 +885,8 @@ the gate; the lease prevents overwriting another writer. Once preflight succeeds
 runs the gate once with the captured environment and combined transcript. A red gate records
 its actual shell status with `failure_reason=gate-failed` and never calls the publisher. A green
 gate transitions the same row directly to `publishing` while retaining the repository barrier
-and every resource allocation. No check, gate, or second landing in that lane can enter the gap
-because no separate job or gap exists.
+and every resource allocation. No same-worktree job, gate, or second landing in that lane can
+enter the gap because no separate job or gap exists.
 
 Publication repeats the exact validation after the gate. Let `M` be the target's observed
 remote commit and `H` the submitted head; `M` must be an ancestor of `H`. The forge-neutral

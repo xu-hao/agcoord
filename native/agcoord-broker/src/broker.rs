@@ -430,7 +430,15 @@ impl Broker {
                 .push(run);
         }
         for (repository, runs) in repositories {
-            if runs.iter().any(|run| run.barrier) && runs.len() != 1 {
+            let barriers: Vec<_> = runs.iter().filter(|run| run.barrier).collect();
+            let Some(barrier) = barriers.first() else {
+                continue;
+            };
+            let overlap = barriers.len() > 1
+                || runs
+                    .iter()
+                    .any(|run| !run.barrier && run.worktree_id == barrier.worktree_id);
+            if overlap {
                 return Err(AppError::new(
                     "broker-active-state-invalid",
                     format!("repository {repository} has overlapping barrier work"),
@@ -479,11 +487,20 @@ impl Broker {
         }
     }
 
+    /// Choose one repository lane's first admissible job in round-robin order.
+    ///
+    /// Within a lane, a queued job that is blocked by a barrier, by its worktree, or by
+    /// capacity lets later admissible lane work pass it; the blockers themselves keep
+    /// barriers in submission order.
     fn next_admissible(&self, active: &[RunRecord], queued: &[RunRecord]) -> Option<RunRecord> {
         let mut heads = Vec::new();
         let mut seen = BTreeSet::new();
         for run in queued {
-            if seen.insert(run.repository_id.clone()) {
+            if seen.contains(&run.repository_id) {
+                continue;
+            }
+            if blocked_by(run, active, queued, &self.capacities).is_empty() {
+                seen.insert(run.repository_id.clone());
                 heads.push(run.clone());
             }
         }
@@ -492,9 +509,7 @@ impl Broker {
                 heads.into_iter().partition(|run| run.repository_id > *last);
             heads = after.into_iter().chain(before).collect();
         }
-        heads
-            .into_iter()
-            .find(|run| blocked_by(run, active, queued, &self.capacities).is_empty())
+        heads.into_iter().next()
     }
 
     fn observe(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {

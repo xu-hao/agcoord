@@ -69,7 +69,7 @@ def _row(
         "checkout": f"/worktrees/{repository_id}/{sequence}",
         "branch": f"feature/{sequence}",
         "head_sha": head_sha,
-        "barrier": kind in {"full", "merge", "land"},
+        "barrier": kind in {"merge", "land"},
         "resources": resources,
         "resource_contract": {
             name: {
