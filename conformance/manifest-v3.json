@@ -160,9 +160,9 @@
       "description": "Migration and rollback preserve history while invalidating stale pre-rollback gates.",
       "tests": {
         "rust_native": [
-          "client_compatibility::migration_runbook_rehearses_backup_rollback_and_final_native_ownership",
-          "client_compatibility::protocol_four_drain_survives_native_migration_until_exact_resume",
-          "scheduler::migration_and_rollback_preserve_history_and_reject_stale_gates"
+          "scheduler::migration_and_rollback_preserve_history_and_reject_stale_gates",
+          "scheduler::every_legacy_protocol_migrates_through_protocol_four_without_inventing_evidence",
+          "scheduler::each_migration_cycle_uses_a_fresh_protocol_four_rollback_baseline"
         ]
       }
     },

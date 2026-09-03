@@ -14,7 +14,6 @@ import pytest
 
 from agcoord.config import config_path
 from agcoord.queue import (
-    CoordinatorBroker,
     CoordinatorClient,
     CoordinatorError,
     broker_config,
@@ -257,67 +256,4 @@ def coordinator(tmp_path: Path):
     running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 2})
     client = running.start()
     yield running, client
-    running.stop()
-
-
-class RunningReferenceBroker:
-    """The in-process protocol-4 Python broker; retired with it (#165)."""
-
-    def __init__(
-        self,
-        state_dir: Path,
-        *,
-        capacities: dict[str, int] | None = None,
-        resource_bindings: dict[str, dict[str, object]] | None = None,
-        resource_backends: dict[str, object] | None = None,
-        idle_timeout: float | None = None,
-    ) -> None:
-        self.broker = CoordinatorBroker(
-            state_dir=state_dir,
-            capacities=capacities,
-            resource_bindings=resource_bindings,
-            resource_backends=resource_backends,
-            idle_timeout=idle_timeout,
-        )
-        self.errors: list[BaseException] = []
-        self.thread = threading.Thread(
-            target=self._serve,
-            name="test-agcoord-broker",
-        )
-
-    def _serve(self) -> None:
-        try:
-            self.broker.serve_forever()
-        except BaseException as exc:  # pragma: no cover - exposed by start/stop
-            self.errors.append(exc)
-
-    def start(self) -> CoordinatorClient:
-        self.thread.start()
-        wait_for(
-            lambda: self.broker.ready.is_set() or self.errors,
-            "the coordinator never acquired spool ownership",
-        )
-        if self.errors:
-            raise self.errors[0]
-        client = CoordinatorClient(
-            state_dir=self.broker.paths.state_dir,
-            autostart=False,
-        )
-        wait_for(client.snapshot, "the coordinator never exposed a snapshot")
-        return client
-
-    def stop(self) -> None:
-        self.broker.close()
-        self.broker.close()
-        self.thread.join(timeout=10)
-        assert not self.thread.is_alive(), "the coordinator did not stop"
-        if self.errors:
-            raise self.errors[0]
-
-
-@pytest.fixture
-def reference_coordinator(tmp_path: Path):
-    running = RunningReferenceBroker(tmp_path / "state", capacities={"jobs": 2})
-    client = running.start()
-    yield running.broker, client
     running.stop()

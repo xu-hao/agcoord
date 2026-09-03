@@ -4,7 +4,7 @@ Capacity, resource bindings, host-backed enforcement, and database lock waiting 
 contracts for one state directory, so they live beside that directory's spool rather than in
 ambient process environment.  This module owns only file location, JSON shape, and section
 types; capacity semantics stay in :mod:`agcoord.queue`, binding semantics in
-:mod:`agcoord.resources`, and delegation semantics in :mod:`agcoord.cgroup`.
+:mod:`agcoord.resources`.
 """
 
 from __future__ import annotations

@@ -5,6 +5,15 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- **Breaking:** retire the Python reference broker. `CoordinatorBroker`, the hidden `serve`
+  entry point, protocol-4 owner discovery, the legacy drain/resume/maintenance helpers,
+  `migrate_queue`, `agc migrate`, and the Python cgroup, project-quota, and worker enforcement
+  backends are removed; the wheel's only broker is the native executable it installs. A client
+  that meets a coordinator spool below protocol 5 refuses every command before starting or
+  claiming a broker and names AGCoord 0.5.2 as the release that migrates it. Conformance
+  manifest v3 points its migration behaviour at the native broker's own legacy-synthesis tests,
+  and the release verifier no longer runs a Python migration rehearsal. Final stage of
+  retiring the Python broker (#165).
 - Fix `--repository` against the native broker: an explicit repository identity is now hashed
   into its `repository_id` like a discovered one, so names such as `example/widgets` are no
   longer refused as invalid identifiers (#168).

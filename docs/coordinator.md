@@ -76,9 +76,7 @@ whose authoritative publication transition has committed remains authoritative. 
 `full`, and `land` submissions and `clear` are refused. A replacement owner may start only to
 recover live rows while the state is `draining`. Once no live row remains, the owner commits
 `drained` and yields its ownership lock even when configured as a managed service; a drained
-spool cannot autostart an ordinary owner. A legacy protocol-4 owner that predates this command
-is asked to stop only after its live count reaches zero, and only through a pidfd for the PID
-the kernel reports as the current ownership-lock holder.
+spool cannot autostart an ordinary owner.
 
 The receipt contains exactly `state`, `drain_id`, `reason`, `started_at`, `protocol`, `live`,
 and `broker_pid`. The marker and its SQLite guards survive client exit, broker crash, host
@@ -139,7 +137,7 @@ set `allow_development` to `true`. That permits only a current-user- or root-own
 or musl development build; it does not weaken file, identity, protocol, or live-owner matching
 checks. `managed_service=true` is valid only for the installed service's default state directory
 and makes autostart call the fixed user unit instead of spawning the binary. Clients never
-search `PATH` and never fall back to the Python broker.
+search `PATH` and never fall back to an unpinned broker.
 
 No environment variable configures capacity, bindings, the delegated cgroup root, or block-I/O
 paths or the database timeout; `AGCOORD_STATE_DIR` selects which state directory, and therefore
@@ -303,8 +301,8 @@ host-wide policy merely to start the broker, and do not switch a binding to `req
 backend probe succeeds. Attaching `userns` permission to a general-purpose Python interpreter,
 including one copied into a root-owned virtual environment, is not a narrow workaround: the
 broker account could invoke that interpreter directly with arbitrary code under the same
-permission. The Python broker therefore has no supported AppArmor exception for this host
-policy. The Rust executable provides the narrow broker-specific target, but it does not bypass
+permission. A general-purpose interpreter therefore has no supported AppArmor exception for
+this host policy. The Rust executable provides the narrow broker-specific target, but it does not bypass
 AppArmor by itself: use the native backend only after the documented host package and broker
 profile are installed and verified. Otherwise keep the cgroup backend disabled unless the
 administrator deliberately accepts a broader account-level user-namespace opt-in.
@@ -1081,41 +1079,10 @@ temporary pages or quota capacity to the kernel and prevents one job inheriting 
 
 ## Migrations
 
-Protocol migration is explicit and out of band. Normal broker or client initialization fails
-closed on an older spool and names the required command; it never mutates schema on a hot
-path. Production upgrades must first install a durable drain, retain its exact receipt, copy
-the whole owner-locked spool, and prove the installed binary's rollback against a disposable
-copy by following the [native migration runbook](native_migration.md). Once the receipt says
-`drained`, run:
-
-```bash
-agc migrate
-# or, for an intentionally isolated spool
-agc --state-dir /path/to/state migrate
-agc resume drain-0123456789ab
-```
-
-Migration leaves the maintenance marker installed, so no new owner or submission can race the
-remaining operator steps. Resume with the exact retained ID only after maintenance is complete;
-the next `agc list` then starts or joins a broker using the new protocol. Migration preserves only
-facts represented by the old schema; it never upgrades a legacy label into an exact-head
-receipt, fuses separate full and merge rows into a land, or invents a gate phase/status that
-the legacy row did not record. Protocol-1 and protocol-2 resource maps migrate as generic
-admission-only contracts with empty applied, peak, and event fields. Familiar legacy names are
-not reinterpreted as typed or enforced resources. Protocol 3 migrates by adding the durable
-child-CPU-lease catalogue; terminal run history remains unchanged and no lease is invented for
-old work.
-
-Protocol-5 migration first produces and verifies
-a normalized protocol-4 rollback backup. An explicit rollback restores that baseline, replays
-terminal native history, writes `invalid_gate_through_sequence`, and retains the current drain
-marker rather than restoring a stale marker from the baseline. Protocol-4 merge submission then
-ignores all full-gate receipts through that sequence, including an explicitly named one; run a
-new exact-head full gate before any legacy merge workflow. The installed `agc migrate` selects
-and verifies the configured native executable, requires no owner or live row, and preserves the
-production drain across its schema transaction. Ordinary client commands refuse a live
-protocol-4 owner or an older spool that has not completed this procedure; installing or building
-the native artifact alone never performs the transition. The canonical runbook also defines the
-0.5 compatibility matrix, whole-spool backup, capability proof, rollback, Python production-path
-retirement, and safe actions for every migration refusal; this section defines only the durable
-protocol semantics.
+AGCoord 0.6.0 retired the Python reference broker and its in-process migrations. The native
+broker owns every spool at protocol 5. A client that meets a spool left at protocol 1 through 4
+by an earlier release refuses every command before starting or claiming a broker and names
+**AGCoord 0.5.2** as the release that migrates it, so an un-migrated spool is never silently
+mutated on a hot path. Migrate such a spool by installing 0.5.2, running its `agc migrate` while
+the spool is idle, and upgrading; roll a 0.5.2 migration back with 0.5.2 itself. The
+[pre-native spool guide](native_migration.md) has the exact steps.

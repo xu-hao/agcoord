@@ -55,7 +55,7 @@ agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.ta
 The low-level commands, the pin contract, the upgrade path, and the failure recovery contract
 are in the [native host runbook](docs/native_host.md).
 
-The client refuses to search `PATH` or fall back to the old Python broker. Release installs
+The client refuses to search `PATH` or fall back to any unpinned broker. Release installs
 require the root-owned static artifact; source developers may instead select an absolute
 current-user-owned development build with the documented
 [`native_broker` configuration](docs/native_broker.md#executable-discovery).
@@ -200,7 +200,6 @@ agc cancel land-0123456789ab
 agc clear
 # For planned maintenance:
 agc drain --reason "native host upgrade"
-agc migrate
 agc resume drain-0123456789ab
 # After deliberately rewriting main to remove a commit:
 agc avoid 0123456789abcdef0123456789abcdef01234567 --reason "removed from main"
@@ -217,11 +216,10 @@ available. Save the returned `drain-…` ID: only `resume` with that exact ID re
 synchronization would push reaches it, so a request branch that still carries a commit removed
 from `main` cannot bring it back. Rebuild such a request as a fresh branch from the current
 `main`.
-`migrate` is the explicit, out-of-band protocol transition for an older spool; ordinary commands
-fail closed on one and name it rather than upgrading a schema on a hot path. Run it only while
-the retained receipt says `drained`, and follow the
-[native migration runbook](docs/native_migration.md) for the backup and rollback rehearsal it
-requires.
+A spool left at protocol 1 through 4 by an AGCoord release before 0.6.0 is refused by every
+command, which names AGCoord 0.5.2 as the release that migrates it. The Python reference broker
+and its in-process migrations were retired in 0.6.0; see the
+[pre-native spool guide](docs/native_migration.md).
 
 Every canonical contract is listed in [the documentation index](docs/index.md). The full
 operating contract, recovery behavior, TUI keys, and resource model are in
