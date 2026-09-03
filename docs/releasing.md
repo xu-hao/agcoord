@@ -92,7 +92,7 @@ interface and must be smoke-tested from the built wheel.
    release's broker digest in `src/agcoord/native_host_pin.json` in that same commit; step 5
    explains where the digest comes from and step 6 refuses a candidate without it.
 2. Land that exact commit through `agc land` with `./scripts/check-conformance`. The checker
-   validates the version-2 manifest and collected Python/native selectors before running both
+   validates the version-3 manifest and collected native selectors before running both
    complete suites serially at their process boundary. It includes generic scheduling, atomic
    publication, real TUI behavior, resources/receipts, migration/rollback rehearsal, malformed
    state, contention, cancellation, and crash-recovery safety properties. Missing declared

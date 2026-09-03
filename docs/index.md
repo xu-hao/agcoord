@@ -16,8 +16,8 @@ procedure is in [the contributor workflow](contributing.md).
   durable protocol, worker boundary, compatibility, and migration requirements.
 - [Native host deployment](native_host.md) — supported host, package verification, managed
   service, AppArmor boundary, enforced-host proof, upgrades, recovery, and rollback.
-- [Cross-implementation conformance](conformance.md) — versioned Python/native behavior,
-  failure-injection coverage, intentional differences, and the executable release gate.
+- [Conformance](conformance.md) — the versioned native behavior contract, failure-injection
+  coverage, execution-mode opt-ins, and the executable release gate.
 - [Native migration and rollback](native_migration.md) — compatibility matrix, drain,
   backup rehearsal, explicit transition, mixed-version refusal, rollback, and retirement.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual

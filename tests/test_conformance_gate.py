@@ -10,7 +10,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = ROOT / "conformance" / "manifest-v2.json"
+MANIFEST = ROOT / "conformance" / "manifest-v3.json"
 CHECKER = ROOT / "scripts" / "check-conformance"
 
 
@@ -35,7 +35,7 @@ def test_versioned_conformance_manifest_passes_its_public_validator():
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == (
-        "conformance manifest v2 passed: 27 behaviors, 2 intentional differences"
+        "conformance manifest v3 passed: 27 behaviors, 1 intentional difference"
     )
     assert completed.stderr == ""
 
@@ -45,17 +45,8 @@ def test_public_checker_lists_both_implementation_selector_sets():
 
     assert completed.returncode == 0, completed.stderr
     selectors = json.loads(completed.stdout)
-    assert set(selectors) == {"python_reference", "rust_native"}
-    assert len(selectors["python_reference"]) == 35
-    assert len(selectors["rust_native"]) == 31
-    assert (
-        "tests/test_queue.py::test_submit_and_snapshot_have_the_strict_generic_schema"
-        in selectors["python_reference"]
-    )
-    assert (
-        "tests/test_queue.py::test_land_target_sync_updates_the_durable_head_before_the_gate"
-        in selectors["python_reference"]
-    )
+    assert set(selectors) == {"rust_native"}
+    assert len(selectors["rust_native"]) == 30
     assert (
         "client_compatibility::python_public_commands_keep_the_protocol_five_json_contract"
         in selectors["rust_native"]
@@ -67,7 +58,7 @@ def test_public_checker_lists_both_implementation_selector_sets():
     [
         (
             lambda document: document.update(manifest_version=1),
-            "manifest_version must be exactly 2",
+            "manifest_version must be exactly 3",
         ),
         (
             lambda document: document["required_domains"].pop(),
@@ -85,9 +76,15 @@ def test_public_checker_lists_both_implementation_selector_sets():
         ),
         (
             lambda document: document["behaviors"][0]["tests"].update(
-                python_reference=["tests/test_queue.py::not_a_test"]
+                rust_native=["scheduler::not a test"]
             ),
             "invalid selector",
+        ),
+        (
+            lambda document: document["behaviors"][0]["tests"].update(
+                python_reference=["tests/test_queue.py::test_anything"]
+            ),
+            "unknown python_reference",
         ),
         (
             lambda document: document.update(undeclared=True),
