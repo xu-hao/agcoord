@@ -149,6 +149,13 @@ durable head that is gated; AGCoord does not rebase or rewrite existing commits.
 concurrent source change, or target movement during the gate hands the work back to the
 contributor and never reuses the earlier verdict.
 
+If the target branch was deliberately rewritten to remove a commit, do not land any request
+branch that still reaches it, and do not rely on target synchronization to make it safe. Store the
+removed commit with `agc avoid SHA --reason ...` so every later landing on the machine refuses to
+publish anything that reaches it, then rebuild the request as a fresh branch from the current
+target and land it with `--no-target-sync`. The coordinator guide describes the
+[avoided-commit refusal](coordinator.md#avoided-commits-after-a-target-rewrite).
+
 Landing repository work does not authorize a package upload. Upload an AGCoord
 distribution to PyPI only when the user explicitly requests it; permission to implement,
 test, commit, push, open or merge a pull request, tag, or create a GitHub release is not

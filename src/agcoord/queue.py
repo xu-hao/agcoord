@@ -87,6 +87,7 @@ CHILD_CPU_RESOURCE = "cpu"
 CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
 LAND_TARGET_SYNC_ENV = "_AGCOORD_LAND_TARGET_SYNC"
+LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
 RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
@@ -399,6 +400,18 @@ def _validate_head_sha(value: Any, *, required: bool) -> str | None:
     if any(character not in "0123456789abcdef" for character in lowered):
         raise CoordinatorError("gate head_sha must contain only hexadecimal characters")
     return lowered
+
+
+def _validate_avoid_commits(value: object) -> tuple[str, ...]:
+    """Normalize the commits one landing must refuse to publish."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise CoordinatorError("avoid_commits must be a sequence of 40-hex commit SHAs")
+    selected: list[str] = []
+    for item in value:
+        sha = _validate_head_sha(item, required=True)
+        if sha not in selected:
+            selected.append(sha)
+    return tuple(selected)
 
 
 def _validate_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
@@ -2134,6 +2147,7 @@ class CoordinatorBroker:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
         synchronize_target: bool = True,
+        avoid_commits: Sequence[str] = (),
     ) -> str:
         """Queue one indivisible exact-head gate and publication."""
         selected_command = _validate_command(command)
@@ -2175,6 +2189,7 @@ class CoordinatorBroker:
         selected_contract = resource_contract(selected_resources, selected_bindings)
         selected_receipt = initial_resource_receipt(selected_resources)
         selected_environment = _validate_environment(environment)
+        selected_avoid = _validate_avoid_commits(avoid_commits)
         if LAND_TARGET_SYNC_ENV in selected_environment:
             raise CoordinatorError(
                 f"gate environment uses the reserved {LAND_TARGET_SYNC_ENV} name"
@@ -2182,6 +2197,12 @@ class CoordinatorBroker:
         selected_environment[LAND_TARGET_SYNC_ENV] = (
             "1" if synchronize_target else "0"
         )
+        if LAND_AVOID_ENV in selected_environment:
+            raise CoordinatorError(
+                f"gate environment uses the reserved {LAND_AVOID_ENV} name"
+            )
+        if selected_avoid:
+            selected_environment[LAND_AVOID_ENV] = ",".join(selected_avoid)
         run_id = f"land-{uuid4().hex[:12]}"
         with self._db_lock, self._connect() as db:
             try:
@@ -5164,6 +5185,7 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
         synchronize_target: bool = True,
+        avoid_commits: Sequence[str] = (),
     ) -> str:
         selected_command = _validate_command(command)
         if adapter != "github":
@@ -5176,6 +5198,7 @@ class CoordinatorClient:
             raise CoordinatorError("label must be a non-empty string")
         if not isinstance(synchronize_target, bool):
             raise CoordinatorError("synchronize_target must be boolean")
+        selected_avoid = _validate_avoid_commits(avoid_commits)
         prepared = self._prepare_submission(
             checkout=checkout,
             repository=repository,
@@ -5196,6 +5219,7 @@ class CoordinatorClient:
                 agent=agent,
                 prepared=prepared,
                 synchronize_target=synchronize_target,
+                avoid_commits=selected_avoid,
                 owner=owner,
             )
         return self._catalogue().submit_land(
@@ -5212,6 +5236,7 @@ class CoordinatorClient:
             caller_pid=caller_pid,
             environment=environment,
             synchronize_target=synchronize_target,
+            avoid_commits=selected_avoid,
         )
 
     def _native_submit_land(
@@ -5225,9 +5250,11 @@ class CoordinatorClient:
         agent: str | None,
         prepared: _PreparedSubmission,
         synchronize_target: bool,
+        avoid_commits: Sequence[str],
         owner: Mapping[str, Any],
     ) -> str:
         selected_environment = dict(prepared.environment)
+        selected_avoid = _validate_avoid_commits(avoid_commits)
         if LAND_TARGET_SYNC_ENV in selected_environment:
             raise CoordinatorError(
                 f"gate environment uses the reserved {LAND_TARGET_SYNC_ENV} name"
@@ -5235,6 +5262,12 @@ class CoordinatorClient:
         selected_environment[LAND_TARGET_SYNC_ENV] = (
             "1" if synchronize_target else "0"
         )
+        if LAND_AVOID_ENV in selected_environment:
+            raise CoordinatorError(
+                f"gate environment uses the reserved {LAND_AVOID_ENV} name"
+            )
+        if selected_avoid:
+            selected_environment[LAND_AVOID_ENV] = ",".join(selected_avoid)
         if "_AGCOORD_LAND_PYTHON" in selected_environment:
             raise CoordinatorError(
                 "gate environment uses the reserved _AGCOORD_LAND_PYTHON name"
