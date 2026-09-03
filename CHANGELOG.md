@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Accept `--broker-sha256` on `agc host install` and `agc host upgrade`, so a client that ships
+  no native-host pin can still download and install a bundle it can actually check, and so an
+  operator can demand a digest comparison on a bundle path that an unpinned client would
+  otherwise skip. A supplied digest never weakens a released client: one that disagrees with the
+  shipped pin is a refusal rather than an override.
 - Decide every shared caller-side refusal before starting a broker. `agc run`, `agc full`, and
   the land and merge submissions now settle repository discovery, the exact clean head, the
   caller PID, and the no-nesting rule before selection or autostart, so a refused submission
