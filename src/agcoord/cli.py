@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Iterable, TextIO
+from typing import Callable, Iterable, TextIO
 
 from . import __version__
 from .native_host import install_native_host, upgrade_native_host
@@ -18,6 +18,7 @@ from .queue import (
     CoordinatorError,
     follow,
     parse_resource_claims,
+    queue_paths,
     wait,
 )
 from .resources import resource_enforcement_summary
@@ -206,7 +207,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="refuse an advanced target instead of merging it into the request branch",
     )
+    land.add_argument(
+        "--avoid",
+        action="append",
+        default=[],
+        metavar="SHA",
+        help="also refuse to publish anything that reaches this commit (repeatable)",
+    )
     land.add_argument("worker_command", nargs="+")
+
+    avoid = state(
+        commands.add_parser(
+            "avoid",
+            help="store commits that no landing on this machine may publish again",
+        )
+    )
+    avoid.add_argument("sha", nargs="?", help="full 40-hex commit to store")
+    avoid.add_argument(
+        "--reason",
+        default="",
+        help="operator-visible reason retained with the stored commit",
+    )
+    avoid.add_argument("--list", dest="list_entries", action="store_true", help="show the set")
+    avoid.add_argument("--remove", metavar="SHA", help="remove one stored commit")
     return parser
 
 
@@ -216,6 +239,53 @@ def _client(args: argparse.Namespace, checkout: Path) -> CoordinatorClient:
         checkout=checkout,
         autostart=True,
     )
+
+
+def _avoid(
+    args: argparse.Namespace,
+    *,
+    emit: Callable[[object], None] | None,
+    out: TextIO,
+) -> int:
+    from .avoid import add_avoided, load_avoided, remove_avoided
+
+    state_dir = queue_paths(
+        state_dir=getattr(args, "state_dir", None),
+        checkout=Path(getattr(args, "checkout", ".")).expanduser().resolve(),
+    ).state_dir
+    actions = sum(1 for chosen in (args.sha, args.list_entries, args.remove) if chosen)
+    if actions > 1:
+        raise CoordinatorError("agc avoid takes one of: a SHA to store, --list, or --remove SHA")
+    if args.remove:
+        result = remove_avoided(state_dir, args.remove)
+        if emit:
+            emit(result)
+        else:
+            verb = "removed" if result["removed"] else "was not storing"
+            print(f"AGCoord: {verb} avoided commit {result['sha']}", file=out)
+        return 0
+    if args.sha:
+        result = add_avoided(state_dir, args.sha, reason=args.reason)
+        if emit:
+            emit(result)
+        else:
+            verb = "stored" if result["added"] else "already stores"
+            print(
+                f"AGCoord: {verb} avoided commit {result['sha']}; every land on this "
+                "machine now refuses to publish anything that reaches it",
+                file=out,
+            )
+        return 0
+    entries = load_avoided(state_dir)
+    if emit:
+        emit({"commits": entries})
+    elif not entries:
+        print("AGCoord: no avoided commits are stored", file=out)
+    else:
+        for entry in entries:
+            reason = f"  {entry['reason']}" if entry["reason"] else ""
+            print(f"{entry['sha']}  {entry['added_at']}{reason}", file=out)
+    return 0
 
 
 def _bundle_path(args: argparse.Namespace) -> Path:
@@ -297,6 +367,9 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         else:
             print(f"AGCoord: protocol {result['to_protocol']} already current", file=out)
         return 0
+
+    if args.command == "avoid":
+        return _avoid(args, emit=emit, out=out)
 
     if args.command in {"drain", "resume"}:
         client = CoordinatorClient(
@@ -408,6 +481,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             agent=args.agent,
             repository=args.repository,
             synchronize_target=args.synchronize_target,
+            avoid_commits=args.avoid,
         )
     else:
         run_id = client.submit(
