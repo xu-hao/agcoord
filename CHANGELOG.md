@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Stop refusing a landing as `head-changed` when the forge briefly still reports the head that
+  `agc land`'s own target-sync push replaced. The repeated preflight now treats exactly that head
+  as read-after-write lag and re-reads for a bounded wait (every 2 seconds, at most 30 seconds)
+  before deciding; any other head, or the replaced head outliving the wait, is still refused.
 - Decide every shared caller-side refusal before starting a broker. `agc run`, `agc full`, and
   the land and merge submissions now settle repository discovery, the exact clean head, the
   caller PID, and the no-nesting rule before selection or autostart, so a refused submission
