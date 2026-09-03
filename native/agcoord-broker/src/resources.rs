@@ -14,6 +14,10 @@ pub struct Binding {
     pub kind: String,
     pub mode: String,
     pub unit: String,
+    /// Whether scratch mounted for this binding allows execution (#177). Only a `tmpfs`
+    /// binding may set it; every other kind is refused at configuration load. Absent
+    /// means `false`, which keeps every existing configuration and contract unchanged.
+    pub exec: bool,
 }
 
 impl Binding {
@@ -23,6 +27,7 @@ impl Binding {
             kind: "generic".to_owned(),
             mode: "admission-only".to_owned(),
             unit: "admission-unit".to_owned(),
+            exec: false,
         }
     }
 
@@ -35,12 +40,16 @@ impl Binding {
     }
 
     pub fn to_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "backend": self.backend,
             "kind": self.kind,
             "mode": self.mode,
             "unit": self.unit,
-        })
+        });
+        if self.exec {
+            value["exec"] = Value::Bool(true);
+        }
+        value
     }
 }
 
@@ -215,10 +224,14 @@ pub fn parse_bindings(value: Option<&Value>) -> Result<BTreeMap<String, Binding>
         let raw = raw.as_object().ok_or_else(|| {
             config_error(format!("resource binding {name} must be a JSON object"))
         })?;
-        let expected = BTreeSet::from(["backend", "kind", "mode", "unit"]);
-        if raw.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        let required = BTreeSet::from(["backend", "kind", "mode", "unit"]);
+        let present = raw.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let mut allowed = required.clone();
+        allowed.insert("exec");
+        if !present.is_superset(&required) || !present.is_subset(&allowed) {
             return Err(config_error(format!(
-                "resource binding {name} must contain exactly backend, kind, mode, and unit"
+                "resource binding {name} must contain exactly backend, kind, mode, and unit, \
+                 plus an optional exec"
             )));
         }
         let kind = raw["kind"]
@@ -250,6 +263,20 @@ pub fn parse_bindings(value: Option<&Value>) -> Result<BTreeMap<String, Binding>
                 "resource binding {name} backend does not match its mode"
             )));
         }
+        let exec = match raw.get("exec") {
+            None => false,
+            Some(Value::Bool(exec)) if kind == "tmpfs" => *exec,
+            Some(Value::Bool(_)) => {
+                return Err(config_error(format!(
+                    "resource binding {name} sets exec, which only a tmpfs binding may"
+                )));
+            }
+            Some(_) => {
+                return Err(config_error(format!(
+                    "resource binding {name} exec must be true or false"
+                )));
+            }
+        };
         selected.insert(
             name.clone(),
             Binding {
@@ -257,6 +284,7 @@ pub fn parse_bindings(value: Option<&Value>) -> Result<BTreeMap<String, Binding>
                 kind: kind.to_owned(),
                 mode: mode.to_owned(),
                 unit: unit.to_owned(),
+                exec,
             },
         );
     }

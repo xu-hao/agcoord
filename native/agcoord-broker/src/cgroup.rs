@@ -127,6 +127,7 @@ struct TmpfsPolicy {
     inode_name: String,
     size: u64,
     inodes: u64,
+    exec: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +138,8 @@ pub struct TmpfsSetup {
     pub report: PathBuf,
     pub token: String,
     pub emulate: bool,
+    /// The binding's operator-set `exec` (#177): mount without `noexec`.
+    pub exec: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1106,13 +1109,19 @@ pub fn mount_current_tmpfs(setup: &TmpfsSetup) -> CgroupResult<TmpfsBaseline> {
         unsafe { libc::getgid() },
     ))
     .unwrap();
+    // #177: `noexec` unless the binding's operator opted the machine into executable
+    // scratch; `nosuid` and `nodev` are never negotiable.
+    let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
+    if !setup.exec {
+        flags |= libc::MS_NOEXEC;
+    }
     // SAFETY: all buffers are NUL terminated and live through mount(2).
     if unsafe {
         libc::mount(
             source.as_ptr(),
             target.as_ptr(),
             filesystem.as_ptr(),
-            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            flags as libc::c_ulong,
             options.as_ptr().cast(),
         )
     } != 0
@@ -1145,9 +1154,10 @@ pub fn mount_current_tmpfs(setup: &TmpfsSetup) -> CgroupResult<TmpfsBaseline> {
             .collect::<Vec<_>>();
         if mounted.len() != 1
             || mounted[0].0 != "tmpfs"
-            || !["nodev", "noexec", "nosuid"]
+            || !["nodev", "nosuid"]
                 .iter()
                 .all(|option| mounted[0].1.contains(option))
+            || mounted[0].1.contains(&"noexec") == setup.exec
         {
             return Err(CgroupError::new("tmpfs-mount-unverified"));
         }
@@ -2087,6 +2097,7 @@ impl CgroupBackend {
             inode_name: inode_name.clone(),
             size,
             inodes: request.resources[inode_name],
+            exec: request.bindings[size_name].exec,
         }))
     }
 
@@ -2659,6 +2670,7 @@ impl CgroupBackend {
             report: self.tmpfs_report_path(&request.run_id),
             token: token.to_owned(),
             emulate: self.system.fixture(),
+            exec: policy.exec,
         }))
     }
 
