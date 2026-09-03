@@ -19,37 +19,48 @@ newer, and Python 3.10 or newer. The broker itself is an ordinary unprivileged u
 root daemon is installed. Full host requirements are in the
 [native host runbook](docs/native_host.md).
 
-### 1. Get the matching client and host bundle
+### 1. Install the client and its native host
 
-The Python client and the native host must be the same version. Install the client from PyPI and
-download that version's native-host bundle — the archive, all four `.sha256` sidecars, and the
-three helpers — from the matching `v<version>` GitHub release into one owner-only directory:
+The Python client and the native host must be the same version, so the client fetches its own:
 
 ```bash
 version=RELEASE_VERSION
 python -m pip install "agcoord==$version"
-chmod 0700 /path/to/native-host-bundle
+agc host install --download
 ```
 
-### 2. Install the native host
+`--download` resolves that version's release bundle — the archive, all four `.sha256` sidecars,
+and the three helpers — into an owner-only cache under
+`${XDG_CACHE_HOME:-~/.cache}/agcoord/native-host`, and reuses it on a later install rather than
+refetching. `agc host install` then verifies the complete bundle, creates or validates the
+default managed configuration, performs the privileged activation, enables and starts the user
+service, checks the installed identity, and submits an enforced one-CPU proof. It refuses an
+incomplete bundle, a mismatched client version, or a nondefault spool rather than activating a
+host it cannot prove.
+
+Every client ships the digest of the broker executable it was released against, and the install
+refuses a package carrying any other broker. That pin arrives with the Python distribution
+rather than with the download, which is what makes fetching a bundle over the network
+meaningful — a package's own manifest and sidecars travel with the files they describe.
+
+#### Installing from a bundle you already hold
+
+A host without network access takes the same eight files in one owner-only directory:
 
 ```bash
+chmod 0700 /path/to/native-host-bundle
 agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
 ```
 
-`agc host install` verifies the complete bundle, creates or validates the default managed
-configuration, performs the privileged activation, enables and starts the user service, checks
-the installed identity, and submits an enforced one-CPU proof. It refuses an incomplete bundle, a
-mismatched client version, or a nondefault spool rather than activating a host it cannot prove.
-The low-level commands, upgrade path, and failure recovery contract are in the
-[native host runbook](docs/native_host.md).
+The low-level commands, the pin contract, the upgrade path, and the failure recovery contract
+are in the [native host runbook](docs/native_host.md).
 
 The client refuses to search `PATH` or fall back to the old Python broker. Release installs
 require the root-owned static artifact; source developers may instead select an absolute
 current-user-owned development build with the documented
 [`native_broker` configuration](docs/native_broker.md#executable-discovery).
 
-### 3. Confirm the coordinator answers
+### 2. Confirm the coordinator answers
 
 ```bash
 agc list
@@ -63,7 +74,7 @@ view and needs the supported Textual 8 release line (`textual>=8.2,<9`), which t
 installs. Textual 1 through 7 are not supported; a future Textual major is admitted only after
 its real-TUI behavior is validated.
 
-### 4. Set the capacities this machine really has
+### 3. Set the capacities this machine really has
 
 State defaults to `${XDG_STATE_HOME:-~/.local/state}/agcoord`. Set `AGCOORD_STATE_DIR` or pass
 `--state-dir` to use a deliberate alternate spool for an unmanaged coordinator; the fixed managed
@@ -80,7 +91,7 @@ slots. One JSON file, `config.json` in the state directory, configures the broke
 10. Current-protocol spools use WAL mode automatically so ordinary readers do not block behind
 writers; transient broker-pump and idle-check contention is retried.
 
-### 5. Submit your first coordinated check
+### 4. Submit your first coordinated check
 
 ```bash
 agc run --label "unit tests" --resource cpu=2 -- python -m pytest -q
