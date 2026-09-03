@@ -209,7 +209,8 @@ the broker starts with the `bindings` section of `config.json`:
 }
 ```
 
-A binding contains exactly `kind`, `unit`, `mode`, and `backend`. The supported typed pairs are
+A binding contains exactly `kind`, `unit`, `mode`, and `backend`, plus an optional `exec` on a
+`tmpfs` binding (see [bounded tmpfs scratch](#bounded-tmpfs-scratch)). The supported typed pairs are
 `cpu/logical-cpu`; `memory`, `memory-high`, `swap`, `tmpfs`, or `storage` with `bytes`;
 `io-bandwidth` with `bytes-per-second`, `read-bytes-per-second`, or
 `write-bytes-per-second`; `io-operations` with `operations-per-second`,
@@ -420,7 +421,14 @@ reports success to the broker, and waits for a second release. Only then does AG
 the tmpfs resources applied and let the command start. `TMPDIR`, `TMP`, and `TEMP` all name that
 mount; the private setup record and ownership token are removed from the command environment.
 The `noexec` policy means tools must execute generated programs through an interpreter or place
-executables outside temporary scratch.
+executables outside temporary scratch. A machine whose jobs legitimately execute what they write
+under `TMPDIR` — command doubles a test suite runs, throwaway virtual environments, plugin
+executables a tool downloads into a temporary data directory — opts in once, in its
+configuration, by setting `"exec": true` on the `tmpfs` binding; the run's scratch is then mounted
+`nosuid,nodev` without `noexec`, and verified as such. This is the operator's decision for the
+machine, never a per-row claim: a job cannot request executable scratch a configuration did not
+grant. `exec` on any other binding kind, or a non-boolean value, is refused when the
+configuration is loaded, and a stored resource contract carries `exec` only when it is set.
 
 The launcher supervises the direct command and samples `statvfs` while the mount exists. Receipts
 retain peak allocated bytes and user-created inodes (above the mount's initial root inode), plus
