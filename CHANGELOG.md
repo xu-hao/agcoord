@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.6.2 — 2026-09-03
 
 - Fix a tmpfs-backed `check` or `full` run whose command exited 0 being recorded as failed with
   exit status 125 and no `failure_reason`. The native launcher that supervises a tmpfs-backed
