@@ -17,6 +17,14 @@ versioning; dates use ISO 8601.
   generation record in the assets README (#204).
 - Point the distribution's Documentation URL and the README at the documentation site,
   https://agcoord.readthedocs.io, now that it builds there (#208).
+- Fix a submitting client aborting with `cannot inspect gate queue protocol …: database is
+  locked` while its admitted row kept running, so a wrapper read exit status 2 as a verdict.
+  The read-only protocol inspection now waits through transient SQLite contention for the
+  configured `database_timeout` instead of failing on the first busy lock; `agc run`, `full`,
+  and `land` retry a transient coordinator error for five seconds while following; and a
+  stream that is still lost ends with exit status 75, a message that the job continues with
+  `agc log <id> --follow` and `agc show <id>`, and, under `--json`, a `coordinator-unreachable`
+  object carrying the run ID, so it cannot be mistaken for a refusal or a red gate (#207).
 
 ## 0.6.3 — 2026-09-05
 

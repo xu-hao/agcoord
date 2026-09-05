@@ -12,6 +12,10 @@ remain the authority for the behavior behind each entry, and the
 - **A command that is refused** prints one `error:` line to standard error and exits with
   status 2. With `--json`, standard error carries `{"code": …, "message": …}` instead, and
   automation should branch on `code`.
+- **A stream that is lost** is neither. A submitting client that cannot reach the coordinator
+  for five seconds after its job was accepted exits 75, says the job continues, and names the
+  commands that follow it; with `--json` it prints `{"code": "coordinator-unreachable", …,
+  "run_id": …}`. The verdict is on the row, not in that exit status.
 - **A job that ran and failed** is a row: `agc --json show <id>` gives `status`, `phase`,
   `failure_reason`, `gate_exit_status` for a landing, `exit_status`, and a `resource_receipt`
   whose `events` list carries `code`, `stage`, `status`, `backend`, and `resource` for every
@@ -36,6 +40,7 @@ remain the authority for the behavior behind each entry, and the
 | `broker-draining` (`agcoord-maintenance-draining` for a direct SQLite writer) | Maintenance closed submissions; admitted work is finishing. | Wait. `list`, `show`, `log`, the TUI, and `cancel` still work. |
 | `broker-drained` | The spool finished draining and has no owner; nothing autostarts. | `agc resume <drain-id>` with the ID the drain printed, or finish the maintenance that needed it. |
 | `Gate queue: <id> waiting at position N for branch …` | Queued, not refused: capacity or a barrier is holding it. | `blocked_by` in `agc --json show <id>` names the jobs ahead; a `land` in the same lane, or a job from the same worktree, waits for that land. |
+| `Gate queue: lost contact with the coordinator while following <id>: …` and exit status 75 | The streaming client could not reach the coordinator for five seconds after acceptance. The job itself continues. | `agc show <id>` for the verdict and `agc log <id> --follow` to keep watching. Never read 75 as a refusal or a red gate. |
 | `native broker executable does not exist: /usr/libexec/agcoord/agcoord-broker; install the host package or configure native_broker.path` | No broker is installed and the configuration selects the default managed path. | Run `agc host install --user` for an unmanaged broker, or `agc host install --download` on a supported host. |
 | `native broker version is unsupported: <v>` | The client and the broker are on different minor lines. | Upgrade the client (`pip install -U agcoord`) and then the broker: `agc host upgrade --download` on a managed host, `agc host install --user` for a user-owned broker. |
 
