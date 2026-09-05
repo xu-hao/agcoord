@@ -14,9 +14,11 @@ procedures listed in [docs/index.md](docs/index.md).
   accompany runtime changes with focused tests, affected canonical documentation, and a
   `CHANGELOG.md` entry when the change is user-facing.
 - A documentation-only change needs no tests or AGCoord gate. It qualifies only when every
-  changed path is `README.md`, `CHANGELOG.md`, `AGENTS.md`, or Markdown below `docs/`.
-  Verify the exact pull-request file list and diff, then merge it through the forge; the
-  issue, worktree, branch, pull-request, and no-direct-target-push rules still apply.
+  changed path is `README.md`, `CHANGELOG.md`, `AGENTS.md`, Markdown below `docs/`, or a
+  `.png` or `.svg` image below `docs/assets/` whose provenance is recorded in
+  [docs/assets/README.md](docs/assets/README.md). Verify the exact pull-request file list and
+  diff, then merge it through the forge; the issue, worktree, branch, pull-request, and
+  no-direct-target-push rules still apply.
 - Tests own and stop every broker, worker, repository, and temporary state they create.
   Never inspect or clean another agent's state.
 - Keep the core coordinator forge-neutral. Forge-specific metadata and publication
