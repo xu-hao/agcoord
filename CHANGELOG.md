@@ -9,6 +9,9 @@ versioning; dates use ISO 8601.
   submissions, landing handbacks, maintenance, broker startup and the spool, the managed host,
   the enforced-host probe, and enforcement receipts, each with its meaning and next action
   (#201).
+- Add `docs/concepts.md`, which explains the broker and the spool, the three kinds of job,
+  lanes and the one barrier, claims, bindings, and receipts, the life of a job, and the
+  maintenance words in plain sentences, each section linking to its exact rule (#203).
 
 ## 0.6.3 — 2026-09-05
 
