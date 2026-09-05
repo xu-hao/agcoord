@@ -15,6 +15,8 @@ versioning; dates use ISO 8601.
 - Show the terminal UI in the README with `docs/assets/agcoord-tui.svg`, an SVG screenshot that
   Textual exported from the real `agc tui` application driven by a fixed snapshot, with its
   generation record in the assets README (#204).
+- Point the distribution's Documentation URL and the README at the documentation site,
+  https://agcoord.readthedocs.io, now that it builds there (#208).
 
 ## 0.6.3 — 2026-09-05
 

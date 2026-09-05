@@ -56,7 +56,7 @@ agcoord-xdist = "agcoord.pytest_xdist"
 [project.urls]
 Homepage = "https://github.com/xu-hao/agcoord"
 Changelog = "https://github.com/xu-hao/agcoord/blob/main/CHANGELOG.md"
-Documentation = "https://github.com/xu-hao/agcoord/tree/main/docs"
+Documentation = "https://agcoord.readthedocs.io"
 Issues = "https://github.com/xu-hao/agcoord/issues"
 Repository = "https://github.com/xu-hao/agcoord"
 
