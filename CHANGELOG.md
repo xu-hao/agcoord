@@ -27,6 +27,17 @@ versioning; dates use ISO 8601.
   own reason after it instead of printing it alone. Describe the distribution on PyPI as a
   local CI and merge queue for coding agents that share one machine, with keywords, so the
   package can be found (#193).
+- Trust a broker executable owned by the current user when its SHA-256 equals the digest
+  pinned in the client, computed before the file is executed; every other selection check is
+  unchanged, `allow_development` is needed only for a build from source, and a user-owned
+  file from another release is refused as `native-broker-pin-mismatch` with the command to
+  fetch the right one. Add `agc host install --user`, which downloads this client's standalone
+  release broker and sidecar through the GitHub adapter, verifies both, places the file at
+  `~/.local/libexec/agcoord/agcoord-broker`, selects it once, and writes an unmanaged
+  configuration into the default or `--state-dir` spool when none exists; it needs no
+  privilege, is idempotent, is the upgrade path after a client upgrade, and refuses a spool
+  configured for another broker or one whose broker is live. The README and quickstart
+  try-out become two commands (#195).
 
 ## 0.6.2 — 2026-09-03
 
