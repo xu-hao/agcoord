@@ -68,7 +68,7 @@ def test_cli_preserves_the_supplied_virtualenv_interpreter(
     assert observed["python"] == virtualenv_python
 
 def test_release_sources_declare_one_stable_version_and_ship_the_gate():
-    assert RELEASE["source_versions"]() == ("0.6.3", "0.6.3", "0.6.3")
+    assert RELEASE["source_versions"]() == ("0.6.4", "0.6.4", "0.6.4")
     assert SCRIPT.stat().st_mode & 0o111
     manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
     assert "include scripts/verify-release-candidate" in manifest
