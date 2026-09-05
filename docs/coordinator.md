@@ -1004,6 +1004,18 @@ receive process-group cancellation and become terminal only after every descenda
 Publishing land jobs refuse cancellation as described above. Unknown IDs and terminal jobs
 produce named errors rather than silently changing another row.
 
+A submitting client streams the job it accepted. The stream ends with the job's own exit
+status, with 70 when a terminal row carries none, with 130 when the caller interrupted it and
+cancellation was requested, and with 75 when the client lost contact with the coordinator
+after acceptance. In that last case the client first retries a transient error for five
+seconds, then prints that the job continues on the broker and how to keep following it
+(`agc log <id> --follow`, `agc show <id>`), and claims no verdict; `--json` reports the same
+case as `{"code": "coordinator-unreachable", "message": …, "run_id": …}`. The read-only
+protocol inspection every client command performs waits through transient SQLite contention
+for the configured `database_timeout` rather than aborting on the first busy lock, so a
+broker committing a publication or checkpointing its WAL does not end a client that is only
+watching its own row.
+
 The native owner authenticates a worker with its PID, Linux start token, and requirement that
 the PID lead its recorded process group. Replacement recovery adopts only that exact live
 identity. If the PID has been reused, its token changed, or it belongs to another group, the run

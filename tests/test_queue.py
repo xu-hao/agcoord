@@ -2260,3 +2260,70 @@ def test_land_reserves_the_avoid_environment_name_for_the_coordinator(
         )
     snapshot = client.snapshot()
     assert snapshot["active"] == [] and snapshot["queued"] == [] and snapshot["recent"] == []
+
+
+def _protocol_spool(state_dir: Path):
+    """Create a protocol-5 spool database the way the broker leaves it, with no owner."""
+    from agcoord.queue import queue_paths
+
+    state_dir.mkdir(mode=0o700)
+    paths = queue_paths(state_dir=state_dir)
+    database = sqlite3.connect(paths.database)
+    try:
+        database.execute("PRAGMA journal_mode=WAL")
+        database.execute(
+            "CREATE TABLE coordinator_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        database.execute("INSERT INTO coordinator_meta VALUES ('protocol', '5')")
+        database.commit()
+    finally:
+        database.close()
+    return paths
+
+
+def _exclusive_holder(database: Path) -> sqlite3.Connection:
+    """Hold the database exclusively, which makes every other reader see `database is locked`."""
+    holder = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
+    holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+    holder.execute("BEGIN")
+    holder.execute("SELECT count(*) FROM coordinator_meta").fetchone()
+    return holder
+
+
+def test_spool_protocol_waits_through_a_transient_lock_instead_of_aborting(tmp_path: Path):
+    from agcoord import queue as queue_module
+
+    paths = _protocol_spool(tmp_path / "state")
+    holder = _exclusive_holder(paths.database)
+    released = threading.Event()
+
+    def release() -> None:
+        time.sleep(0.5)
+        holder.execute("COMMIT")
+        holder.close()
+        released.set()
+
+    thread = threading.Thread(target=release)
+    thread.start()
+    started = time.monotonic()
+    try:
+        assert queue_module._spool_protocol(paths, timeout=5.0) == 5
+    finally:
+        thread.join(timeout=10)
+    assert released.is_set()
+    assert time.monotonic() - started < 5.0
+
+
+def test_spool_protocol_reports_a_persistent_lock_only_after_the_timeout(tmp_path: Path):
+    from agcoord import queue as queue_module
+
+    paths = _protocol_spool(tmp_path / "state")
+    holder = _exclusive_holder(paths.database)
+    try:
+        started = time.monotonic()
+        with pytest.raises(CoordinatorError, match="database is locked"):
+            queue_module._spool_protocol(paths, timeout=0.3)
+        assert time.monotonic() - started >= 0.3
+    finally:
+        holder.execute("COMMIT")
+        holder.close()
