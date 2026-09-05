@@ -21,6 +21,12 @@ versioning; dates use ISO 8601.
 - Add `docs/why.md`, the case for AGCoord in depth, and `docs/comparison.md`, which places it
   next to hosted merge queues, local job queues, agent session managers, Gas Town, sandboxes,
   and local CI runners by the reader's situation (#191).
+- Refuse a `run`, `full`, or `land` submission made outside a Git repository with one line that
+  names the rule and the remedy (`… is not inside a Git repository; agc schedules work per
+  repository and worktree, so run it from a checkout or pass --checkout PATH`), keeping Git's
+  own reason after it instead of printing it alone. Describe the distribution on PyPI as a
+  local CI and merge queue for coding agents that share one machine, with keywords, so the
+  package can be found (#193).
 
 ## 0.6.2 — 2026-09-03
 
