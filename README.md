@@ -2,6 +2,8 @@
 
 <img src="https://raw.githubusercontent.com/xu-hao/agcoord/main/docs/assets/agcoord-gourd-mascot.png" alt="Golden botanical AGCoord gourd with a curled green stem and leaf" width="240">
 
+[![Documentation](https://readthedocs.org/projects/agcoord/badge/?version=latest)](https://agcoord.readthedocs.io/en/latest/)
+
 **Local CI and merge queue for coding agents that share one machine.**
 
 When several coding agents share one workstation, nothing coordinates them. They compete for
@@ -174,6 +176,8 @@ depth.
 
 ## Documentation
 
+- [agcoord.readthedocs.io](https://agcoord.readthedocs.io): these pages as a site, with search and
+  a version switcher.
 - [Quickstart](docs/quickstart.md): the no-root try-out and the enforced host, step by step.
 - [Coordinator contract](docs/coordinator.md): scheduling, lanes, resources, landing,
   recovery, CLI, and TUI.
