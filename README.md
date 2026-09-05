@@ -105,6 +105,8 @@ and what to do next, and notes for sandboxed shells. This repository's own
 
 ## Run work
 
+<img src="https://raw.githubusercontent.com/xu-hao/agcoord/main/docs/assets/agcoord-tui.svg" alt="agc tui showing two repositories: a landing in its gating phase, a running check, two queued jobs, recent history, the selected row's detail, and the machine's capacity footer" width="820">
+
 ```bash
 agc run  --label "unit tests"   --resource cpu=2 -- python -m pytest -q   # an ordinary check
 agc full --label "release gate" --resource cpu=4 -- ./scripts/test.sh      # a clean exact-head receipt
