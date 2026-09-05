@@ -102,8 +102,7 @@ kernel's dotted field names, including Linux 6.17's `core_sched.force_idle_usec`
 Install the exact matching Python client first, then let the client fetch its own bundle:
 
 ```bash
-version=RELEASE_VERSION
-python -m pip install "agcoord==$version"
+python -m pip install --upgrade agcoord   # pin agcoord==<version> to install an exact release
 agc host install --download
 ```
 
@@ -121,8 +120,7 @@ package, all four `.sha256` sidecars, and the three helpers into one owner-only 
 passes that path instead:
 
 ```bash
-version=RELEASE_VERSION
-python -m pip install "agcoord==$version"
+python -m pip install --upgrade agcoord   # the same version as the bundle you downloaded
 chmod 0700 /path/to/native-host-bundle
 agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
 ```
@@ -319,8 +317,7 @@ For a protocol-5 upgrade, install the exact matching Python client first and inv
 operation:
 
 ```bash
-version=RELEASE_VERSION
-python -m pip install --upgrade "agcoord==$version"
+python -m pip install --upgrade agcoord   # pin agcoord==<version> to move to an exact release
 agc host upgrade --download
 ```
 
