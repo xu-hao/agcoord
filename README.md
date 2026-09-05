@@ -2,237 +2,200 @@
 
 <img src="https://raw.githubusercontent.com/xu-hao/agcoord/main/docs/assets/agcoord-gourd-mascot.png" alt="Golden botanical AGCoord gourd with a curled green stem and leaf" width="240">
 
-AGCoord is a machine-local coordinator for developers and coding agents that share a
-workstation. It gives every check, standalone full gate, and atomic gate-and-publication
-request one durable job ID, then schedules compatible work across repositories without
-letting two agents accidentally publish stale or untested code.
+**Local CI and merge queue for coding agents that share one machine.**
 
-The coordinator is local infrastructure: one detached broker per OS user, a private durable
-spool, per-job logs, and an optional terminal UI. It does not require a hosted service. The
-core package is forge-neutral; GitHub support is an optional adapter.
+When several coding agents share one workstation, nothing coordinates them. They compete for
+the machine, so test runs time out or get OOM-killed for reasons that have nothing to do with
+the code. They merge on stale evidence, so `main` breaks from changes that were never tested
+together. And they leave no shared record of what ran, on which head, with what result.
 
-## Get started
+AGCoord is the missing layer. One detached broker per OS user owns a queue for every
+repository and worktree on the machine:
 
-AGCoord's production host runs on x86_64 Ubuntu with AppArmor ABI 4, unified cgroup v2 mounted
-read-write with `nsdelegate`, `kernel.apparmor_restrict_unprivileged_userns=1`, systemd 254 or
-newer, and Python 3.10 or newer. The broker itself is an ordinary unprivileged user service; no
-root daemon is installed. Full host requirements are in the
-[native host runbook](docs/native_host.md).
+- **Resource-aware admission.** A job declares the CPU, memory, and scratch it needs. It starts
+  when the machine has room, and on a supported host cgroup v2 holds it to what it declared.
+- **Atomic landing.** `agc land 123 -- ./scripts/test.sh` brings the current target into the
+  pull-request branch, runs your gate once, and merges the pull request in the same durable
+  step. A red gate publishes nothing. A moved target never reuses a green result.
+- **One record.** Every job has a stable ID, a combined log, and a row you can list, follow,
+  cancel, or watch in a terminal UI from any shell.
 
-### 1. Install the client and its native host
+It works with any agent that can run a shell command, such as Claude Code, Codex, or Aider,
+and with people. It complements hosted CI rather than replacing it. The core is
+forge-neutral; GitHub support is an optional adapter.
 
-The Python client and the native host must be the same version, so the client fetches its own:
+## What you need
+
+- Linux on x86_64, and Python 3.10 or newer for the `agcoord` client.
+- For the two-minute try-out below: nothing else. The released broker runs as your own user
+  with admission-only accounting.
+- For enforced limits: an Ubuntu 24.04-class host (unified cgroup v2 mounted read-write with
+  `nsdelegate`, AppArmor ABI 4, `kernel.apparmor_restrict_unprivileged_userns=1`, systemd 254
+  or newer) and one privileged install step. The broker itself runs as an unprivileged user
+  service; no root daemon is installed.
+- For landing: a GitHub pull request. Checks and full gates need no forge at all.
+
+AGCoord is alpha software that moves quickly. A client commands only a broker of its own
+minor release line, and the [changelog](CHANGELOG.md) records every user-facing change.
+
+## Try it in two minutes, without root
+
+The client talks to a broker executable that must match its version exactly. Fetch that
+executable from the matching GitHub release, verify it, and point a try-out spool at it:
 
 ```bash
-version=RELEASE_VERSION
-python -m pip install "agcoord==$version"
-agc host install --download
+python -m pip install agcoord            # in a virtual environment, or: pipx install agcoord
+version=$(agc --version | awk '{print $2}')
+
+mkdir -p ~/.local/libexec/agcoord && cd ~/.local/libexec/agcoord
+base="https://github.com/xu-hao/agcoord/releases/download/v$version"
+curl -fsSL -O "$base/agcoord-broker-x86_64-unknown-linux-musl" \
+     -O "$base/agcoord-broker-x86_64-unknown-linux-musl.sha256"
+sha256sum -c agcoord-broker-x86_64-unknown-linux-musl.sha256
+chmod 0755 agcoord-broker-x86_64-unknown-linux-musl
+
+export AGCOORD_STATE_DIR="$HOME/.local/state/agcoord-try"
+mkdir -p "$AGCOORD_STATE_DIR" && chmod 0700 "$AGCOORD_STATE_DIR"
+cat > "$AGCOORD_STATE_DIR/config.json" <<EOF
+{"capacities": {"jobs": 2, "cpu": 4},
+ "native_broker": {"path": "$HOME/.local/libexec/agcoord/agcoord-broker-x86_64-unknown-linux-musl",
+                   "allow_development": true, "managed_service": false}}
+EOF
+chmod 0600 "$AGCOORD_STATE_DIR/config.json"
 ```
 
-`--download` resolves that version's release bundle — the archive, all four `.sha256` sidecars,
-and the three helpers — into an owner-only cache under
-`${XDG_CACHE_HOME:-~/.cache}/agcoord/native-host`, and reuses it on a later install rather than
-refetching. `agc host install` then verifies the complete bundle, creates or validates the
-default managed configuration, performs the privileged activation, enables and starts the user
-service, checks the installed identity, and submits an enforced one-CPU proof. It refuses an
-incomplete bundle, a mismatched client version, or a nondefault spool rather than activating a
-host it cannot prove.
-
-Every client ships the digest of the broker executable it was released against, and the install
-refuses a package carrying any other broker. That pin arrives with the Python distribution
-rather than with the download, which is what makes fetching a bundle over the network
-meaningful — a package's own manifest and sidecars travel with the files they describe.
-
-#### Installing from a bundle you already hold
-
-A host without network access takes the same eight files in one owner-only directory:
+Now submit work from inside any Git checkout:
 
 ```bash
-chmod 0700 /path/to/native-host-bundle
-agc host install /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
-```
-
-The low-level commands, the pin contract, the upgrade path, and the failure recovery contract
-are in the [native host runbook](docs/native_host.md).
-
-The client refuses to search `PATH` or fall back to any unpinned broker. Release installs
-require the root-owned static artifact; source developers may instead select an absolute
-current-user-owned development build with the documented
-[`native_broker` configuration](docs/native_broker.md#executable-discovery).
-
-### 2. Confirm the coordinator answers
-
-```bash
+cd ~/src/your-repo
+agc run --label "unit tests" --resource cpu=2 -- python -m pytest -q
 agc list
 agc tui
 ```
 
-With the production host package configured, the first command asks systemd to start the
-long-lived user service; later shells and repositories join the same user-scoped coordinator.
-Explicit development binaries retain detached on-demand startup. `agc tui` opens the terminal
-view and needs the supported Textual 8 release line (`textual>=8.2,<9`), which the base package
-installs. Textual 1 through 7 are not supported; a future Textual major is admitted only after
-its real-TUI behavior is validated.
+The first client starts the broker on demand, and closing the terminal does not cancel the
+job. The [quickstart](docs/quickstart.md) continues from here: watching two oversized jobs
+queue behind each other, following logs, cleaning up, and landing a pull request.
+`allow_development` is the current name for "trust an executable owned by me"; the release
+binary you downloaded is still checked for ownership, mode, version, target, and build
+identity.
 
-### 3. Set the capacities this machine really has
+## Turn on enforcement
 
-State defaults to `${XDG_STATE_HOME:-~/.local/state}/agcoord`. Set `AGCOORD_STATE_DIR` or pass
-`--state-dir` to use a deliberate alternate spool for an unmanaged coordinator; the fixed managed
-service and `agc host` operations accept only the default state. A fresh `agc host install`
-records the process's available CPU-affinity count as both `cpu` and `jobs` capacity and requires
-cgroup-v2 CPU enforcement; with no configuration at all, capacity defaults to two concurrent job
-slots. One JSON file, `config.json` in the state directory, configures the broker that owns it:
-
-```json
-{"capacities": {"jobs": 4, "cpu": 8, "browser": 1}, "database_timeout": 10}
-```
-
-`database_timeout` is the optional positive SQLite lock-wait limit in seconds and defaults to
-10. Current-protocol spools use WAL mode automatically so ordinary readers do not block behind
-writers; transient broker-pump and idle-check contention is retried.
-
-### 4. Submit your first coordinated check
+On a supported Ubuntu host, one privileged step installs the pinned broker as a root-owned
+file, enables a systemd user service and an enforcing AppArmor profile, and proves a one-CPU
+limit before reporting success. Use the default spool for this, with `AGCOORD_STATE_DIR`
+unset:
 
 ```bash
-agc run --label "unit tests" --resource cpu=2 -- python -m pytest -q
-agc list
-agc log run-0123456789ab --follow
+python -m pip install --upgrade agcoord
+agc host install --download
 ```
 
-That is the whole loop: declare what the command consumes, let the coordinator admit it when the
-machine has room, and watch it from any terminal. [Run work](#run-work) below covers standalone
-full validation, atomic gate-and-publish landing, and job management.
+`--download` fetches the release bundle that matches the installed client, verifies its
+checksums and the broker against the digest the client ships with, and refuses anything else.
+A fresh install records the machine's available CPU count as both `cpu` and `jobs` capacity
+with a required cgroup-v2 binding, so `--resource cpu=N` becomes a real `cpu.max` limit.
+Memory, tmpfs, persistent scratch, process, and block-I/O bindings live in the same
+`config.json`. The [native host runbook](docs/native_host.md) has the full host contract,
+offline installation from a bundle, upgrades, recovery, and rollback.
+
+## Tell your agents
+
+Agents follow the tools they are given. Paste this into your repository's `CLAUDE.md` or
+`AGENTS.md`, and every agent on the machine coordinates through the same queue:
+
+```text
+Run every check through the local coordinator and declare what it uses:
+  agc run --label "<what>" --resource cpu=2 -- <command>
+Land a pull request only through one gate-and-publish request; never merge directly:
+  agc land <pr> --resource cpu=4 -- <full test command>
+Never run agc from inside an admitted job. A stale-main or head-changed refusal means:
+update the branch, push, and submit a new land request.
+```
+
+This repository's own [AGENTS.md](AGENTS.md) is the long form.
 
 ## Run work
 
-Submit focused checks with the resources they consume:
-
 ```bash
-agc run --label "unit tests" --resource cpu=2 -- python -m pytest -q
+agc run  --label "unit tests"   --resource cpu=2 -- python -m pytest -q   # an ordinary check
+agc full --label "release gate" --resource cpu=4 -- ./scripts/test.sh      # a clean exact-head receipt
+agc land 123 --label "land PR 123" --resource cpu=4 -- ./scripts/test.sh   # gate and publish, one row
+agc list                                                                   # every job on the machine
+agc show check-0123456789ab                                                # one durable row, as JSON
+agc log land-0123456789ab --follow                                         # one combined log
+agc cancel check-0123456789ab                                              # process-group cancellation
+agc tui                                                                    # live view across repositories
 ```
 
-Every job implicitly holds one `jobs` slot. Repeatable `--resource` options add only named,
-configured resources; unknown or impossible requests fail instead of waiting forever.
-Those names are admission accounting by default. Optional `bindings` entries in the same
-`config.json` give selected names explicit units and `admission-only`, `best-effort`, or
-`required` backend semantics; every run then reports what was requested, actually applied, and
-measured. See the
-[resource contract](docs/coordinator.md#repository-lanes-and-resources) for the strict binding
-shape and current backend availability.
+Every job implicitly holds one `jobs` slot. Repeatable `--resource NAME=UNITS` options add
+named, configured resources; an unknown or impossible request fails instead of waiting
+forever. Without a binding, a name is admission accounting only. With a binding in
+`config.json`, the broker applies and measures it, and every run reports what was requested,
+applied, and observed. Scratch is opt-in: a job that declares neither a tmpfs nor a
+project-quota policy receives no temporary directory from AGCoord, and inherited `TMPDIR`,
+`TMP`, and `TEMP` values are removed. The
+[resource contract](docs/coordinator.md#repository-lanes-and-resources) covers bindings,
+[delegated cgroups](docs/coordinator.md#delegated-cgroup-v2-lifecycle),
+[child CPU leases](docs/coordinator.md#child-cpu-leases-for-parallel-tools) for tools that
+fan out inside one job, and the optional
+[pytest-xdist adapter](docs/coordinator.md#optional-pytest-xdist-adapter).
 
-On Linux, the built-in `cgroup-v2` backend can own the complete descendant lifecycle for an
-explicitly delegated, namespace-safe cgroup root. It attaches the blocked launcher before user
-code, kills detached descendants on finish or cancellation, and recovers ownership across broker
-restart. Typed `cpu/logical-cpu` and `processes/processes` bindings add aggregate `cpu.max` and
-`pids.max` limits plus peak and violation reporting; they do not imply CPU affinity. Memory and
-swap envelopes, bounded temporary storage, and verified per-device block-I/O limits remain
-separate opt-in contracts. See
-[delegated cgroup setup](docs/coordinator.md#delegated-cgroup-v2-lifecycle) before enabling a
-required binding.
+`full` validates an exact clean head and keeps a durable receipt; it is ordinary lane work,
+not a barrier. `land` is the only barrier. Push the branch, open the pull request, and submit
+from a clean checkout of that head: the row excludes other lands in its repository and jobs
+from its own worktree, holds its lane and resources from preflight through publication, and
+never rebases or rewrites commits. If the target advanced, the default GitHub adapter first
+merges it into the request branch and pushes with an exact lease; `--no-target-sync` refuses
+instead. A red gate records `gate-failed` and publishes nothing. `stale-main`,
+`head-changed`, `pr-not-ready`, `publish-failed`, `merge-error`, and `avoided-commit` are the
+other handbacks, and none of them moves the target. Cancellation is refused only once a land
+is publishing. The [atomic landing contract](docs/coordinator.md#atomic-landing) is the
+authority.
 
-Scratch is opt-in: a run that declares neither a complete tmpfs policy nor a complete
-project-quota policy receives no AGCoord-provided temporary directory, and inherited `TMPDIR`,
-`TMP`, and `TEMP` values are removed. Jobs that need accounted temporary storage must declare one
-of those providers explicitly.
+Maintenance stays in the same tool. `agc drain --reason ...` refuses new submissions while
+admitted work finishes, and `agc resume <drain-id>` reopens the queue. `agc avoid <sha>`
+stores a commit that no landing on this machine may publish again after a target rewrite.
+`agc clear` removes terminal history while the queue is idle.
 
-If a gate starts several worker-owning tools concurrently, admitted subprocesses can use
-the public Python [child CPU lease API](docs/coordinator.md#child-cpu-leases-for-parallel-tools)
-to divide the job's declared CPU budget fairly. Leases support exact or partial grants,
-waiting, cancellation, crash reclamation, and broker recovery without creating nested jobs.
-Install `agcoord[xdist]` to activate the optional
-[pytest-xdist adapter](docs/coordinator.md#optional-pytest-xdist-adapter): positive `-n` modes
-then lease their worker count inside admitted runs, while plain pytest, `-n 0`, and pytest
-outside AGCoord keep their upstream behavior.
+State lives in `${XDG_STATE_HOME:-~/.local/state}/agcoord`; `AGCOORD_STATE_DIR` or
+`--state-dir` selects a different spool for an unmanaged coordinator. One `config.json` there
+holds `capacities`, `bindings`, `cgroup_root`, `database_timeout`, and `native_broker`; with
+no file at all, capacity defaults to two job slots. A spool left below protocol 5 by a release
+before 0.6.0 is refused with instructions; see
+[migrating a pre-native spool](docs/native_migration.md).
 
-Run a standalone full validation for an exact clean Git head when publication is not part of
-the request:
+## How it compares
 
-```bash
-agc full --label "release gate" --resource cpu=4 -- ./scripts/test.sh
-```
+| If you use | What it coordinates | Machine resources | Merge gating |
+| --- | --- | --- | --- |
+| GitHub merge queue, Mergify | Pull requests, on hosted CI | No | Yes, in CI |
+| pueue, task-spooler, nq | Shell commands on one machine | Parallel count only | No |
+| Claude Squad, Conductor, Vibe Kanban | Agent sessions and worktrees | No | Manual |
+| Gas Town | An agent workforce with an LLM-run merge queue | Session count cap | Yes |
+| Container limits | One container | Static per container | No |
+| **AGCoord** | Jobs from any agent, tool, or person | Declared and enforced | Yes, atomic with the gate |
 
-`full` records the checkout's full 40-character `HEAD` and checks that the worktree is clean.
-It remains useful for validation and release preparation, but normal landing does not compose
-a full row with a later publication row. It is not a barrier or a machine-global lock:
-compatible work in any repository or worktree can overlap it when configured resource
-capacities allow it. Only `land` is a lane barrier, and it excludes just other lands in its
-repository and jobs from its own worktree.
+AGCoord sits under the session managers and beside the hosted queues. Use one or the other
+per branch: a branch that requires a hosted merge queue rejects the direct ref update that
+atomic publication performs for anyone without bypass rights.
 
-After pushing the exact clean head and opening a pull request, gate and publish it as one
-indivisible request:
+## Documentation
 
-```bash
-agc land 123 \
-  --label "gate and publish PR 123" \
-  --resource cpu=4 \
-  -- ./scripts/test.sh
-# GitHub is the convenience default and may also be named explicitly.
-agc land 123 --adapter github -- ./scripts/test.sh
-# Opt out when the request must fail instead of merging an advanced target.
-agc land 123 --no-target-sync -- ./scripts/test.sh
-```
-
-`land` stores the adapter, request, exact checkout/head, gate command, caller environment,
-and resource claim in one durable repository barrier. The core record keeps adapter and
-request separate even though the current installed adapter uses GitHub pull-request numbers.
-If the target advanced while a same-repository request waited, the default GitHub adapter makes
-one ordinary merge commit from the current target into the unchanged request branch, pushes it
-with an exact lease, and records that commit as the durable head before running the gate. It
-then runs the gate once and publishes immediately after a green result without releasing the
-lane or resources. A red gate publishes nothing.
-`--adapter github` is the default when the option is omitted; the core request remains
-forge-neutral.
-
-Target synchronization never rebases or rewrites existing commits. A merge conflict is aborted
-and reported before the gate, with the checkout restored cleanly. A concurrent source change,
-failed lease-protected push, target movement during the gate, or changed post-gate observation
-ends with a named handback and does not update the target. Use `--no-target-sync` when even the
-pre-gate source merge is unwanted. A separate full-plus-merge sequence is not a landing
-substitute.
-
-Inspect or manage jobs from any terminal:
-
-```bash
-agc list
-agc show land-0123456789ab
-agc log land-0123456789ab --follow
-agc cancel land-0123456789ab
-agc clear
-# For planned maintenance:
-agc drain --reason "native host upgrade"
-agc resume drain-0123456789ab
-# After deliberately rewriting main to remove a commit:
-agc avoid 0123456789abcdef0123456789abcdef01234567 --reason "removed from main"
-```
-
-`clear` removes terminal history and its logs only. It refuses while queued or running work
-exists and never removes the spool, broker ownership, or migration history.
-`drain` durably and atomically refuses new submissions without cancelling work already admitted.
-It waits for those rows—including an authoritative land publication—to become terminal and for
-the broker to yield ownership. `list`, `show`, `log`, the TUI, and explicit cancellation remain
-available. Save the returned `drain-…` ID: only `resume` with that exact ID reopens submissions.
-`avoid` stores a commit that no landing on this machine may publish again: every later
-`agc land` refuses before any push if the request, the current target, or the head target
-synchronization would push reaches it, so a request branch that still carries a commit removed
-from `main` cannot bring it back. Rebuild such a request as a fresh branch from the current
-`main`.
-A spool left at protocol 1 through 4 by an AGCoord release before 0.6.0 is refused by every
-command, which names AGCoord 0.5.2 as the release that migrates it. The Python reference broker
-and its in-process migrations were retired in 0.6.0; see the
-[pre-native spool guide](docs/native_migration.md).
-
-Every canonical contract is listed in [the documentation index](docs/index.md). The full
-operating contract, recovery behavior, TUI keys, and resource model are in
-[the coordinator guide](docs/coordinator.md). Package maintainers should also read
-[the release guide](docs/releasing.md), and published user-facing changes are recorded in
-[the changelog](CHANGELOG.md). Contributors follow the repository workflow in
-[AGENTS.md](AGENTS.md).
+- [Quickstart](docs/quickstart.md): the no-root try-out and the enforced host, step by step.
+- [Coordinator contract](docs/coordinator.md): scheduling, lanes, resources, landing,
+  recovery, CLI, and TUI.
+- [Native host runbook](docs/native_host.md) and
+  [native broker architecture](docs/native_broker.md).
+- [Documentation index](docs/index.md) for everything else, including the release and
+  conformance contracts.
 
 ## Project status
 
 AGCoord is distributed as the `agcoord` project on PyPI, with import package `agcoord` and
-the `agc` console command. The `python -m agcoord` module entry point remains available.
+the `agc` console command; `python -m agcoord` remains an equivalent module entry point.
 Build and install development checkouts in an isolated environment rather than copying
-modules into another project.
-
-The gourd mascot and its asset notes live under [docs/assets](docs/assets/README.md).
+modules into another project. Contributors follow [AGENTS.md](AGENTS.md) and the
+[contributor workflow](docs/contributing.md). The gourd mascot and its asset notes live under
+[docs/assets](docs/assets/README.md).
