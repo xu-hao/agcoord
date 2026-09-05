@@ -86,7 +86,7 @@ interface and must be smoke-tested from the built wheel.
 
 1. Start from one clean release commit. Set the same stable version in
    `src/agcoord/__init__.py`, the Cargo workspace, and `Cargo.lock`; development suffixes are
-   release refusals. Add a dated matching section to [the changelog](../CHANGELOG.md). Record the
+   release refusals. Add a dated matching section to [the changelog](changelog.md). Record the
    release's broker digest in `src/agcoord/native_host_pin.json` in that same commit; step 5
    explains where the digest comes from and step 6 refuses a candidate without it.
 2. Land that exact commit through `agc land` with `./scripts/check-conformance`. The checker

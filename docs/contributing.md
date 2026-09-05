@@ -1,7 +1,7 @@
 # Contributor workflow
 
 This guide contains the repository procedure summarized by
-[AGENTS.md](../AGENTS.md). The [coordinator guide](coordinator.md) remains authoritative
+[the contributor guardrails](guardrails.md). The [coordinator guide](coordinator.md) remains authoritative
 for scheduling and landing behavior, and the [release guide](releasing.md) remains
 authoritative for package releases.
 
@@ -28,7 +28,7 @@ assertions against source code or documentation text do not prove runtime behavi
 Every runtime change needs focused tests and updates to affected canonical
 documentation. Register new canonical documents in
 [the documentation index](index.md), and record published user-facing changes in
-[the changelog](../CHANGELOG.md). Tests must own and stop every broker, worker,
+[the changelog](changelog.md). Tests must own and stop every broker, worker,
 repository, and temporary state they start.
 
 ## Coordinate validation

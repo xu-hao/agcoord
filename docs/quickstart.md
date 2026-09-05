@@ -2,7 +2,7 @@
 
 This page takes you from nothing to two coordinated jobs in a few minutes, without root, and
 then to the enforced host and a first landing. Every command and output below was run against
-AGCoord 0.6.2 on x86_64 Linux. The [README](../README.md) explains what AGCoord is for; the
+AGCoord 0.6.2 on x86_64 Linux. The [overview](overview.md) explains what AGCoord is for; the
 [coordinator contract](coordinator.md) defines every guarantee mentioned here.
 
 ## 1. Install the client and the matching broker
@@ -174,7 +174,7 @@ step and refusal.
 
 ## Where next
 
-- Tell your agents. The [README](../README.md#tell-your-agents) has a paragraph to paste into
+- Tell your agents. The [overview](overview.md#tell-your-agents) has a paragraph to paste into
   `CLAUDE.md` or `AGENTS.md`.
 - Give jobs real budgets. The
   [resource contract](coordinator.md#repository-lanes-and-resources) explains bindings,
