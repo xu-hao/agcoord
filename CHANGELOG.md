@@ -3,6 +3,13 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Add `docs/troubleshooting.md`: how a refusal reaches you, and one table per situation for
+  submissions, landing handbacks, maintenance, broker startup and the spool, the managed host,
+  the enforced-host probe, and enforcement receipts, each with its meaning and next action
+  (#201).
+
 ## 0.6.3 — 2026-09-05
 
 - Rewrite the README around the problem AGCoord solves for coding agents that share one
