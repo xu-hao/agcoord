@@ -16,6 +16,8 @@ from .queue import (
     RUN_ID_ENV,
     CoordinatorClient,
     CoordinatorError,
+    CoordinatorUnreachable,
+    EXIT_COORDINATOR_UNREACHABLE,
     follow,
     parse_resource_claims,
     queue_paths,
@@ -553,7 +555,17 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         )
 
     if emit:
-        final = wait(client, run_id)
+        try:
+            final = wait(client, run_id)
+        except CoordinatorUnreachable as lost:
+            print(
+                json.dumps(
+                    {"code": lost.code, "message": str(lost), "run_id": lost.run_id},
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return EXIT_COORDINATOR_UNREACHABLE
         emit(final)
         return int(final["exit_status"] if final["exit_status"] is not None else 70)
     print(f"AGCoord: accepted {run_id}", file=out, flush=True)

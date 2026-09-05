@@ -50,6 +50,9 @@ STATUSES = LIVE_STATUSES | TERMINAL_STATUSES
 DEFAULT_RECENT_LIMIT = 50
 DEFAULT_JOB_CAPACITY = 2
 DEFAULT_DATABASE_TIMEOUT = 10.0
+FOLLOW_RETRY_SECONDS = 5.0
+EXIT_COORDINATOR_UNREACHABLE = 75
+_TRANSIENT_SQLITE_WORDS = ("locked", "busy")
 MAX_LOG_BYTES = 64 * 1024
 MAX_OWNER_METADATA_BYTES = 1024 * 1024
 CANCEL_GRACE_SECONDS = 5.0
@@ -95,6 +98,25 @@ class CoordinatorError(RuntimeError):
     def __init__(self, message: str, *, code: str | None = None):
         super().__init__(message)
         self.code = code
+
+
+
+class CoordinatorUnreachable(CoordinatorError):
+    """The client lost contact with the coordinator after a job was accepted.
+
+    The job itself continues on the broker; only this client's stream ended. The message
+    names the run and how to keep following it, and the CLI maps it to exit status 75 so a
+    wrapper cannot mistake it for a refusal or a red verdict.
+    """
+
+    def __init__(self, run_id: str, cause: BaseException):
+        super().__init__(
+            f"lost contact with the coordinator while following {run_id}: {cause}; the job "
+            f"continues on the broker; follow it with `agc log {run_id} --follow` and read "
+            f"its verdict with `agc show {run_id}`",
+            code="coordinator-unreachable",
+        )
+        self.run_id = run_id
 
 
 class _OwnerMetadataError(CoordinatorError):
@@ -540,20 +562,52 @@ def broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
         raise CoordinatorError(str(exc)) from exc
 
 
-def _spool_protocol(paths: CoordinatorPaths) -> int | None:
-    """Read an existing idle spool generation without creating or migrating it."""
+def _configured_database_timeout(state_dir: Path) -> float:
+    """Return the spool's SQLite lock-wait limit, or the default when none is configured."""
+    try:
+        configured = load_broker_config(state_dir).database_timeout
+    except BrokerConfigError:
+        return DEFAULT_DATABASE_TIMEOUT
+    return DEFAULT_DATABASE_TIMEOUT if configured is None else float(configured)
+
+
+def _spool_protocol(paths: CoordinatorPaths, *, timeout: float | None = None) -> int | None:
+    """Read an existing idle spool generation without creating or migrating it.
+
+    The read is read-only and waits through transient SQLite contention for ``timeout``
+    seconds, the configured ``database_timeout`` by default. A broker committing a
+    publication or checkpointing its WAL must not abort a client that is only inspecting
+    the spool; a lock that outlives the timeout is still reported.
+    """
     if not paths.database.exists():
         return None
-    try:
-        uri = paths.database.resolve().as_uri() + "?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True)) as database:
-            row = database.execute(
-                "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-            ).fetchone()
-    except sqlite3.Error as exc:
-        raise CoordinatorError(
-            f"cannot inspect gate queue protocol in {paths.database}: {exc}"
-        ) from exc
+    wait_for = (
+        _configured_database_timeout(paths.state_dir)
+        if timeout is None
+        else max(0.0, float(timeout))
+    )
+    deadline = time.monotonic() + wait_for
+    uri = paths.database.resolve().as_uri() + "?mode=ro"
+    while True:
+        try:
+            with closing(sqlite3.connect(uri, uri=True, timeout=wait_for)) as database:
+                row = database.execute(
+                    "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
+                ).fetchone()
+            break
+        except sqlite3.OperationalError as exc:
+            detail = str(exc).lower()
+            transient = any(word in detail for word in _TRANSIENT_SQLITE_WORDS)
+            remaining = deadline - time.monotonic()
+            if not transient or remaining <= 0:
+                raise CoordinatorError(
+                    f"cannot inspect gate queue protocol in {paths.database}: {exc}"
+                ) from exc
+            time.sleep(min(0.05, remaining))
+        except sqlite3.Error as exc:
+            raise CoordinatorError(
+                f"cannot inspect gate queue protocol in {paths.database}: {exc}"
+            ) from exc
     if row is None:
         raise CoordinatorError(
             f"gate queue database {paths.database} has no protocol metadata"
@@ -1046,16 +1100,15 @@ class CoordinatorClient:
                 "callback run does not match the admitted AGCoord context"
             )
 
+    def _database_timeout(self) -> float:
+        return _configured_database_timeout(self.paths.state_dir)
+
     def _maintenance_if_active(self) -> dict[str, Any] | None:
-        protocol = _spool_protocol(self.paths)
+        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
         if protocol is None:
             return None
-        configuration = broker_config(self.paths.state_dir)
-        timeout = (
-            DEFAULT_DATABASE_TIMEOUT
-            if configuration.database_timeout is None
-            else configuration.database_timeout
-        )
+        broker_config(self.paths.state_dir)
+        timeout = self._database_timeout()
         with closing(sqlite3.connect(self.paths.database, timeout=timeout)) as db:
             db.row_factory = sqlite3.Row
             if _maintenance_record(db) is None:
@@ -1669,7 +1722,7 @@ class CoordinatorClient:
             raise CoordinatorError("maintenance wait must be boolean")
         if poll_interval <= 0:
             raise CoordinatorError("maintenance poll interval must be positive")
-        protocol = _spool_protocol(self.paths)
+        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
         if protocol is None:
             raise CoordinatorError(
                 f"no gate queue database exists at {self.paths.database}"
@@ -1697,7 +1750,7 @@ class CoordinatorClient:
 
     def drain_status(self) -> dict[str, Any]:
         """Return the validated durable drain status without starting a broker."""
-        protocol = _spool_protocol(self.paths)
+        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
         if protocol == NATIVE_PROTOCOL:
             result = self._native_invoke("drain-status")
         elif protocol is None:
@@ -1714,7 +1767,7 @@ class CoordinatorClient:
         """Remove one exact drained guard while holding exclusive spool ownership."""
         if not isinstance(drain_id, str) or not _DRAIN_ID.fullmatch(drain_id):
             raise CoordinatorError("maintenance drain ID is invalid")
-        protocol = _spool_protocol(self.paths)
+        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
         if protocol == NATIVE_PROTOCOL:
             result = self._native_invoke(
                 "resume",
@@ -2079,7 +2132,7 @@ class CoordinatorClient:
 
     def _start_broker(self) -> None:
         try:
-            existing_protocol = _spool_protocol(self.paths)
+            existing_protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
         except CoordinatorError as exc:
             if not _spool_initializing_error(exc):
                 raise
@@ -2214,19 +2267,54 @@ class CoordinatorClient:
         )
 
 
+def _following_call(operation, run_id: str, state: dict[str, float | None]):
+    """Run one client call while following a job, waiting through transient errors.
+
+    A first failure opens a retry window of ``FOLLOW_RETRY_SECONDS``; a success closes it.
+    When the window closes without a success the stream is declared lost, which says the
+    job continues and how to keep following it instead of pretending to know its verdict.
+    """
+    while True:
+        try:
+            result = operation()
+        except CoordinatorUnreachable:
+            raise
+        except CoordinatorError as exc:
+            now = time.monotonic()
+            deadline = state.get("deadline")
+            if deadline is None:
+                deadline = now + FOLLOW_RETRY_SECONDS
+                state["deadline"] = deadline
+            if now >= deadline:
+                raise CoordinatorUnreachable(run_id, exc) from exc
+            time.sleep(min(0.25, max(0.0, deadline - now)))
+            continue
+        state["deadline"] = None
+        return result
+
+
 def follow(
     client: CoordinatorClient,
     run_id: str,
     *,
-    out=sys.stdout,
-    err=sys.stderr,
+    out=None,
+    err=None,
 ) -> int:
-    """Print a submitted gate's one log stream and return its exact verdict."""
+    """Print a submitted gate's one log stream and return its exact verdict.
+
+    Returns the job's exit status, 70 when a terminal row carries none, 130 when the
+    caller interrupted the stream and cancellation was requested, and 75 when this client
+    lost contact with the coordinator after acceptance; in that last case the job continues
+    and no verdict is claimed.
+    """
+    out = sys.stdout if out is None else out
+    err = sys.stderr if err is None else err
     offset = 0
     previous_status = ""
+    retry: dict[str, float | None] = {"deadline": None}
     try:
         while True:
-            row = client.status(run_id)
+            row = _following_call(lambda: client.status(run_id), run_id, retry)
             status = row["status"]
             if status != previous_status:
                 if status == "queued":
@@ -2244,13 +2332,18 @@ def follow(
                         flush=True,
                     )
                 previous_status = status
-            page = client.log(run_id, offset=offset)
+            page = _following_call(
+                lambda: client.log(run_id, offset=offset), run_id, retry
+            )
             if page["text"]:
                 print(page["text"], end="", file=out, flush=True)
             offset = page["next_offset"]
             if status in TERMINAL_STATUSES and page["eof"]:
                 return int(row["exit_status"] if row["exit_status"] is not None else 70)
             time.sleep(0.1)
+    except CoordinatorUnreachable as lost:
+        print(f"\nGate queue: {lost}", file=err, flush=True)
+        return EXIT_COORDINATOR_UNREACHABLE
     except KeyboardInterrupt:
         try:
             client.cancel(run_id)
@@ -2264,8 +2357,9 @@ def wait(client: CoordinatorClient, run_id: str, *, poll_interval: float = 0.1) 
     """Wait without consuming the log, for a script that wants one strict final row."""
     if poll_interval <= 0:
         raise ValueError("poll_interval must be positive")
+    retry: dict[str, float | None] = {"deadline": None}
     while True:
-        row = client.status(run_id)
+        row = _following_call(lambda: client.status(run_id), run_id, retry)
         if row["status"] in TERMINAL_STATUSES:
             return row
         time.sleep(poll_interval)

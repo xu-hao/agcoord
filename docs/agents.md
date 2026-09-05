@@ -96,6 +96,7 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | `error: … is not the broker this agc <version> client was released with …` | A user-owned broker no longer matches the client's pin, usually after a client upgrade. | Run `agc host install --user` again; set `native_broker.allow_development` only for a build from source. |
 | A refusal with code `broker-draining` | Maintenance is closing the queue. | Wait; `agc list`, `show`, and `log` still work. |
 | `Gate queue: <id> waiting at position N for branch …` | Queued, not refused. | Wait; `blocked_by` in `agc --json show <id>` names the jobs ahead. |
+| `Gate queue: lost contact with the coordinator while following <id>: …`, exit status 75 | This client's stream ended; the job continues on the broker. | Read the verdict with `agc show <id>`; keep watching with `agc log <id> --follow`. Do not report 75 as a failed gate. |
 | `failure_reason: gate-failed` | The gate command exited non-zero; `gate_exit_status` has the status. | Fix the code, push, and submit a new land request. |
 | `failure_reason: stale-main` | The target moved after preflight or during the gate, or `--no-target-sync` met an advanced target. | Update the branch from the target, push, and submit a new land request. |
 | `failure_reason: head-changed` | The source branch moved while the landing ran. | Do not push to a branch that is landing; submit a new request for the new head. |
