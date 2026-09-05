@@ -18,6 +18,12 @@
 - [Where AGCoord sits](comparison.md) — hosted merge queues, local job queues, session
   managers, Gas Town in depth, sandboxes, and local CI runners, by the reader's situation.
 
+## Understand
+
+- [Concepts](concepts.md) — the broker and the spool, the three kinds of job, lanes and the one
+  barrier, claims, bindings, and receipts, the life of a job, and the maintenance words, in
+  plain sentences with a link to each exact rule.
+
 ## Operate
 
 - [Troubleshooting](troubleshooting.md) — every refusal, handback, host probe failure, and
@@ -67,6 +73,13 @@ changelog
 
 agents
 comparison
+```
+
+```{toctree}
+:hidden:
+:caption: Understand
+
+concepts
 ```
 
 ```{toctree}
