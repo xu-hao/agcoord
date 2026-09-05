@@ -8,6 +8,12 @@
   watching jobs queue, cleanup, enforcement, and a first landing.
 - [Changelog](changelog.md) — published user-facing changes by version.
 
+## Integrate
+
+- [Using AGCoord from coding agents](agents.md) — the paragraph to paste into `CLAUDE.md`
+  or `AGENTS.md`, the rules behind it, every refusal and handback with the next action,
+  sizing claims, parallel tools, sandboxed shells, and orchestrators.
+
 ## Operate and reference
 
 These are the canonical contracts. Every guarantee the Start pages mention is defined here.
@@ -43,6 +49,13 @@ These are the canonical contracts. Every guarantee the Start pages mention is de
 overview
 quickstart
 changelog
+```
+
+```{toctree}
+:hidden:
+:caption: Integrate
+
+agents
 ```
 
 ```{toctree}

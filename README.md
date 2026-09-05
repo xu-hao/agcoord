@@ -114,7 +114,9 @@ Never run agc from inside an admitted job. A stale-main or head-changed refusal 
 update the branch, push, and submit a new land request.
 ```
 
-This repository's own [AGENTS.md](https://github.com/xu-hao/agcoord/blob/main/AGENTS.md) is the long form.
+The [agent guide](docs/agents.md) has the long form, what every refusal and handback means
+and what to do next, and notes for sandboxed shells. This repository's own
+[AGENTS.md](https://github.com/xu-hao/agcoord/blob/main/AGENTS.md) is a worked example.
 
 ## Run work
 

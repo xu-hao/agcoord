@@ -14,6 +14,10 @@ versioning; dates use ISO 8601.
   `docs/conf.py` (MyST, Furo, warnings fatal, version read from the installed
   distribution), hidden toctrees in the documentation index, and include pages that carry the
   root README, changelog, and contributor guardrails into the site (#187).
+- Add the agent integration guide (`docs/agents.md`): the paragraph to paste into `CLAUDE.md`
+  or `AGENTS.md`, the three rules and why they exist, a table of every submission refusal
+  and landing handback with the agent's next action, naming agents, sizing claims from
+  receipts, parallel tools inside one job, sandboxed shells, and orchestrators (#189).
 
 ## 0.6.2 — 2026-09-03
 
