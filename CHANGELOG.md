@@ -3,6 +3,14 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Rewrite the README around the problem AGCoord solves for coding agents that share one
+  machine, add a no-root quickstart (`docs/quickstart.md`) that runs the released broker as an
+  unmanaged user-owned executable in a dedicated spool, regroup the documentation index by
+  reader journey, and replace the unresolved `RELEASE_VERSION` placeholder in the README and
+  the native host runbook with runnable commands (#185).
+
 ## 0.6.2 — 2026-09-03
 
 - Fix a tmpfs-backed `check` or `full` run whose command exited 0 being recorded as failed with
