@@ -11,7 +11,7 @@ import time
 from typing import Callable, Iterable, TextIO
 
 from . import __version__
-from .native_host import install_native_host, upgrade_native_host
+from .native_host import install_native_host, install_user_broker, upgrade_native_host
 from .queue import (
     RUN_ID_ENV,
     CoordinatorClient,
@@ -156,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     _bundle_source(host_install)
+    host_install.add_argument(
+        "--user",
+        action="store_true",
+        help="fetch this client's release broker into ~/.local/libexec/agcoord and configure "
+        "an unmanaged user-owned spool; needs no privileges",
+    )
     host_upgrade = state(
         host_commands.add_parser(
             "upgrade",
@@ -341,6 +347,37 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         if args.json
         else None
     )
+
+    if args.command == "host" and args.host_command == "install" and args.user:
+        if args.download or args.package is not None:
+            raise CoordinatorError(
+                "agc host install --user fetches this client's release broker itself and "
+                "takes neither a bundle path nor --download",
+                code="native-host-bundle-source-conflict",
+            )
+        if args.adapter != "github":
+            raise CoordinatorError(
+                f"unknown native-host download adapter {args.adapter!r}",
+                code="native-host-download-unknown-adapter",
+            )
+        from .github_release import fetch_native_broker
+
+        broker = fetch_native_broker(expected_broker=args.broker_sha256)
+        result = install_user_broker(
+            broker,
+            state_dir=args.state_dir,
+            broker_sha256=args.broker_sha256,
+        )
+        if emit:
+            emit(result)
+        else:
+            configured = "configured" if result["configured"] else "already configured"
+            print(
+                f"AGCoord: installed user broker {result['version']} at {result['broker']}; "
+                f"spool {result['state_dir']} {configured}",
+                file=out,
+            )
+        return 0
 
     if args.command == "host" and args.host_command in {"install", "upgrade"}:
         operation = (

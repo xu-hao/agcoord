@@ -41,28 +41,13 @@ minor release line, and the [changelog](https://github.com/xu-hao/agcoord/blob/m
 
 ## Try it in two minutes, without root
 
-The client talks to a broker executable that must match its version exactly. Fetch that
-executable from the matching GitHub release, verify it, and point a try-out spool at it:
+The client talks to a broker executable that must match its version exactly, and it ships
+the SHA-256 of that executable. One command fetches the release broker, verifies it against
+that pin, places it under `~/.local/libexec/agcoord`, and configures an unmanaged spool:
 
 ```bash
 python -m pip install agcoord            # in a virtual environment, or: pipx install agcoord
-version=$(agc --version | awk '{print $2}')
-
-mkdir -p ~/.local/libexec/agcoord && cd ~/.local/libexec/agcoord
-base="https://github.com/xu-hao/agcoord/releases/download/v$version"
-curl -fsSL -O "$base/agcoord-broker-x86_64-unknown-linux-musl" \
-     -O "$base/agcoord-broker-x86_64-unknown-linux-musl.sha256"
-sha256sum -c agcoord-broker-x86_64-unknown-linux-musl.sha256
-chmod 0755 agcoord-broker-x86_64-unknown-linux-musl
-
-export AGCOORD_STATE_DIR="$HOME/.local/state/agcoord-try"
-mkdir -p "$AGCOORD_STATE_DIR" && chmod 0700 "$AGCOORD_STATE_DIR"
-cat > "$AGCOORD_STATE_DIR/config.json" <<EOF
-{"capacities": {"jobs": 2, "cpu": 4},
- "native_broker": {"path": "$HOME/.local/libexec/agcoord/agcoord-broker-x86_64-unknown-linux-musl",
-                   "allow_development": true, "managed_service": false}}
-EOF
-chmod 0600 "$AGCOORD_STATE_DIR/config.json"
+agc host install --user
 ```
 
 Now submit work from inside any Git checkout:
@@ -76,17 +61,16 @@ agc tui
 
 The first client starts the broker on demand, and closing the terminal does not cancel the
 job. The [quickstart](docs/quickstart.md) continues from here: watching two oversized jobs
-queue behind each other, following logs, cleaning up, and landing a pull request.
-`allow_development` is the current name for "trust an executable owned by me"; the release
-binary you downloaded is still checked for ownership, mode, version, target, and build
-identity.
+queue behind each other, following logs, moving to the enforced host, and landing a pull
+request. After `pip install --upgrade agcoord`, run `agc host install --user` again; a client
+refuses a user-owned broker that is not the one it was released with.
 
 ## Turn on enforcement
 
 On a supported Ubuntu host, one privileged step installs the pinned broker as a root-owned
 file, enables a systemd user service and an enforcing AppArmor profile, and proves a one-CPU
-limit before reporting success. Use the default spool for this, with `AGCOORD_STATE_DIR`
-unset:
+limit before reporting success. It needs an empty default spool: if you ran the try-out on
+this machine, `agc drain` it and move `~/.local/state/agcoord` aside first.
 
 ```bash
 python -m pip install --upgrade agcoord

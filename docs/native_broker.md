@@ -161,9 +161,12 @@ The default is the host-package path `/usr/libexec/agcoord/agcoord-broker`; clie
 When selecting the command, the client rejects symlinks, non-executable or group/world writable
 files, unsupported hosts and targets, and incompatible identity JSON. A release binary must be
 root-owned, identify the `x86_64-unknown-linux-musl` target, and report a SHA-256 build identity;
-host artifact auditing establishes that it is static. A deliberately selected development
-binary may instead be owned by the current user and report `development` only when
-`allow_development` is true.
+host artifact auditing establishes that it is static. A release binary owned by the current
+user is accepted instead when the file's SHA-256, computed before the file is executed, equals
+the digest pinned in the client's `native_host_pin.json`; a client whose pin does not name its
+own version refuses such a file as `native-broker-unpinned-client`, and a digest that differs
+is `native-broker-pin-mismatch`. A deliberately selected development binary may be owned by
+the current user and report `development` only when `allow_development` is true.
 
 ```json
 {

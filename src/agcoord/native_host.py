@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import re
 import stat
@@ -17,12 +19,19 @@ from . import __version__
 from .config import (
     DEFAULT_NATIVE_BROKER_PATH,
     BrokerConfigError,
+    NativeBrokerConfig,
     config_path,
     load_broker_config,
 )
-from .native_client import NATIVE_IMPLEMENTATION, NATIVE_PROTOCOL
+from .native_client import (
+    NATIVE_IMPLEMENTATION,
+    NATIVE_PROTOCOL,
+    NativeBrokerCommand,
+    NativeClientError,
+)
 from .queue import (
     RUN_ID_ENV,
+    CoordinatorPaths,
     STATE_DIR_ENV,
     CoordinatorClient,
     CoordinatorError,
@@ -45,6 +54,9 @@ INSTALLER_NAME = "install-native-host"
 PROBE_NAME = "test-native-host-enforcement"
 MANIFEST_NAME = "./usr/share/doc/agcoord/native-host-manifest.json"
 BROKER_NAME = "./usr/libexec/agcoord/agcoord-broker"
+BROKER_ASSET_NAME = "agcoord-broker-x86_64-unknown-linux-musl"
+USER_BROKER_NAME = "agcoord-broker"
+USER_BROKER_DIR = (Path.home() / ".local/libexec/agcoord").resolve()
 PIN_NAME = "native_host_pin.json"
 PIN_PATH = Path(__file__).with_name(PIN_NAME)
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -355,20 +367,21 @@ def _state_error(message: str) -> CoordinatorError:
     return CoordinatorError(message, code="native-host-state-invalid")
 
 
-def _validate_state_directory(state_dir: Path, *, create: bool) -> None:
+def _validate_state_directory(
+    state_dir: Path,
+    *,
+    create: bool,
+    subject: str = "managed state directory",
+) -> None:
     if create:
         try:
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as exc:
-            raise _state_error(
-                f"cannot create managed state directory {state_dir}: {exc}"
-            ) from exc
+            raise _state_error(f"cannot create {subject} {state_dir}: {exc}") from exc
     try:
         details = state_dir.lstat()
     except OSError as exc:
-        raise _state_error(
-            f"cannot inspect managed state directory {state_dir}: {exc}"
-        ) from exc
+        raise _state_error(f"cannot inspect {subject} {state_dir}: {exc}") from exc
     if (
         stat.S_ISLNK(details.st_mode)
         or not stat.S_ISDIR(details.st_mode)
@@ -376,9 +389,175 @@ def _validate_state_directory(state_dir: Path, *, create: bool) -> None:
         or details.st_mode & 0o077
     ):
         raise _state_error(
-            "managed state directory must be a real current-user-owned directory "
-            f"with mode 0700: {state_dir}"
+            f"{subject} must be a real current-user-owned directory with mode 0700: "
+            f"{state_dir}"
         )
+
+
+
+def _refuse_live_broker(paths: CoordinatorPaths) -> None:
+    """Refuse to replace a broker executable while a broker owns the spool."""
+    try:
+        descriptor = os.open(paths.owner_lock, os.O_RDWR)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _state_error(
+            f"cannot open broker ownership file {paths.owner_lock}: {exc}"
+        ) from exc
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise CoordinatorError(
+                f"a broker currently owns {paths.state_dir}; run `agc drain` and let it exit "
+                "before replacing its executable",
+                code="native-host-user-live-broker",
+            ) from None
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _user_config_plan(state_dir: Path, target: Path) -> bool:
+    """Return whether a configuration must be written, refusing one for another broker."""
+    path = config_path(state_dir)
+    if not path.exists() and not path.is_symlink():
+        return True
+    try:
+        configuration = load_broker_config(state_dir)
+    except BrokerConfigError as exc:
+        raise _state_error(str(exc)) from exc
+    native = configuration.native_broker
+    if native.path == str(target) and not native.managed_service:
+        return False
+    managed = " as a managed service" if native.managed_service else ""
+    raise CoordinatorError(
+        f"{path} already selects {native.path}{managed}; edit it to select {target} with "
+        "managed_service false, or choose another --state-dir for the user-owned broker",
+        code="native-host-user-config-conflict",
+    )
+
+
+def _write_user_config(state_dir: Path, target: Path) -> None:
+    capacity = _cpu_capacity()
+    configuration = {
+        "capacities": {"cpu": capacity, "jobs": capacity},
+        "native_broker": {
+            "path": str(target),
+            "allow_development": False,
+            "managed_service": False,
+        },
+    }
+    destination = config_path(state_dir)
+    encoded = (json.dumps(configuration, indent=2, sort_keys=True) + "\n").encode()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except OSError as exc:
+        raise _state_error(f"cannot create broker configuration {destination}: {exc}") from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise _state_error(f"cannot write broker configuration {destination}: {exc}") from exc
+
+
+def install_user_broker(
+    source: str | os.PathLike[str],
+    *,
+    state_dir: str | os.PathLike[str] | None = None,
+    destination_dir: str | os.PathLike[str] | None = None,
+    broker_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Install this client's release broker as a user-owned executable for an unmanaged spool.
+
+    ``source`` is a downloaded copy of the standalone release broker. Its bytes are compared
+    with the digest this client was released against before anything is placed, the placed
+    copy is verified again, and it is then selected exactly as a later client will select
+    it. No privilege is used and no service is created; the spool may be the default state
+    directory or any ``--state-dir``.
+    """
+    if os.environ.get(RUN_ID_ENV):
+        raise CoordinatorError(
+            "the user broker cannot be installed from an admitted AGCoord job",
+            code="native-host-upgrade-nested",
+        )
+    expected = require_expected_broker_digest(broker_sha256)
+    source_path = Path(source).expanduser().resolve()
+    _regular_owner_file(source_path, subject="downloaded broker")
+    actual = _sha256(source_path)
+    if actual != expected:
+        raise CoordinatorError(
+            f"broker digest {actual} does not match the digest {expected} pinned by this "
+            f"agc {__version__} client; the file is not the broker this client was "
+            "released with",
+            code="native-host-pin-mismatch",
+        )
+    paths = queue_paths(state_dir=state_dir)
+    spool = paths.state_dir
+    _validate_state_directory(spool, create=True, subject="state directory")
+    _refuse_live_broker(paths)
+    destination = Path(destination_dir or USER_BROKER_DIR).expanduser().resolve()
+    target = destination / USER_BROKER_NAME
+    write_config = _user_config_plan(spool, target)
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        details = destination.lstat()
+        if details.st_mode & 0o022:
+            os.chmod(destination, stat.S_IMODE(details.st_mode) & ~0o022)
+            details = destination.lstat()
+    except OSError as exc:
+        raise _state_error(f"cannot prepare {destination}: {exc}") from exc
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+    ):
+        raise _state_error(
+            f"{destination} must be a real current-user-owned directory"
+        )
+    staging = destination / f".{USER_BROKER_NAME}.partial"
+    try:
+        shutil.copyfile(source_path, staging)
+        os.chmod(staging, 0o755)
+        os.replace(staging, target)
+    except OSError as exc:
+        staging.unlink(missing_ok=True)
+        raise _state_error(f"cannot place the broker at {target}: {exc}") from exc
+    placed = _sha256(target)
+    if placed != expected:
+        target.unlink(missing_ok=True)
+        raise CoordinatorError(
+            f"the placed broker {target} does not carry the pinned digest {expected}",
+            code="native-host-pin-mismatch",
+        )
+    try:
+        NativeBrokerCommand.select(
+            NativeBrokerConfig(
+                path=str(target),
+                allow_development=False,
+                managed_service=False,
+            )
+        )
+    except NativeClientError as exc:
+        raise CoordinatorError(
+            f"the installed user broker was not selectable: {exc}",
+            code=exc.code or "native-host-user-broker-invalid",
+        ) from exc
+    if write_config:
+        _write_user_config(spool, target)
+    return {
+        "state": "complete",
+        "operation": "install-user",
+        "version": __version__,
+        "broker": str(target),
+        "broker_sha256": placed,
+        "state_dir": str(spool),
+        "configured": write_config,
+    }
 
 
 def _default_managed_config() -> dict[str, Any]:

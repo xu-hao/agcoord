@@ -132,7 +132,10 @@ defaults capacity to `jobs=2`.
 `native_broker.path` must be absolute. The default/release policy requires a root-owned,
 non-writable-by-group-or-others x86_64 Linux artifact with the supported protocol, version,
 implementation, and SHA-256 build identity; host packaging separately audits its static ELF
-contract. Development from a checkout is explicit: select the absolute regular executable and
+contract. A current-user-owned release executable is accepted without any flag when its
+SHA-256 equals the digest pinned in the client (`native_host_pin.json`), which the client
+computes before executing the file; `agc host install --user` places and configures such a
+broker. Development from a checkout is explicit: select the absolute regular executable and
 set `allow_development` to `true`. That permits only a current-user- or root-owned supported GNU
 or musl development build; it does not weaken file, identity, protocol, or live-owner matching
 checks. `managed_service=true` is valid only for the installed service's default state directory
