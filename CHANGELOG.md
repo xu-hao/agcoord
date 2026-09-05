@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.6.4 — 2026-09-05
 
 - Add `docs/troubleshooting.md`: how a refusal reaches you, and one table per situation for
   submissions, landing handbacks, maintenance, broker startup and the spool, the managed host,
