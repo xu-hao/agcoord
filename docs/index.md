@@ -2,11 +2,11 @@
 
 ## Start
 
-- [README](../README.md) — what AGCoord is for, the two-minute try-out, the enforced host,
-  and the command reference.
+- [Overview](overview.md) — the README: what AGCoord is for, the two-minute try-out, the
+  enforced host, and the command reference.
 - [Quickstart](quickstart.md) — the no-root try-out step by step: install, first job,
   watching jobs queue, cleanup, enforcement, and a first landing.
-- [Changelog](../CHANGELOG.md) — published user-facing changes by version.
+- [Changelog](changelog.md) — published user-facing changes by version.
 
 ## Operate and reference
 
@@ -26,7 +26,7 @@ These are the canonical contracts. Every guarantee the Start pages mention is de
 
 ## Project
 
-- [AGENTS.md](../AGENTS.md) — repository-wide contributor guardrails.
+- [Contributor guardrails](guardrails.md) — the repository-wide rules in `AGENTS.md`.
 - [Contributor workflow](contributing.md) — issue tracking, isolated worktrees,
   behavioral validation, coordinated checks, atomic landing, and cleanup.
 - [Packaging and release](releasing.md) — PyPI identity, build validation, direct manual
@@ -35,3 +35,34 @@ These are the canonical contracts. Every guarantee the Start pages mention is de
   status, open work, genuine decisions, and recommended options.
 - [Asset sources](assets/README.md) — canonical location and provenance requirements for
   the AGCoord gourd mascot.
+
+```{toctree}
+:hidden:
+:caption: Start
+
+overview
+quickstart
+changelog
+```
+
+```{toctree}
+:hidden:
+:caption: Operate and reference
+
+coordinator
+native_broker
+native_host
+conformance
+native_migration
+```
+
+```{toctree}
+:hidden:
+:caption: Project
+
+guardrails
+contributing
+releasing
+session_handoff_format
+assets/README
+```

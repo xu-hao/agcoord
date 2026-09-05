@@ -10,6 +10,10 @@ versioning; dates use ISO 8601.
   unmanaged user-owned executable in a dedicated spool, regroup the documentation index by
   reader journey, and replace the unresolved `RELEASE_VERSION` placeholder in the README and
   the native host runbook with runnable commands (#185).
+- Publish the documentation as a Sphinx site for Read the Docs: `.readthedocs.yaml`,
+  `docs/conf.py` (MyST, Furo, warnings fatal, version read from the installed
+  distribution), hidden toctrees in the documentation index, and include pages that carry the
+  root README, changelog, and contributor guardrails into the site (#187).
 
 ## 0.6.2 — 2026-09-03
 
