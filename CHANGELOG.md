@@ -12,6 +12,9 @@ versioning; dates use ISO 8601.
 - Add `docs/concepts.md`, which explains the broker and the spool, the three kinds of job,
   lanes and the one barrier, claims, bindings, and receipts, the life of a job, and the
   maintenance words in plain sentences, each section linking to its exact rule (#203).
+- Show the terminal UI in the README with `docs/assets/agcoord-tui.svg`, an SVG screenshot that
+  Textual exported from the real `agc tui` application driven by a fixed snapshot, with its
+  generation record in the assets README (#204).
 
 ## 0.6.3 — 2026-09-05
 
