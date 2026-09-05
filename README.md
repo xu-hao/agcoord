@@ -22,7 +22,8 @@ repository and worktree on the machine:
 
 It works with any agent that can run a shell command, such as Claude Code, Codex, or Aider,
 and with people. It complements hosted CI rather than replacing it. The core is
-forge-neutral; GitHub support is an optional adapter.
+forge-neutral; GitHub support is an optional adapter. [Why AGCoord exists](docs/why.md) makes
+the case in depth.
 
 ## What you need
 
@@ -182,6 +183,8 @@ before 0.6.0 is refused with instructions; see
 AGCoord sits under the session managers and beside the hosted queues. Use one or the other
 per branch: a branch that requires a hosted merge queue rejects the direct ref update that
 atomic publication performs for anyone without bypass rights.
+The [comparison](docs/comparison.md) covers each of these by situation, with Gas Town in
+depth.
 
 ## Documentation
 

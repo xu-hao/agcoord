@@ -18,6 +18,9 @@ versioning; dates use ISO 8601.
   or `AGENTS.md`, the three rules and why they exist, a table of every submission refusal
   and landing handback with the agent's next action, naming agents, sizing claims from
   receipts, parallel tools inside one job, sandboxed shells, and orchestrators (#189).
+- Add `docs/why.md`, the case for AGCoord in depth, and `docs/comparison.md`, which places it
+  next to hosted merge queues, local job queues, agent session managers, Gas Town, sandboxes,
+  and local CI runners by the reader's situation (#191).
 
 ## 0.6.2 — 2026-09-03
 
