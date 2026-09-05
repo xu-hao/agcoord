@@ -23,6 +23,7 @@ import urllib.request
 
 from . import __version__
 from .native_host import (
+    BROKER_ASSET_NAME,
     CHECKER_NAME,
     INSTALLER_NAME,
     PACKAGE_NAME,
@@ -232,3 +233,60 @@ def fetch_native_host_bundle(
         raise
     _normalize_modes(target)
     return target / PACKAGE_NAME
+
+
+def fetch_native_broker(
+    version: str | None = None,
+    *,
+    destination: str | os.PathLike[str] | None = None,
+    expected_broker: str | None = None,
+) -> Path:
+    """Fetch this client's standalone release broker and return its verified cached path.
+
+    The ``.sha256`` sidecar proves only that the transfer was intact; the digest pinned in
+    this client decides whether the asset is the broker it was released with. A cached copy
+    that already carries the pinned digest is reused without a request.
+    """
+    expected = require_expected_broker_digest(expected_broker)
+    selected = version or __version__
+    target = (
+        Path(destination).expanduser().resolve()
+        if destination is not None
+        else bundle_cache(selected) / "broker"
+    )
+    asset = target / BROKER_ASSET_NAME
+    if asset.is_file() and _file_digest(asset) == expected:
+        return asset
+    base = _base_url()
+    repository = _repository()
+    staging = target.with_name(f"{target.name}.partial")
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        _owner_only_mkdir(staging)
+    except OSError as exc:
+        raise _download_error(f"cannot create {staging}: {exc}") from exc
+    try:
+        for name in (BROKER_ASSET_NAME, f"{BROKER_ASSET_NAME}.sha256"):
+            _fetch(_asset_url(base, repository, selected, name), staging / name)
+        transport = _sidecar_digest(staging / f"{BROKER_ASSET_NAME}.sha256", BROKER_ASSET_NAME)
+        actual = _file_digest(staging / BROKER_ASSET_NAME)
+        if actual != transport:
+            raise _download_error(
+                f"of {BROKER_ASSET_NAME} was corrupted in transit: sidecar {transport}, "
+                f"received {actual}"
+            )
+        if actual != expected:
+            raise CoordinatorError(
+                f"downloaded broker digest {actual} does not match the digest {expected} "
+                f"pinned by this agc {__version__} client; the release asset is not the "
+                "broker this client was released with",
+                code="native-host-pin-mismatch",
+            )
+        if target.exists():
+            shutil.rmtree(target)
+        staging.replace(target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return asset

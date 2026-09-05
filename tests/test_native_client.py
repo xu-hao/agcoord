@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -185,16 +186,135 @@ def test_host_maintenance_selection_keeps_every_other_trust_boundary(tmp_path: P
         )
 
     development = _identity_executable(tmp_path / "development", version="0.3.2")
-    with pytest.raises(NativeClientError, match="owned by root|development build"):
+    with pytest.raises(
+        NativeClientError,
+        match="released with|carries no native-host pin|development build",
+    ):
         NativeBrokerCommand.select_for_host_maintenance(
             NativeBrokerConfig(path=str(development), allow_development=False)
         )
 
 def test_release_policy_rejects_a_user_owned_development_binary(tmp_path: Path):
     executable = _identity_executable(tmp_path / "broker")
-    with pytest.raises(NativeClientError, match="owned by root|development build"):
+    with pytest.raises(
+        NativeClientError,
+        match="released with|carries no native-host pin|development build",
+    ):
         NativeBrokerCommand.select(
             NativeBrokerConfig(path=str(executable), allow_development=False)
+        )
+
+
+def _release_executable(path: Path, *, marker: Path | None = None) -> Path:
+    """A user-owned fake that reports a release identity and records every execution."""
+    identity = json.dumps(
+        {
+            "name": "agcoord-broker",
+            "version": __version__,
+            "protocol": 5,
+            "implementation": "rust-native",
+            "build": "sha256:" + "b" * 64,
+            "target": "x86_64-unknown-linux-musl",
+            "sqlite": "3.51.1",
+        },
+        separators=(",", ":"),
+    )
+    record = f": > '{marker}'\n" if marker is not None else ""
+    path.write_text(
+        "#!/bin/sh\n"
+        f"{record}"
+        "if [ \"$1\" = identity ] && [ \"$2\" = --json ]; then\n"
+        f"  printf '%s\\n' '{identity}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _pin(monkeypatch, tmp_path: Path, digest: str | None, *, version: str = __version__) -> None:
+    from agcoord import native_host
+
+    pin = tmp_path / "native_host_pin.json"
+    pin.write_text(
+        json.dumps({"format": 1, "version": version, "broker_sha256": digest}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_host, "PIN_PATH", pin)
+
+
+def test_user_owned_release_broker_is_selected_when_it_matches_the_client_pin(
+    monkeypatch,
+    tmp_path: Path,
+):
+    executable = _release_executable(tmp_path / "agcoord-broker")
+    _pin(monkeypatch, tmp_path, hashlib.sha256(executable.read_bytes()).hexdigest())
+
+    selected = NativeBrokerCommand.select(
+        NativeBrokerConfig(path=str(executable), allow_development=False)
+    )
+
+    assert selected.path == executable
+    assert selected.identity.build.startswith("sha256:")
+    assert selected.identity.version == __version__
+
+
+def test_user_owned_broker_that_differs_from_the_pin_is_refused_before_it_runs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    marker = tmp_path / "executed"
+    executable = _release_executable(tmp_path / "agcoord-broker", marker=marker)
+    _pin(monkeypatch, tmp_path, "c" * 64)
+
+    with pytest.raises(NativeClientError) as refused:
+        NativeBrokerCommand.select(
+            NativeBrokerConfig(path=str(executable), allow_development=False)
+        )
+
+    assert refused.value.code == "native-broker-pin-mismatch"
+    message = str(refused.value)
+    assert f"{executable} is not the broker this agc {__version__} client was released with" in message
+    assert "pinned " + "c" * 64 in message
+    assert "agc host install --user" in message
+    assert "allow_development" in message
+    assert not marker.exists()
+
+
+def test_user_owned_release_broker_needs_a_pinned_client(monkeypatch, tmp_path: Path):
+    marker = tmp_path / "executed"
+    executable = _release_executable(tmp_path / "agcoord-broker", marker=marker)
+    _pin(monkeypatch, tmp_path, "c" * 64, version="0.0.0")
+
+    with pytest.raises(NativeClientError) as refused:
+        NativeBrokerCommand.select(
+            NativeBrokerConfig(path=str(executable), allow_development=False)
+        )
+
+    assert refused.value.code == "native-broker-unpinned-client"
+    assert "carries no native-host pin" in str(refused.value)
+    assert "allow_development" in str(refused.value)
+    assert not marker.exists()
+
+
+def test_a_pinned_user_owned_file_still_passes_every_other_check(monkeypatch, tmp_path: Path):
+    executable = _release_executable(tmp_path / "agcoord-broker")
+    _pin(monkeypatch, tmp_path, hashlib.sha256(executable.read_bytes()).hexdigest())
+
+    executable.chmod(0o775)
+    with pytest.raises(NativeClientError, match="group- or world-writable"):
+        NativeBrokerCommand.select(
+            NativeBrokerConfig(path=str(executable), allow_development=False)
+        )
+    executable.chmod(0o755)
+
+    symlink = tmp_path / "broker-link"
+    symlink.symlink_to(executable)
+    with pytest.raises(NativeClientError, match="symlink"):
+        NativeBrokerCommand.select(
+            NativeBrokerConfig(path=str(symlink), allow_development=False)
         )
 
 

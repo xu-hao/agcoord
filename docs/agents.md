@@ -91,6 +91,7 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | `error: resource 'gpu' has no configured machine capacity` | The broker's `config.json` has no such capacity. | Claim only configured names; ask the operator to add one. |
 | `error: resource 'cpu' requests 99, above capacity 4` | The claim can never be admitted. | Lower the claim; `agc --json list` shows `capacities`. |
 | `error: a coordinated job cannot submit another coordinated job; …` | Nested submission. | Run the tool directly inside the job. |
+| `error: … is not the broker this agc <version> client was released with …` | A user-owned broker no longer matches the client's pin, usually after a client upgrade. | Run `agc host install --user` again; set `native_broker.allow_development` only for a build from source. |
 | A refusal with code `broker-draining` | Maintenance is closing the queue. | Wait; `agc list`, `show`, and `log` still work. |
 | `Gate queue: <id> waiting at position N for branch …` | Queued, not refused. | Wait; `blocked_by` in `agc --json show <id>` names the jobs ahead. |
 | `failure_reason: gate-failed` | The gate command exited non-zero; `gate_exit_status` has the status. | Fix the code, push, and submit a new land request. |

@@ -802,6 +802,77 @@ def test_native_host_install_refuses_no_bundle_source():
     assert failure.value.code == "native-host-bundle-source-missing"
 
 
+def test_native_host_install_user_refuses_another_bundle_source(tmp_path: Path):
+    package = tmp_path / "agcoord-native-host-x86_64-linux.tar.gz"
+    package.write_bytes(b"verified release package")
+
+    with pytest.raises(CoordinatorError) as failure:
+        cli.run(_args("host", "install", "--user", str(package)))
+    assert failure.value.code == "native-host-bundle-source-conflict"
+
+    with pytest.raises(CoordinatorError) as failure:
+        cli.run(_args("host", "install", "--user", "--download"))
+    assert failure.value.code == "native-host-bundle-source-conflict"
+
+
+def test_native_host_install_user_fetches_then_installs_without_privileges(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord import github_release
+
+    observed: list[tuple[object, ...]] = []
+    downloaded = tmp_path / "cache" / "agcoord-broker-x86_64-unknown-linux-musl"
+    placed = tmp_path / "libexec" / "agcoord-broker"
+    state_dir = tmp_path / "state"
+
+    def fake_fetch(*, expected_broker=None):
+        observed.append(("fetch", expected_broker))
+        return downloaded
+
+    def fake_install(broker, *, state_dir, broker_sha256):
+        observed.append(("install", broker, state_dir, broker_sha256))
+        return {
+            "state": "complete",
+            "operation": "install-user",
+            "version": "0.6.2",
+            "broker": str(placed),
+            "broker_sha256": "f" * 64,
+            "state_dir": str(state_dir),
+            "configured": True,
+        }
+
+    monkeypatch.setattr(github_release, "fetch_native_broker", fake_fetch)
+    monkeypatch.setattr(cli, "install_user_broker", fake_install)
+
+    output = StringIO()
+    assert (
+        cli.run(
+            _args("host", "install", "--user", "--state-dir", str(state_dir)),
+            out=output,
+        )
+        == 0
+    )
+    assert observed == [
+        ("fetch", None),
+        ("install", downloaded, str(state_dir), None),
+    ]
+    assert output.getvalue() == (
+        f"AGCoord: installed user broker 0.6.2 at {placed}; spool {state_dir} configured\n"
+    )
+
+    output = StringIO()
+    assert (
+        cli.run(
+            _args("--json", "host", "install", "--user", "--broker-sha256", "f" * 64),
+            out=output,
+        )
+        == 0
+    )
+    assert observed[-2:] == [("fetch", "f" * 64), ("install", downloaded, None, "f" * 64)]
+    assert json.loads(output.getvalue())["operation"] == "install-user"
+
+
 def test_native_host_install_refuses_an_unknown_download_adapter():
     with pytest.raises(CoordinatorError) as failure:
         cli.run(_args("host", "install", "--download", "--adapter", "gitlab"))

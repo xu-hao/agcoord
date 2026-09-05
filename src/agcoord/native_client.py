@@ -8,6 +8,7 @@ and every command exchanges one bounded JSON value over standard streams.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -119,13 +120,21 @@ class NativeBrokerCommand:
             )
         allowed_owners = {0, os.geteuid()} if configured.allow_development else {0}
         callback_owner = False
+        pinned_owner = False
         if details.st_uid not in allowed_owners and admitted_callback:
             callback_owner = _is_attested_callback_owner(
                 path,
                 configured=configured,
                 observed_uid=details.st_uid,
             )
-        if details.st_uid not in allowed_owners and not callback_owner:
+        if (
+            details.st_uid not in allowed_owners
+            and not admitted_callback
+            and details.st_uid == os.geteuid()
+        ):
+            _require_pinned_user_broker(path)
+            pinned_owner = True
+        if details.st_uid not in allowed_owners and not callback_owner and not pinned_owner:
             owner = "root" if not configured.allow_development else "root or the current user"
             raise NativeClientError(
                 f"native broker executable must be owned by {owner}: {path}"
@@ -241,6 +250,46 @@ def _one_entry_identity_map(path: Path, identity: int) -> bool:
     except (OSError, UnicodeError):
         return False
     return fields == [str(identity), str(identity), "1"]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise NativeClientError(f"cannot hash native broker executable {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _require_pinned_user_broker(path: Path) -> None:
+    """Trust a current-user-owned executable only when it is this client's pinned release.
+
+    The pin arrives with the Python distribution, so it can establish that a file the user
+    downloaded is the broker this exact release was built against. The comparison happens
+    before the file is executed for its identity, and it never relaxes the mode, symlink,
+    target, build, or version checks that follow.
+    """
+    from . import __version__
+    from .native_host import pinned_broker_digest
+
+    expected = pinned_broker_digest()
+    if expected is None:
+        raise NativeClientError(
+            f"this agc {__version__} client carries no native-host pin, so the user-owned "
+            f"broker {path} cannot be verified; install a release client, or set "
+            "native_broker.allow_development to trust a build from source",
+            code="native-broker-unpinned-client",
+        )
+    actual = _file_sha256(path)
+    if actual != expected:
+        raise NativeClientError(
+            f"{path} is not the broker this agc {__version__} client was released with "
+            f"(sha256 {actual}, pinned {expected}); rerun `agc host install --user` to fetch "
+            "it, or set native_broker.allow_development to trust a build from source",
+            code="native-broker-pin-mismatch",
+        )
 
 
 def _is_attested_callback_owner(
