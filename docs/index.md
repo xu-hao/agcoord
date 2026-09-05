@@ -18,9 +18,14 @@
 - [Where AGCoord sits](comparison.md) — hosted merge queues, local job queues, session
   managers, Gas Town in depth, sandboxes, and local CI runners, by the reader's situation.
 
-## Operate and reference
+## Operate
 
-These are the canonical contracts. Every guarantee the Start pages mention is defined here.
+- [Troubleshooting](troubleshooting.md) — every refusal, handback, host probe failure, and
+  enforcement event an operator or agent meets, with the next action.
+
+## Reference
+
+These are the canonical contracts. Every guarantee the other pages mention is defined here.
 
 - [Coordinator contract and operations](coordinator.md) — machine-local topology,
   resource scheduling, repository lanes, atomic landing, cleanup, recovery, CLI, and
@@ -66,7 +71,14 @@ comparison
 
 ```{toctree}
 :hidden:
-:caption: Operate and reference
+:caption: Operate
+
+troubleshooting
+```
+
+```{toctree}
+:hidden:
+:caption: Reference
 
 coordinator
 native_broker
