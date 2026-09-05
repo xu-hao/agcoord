@@ -142,7 +142,7 @@ owner record is:
 pid=12345
 protocol=5
 implementation=rust-native
-version=0.6.2
+version=0.6.3
 build=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 capacities={"cpu":8,"jobs":2}
 resource_bindings={}
