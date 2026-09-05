@@ -17,7 +17,7 @@ agc host install --user
 ```
 
 ```text
-AGCoord: installed user broker 0.6.3 at /home/you/.local/libexec/agcoord/agcoord-broker; spool /home/you/.local/state/agcoord configured
+AGCoord: installed user broker 0.6.4 at /home/you/.local/libexec/agcoord/agcoord-broker; spool /home/you/.local/state/agcoord configured
 ```
 
 Four things happened. The client downloaded the standalone release broker for its own version
