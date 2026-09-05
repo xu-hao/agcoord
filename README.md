@@ -36,7 +36,7 @@ forge-neutral; GitHub support is an optional adapter.
 - For landing: a GitHub pull request. Checks and full gates need no forge at all.
 
 AGCoord is alpha software that moves quickly. A client commands only a broker of its own
-minor release line, and the [changelog](CHANGELOG.md) records every user-facing change.
+minor release line, and the [changelog](https://github.com/xu-hao/agcoord/blob/main/CHANGELOG.md) records every user-facing change.
 
 ## Try it in two minutes, without root
 
@@ -114,7 +114,7 @@ Never run agc from inside an admitted job. A stale-main or head-changed refusal 
 update the branch, push, and submit a new land request.
 ```
 
-This repository's own [AGENTS.md](AGENTS.md) is the long form.
+This repository's own [AGENTS.md](https://github.com/xu-hao/agcoord/blob/main/AGENTS.md) is the long form.
 
 ## Run work
 
@@ -196,6 +196,6 @@ atomic publication performs for anyone without bypass rights.
 AGCoord is distributed as the `agcoord` project on PyPI, with import package `agcoord` and
 the `agc` console command; `python -m agcoord` remains an equivalent module entry point.
 Build and install development checkouts in an isolated environment rather than copying
-modules into another project. Contributors follow [AGENTS.md](AGENTS.md) and the
+modules into another project. Contributors follow [AGENTS.md](https://github.com/xu-hao/agcoord/blob/main/AGENTS.md) and the
 [contributor workflow](docs/contributing.md). The gourd mascot and its asset notes live under
 [docs/assets](docs/assets/README.md).
