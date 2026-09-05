@@ -4,6 +4,8 @@
 
 - [Overview](overview.md) — the README: what AGCoord is for, the two-minute try-out, the
   enforced host, and the command reference.
+- [Why AGCoord exists](why.md) — the problem coding agents create when they share one
+  machine, why the gate and the merge are one step, and what AGCoord deliberately does not do.
 - [Quickstart](quickstart.md) — the no-root try-out step by step: install, first job,
   watching jobs queue, cleanup, enforcement, and a first landing.
 - [Changelog](changelog.md) — published user-facing changes by version.
@@ -13,6 +15,8 @@
 - [Using AGCoord from coding agents](agents.md) — the paragraph to paste into `CLAUDE.md`
   or `AGENTS.md`, the rules behind it, every refusal and handback with the next action,
   sizing claims, parallel tools, sandboxed shells, and orchestrators.
+- [Where AGCoord sits](comparison.md) — hosted merge queues, local job queues, session
+  managers, Gas Town in depth, sandboxes, and local CI runners, by the reader's situation.
 
 ## Operate and reference
 
@@ -47,6 +51,7 @@ These are the canonical contracts. Every guarantee the Start pages mention is de
 :caption: Start
 
 overview
+why
 quickstart
 changelog
 ```
@@ -56,6 +61,7 @@ changelog
 :caption: Integrate
 
 agents
+comparison
 ```
 
 ```{toctree}
