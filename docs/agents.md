@@ -81,6 +81,8 @@ verdict and publication that the tool exists to close. The
 ## What the agent sees, and what to do next
 
 Submission refusals arrive as an `error:` line and a non-zero exit before any row exists.
+The [troubleshooting page](troubleshooting.md) covers every other refusal, including host
+and enforcement codes; this table keeps to what an agent meets while working.
 Landing handbacks arrive as a failed row whose `failure_reason` carries a stable code; read it
 with `agc --json show <id>` rather than parsing the log, and read the log for the detail.
 
