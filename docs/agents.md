@@ -86,7 +86,7 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 
 | What appears | Meaning | Next action |
 | --- | --- | --- |
-| `error: cannot inspect Git checkout …: fatal: not a git repository` | `agc` schedules work per repository and worktree. | Run from inside the checkout, or pass `--checkout PATH`. |
+| `error: … is not inside a Git repository; agc schedules work per repository and worktree, so run it from a checkout or pass --checkout PATH` | The working directory is not in a Git repository. | Run from inside the checkout, or pass `--checkout PATH`. |
 | `error: checkout is dirty; commit or remove changes before a full run` | `full` and `land` bind an exact clean head. | Commit or remove the changes; for `land`, push the head first. |
 | `error: resource 'gpu' has no configured machine capacity` | The broker's `config.json` has no such capacity. | Claim only configured names; ask the operator to add one. |
 | `error: resource 'cpu' requests 99, above capacity 4` | The claim can never be admitted. | Lower the claim; `agc --json list` shows `capacities`. |
