@@ -5,7 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agcoord"
 dynamic = ["version"]
-description = "Machine-local gate and publication coordinator for development agents"
+description = "Local CI and merge queue for coding agents that share one machine"
+keywords = [
+  "coding-agents",
+  "claude-code",
+  "codex",
+  "merge-queue",
+  "job-scheduler",
+  "cgroups",
+  "git-worktree",
+  "ci",
+]
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

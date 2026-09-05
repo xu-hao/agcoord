@@ -205,6 +205,33 @@ def _git_value(checkout: Path, *arguments: str, required: bool = True) -> str | 
     raise CoordinatorError(f"cannot inspect Git checkout {checkout}: {detail}")
 
 
+_NOT_A_REPOSITORY = "not a git repository"
+
+
+def _worktree_root(selected: Path) -> Path:
+    """Resolve the Git worktree root, naming the repository rule when there is none."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(selected), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise CoordinatorError(f"cannot run Git for {selected}: {exc}") from exc
+    value = result.stdout.strip()
+    if result.returncode == 0 and value:
+        return _absolute(value)
+    detail = result.stderr.strip() or "Git returned no value"
+    if _NOT_A_REPOSITORY in detail.lower():
+        reason = detail.splitlines()[0]
+        raise CoordinatorError(
+            f"{selected} is not inside a Git repository; agc schedules work per repository "
+            f"and worktree, so run it from a checkout or pass --checkout PATH (git: {reason})"
+        )
+    raise CoordinatorError(f"cannot inspect Git checkout {selected}: {detail}")
+
+
 def _remote_identity(value: str) -> str:
     """Normalize a remote without retaining URL credentials."""
     selected = value.strip().rstrip("/")
@@ -232,7 +259,7 @@ def discover_repository(
     selected = _absolute(checkout)
     if not selected.is_dir():
         raise CoordinatorError(f"checkout does not exist: {selected}")
-    root = _absolute(_git_value(selected, "rev-parse", "--show-toplevel") or selected)
+    root = _worktree_root(selected)
     if repository is not None:
         if not isinstance(repository, str) or not repository.strip():
             raise CoordinatorError("repository must be a non-empty string")

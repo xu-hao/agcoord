@@ -1835,6 +1835,31 @@ def test_dirty_checkout_refusal_precedes_nesting_and_any_broker_start(
 
     assert not (state_dir / "broker.lock").exists()
     assert not (state_dir / "queue.sqlite3").exists()
+
+
+@pytest.mark.parametrize("entry", ["submit", "submit_merge", "submit_land"])
+def test_submission_outside_a_git_repository_explains_the_rule_before_any_broker_can_start(
+    tmp_path: Path,
+    entry: str,
+):
+    state_dir = tmp_path / "state"
+    _unreachable_native_state(state_dir)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    client = CoordinatorClient(state_dir=state_dir)
+
+    with pytest.raises(CoordinatorError) as refused:
+        _submit_through(client, entry, scratch, caller_environment())
+
+    message = str(refused.value)
+    assert scratch.name in message
+    assert "is not inside a Git repository; agc schedules work per repository and worktree" in message
+    assert "run it from a checkout or pass --checkout PATH" in message
+    assert "(git: fatal: not a git repository" in message
+    assert "Stopping at filesystem boundary" not in message
+    assert not (state_dir / "broker.lock").exists()
+    assert not (state_dir / "queue.sqlite3").exists()
+    assert not (state_dir / "missing-broker").exists()
 @pytest.mark.parametrize("kind", ["check", "full"])
 def test_worker_receives_exact_immutable_admission_context(
     tmp_path: Path,
