@@ -27,3 +27,29 @@ Constraints: no eyes, mouth, facial marks, arms, hands, legs, feet, pose, blush,
 Any later replacement must retain its editable source or generation record,
 license/provenance, and accessible description here rather than silently overwriting the
 published identity.
+
+## Terminal UI screenshot
+
+[`agcoord-tui.svg`](agcoord-tui.svg) is the screenshot of `agc tui` that the root README shows.
+It is an SVG that Textual exported from the real application, so the text is selectable and it
+renders at any size; it shows a 100 × 24 terminal with two repositories, a landing in its
+gating phase, a running check, two queued jobs, recent history, the detail pane for the selected
+row, and the capacity footer. Keep the canonical path stable so the README URL does not change.
+
+### Generation record
+
+- Date: 2026-09-05
+- Tool: Textual 8.2.8, `App.save_screenshot` inside `App.run_test(size=(100, 24))`, driving
+  `agcoord.tui.build_app` from AGCoord 0.6.3 with a fixed in-memory snapshot in the durable row
+  shape (no broker, credentials, or network); one `down` key press selects the second row
+- Content: repositories `github.com/acme/api` and `github.com/acme/web`; agents `claude-a`,
+  `claude-c`, and `codex-b`; rows `land-8c1f2a9d4e07` (gating), `check-5d2e77b1c3a9` (running),
+  `full-0a3b6c9d2e5f` and `check-e4f5a6b7c8d9` (queued), and four terminal rows including a
+  `stale-main` handback; capacities `jobs=4`, `cpu=8`, `memory=24 GiB`, `tmpfs=8 GiB`
+- SHA-256: `c6cdce6a580adbea2b62e2ef63c019e2762985c1bf11d367f730d706151120a4`
+- Regenerate by re-exporting from the current `agc tui` with the same snapshot whenever the
+  table layout changes, and update this record
+
+Any later replacement must retain its editable source or generation record,
+license/provenance, and accessible description here rather than silently overwriting the
+published identity.
