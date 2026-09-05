@@ -1012,3 +1012,109 @@ def test_verify_admission_refuses_a_wrong_head_with_the_verifier_s_message(tmp_p
     assert status == "passed"  # the wrapper decides what a refusal means; the row itself ran
     assert "invalid choice" not in stderr
     assert "error:" in stderr
+
+
+def _locked_error() -> CoordinatorError:
+    return CoordinatorError(
+        "cannot inspect gate queue protocol in /spool/queue.sqlite3: database is locked"
+    )
+
+
+def test_follow_retries_a_transient_coordinator_error_and_keeps_the_verdict(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+):
+    from agcoord import queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FOLLOW_RETRY_SECONDS", 2.0)
+    calls = {"status": 0}
+
+    class FlakyClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "check-flaky"
+
+        def status(self, run_id):
+            calls["status"] += 1
+            if calls["status"] == 2:
+                raise _locked_error()
+            return _row(run_id, "running" if calls["status"] < 3 else "passed", "check", "flaky")
+
+        def log(self, run_id, *, offset=0):
+            return {"run_id": run_id, "offset": offset, "next_offset": offset, "text": "", "eof": True}
+
+    monkeypatch.setattr(cli, "CoordinatorClient", FlakyClient)
+
+    output = StringIO()
+    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=output) == 0
+    assert "AGCoord: accepted check-flaky" in output.getvalue()
+    assert "lost contact" not in capsys.readouterr().err
+    assert calls["status"] >= 3
+
+
+def test_follow_reports_a_lost_stream_and_exits_75_without_claiming_a_verdict(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+):
+    from agcoord import queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FOLLOW_RETRY_SECONDS", 0.3)
+
+    class LockedClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "full-locked"
+
+        def status(self, _run_id):
+            raise _locked_error()
+
+        def log(self, _run_id, *, offset=0):
+            raise AssertionError("the log is not read once the status poll fails")
+
+    monkeypatch.setattr(cli, "CoordinatorClient", LockedClient)
+
+    output = StringIO()
+    assert cli.run(_args("full", "--checkout", str(tmp_path), "--", "true"), out=output) == 75
+    captured = capsys.readouterr()
+    assert output.getvalue() == "AGCoord: accepted full-locked\n"
+    assert "lost contact with the coordinator while following full-locked" in captured.err
+    assert "database is locked" in captured.err
+    assert "the job continues" in captured.err
+    assert "agc log full-locked --follow" in captured.err
+    assert "agc show full-locked" in captured.err
+
+
+def test_json_wait_reports_a_lost_stream_as_a_coded_object_with_the_run_id(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+):
+    from agcoord import queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FOLLOW_RETRY_SECONDS", 0.3)
+
+    class LockedClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "check-locked"
+
+        def status(self, _run_id):
+            raise _locked_error()
+
+    monkeypatch.setattr(cli, "CoordinatorClient", LockedClient)
+
+    assert cli.main(["--json", "run", "--checkout", str(tmp_path), "--", "true"]) == 75
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["code"] == "coordinator-unreachable"
+    assert payload["run_id"] == "check-locked"
+    assert "database is locked" in payload["message"]
