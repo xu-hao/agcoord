@@ -2,61 +2,40 @@
 
 This page takes you from nothing to two coordinated jobs in a few minutes, without root, and
 then to the enforced host and a first landing. Every command and output below was run against
-AGCoord 0.6.2 on x86_64 Linux. The [overview](overview.md) explains what AGCoord is for; the
+AGCoord on x86_64 Linux. The [overview](overview.md) explains what AGCoord is for; the
 [coordinator contract](coordinator.md) defines every guarantee mentioned here.
 
-## 1. Install the client and the matching broker
+## 1. Install the client and its broker
 
-The Python client and the broker executable must be the same version. Install the client,
-read its version, and fetch that release's broker:
+The Python client and the broker executable must be the same version, and the client ships
+the SHA-256 of the broker it was released with. Install the client, then let it fetch, verify,
+and place its own broker:
 
 ```bash
 python -m pip install agcoord            # in a virtual environment, or: pipx install agcoord
-version=$(agc --version | awk '{print $2}')
-
-mkdir -p ~/.local/libexec/agcoord && cd ~/.local/libexec/agcoord
-base="https://github.com/xu-hao/agcoord/releases/download/v$version"
-curl -fsSL -O "$base/agcoord-broker-x86_64-unknown-linux-musl" \
-     -O "$base/agcoord-broker-x86_64-unknown-linux-musl.sha256"
-sha256sum -c agcoord-broker-x86_64-unknown-linux-musl.sha256
-chmod 0755 agcoord-broker-x86_64-unknown-linux-musl
-./agcoord-broker-x86_64-unknown-linux-musl --version
+agc host install --user
 ```
-
-The broker is one static executable and needs nothing else to run unmanaged. Its
-`--version` line names the protocol and its build digest:
 
 ```text
-agcoord-broker 0.6.2 (protocol 5, sha256:e9c1aebb…)
+AGCoord: installed user broker 0.6.2 at /home/you/.local/libexec/agcoord/agcoord-broker; spool /home/you/.local/state/agcoord configured
 ```
 
-## 2. Give the try-out its own spool
+Four things happened. The client downloaded the standalone release broker for its own version
+from the GitHub release, together with its `.sha256` sidecar. It compared the download with
+the digest pinned inside the client itself, not only with the sidecar that travelled with it.
+It placed the file at `~/.local/libexec/agcoord/agcoord-broker` with mode `0755` and selected
+it once, exactly as every later command will. And it wrote a `config.json` in the default
+state directory, `~/.local/state/agcoord`, declaring your available CPU count as both `cpu`
+and `jobs` capacity and `managed_service: false`, so the first client starts the broker on
+demand instead of asking systemd.
 
-Keep the try-out out of the default state directory. A later `agc host install` needs an
-untouched default spool: it refuses one that already holds a queue or a configuration that
-is not the managed one. Export the variable in every shell that will run `agc`, including
-the one your agent runs in:
+No privilege was used and no service was created. The command is safe to repeat: after
+`pip install --upgrade agcoord`, run it again, because a client accepts a user-owned broker
+only when the file is the one that client was released with. `AGCOORD_STATE_DIR` or
+`--state-dir` selects a different spool; `native_broker.allow_development` is needed only for
+a broker you built from source.
 
-```bash
-export AGCOORD_STATE_DIR="$HOME/.local/state/agcoord-try"
-mkdir -p "$AGCOORD_STATE_DIR" && chmod 0700 "$AGCOORD_STATE_DIR"
-cat > "$AGCOORD_STATE_DIR/config.json" <<EOF
-{"capacities": {"jobs": 2, "cpu": 4},
- "native_broker": {"path": "$HOME/.local/libexec/agcoord/agcoord-broker-x86_64-unknown-linux-musl",
-                   "allow_development": true, "managed_service": false}}
-EOF
-chmod 0600 "$AGCOORD_STATE_DIR/config.json"
-```
-
-Three things are going on in that file. `capacities` declares what this spool hands out:
-every job implicitly takes one `jobs` slot, and `cpu` here is admission accounting because no
-binding enforces it. `allow_development: true` is the current name for "trust an executable
-owned by the current user"; the client still refuses a symlink, a group- or world-writable
-file, or a broker whose version, target, or build identity does not match.
-`managed_service: false` lets the first client start the broker on demand instead of asking
-systemd for a service.
-
-## 3. Run something
+## 2. Run something
 
 `agc` schedules work per repository and worktree, so run it from inside a Git checkout:
 
@@ -94,14 +73,16 @@ row, `l` shows its log, `c` cancels, `p` and `a` filter by repository and agent,
 leaves the jobs running. Set `AGCOORD_AGENT` in each agent's environment, or pass `--agent`,
 and the rows say which agent submitted them.
 
-## 4. Watch two jobs queue
+## 3. Watch two jobs queue
 
-The spool has four CPU units. Submit two jobs that each want three:
+The spool's `cpu` capacity is your CPU count. Submit two jobs that each claim more than half
+of it:
 
 ```bash
-agc run --label "first"  --resource cpu=3 -- sh -c 'sleep 10; echo first done' &
+n=$(nproc); claim=$((n / 2 + 1))
+agc run --label "first"  --resource cpu=$claim -- sh -c 'sleep 10; echo first done' &
 sleep 1
-agc run --label "second" --resource cpu=3 -- sh -c 'echo second done'
+agc run --label "second" --resource cpu=$claim -- sh -c 'echo second done'
 ```
 
 The second job is accepted at once, reports `waiting at position 1`, and runs only after the
@@ -109,31 +90,32 @@ first finishes. That is the whole idea: every agent on the machine declares what
 and the broker admits work when the machine has room. Both rows stay in `agc list` as
 history.
 
-## 5. Clean up, or keep going
+## 4. Keep going, or clean up
 
-`agc drain` refuses new submissions, lets admitted work finish, and stops the unmanaged
-broker:
+To keep using AGCoord unmanaged there is nothing more to do. Unmanaged mode gives you
+scheduling, lanes, logs, landings, and the TUI on any x86_64 Linux machine. What it cannot do
+is enforce a declared limit; a job that claims two CPUs can still use eight.
+
+To remove the try-out, drain the spool so the broker exits, then delete what the install
+created:
 
 ```bash
 agc drain --reason "done with the try-out"
-unset AGCOORD_STATE_DIR
-rm -r ~/.local/state/agcoord-try
+rm -r ~/.local/state/agcoord ~/.local/libexec/agcoord
 ```
 
-Keep the spool instead if you want to go on unmanaged: `agc resume <drain-id>`, with the ID
-that `drain` printed, reopens it. Unmanaged mode gives you scheduling, lanes, logs, landings,
-and the TUI on any x86_64 Linux machine. What it cannot do is enforce a declared limit; a job
-that claims two CPUs can still use eight.
-
-## 6. Turn on enforcement
+## 5. Turn on enforcement
 
 Enforcement needs an Ubuntu 24.04-class host: unified cgroup v2 mounted read-write with
 `nsdelegate`, AppArmor ABI 4, `kernel.apparmor_restrict_unprivileged_userns=1`, and systemd
-254 or newer. With `AGCOORD_STATE_DIR` unset, one command installs the pinned broker as a
-root-owned file, enables a systemd user service and an enforcing AppArmor profile, and proves
-a one-CPU limit before reporting success:
+254 or newer. The managed install needs an empty default spool, so drain the try-out and move
+it aside first. Then one command installs the pinned broker as a root-owned file, enables a
+systemd user service and an enforcing AppArmor profile, and proves a one-CPU limit before
+reporting success:
 
 ```bash
+agc drain --reason "moving to the managed host"
+mv ~/.local/state/agcoord ~/.local/state/agcoord-user
 python -m pip install --upgrade agcoord
 agc host install --download
 ```
@@ -149,9 +131,9 @@ a tmpfs or project-quota policy. The
 upgrades, recovery, and rollback, and the
 [resource contract](coordinator.md#repository-lanes-and-resources) covers every binding.
 
-## 7. Land a pull request
+## 6. Land a pull request
 
-Landing works in both spools and needs an authenticated GitHub CLI (`gh`), because GitHub is
+Landing works in both modes and needs an authenticated GitHub CLI (`gh`), because GitHub is
 the publication adapter. Push the branch, open its pull request, and submit one landing
 request from a clean checkout of that exact head:
 
@@ -174,8 +156,8 @@ step and refusal.
 
 ## Where next
 
-- Tell your agents. The [overview](overview.md#tell-your-agents) has a paragraph to paste into
-  `CLAUDE.md` or `AGENTS.md`.
+- Tell your agents. The [agent guide](agents.md) has the paragraph to paste into `CLAUDE.md`
+  or `AGENTS.md` and what to do with every refusal.
 - Give jobs real budgets. The
   [resource contract](coordinator.md#repository-lanes-and-resources) explains bindings,
   receipts, and the [child CPU leases](coordinator.md#child-cpu-leases-for-parallel-tools)

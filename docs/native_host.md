@@ -152,6 +152,10 @@ Before staging, `agc host` digests the broker the package actually carries and c
 pin. A mismatch is `native-host-pin-mismatch` and stops the operation before the privileged
 staging step.
 
+The same pin lets a client trust a broker it did not install as root: a current-user-owned
+executable whose digest equals the pin is selected without `allow_development`, which is how
+[the user install](#a-user-owned-broker-without-root) works.
+
 The pin is what makes a download meaningful. A package's embedded manifest and the `.sha256`
 sidecars beside it travel with the files they describe, so a source serving a substituted bundle
 can serve matching sidecars and a matching manifest just as easily. Only the pin reaches the host
@@ -265,6 +269,43 @@ agc list
 Activation preserves the drain marker and never removes it.
 Resume only after every owner-locked maintenance step has succeeded. If any step fails, leave
 the service stopped and the marker in place; rerunning `drain` reports the same ID.
+
+## A user-owned broker without root
+
+`agc host install --user` is the unprivileged counterpart of the managed install. It fetches
+this client's standalone release broker, `agcoord-broker-x86_64-unknown-linux-musl`, and its
+`.sha256` sidecar through the same GitHub adapter and the same `AGCOORD_HOST_RELEASE_BASE_URL`
+and `AGCOORD_HOST_RELEASE_REPOSITORY` overrides as `--download`, verifies the transfer against
+the sidecar and the bytes against the digest pinned in the client, places the file at
+`~/.local/libexec/agcoord/agcoord-broker` with mode `0755`, selects it once exactly as a later
+client will, and writes an unmanaged `config.json` into the spool when none exists:
+
+```json
+{
+  "capacities": {"cpu": 8, "jobs": 8},
+  "native_broker": {
+    "path": "/home/you/.local/libexec/agcoord/agcoord-broker",
+    "allow_development": false,
+    "managed_service": false
+  }
+}
+```
+
+The spool is the default state directory unless `AGCOORD_STATE_DIR` or `--state-dir` selects
+another; the user install accepts any spool because an unmanaged broker does. A configuration
+that already selects that path is left alone, so the command is idempotent and is the upgrade
+path after `pip install --upgrade agcoord`: a client accepts a user-owned broker only when the
+file's digest equals its own pin, and refuses one from another release with the instruction to
+rerun the command. A configuration that selects a different broker, or a managed service, is
+refused as `native-host-user-config-conflict` rather than rewritten, and a spool whose broker
+is live is refused as `native-host-user-live-broker` until `agc drain` lets it exit.
+`--user` takes neither a bundle path nor `--download`, and `--broker-sha256` keeps its meaning
+for a client without a pin.
+
+What the user install does not provide is enforcement: every resource is admission accounting,
+no systemd service or AppArmor profile exists, and the broker is not root-owned. Moving a
+machine to the managed host later needs an empty default spool: drain the user spool, move
+`~/.local/state/agcoord` aside, and run the [first install](#first-install).
 
 ## Enforced-host proof
 
