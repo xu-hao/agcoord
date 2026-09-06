@@ -19,6 +19,7 @@ import pytest
 from agcoord.config import config_path
 from agcoord.queue import (
     LAND_AVOID_ENV,
+    LAND_REUSE_ENV,
     CoordinatorClient,
     CoordinatorError,
     NATIVE_PROTOCOL,
@@ -2327,3 +2328,466 @@ def test_spool_protocol_reports_a_persistent_lock_only_after_the_timeout(tmp_pat
     finally:
         holder.execute("COMMIT")
         holder.close()
+
+
+def _counting_gate(ledger: Path, tag: str) -> list[str]:
+    """One gate whose every execution appends a line, so reuse is countable."""
+    return _python(
+        """
+from pathlib import Path
+import sys
+
+ledger, tag = sys.argv[1:]
+with Path(ledger).open("a", encoding="utf-8") as stream:
+    stream.write(f"{tag}\\n")
+print(f"gate ran: {tag}", flush=True)
+""",
+        ledger,
+        tag,
+    )
+
+
+def _failing_gate(ledger: Path, tag: str) -> list[str]:
+    return _python(
+        """
+from pathlib import Path
+import sys
+
+ledger, tag = sys.argv[1:]
+with Path(ledger).open("a", encoding="utf-8") as stream:
+    stream.write(f"{tag}\\n")
+raise SystemExit(3)
+""",
+        ledger,
+        tag,
+    )
+
+
+def _executions(ledger: Path) -> list[str]:
+    if not ledger.exists():
+        return []
+    return ledger.read_text(encoding="utf-8").splitlines()
+
+
+def test_land_reuses_a_passed_full_receipt_for_the_same_exact_head(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    ledger = tmp_path / "gate-executions"
+    gate = _counting_gate(ledger, "shared")
+
+    receipt_id = _submit(client, gate, checkout, kind="full", label="pre-barrier gate")
+    receipt = _row(client, receipt_id, "passed")
+    assert receipt["head_sha"] == head_sha
+    assert _executions(ledger) == ["shared"]
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="reused",
+        event_log=events,
+    )
+    land_id = client.submit_land(
+        "github",
+        123,
+        gate,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        reuse_full=True,
+    )
+    row = _row(client, land_id, "passed")
+
+    assert _executions(ledger) == ["shared"]
+    assert row["gate_run_id"] == receipt_id
+    assert row["gate_exit_status"] == 0
+    assert row["head_sha"] == head_sha
+    assert row["phase"] == "complete"
+    assert events.read_text(encoding="utf-8").splitlines() == ["publish:reused"]
+
+
+def test_land_reuse_gates_normally_when_the_target_advanced(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    ledger = tmp_path / "gate-executions"
+    gate = _counting_gate(ledger, "shared")
+
+    receipt_id = _submit(client, gate, checkout, kind="full", label="pre-barrier gate")
+    _row(client, receipt_id, "passed")
+    assert _executions(ledger) == ["shared"]
+
+    target_checkout = tmp_path / "target-checkout"
+    subprocess.run(
+        [GIT, "clone", "--branch", "main", str(remote), str(target_checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(target_checkout, "config", "user.name", "AGCoord target test")
+    _git(target_checkout, "config", "user.email", "target@example.invalid")
+    (target_checkout / "target.txt").write_text("advanced\n", encoding="utf-8")
+    _git(target_checkout, "add", "target.txt")
+    _git(target_checkout, "commit", "-m", "advance target")
+    _git(target_checkout, "push", "origin", "main")
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="synchronized",
+        event_log=events,
+        dynamic_head=True,
+    )
+    land_id = client.submit_land(
+        "github",
+        123,
+        gate,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        reuse_full=True,
+    )
+    row = _row(client, land_id, "passed")
+
+    assert _executions(ledger) == ["shared", "shared"]
+    assert row["gate_run_id"] is None
+    assert row["head_sha"] != head_sha
+
+
+def test_land_reuse_ignores_a_full_receipt_that_failed(coordinator, tmp_path: Path):
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    ledger = tmp_path / "gate-executions"
+    failing = _failing_gate(ledger, "red")
+
+    receipt_id = _submit(client, failing, checkout, kind="full", label="red gate")
+    _row(client, receipt_id, "failed")
+    assert _executions(ledger) == ["red"]
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="red",
+        event_log=events,
+    )
+    land_id = client.submit_land(
+        "github",
+        123,
+        failing,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        reuse_full=True,
+    )
+    row = _row(client, land_id, "failed")
+
+    assert _executions(ledger) == ["red", "red"]
+    assert row["gate_run_id"] is None
+    assert row["gate_exit_status"] == 3
+    assert not events.exists()
+
+
+def test_land_reuse_ignores_a_receipt_for_a_different_command(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    ledger = tmp_path / "gate-executions"
+
+    receipt_id = _submit(
+        client,
+        _counting_gate(ledger, "other"),
+        checkout,
+        kind="full",
+        label="a different gate",
+    )
+    _row(client, receipt_id, "passed")
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="mismatch",
+        event_log=events,
+    )
+    land_id = client.submit_land(
+        "github",
+        123,
+        _counting_gate(ledger, "landing"),
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        reuse_full=True,
+    )
+    row = _row(client, land_id, "passed")
+
+    assert _executions(ledger) == ["other", "landing"]
+    assert row["gate_run_id"] is None
+
+
+def test_land_reuse_never_accepts_a_check_receipt(coordinator, tmp_path: Path):
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    ledger = tmp_path / "gate-executions"
+    gate = _counting_gate(ledger, "shared")
+
+    check_id = _submit(client, gate, checkout, kind="check", label="ordinary check")
+    _row(client, check_id, "passed")
+    assert _executions(ledger) == ["shared"]
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="check-source",
+        event_log=events,
+    )
+    land_id = client.submit_land(
+        "github",
+        123,
+        gate,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+        reuse_full=True,
+    )
+    row = _row(client, land_id, "passed")
+
+    assert _executions(ledger) == ["shared", "shared"]
+    assert row["gate_run_id"] is None
+
+
+def test_land_without_the_opt_in_never_consults_a_full_receipt(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    ledger = tmp_path / "gate-executions"
+    gate = _counting_gate(ledger, "shared")
+
+    receipt_id = _submit(client, gate, checkout, kind="full", label="pre-barrier gate")
+    _row(client, receipt_id, "passed")
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="default",
+        event_log=events,
+    )
+    land_id = client.submit_land(
+        "github",
+        123,
+        gate,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=environment,
+    )
+    row = _row(client, land_id, "passed")
+
+    assert _executions(ledger) == ["shared", "shared"]
+    assert row["gate_run_id"] is None
+
+
+def _reuse_coordinator(state_dir: Path, max_age: float) -> RunningCoordinator:
+    """One coordinator whose configured receipt lifetime the caller owns and stops."""
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state_dir / "config.json").write_text(
+        json.dumps({"land_gate_reuse_max_age": max_age}), encoding="utf-8"
+    )
+    return RunningCoordinator(state_dir, capacities={"jobs": 2})
+
+
+def _reuse_land(
+    client: CoordinatorClient,
+    *,
+    checkout: Path,
+    branch: str,
+    head_sha: str,
+    gate: list[str],
+    bin_dir: Path,
+    events: Path,
+    tag: str,
+) -> dict[str, object]:
+    land_id = client.submit_land(
+        "github",
+        123,
+        gate,
+        checkout=str(checkout),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=_land_environment(
+            bin_dir,
+            branch=branch,
+            head_sha=head_sha,
+            tag=tag,
+            event_log=events,
+        ),
+        reuse_full=True,
+    )
+    return _row(client, land_id, "passed")
+
+
+def test_land_gate_reuse_is_disabled_by_a_zero_configured_maximum_age(tmp_path: Path):
+    running = _reuse_coordinator(tmp_path / "state", 0)
+    client = running.start()
+    try:
+        checkout, _remote, branch, head_sha = _publication_repository(
+            tmp_path / "repository"
+        )
+        ledger = tmp_path / "gate-executions"
+        gate = _counting_gate(ledger, "shared")
+        _row(
+            client,
+            _submit(client, gate, checkout, kind="full", label="pre-barrier gate"),
+            "passed",
+        )
+
+        row = _reuse_land(
+            client,
+            checkout=checkout,
+            branch=branch,
+            head_sha=head_sha,
+            gate=gate,
+            bin_dir=_install_land_gh(tmp_path),
+            events=tmp_path / "events",
+            tag="disabled",
+        )
+
+        assert _executions(ledger) == ["shared", "shared"]
+        assert row["gate_run_id"] is None
+    finally:
+        running.stop()
+
+
+def test_land_gate_reuse_ignores_a_receipt_past_the_configured_maximum_age(
+    tmp_path: Path,
+):
+    running = _reuse_coordinator(tmp_path / "state", 0.05)
+    client = running.start()
+    try:
+        checkout, _remote, branch, head_sha = _publication_repository(
+            tmp_path / "repository"
+        )
+        ledger = tmp_path / "gate-executions"
+        gate = _counting_gate(ledger, "shared")
+        _row(
+            client,
+            _submit(client, gate, checkout, kind="full", label="pre-barrier gate"),
+            "passed",
+        )
+        time.sleep(0.4)
+
+        row = _reuse_land(
+            client,
+            checkout=checkout,
+            branch=branch,
+            head_sha=head_sha,
+            gate=gate,
+            bin_dir=_install_land_gh(tmp_path),
+            events=tmp_path / "events",
+            tag="expired",
+        )
+
+        assert _executions(ledger) == ["shared", "shared"]
+        assert row["gate_run_id"] is None
+    finally:
+        running.stop()
+
+
+def test_land_reserves_the_gate_reuse_environment_name_for_the_coordinator(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    environment = caller_environment()
+    environment[LAND_REUSE_ENV] = "1"
+
+    with pytest.raises(CoordinatorError, match=f"reserved {LAND_REUSE_ENV}"):
+        client.submit_land(
+            "github",
+            123,
+            _python("raise SystemExit('must not run')"),
+            checkout=str(repository),
+            environment=environment,
+        )
+    snapshot = client.snapshot()
+    assert snapshot["active"] == [] and snapshot["queued"] == [] and snapshot["recent"] == []
+
+
+def test_land_gate_reuse_rejects_a_receipt_from_another_worktree_of_one_repository(
+    coordinator,
+    tmp_path: Path,
+):
+    """Two worktrees at one commit share a tree but not the ignored files beside it."""
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(
+        tmp_path / "repository"
+    )
+    sibling = tmp_path / "sibling-worktree"
+    _git(checkout, "worktree", "add", "-b", "sibling/same-head", str(sibling), head_sha)
+    assert _head(sibling) == head_sha
+
+    ledger = tmp_path / "gate-executions"
+    gate = _counting_gate(ledger, "shared")
+    receipt_id = _submit(
+        client, gate, sibling, kind="full", label="receipt from the sibling"
+    )
+    receipt = _row(client, receipt_id, "passed")
+    assert receipt["head_sha"] == head_sha
+
+    bin_dir = _install_land_gh(tmp_path)
+    events = tmp_path / "events"
+    row = _reuse_land(
+        client,
+        checkout=checkout,
+        branch=branch,
+        head_sha=head_sha,
+        gate=gate,
+        bin_dir=bin_dir,
+        events=events,
+        tag="other-worktree",
+    )
+
+    assert _executions(ledger) == ["shared", "shared"]
+    assert row["gate_run_id"] is None

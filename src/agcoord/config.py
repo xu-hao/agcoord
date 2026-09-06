@@ -27,6 +27,7 @@ _CONFIG_KEYS = frozenset(
         "cgroup_root",
         "cgroup_io",
         "database_timeout",
+        "land_gate_reuse_max_age",
         "native_broker",
     }
 )
@@ -54,6 +55,7 @@ class BrokerConfig:
     cgroup_root: str | None
     cgroup_io: Mapping[str, Any] | None
     database_timeout: float | None
+    land_gate_reuse_max_age: float | None
     native_broker: NativeBrokerConfig
 
 
@@ -74,6 +76,7 @@ def load_broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
             cgroup_root=None,
             cgroup_io=None,
             database_timeout=None,
+            land_gate_reuse_max_age=None,
             native_broker=NativeBrokerConfig(
                 path=DEFAULT_NATIVE_BROKER_PATH,
                 allow_development=False,
@@ -106,6 +109,7 @@ def parse_broker_config(
     bindings = _section(document, "bindings", source=source)
     cgroup_io = _cgroup_io_section(document, source=source)
     database_timeout = _database_timeout(document, source=source)
+    land_gate_reuse_max_age = _land_gate_reuse_max_age(document, source=source)
     native_broker = _native_broker_section(document, source=source)
     cgroup_root = document.get("cgroup_root")
     if cgroup_root is not None and (
@@ -120,6 +124,7 @@ def parse_broker_config(
         cgroup_root=cgroup_root,
         cgroup_io=cgroup_io,
         database_timeout=database_timeout,
+        land_gate_reuse_max_age=land_gate_reuse_max_age,
         native_broker=native_broker,
     )
 
@@ -226,6 +231,34 @@ def _cgroup_io_section(
         identities.add(identity)
         selected.append(raw_path)
     return {"paths": selected}
+
+
+def _land_gate_reuse_max_age(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> float | None:
+    """How long a passed full receipt may stand in for a land gate; zero disables reuse."""
+    value = document.get("land_gate_reuse_max_age")
+    if value is None:
+        return None
+    selected: float | None = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            selected = float(value)
+        except OverflowError:
+            pass
+    if (
+        selected is None
+        or not math.isfinite(selected)
+        or selected < 0
+        or selected > MAX_DATABASE_TIMEOUT
+    ):
+        raise BrokerConfigError(
+            f"broker configuration {source} land_gate_reuse_max_age must be "
+            f"a finite number of seconds from 0 to {MAX_DATABASE_TIMEOUT}"
+        )
+    return selected
 
 
 def _database_timeout(

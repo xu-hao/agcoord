@@ -105,11 +105,15 @@ the entire machine:
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
-`database_timeout`, and `native_broker`; invalid JSON, a top-level value that is not an object,
+`database_timeout`, `land_gate_reuse_max_age`, and `native_broker`; invalid JSON, a top-level
+value that is not an object,
 an unknown key, a section that is not an object, or an empty `cgroup_root` is refused when the
 client or broker loads its configuration. When present, `cgroup_io` contains exactly one
 nonempty `paths` list of unique absolute strings. `database_timeout` is a positive finite number
-of seconds no greater than `2147483.647` (SQLite's millisecond limit) and defaults to `10`. An
+of seconds no greater than `2147483.647` (SQLite's millisecond limit) and defaults to `10`.
+`land_gate_reuse_max_age` is a finite number of seconds from `0` to `2147483.647`, defaults to
+`3600`, and bounds how long a passed `full` receipt may stand in for a land gate; `0` refuses
+every reuse on that host even when a caller asks for one. An
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
 defaults capacity to `jobs=2`.
 
@@ -121,6 +125,7 @@ defaults capacity to `jobs=2`.
   },
   "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/agcoord-broker.service",
   "database_timeout": 30,
+  "land_gate_reuse_max_age": 3600,
   "native_broker": {
     "path": "/usr/libexec/agcoord/agcoord-broker",
     "allow_development": false,
@@ -728,7 +733,10 @@ its exact durable identity, the unchanged head, and cleanliness again after wait
 queue. A passed row is therefore an immutable validation receipt for that repository,
 branch, and head. It remains useful for standalone release preparation and audit, but normal
 publication uses the gate embedded in one `land` row rather than treating a prior full
-receipt as a separate authorization step.
+receipt as a separate authorization step. The one exception is the opt-in described in
+[reusing a full receipt as the land gate](#reusing-a-full-receipt-as-the-land-gate), which
+still records the verdict inside the same land row rather than making the receipt a separate
+authorization.
 
 `full` is neither a lane barrier nor machine-wide exclusivity. Declare every scarce machine
 resource it requires. Capacities—not the fact that the job is named “full”—decide whether
@@ -899,8 +907,10 @@ The CLI defaults `--adapter` to `github` as a convenience, while the client API 
 publication record keep the adapter and request separate. The current GitHub adapter accepts
 a pull-request number; future adapters can normalize their own request shape. Submission
 requires a clean checkout at one full 40-hex `HEAD` and inserts exactly one `kind=land`
-repository barrier. Its command and environment are the gate, not a second queued job, and
-its `gate_run_id` is null.
+repository barrier. Its command and environment are the gate, not a second queued job, and it
+is submitted with a null `gate_run_id`. The coordinator sets that field only when it authorizes
+[reuse of a full receipt](#reusing-a-full-receipt-as-the-land-gate), where it names the receipt
+the verdict came from; a land that ran its own gate keeps it null.
 
 The worker first validates local and forge identity, readiness, and the current target and
 source refs. If the target advanced while an open, ready, same-repository request waited, the
@@ -955,6 +965,52 @@ A land request is cancellable while queued, preflighting, or gating. Once its du
 is `publishing`, cancellation is refused because killing a client during an authenticated
 atomic mutation would leave the outcome indeterminate. Graceful broker stop cancels safe
 earlier phases but waits for publishing and records its authoritative result.
+
+### Reusing a full receipt as the land gate
+
+The two-step a worktree usually follows — `agc full`, then `agc land` — exists so that a red gate
+is discovered outside the repository lane barrier rather than while holding it. `--reuse-full`
+keeps that pre-barrier check and stops paying for it twice:
+
+```bash
+agc land 123 --reuse-full -- ./scripts/test.sh
+```
+
+The worker never decides this. After preflight reaches its exact head it asks the coordinator,
+which resolves and records the reuse in one immediate transaction, so a gate is skipped only on a
+verdict the durable record already holds. A candidate must satisfy every one of:
+
+- `kind` is exactly `full` and its status is `passed`. A `check` is never eligible, because it
+  asserts no clean head and so its `head_sha` does not pin a tree.
+- the same `repository_id` **and** the same `worktree_id`. A second worktree of the same
+  repository at the same commit holds a different ignored working tree, so its receipt is
+  not accepted here;
+- `head_sha` equal to the head preflight reached, not the head that was submitted;
+- an identical gate command;
+- `finished_at` no older than `land_gate_reuse_max_age`.
+
+On a hit the row moves to `gating` with gate exit status `0`, its `gate_run_id` names the receipt,
+and the transcript records the substitution:
+
+```
+Land coordinator: gate reused from full-abc123def456; that receipt already gated the exact head <sha>
+```
+
+On a miss nothing changes and the gate runs. Without the flag the coordinator is never asked.
+
+What reuse preserves, because each happens at land time regardless of where the verdict came
+from: preflight validates the target inside the barrier; publication is one atomic
+compare-and-swap on both refs; the barrier still serializes landings in the repository; and the
+avoided-commit check still re-reads the target. **A moved target cannot reuse a green result**,
+and not by policy: synchronizing an advanced target creates a merge commit, which changes the
+exact head, so no earlier receipt can match it.
+
+What reuse does not preserve is freshness against a gate that is not a function of the tree. The
+same commit is not the same gate inputs when the gate reads the clock, the network, the installed
+toolchain, or the ignored working tree — `node_modules`, a virtual environment, a build directory.
+A clean `git status` says nothing about those. The coordinator cannot detect it, which is why the
+flag is opt-in, why receipts expire, and why an operator can set `land_gate_reuse_max_age` to `0`
+to refuse every reuse on a host.
 
 ### Avoided commits after a target rewrite
 

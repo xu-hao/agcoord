@@ -215,6 +215,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="refuse an advanced target instead of merging it into the request branch",
     )
     land.add_argument(
+        "--reuse-full",
+        action="store_true",
+        help=(
+            "let a passed full receipt for the very same exact head and gate command "
+            "stand in for this gate instead of running it again"
+        ),
+    )
+    land.add_argument(
         "--avoid",
         action="append",
         default=[],
@@ -542,6 +550,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             repository=args.repository,
             synchronize_target=args.synchronize_target,
             avoid_commits=args.avoid,
+            reuse_full=args.reuse_full,
         )
     else:
         run_id = client.submit(

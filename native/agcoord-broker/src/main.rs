@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 use store::{
     AdmissionRequest, ChildLeaseOwnerRequest, ChildLeaseRequest, LandResultRequest, PROTOCOL,
-    Paths, PhaseRequest, SubmitRequest,
+    Paths, PhaseRequest, ReuseRequest, SubmitRequest,
 };
 use worker::WorkerFault;
 
@@ -649,6 +649,61 @@ fn parse_phase(arguments: &[String]) -> Result<(Paths, PhaseRequest)> {
     ))
 }
 
+fn parse_reuse(arguments: &[String]) -> Result<(Paths, ReuseRequest)> {
+    let mut state_dir = None;
+    let mut run_id = None;
+    let mut worker_pid = None;
+    let mut worker_start_token = None;
+    let mut checkout = None;
+    let mut head_sha = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir"
+            | "--run-id"
+            | "--worker-pid"
+            | "--worker-start-token"
+            | "--checkout"
+            | "--head" => option_value(arguments, &mut index, &option)?,
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--run-id" => run_id = Some(value),
+            "--worker-pid" => {
+                worker_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| {
+                            AppError::usage("--worker-pid must be a positive integer")
+                        })?,
+                );
+            }
+            "--worker-start-token" => worker_start_token = Some(value),
+            "--checkout" => checkout = Some(PathBuf::from(value)),
+            "--head" => head_sha = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        Paths::new(&state_dir).configured()?,
+        ReuseRequest {
+            run_id: run_id.ok_or_else(|| AppError::usage("--run-id is required"))?,
+            worker_pid: worker_pid.ok_or_else(|| AppError::usage("--worker-pid is required"))?,
+            worker_start_token: worker_start_token
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::usage("--worker-start-token is required"))?,
+            checkout: checkout.ok_or_else(|| AppError::usage("--checkout is required"))?,
+            head_sha: head_sha.ok_or_else(|| AppError::usage("--head is required"))?,
+        },
+    ))
+}
+
 fn parse_admission(arguments: &[String]) -> Result<(Paths, AdmissionRequest)> {
     let mut state_dir = None;
     let mut run_id = None;
@@ -1015,6 +1070,10 @@ fn run_command(arguments: &[String]) -> Result<()> {
         [command, rest @ ..] if command == "phase" => {
             let (paths, request) = parse_phase(rest)?;
             emit_json(&store::advance_land_phase(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "reuse-gate" => {
+            let (paths, request) = parse_reuse(rest)?;
+            emit_json(&store::reuse_gate(&paths, &request)?)
         }
         [command, rest @ ..] if command == "report" => {
             let (paths, request) = parse_land_result(rest)?;
