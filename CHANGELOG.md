@@ -3,17 +3,22 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.0 — 2026-09-06
 
-- `agc land --reuse-full` lets one passed `agc full` receipt stand in for the land gate when it
-  covers the very same exact head, repository, worktree, and gate command and is no older than
-  the new
-  `land_gate_reuse_max_age` configuration (3600 seconds by default; `0` refuses every reuse on a
-  host). The coordinator, not the worker, resolves and records the substitution, and the land row
-  names the receipt in `gate_run_id`. A synchronized target changes the exact head, so an advanced
-  target can never reuse a green result, and without the flag nothing changes (#213).
-  Because `--reuse-full` needs a broker that answers the new `reuse-gate` command, the release
-  carrying it must open a new minor line rather than extend 0.6.
+- `agc land --reuse-full` lets one passed `agc full` receipt stand in for the land gate instead
+  of running the same gate twice against the same commit. The coordinator, not the worker,
+  resolves and records the substitution, so a gate is skipped only on a verdict the durable
+  record already holds: a candidate must be a passed `full` for the same repository and worktree,
+  the exact head preflight reached, and an identical gate command, finished no longer ago than
+  the new `land_gate_reuse_max_age` configuration (3600 seconds by default; `0` refuses every
+  reuse on a host). The land row names the receipt in `gate_run_id`, which the terminal UI shows
+  as its gate receipt. Synchronizing an advanced target creates a merge commit and so changes the
+  exact head, which means an advanced target can never reuse a green result. Without the flag
+  nothing changes (#213).
+- A 0.7 client commands only a 0.7 broker. `--reuse-full` needs the broker's new `reuse-gate`
+  command, so the client's supported-broker line moves from 0.6 to 0.7; upgrade the client and
+  the broker together. The on-disk protocol is unchanged and stays 5, so no spool migration is
+  required (#215).
 
 ## 0.6.4 — 2026-09-05
 
