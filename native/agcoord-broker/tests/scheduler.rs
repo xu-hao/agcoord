@@ -6022,6 +6022,7 @@ fn land_request_options_reach_the_worker_as_arguments() {
             &[],
             &[
                 ("_AGCOORD_LAND_TARGET_SYNC", "0"),
+                ("_AGCOORD_LAND_REUSE_FULL", "1"),
                 ("_AGCOORD_LAND_AVOID", avoid_value.as_str()),
             ],
             None,
@@ -6036,6 +6037,7 @@ fn land_request_options_reach_the_worker_as_arguments() {
         .expect("the land worker command separates its gate command");
     let options = &arguments[..separator];
     assert!(options.contains(&"--no-target-sync"), "{options:?}");
+    assert!(options.contains(&"--reuse-full"), "{options:?}");
     let requested: Vec<&str> = options
         .windows(2)
         .filter(|pair| pair[0] == "--avoid")
@@ -6052,6 +6054,7 @@ fn land_request_options_reach_the_worker_as_arguments() {
 
     for (name, value) in [
         ("_AGCOORD_LAND_TARGET_SYNC", "maybe"),
+        ("_AGCOORD_LAND_REUSE_FULL", "yes"),
         (
             "_AGCOORD_LAND_AVOID",
             "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",

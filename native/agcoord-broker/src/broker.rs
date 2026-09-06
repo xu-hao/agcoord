@@ -96,6 +96,20 @@ fn land_request_options(run: &RunRecord) -> Result<Vec<String>> {
             ));
         }
     }
+    match run
+        .environment
+        .get("_AGCOORD_LAND_REUSE_FULL")
+        .map(String::as_str)
+    {
+        None | Some("0") => {}
+        Some("1") => options.push("--reuse-full".to_owned()),
+        Some(_) => {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "land run has an invalid gate-reuse setting",
+            ));
+        }
+    }
     if let Some(avoided) = run.environment.get("_AGCOORD_LAND_AVOID") {
         for sha in avoided.split(',') {
             if !commit_sha_valid(sha) {

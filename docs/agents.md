@@ -33,6 +33,9 @@ Use `agc full` for a clean exact-head verdict when you need one without publishi
 Land only through one gate-and-publish request, from a clean checkout of the pushed
 head, after the pull request is open and ready:
   agc land <pr> --label "<ticket> land" --resource cpu=<n> -- <full test command>
+Add --reuse-full when you already have a passed `agc full` for that exact head and the
+same gate command, and the gate does not depend on the clock, the network, or anything
+outside the commit; the coordinator then reuses that verdict instead of running it twice.
 Never use `gh pr merge`, a direct push to the target branch, or a separate full-then-merge
 sequence; the coordinator's verdict and the merge are one step.
 Never run `agc` from inside an admitted job; nested submissions are refused.
