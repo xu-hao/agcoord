@@ -23,6 +23,7 @@ from .merge import (
 
 PhaseChanged = Callable[[str, int | None], None]
 HeadChanged = Callable[[str, str], None]
+ReuseGate = Callable[[], str | None]
 
 
 def _command(value: Sequence[str]) -> list[str]:
@@ -118,6 +119,7 @@ def execute(
     synchronize_target: bool = True,
     wait: Wait | None = None,
     avoid_commits: Mapping[str, str] | None = None,
+    reuse_gate: ReuseGate | None = None,
 ) -> int:
     """Preflight, gate, and publish without releasing the caller's reservation."""
     selected = Path(checkout).expanduser().resolve()
@@ -164,23 +166,35 @@ def execute(
     if status != 0:
         return status
 
-    changed("gating", None)
-    print(f"Land coordinator: gate started for {effective_head}", file=out, flush=True)
-    gate_status = _run_gate(
-        command,
-        checkout=selected,
-        environment=selected_environment,
-        out=out,
-    )
-    if gate_status != 0:
-        changed("gating", gate_status)
+    # The coordinator, not this worker, decides whether an existing receipt covers the
+    # exact head preflight reached. A moved target already changed that head, so a
+    # synchronized source can never match one.
+    reused = reuse_gate() if reuse_gate is not None else None
+    if reused is not None:
         print(
-            f"Land coordinator: gate failed with exit status {gate_status}; "
-            "publication was not attempted",
-            file=err,
+            f"Land coordinator: gate reused from {reused}; that receipt already gated "
+            f"the exact head {effective_head}",
+            file=out,
             flush=True,
         )
-        return gate_status
+    else:
+        changed("gating", None)
+        print(f"Land coordinator: gate started for {effective_head}", file=out, flush=True)
+        gate_status = _run_gate(
+            command,
+            checkout=selected,
+            environment=selected_environment,
+            out=out,
+        )
+        if gate_status != 0:
+            changed("gating", gate_status)
+            print(
+                f"Land coordinator: gate failed with exit status {gate_status}; "
+                "publication was not attempted",
+                file=err,
+                flush=True,
+            )
+            return gate_status
 
     if avoided:
         refusal = _avoided_refusal(
@@ -289,6 +303,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--request-json", required=True)
     parser.add_argument("--no-target-sync", action="store_true")
+    parser.add_argument("--reuse-full", action="store_true")
     parser.add_argument("--avoid", action="append", default=[])
     parser.add_argument("gate_command", nargs=argparse.REMAINDER)
     return parser
@@ -378,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
                 new_head_sha=new_head,
             )
 
+        def reuse_gate() -> str | None:
+            return client.reuse_gate(args.run_id, worker_pid=os.getpid())
+
         result = execute(
             request,
             command,
@@ -393,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             head_changed=head_changed,
             synchronize_target=(target_sync == "1" and not args.no_target_sync),
             avoid_commits=avoid_commits,
+            reuse_gate=reuse_gate if args.reuse_full else None,
         )
         client.report_land_result(
             args.run_id,

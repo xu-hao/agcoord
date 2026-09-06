@@ -66,6 +66,7 @@ CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
 LAND_TARGET_SYNC_ENV = "_AGCOORD_LAND_TARGET_SYNC"
 LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
+LAND_REUSE_ENV = "_AGCOORD_LAND_REUSE_FULL"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
 RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
@@ -1525,6 +1526,7 @@ class CoordinatorClient:
         environment: Mapping[str, str] | None = None,
         synchronize_target: bool = True,
         avoid_commits: Sequence[str] = (),
+        reuse_full: bool = False,
     ) -> str:
         selected_command = _validate_command(command)
         if adapter != "github":
@@ -1537,6 +1539,8 @@ class CoordinatorClient:
             raise CoordinatorError("label must be a non-empty string")
         if not isinstance(synchronize_target, bool):
             raise CoordinatorError("synchronize_target must be boolean")
+        if not isinstance(reuse_full, bool):
+            raise CoordinatorError("reuse_full must be boolean")
         selected_avoid = _validate_avoid_commits(avoid_commits)
         prepared = self._prepare_submission(
             checkout=checkout,
@@ -1558,6 +1562,7 @@ class CoordinatorClient:
             prepared=prepared,
             synchronize_target=synchronize_target,
             avoid_commits=selected_avoid,
+            reuse_full=reuse_full,
             owner=owner,
         )
 
@@ -1573,6 +1578,7 @@ class CoordinatorClient:
         prepared: _PreparedSubmission,
         synchronize_target: bool,
         avoid_commits: Sequence[str],
+        reuse_full: bool,
         owner: Mapping[str, Any],
     ) -> str:
         selected_environment = dict(prepared.environment)
@@ -1590,6 +1596,12 @@ class CoordinatorClient:
             )
         if selected_avoid:
             selected_environment[LAND_AVOID_ENV] = ",".join(selected_avoid)
+        if LAND_REUSE_ENV in selected_environment:
+            raise CoordinatorError(
+                f"gate environment uses the reserved {LAND_REUSE_ENV} name"
+            )
+        if reuse_full:
+            selected_environment[LAND_REUSE_ENV] = "1"
         if "_AGCOORD_LAND_PYTHON" in selected_environment:
             raise CoordinatorError(
                 "gate environment uses the reserved _AGCOORD_LAND_PYTHON name"
@@ -2043,6 +2055,42 @@ class CoordinatorClient:
         if not isinstance(result, dict) or result.get("run_id") != run_id:
             raise CoordinatorError("native broker returned an invalid land phase receipt")
         return
+
+    def reuse_gate(self, run_id: str, *, worker_pid: int) -> str | None:
+        """Ask the coordinator to authorize this land gate from a passed full receipt.
+
+        The broker decides and records; a worker never skips its gate on its own claim.
+        Returns the source run when one was recorded, and ``None`` when the gate must run.
+        """
+        self._assert_admitted_callback(run_id)
+        self._ensure_broker(admitted_callback=True)
+        token = _process_start_token(worker_pid)
+        if token is None:
+            raise CoordinatorError("cannot identify admitted land worker process")
+        row = self.admitted_run_status(run_id)
+        result = self._native_callback_invoke(
+            "reuse-gate",
+            [
+                "--run-id",
+                run_id,
+                "--worker-pid",
+                str(worker_pid),
+                "--worker-start-token",
+                token,
+                "--checkout",
+                str(row["checkout"]),
+                "--head",
+                str(row["head_sha"]),
+            ],
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("reused"), bool):
+            raise CoordinatorError("native broker returned an invalid gate reuse receipt")
+        if not result["reused"]:
+            return None
+        source = result.get("run_id")
+        if not isinstance(source, str) or not source:
+            raise CoordinatorError("native broker returned an invalid gate reuse receipt")
+        return source
 
     def report_land_result(
         self,

@@ -3,6 +3,18 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- `agc land --reuse-full` lets one passed `agc full` receipt stand in for the land gate when it
+  covers the very same exact head, repository, worktree, and gate command and is no older than
+  the new
+  `land_gate_reuse_max_age` configuration (3600 seconds by default; `0` refuses every reuse on a
+  host). The coordinator, not the worker, resolves and records the substitution, and the land row
+  names the receipt in `gate_run_id`. A synchronized target changes the exact head, so an advanced
+  target can never reuse a green result, and without the flag nothing changes (#213).
+  Because `--reuse-full` needs a broker that answers the new `reuse-gate` command, the release
+  carrying it must open a new minor line rather than extend 0.6.
+
 ## 0.6.4 — 2026-09-05
 
 - Add `docs/troubleshooting.md`: how a refusal reaches you, and one table per situation for
