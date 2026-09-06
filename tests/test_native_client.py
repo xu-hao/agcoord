@@ -100,6 +100,14 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
         with pytest.raises(BrokerConfigError, match="native_broker"):
             parse_broker_config(json.dumps(invalid))
 
+    assert parse_broker_config(json.dumps({})).land_gate_reuse_max_age is None
+    assert parse_broker_config(
+        json.dumps({"land_gate_reuse_max_age": 0})
+    ).land_gate_reuse_max_age == 0
+    for invalid in (-1, "3600", True, float("inf")):
+        with pytest.raises(BrokerConfigError, match="land_gate_reuse_max_age"):
+            parse_broker_config(json.dumps({"land_gate_reuse_max_age": invalid}))
+
 
 def test_explicit_development_selection_rejects_mutable_symlinked_and_wrong_target_binaries(
     tmp_path: Path,

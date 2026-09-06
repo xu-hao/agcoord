@@ -217,15 +217,16 @@ callback boundary.
 
 The native executable implements the protocol-5 owner lock, SQLite spool initialization,
 submission validation, admission, repository barriers, queue-order-preserving round-robin
-selection, generic capacity accounting, cancellation, land-phase authority, history reads,
+selection, generic capacity accounting, cancellation, land-phase authority, land gate-reuse
+authority, history reads,
 worker observation, child leases, durable drain/status/resume, and protocol-4-to-5 migration
 and rollback. The Python client, TUI, and pytest-xdist adapter use these native commands while
 retaining their public JSON and environment contracts; migration and rollback are broker-internal
 and are no longer exposed as client commands.
 
 `serve` validates the complete schema and every stored run before changing activity metadata,
-puts new and migrated databases in WAL mode, and uses `database_timeout` from the state
-directory's strict `config.json`. Busy or locked pump transactions are retried. Other structural
+puts new and migrated databases in WAL mode, and uses `database_timeout` and
+`land_gate_reuse_max_age` from the state directory's strict `config.json`. Busy or locked pump transactions are retried. Other structural
 errors stop the owner with a stable JSON refusal; one executable that cannot be spawned fails
 only its owning row.
 

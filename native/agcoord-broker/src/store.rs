@@ -20,6 +20,7 @@ pub const PROTOCOL: u64 = 5;
 pub const SCHEMA_FINGERPRINT: &str = "agcoord-spool-v5";
 pub const MAINTENANCE_REFUSAL: &str = "agcoord-maintenance-draining";
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
+const LAND_GATE_REUSE_MAX_AGE: Duration = Duration::from_secs(3600);
 const RECENT_LIMIT: usize = 50;
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_MAINTENANCE_REASON: usize = 256;
@@ -214,6 +215,15 @@ pub struct PhaseRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct ReuseRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct AdmissionRequest {
     pub run_id: String,
     pub kind: String,
@@ -376,6 +386,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
         "cgroup_root",
         "cgroup_io",
         "database_timeout",
+        "land_gate_reuse_max_age",
         "native_broker",
     ];
     if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
@@ -498,6 +509,17 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             }
         }
     }
+    if let Some(value) = object.get("land_gate_reuse_max_age")
+        && value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= 2_147_483.647)
+            .is_none()
+    {
+        return Err(AppError::new(
+            "broker-config-invalid",
+            "land_gate_reuse_max_age must be a finite number of seconds from 0 to 2147483.647",
+        ));
+    }
     let Some(value) = object.get("database_timeout") else {
         return Ok(DATABASE_TIMEOUT);
     };
@@ -508,6 +530,42 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             AppError::new(
                 "broker-config-invalid",
                 "database_timeout must be a positive finite number no greater than 2147483.647",
+            )
+        })?;
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+/// How long a passed `full` receipt may authorize a land gate; zero disables reuse.
+fn land_gate_reuse_max_age(paths: &Paths) -> Result<Duration> {
+    let path = paths.state_dir.join("config.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LAND_GATE_REUSE_MAX_AGE);
+        }
+        Err(error) => {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                format!("cannot read broker configuration: {error}"),
+            ));
+        }
+    };
+    let document: Value = serde_json::from_str(&text).map_err(|_| {
+        AppError::new(
+            "broker-config-invalid",
+            "broker configuration is not valid JSON",
+        )
+    })?;
+    let Some(value) = document.get("land_gate_reuse_max_age") else {
+        return Ok(LAND_GATE_REUSE_MAX_AGE);
+    };
+    let seconds = value
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= 2_147_483.647)
+        .ok_or_else(|| {
+            AppError::new(
+                "broker-config-invalid",
+                "land_gate_reuse_max_age must be a finite number of seconds from 0 to 2147483.647",
             )
         })?;
     Ok(Duration::from_secs_f64(seconds))
@@ -2449,6 +2507,16 @@ fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
         }
         if request
             .environment
+            .get("_AGCOORD_LAND_REUSE_FULL")
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "1"))
+        {
+            return Err(AppError::new(
+                "broker-submission-invalid",
+                "land gate-reuse setting must be 0 or 1",
+            ));
+        }
+        if request
+            .environment
             .get("_AGCOORD_LAND_AVOID")
             .is_some_and(|value| !value.split(',').all(commit_sha_valid))
         {
@@ -2881,6 +2949,99 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
     status(paths, &request.run_id)
+}
+
+/// Authorize one land gate from a passed `full` receipt for the very same exact head.
+///
+/// The broker, not the worker, decides whether a receipt exists and records it, so a gate can
+/// never be skipped on a claim the durable record does not support.  A candidate must be a
+/// passed `full` for the same repository, the same exact head the land reached after preflight,
+/// and the same gate command; `check` rows are never eligible because they assert no clean head.
+/// On a hit the row moves to `gating` with a zero gate status and names its source in
+/// `gate_run_id`; on a miss nothing changes and the worker runs the gate.
+pub fn reuse_gate(paths: &Paths, request: &ReuseRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let max_age = land_gate_reuse_max_age(paths)?;
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let run = load_run(&connection, &request.run_id)?;
+    if run.kind != "land" || run.status != "running" || run.phase != "preflight" {
+        return Err(AppError::new(
+            "broker-gate-reuse-invalid",
+            "only a running land still in preflight may reuse a gate",
+        ));
+    }
+    if !admitted_worker_presents(&run, request.worker_pid, &request.worker_start_token)
+        || run.checkout != request.checkout
+        || run.head_sha.as_deref() != Some(&request.head_sha)
+    {
+        return Err(AppError::new(
+            "broker-land-identity-mismatch",
+            "gate reuse requester does not match the admitted worker, checkout, and head",
+        ));
+    }
+    if run.cancel_requested {
+        return Err(AppError::new(
+            "broker-land-cancelled",
+            "land cancellation committed before a gate could be reused",
+        ));
+    }
+    if run.gate_exit_status.is_some() || run.gate_run_id.is_some() {
+        return Err(AppError::new(
+            "broker-gate-reuse-invalid",
+            "land already carries a gate verdict",
+        ));
+    }
+    if max_age.is_zero() {
+        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "disabled"}));
+    }
+    let command_json = serde_json::to_string(&run.command).map_err(|error| {
+        AppError::new(
+            "broker-row-invalid",
+            format!("cannot encode land gate command: {error}"),
+        )
+    })?;
+    let horizon = format!("-{} seconds", max_age.as_secs_f64());
+    let candidate = connection
+        .query_row(
+            "SELECT run_id, finished_at FROM runs
+             WHERE kind = 'full' AND status = 'passed'
+               AND repository_id = ?1 AND worktree_id = ?2
+               AND head_sha = ?3 AND command_json = ?4
+               AND finished_at IS NOT NULL
+               AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?5)
+             ORDER BY sequence DESC LIMIT 1",
+            params![
+                run.repository_id,
+                run.worktree_id,
+                request.head_sha,
+                command_json,
+                horizon
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_database_error)?;
+    let Some((source, finished_at)) = candidate else {
+        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "no-receipt"}));
+    };
+    connection
+        .execute(
+            "UPDATE runs SET phase = 'gating', gate_exit_status = 0, gate_run_id = ?1
+             WHERE run_id = ?2",
+            params![source, request.run_id],
+        )
+        .map_err(map_database_error)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({
+        "reused": true,
+        "run_id": source,
+        "finished_at": finished_at,
+    }))
 }
 
 pub fn report_land_result(paths: &Paths, request: &LandResultRequest) -> Result<Value> {
