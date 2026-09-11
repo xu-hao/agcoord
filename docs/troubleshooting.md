@@ -59,8 +59,9 @@ These arrive as a failed row. `failure_reason` is stable; the log has the detail
 | `publish-failed` | The forge rejected the atomic update; nothing moved. | Check `gh auth status`, branch protection (a required hosted merge queue rejects the update), and the pull request; resubmit. |
 | `memory-oom` | The job exceeded its declared memory and was ended as one process group. | Raise the `memory` claim or reduce the job's footprint; the receipt's `peak` says how far over it went. |
 | `resource-enforcement-failed` | A `required` binding could not be applied before user code; the launcher exited 125. | Read the receipt's events for the backend's code; fix the host or make the binding `best-effort`. |
-| status `interrupted` | The worker vanished before it could report; no verdict is claimed. | Read the log; unless it ends with `LANDED`, submit again. |
-| status `cancelled` | `agc cancel`, or a graceful broker stop reaped a queued or gating job. | Resubmit when appropriate. Publication is never cancelled. |
+| status `interrupted`, reason `broker-stopped` | The broker was stopped and the job outlived `stop_grace`, or a second stop signal arrived; no verdict is claimed. | Submit again. Publication is never interrupted. |
+| status `interrupted`, reason `worker-result-lost` | The worker vanished before it could report; no verdict is claimed. | Read the log; unless it ends with `LANDED`, submit again. |
+| status `cancelled` | `agc cancel` asked for it. | Resubmit when appropriate. Publication is never cancelled. |
 
 ## Maintenance
 
@@ -105,6 +106,7 @@ These arrive as a failed row. `failure_reason` is stable; the log has the detail
 | `…-stage-failed`, `…-activation-failed`, `…-reload-failed`, `…-start-failed`, `…-stop-failed` | The named phase failed; the receipt says what was rolled back. | Fix the cause the phase names and rerun the same command. |
 | `native-host-install-incomplete`, `native-host-upgrade-incomplete` | Activation happened but verification or the enforcement proof failed; an unproved fresh service is disabled again. | Read the receipt's inner error, fix it, rerun. An upgrade's drain ID is retained; `agc resume` it only when the host is proved. |
 | `native-host-upgrade-drain-invalid` | The drain receipt the upgrade needs is missing or malformed. | Rerun `agc drain`, then the upgrade. |
+| `systemctl --user stop` or `restart` does not return | A graceful stop waits for running jobs, up to `stop_grace` (600 seconds by default). | Wait, or interrupt them now with `systemctl --user kill --kill-whom=main --signal=SIGTERM agcoord-broker.service`; they end `interrupted` (`broker-stopped`). Never use a plain `systemctl kill`, which signals the jobs too. |
 
 ## Enforced-host probe failures
 

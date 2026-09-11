@@ -108,6 +108,13 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
         with pytest.raises(BrokerConfigError, match="land_gate_reuse_max_age"):
             parse_broker_config(json.dumps({"land_gate_reuse_max_age": invalid}))
 
+    assert parse_broker_config(json.dumps({})).stop_grace is None
+    assert parse_broker_config(json.dumps({"stop_grace": 0})).stop_grace == 0
+    assert parse_broker_config(json.dumps({"stop_grace": 900})).stop_grace == 900
+    for invalid in (-1, "600", True, float("inf")):
+        with pytest.raises(BrokerConfigError, match="stop_grace"):
+            parse_broker_config(json.dumps({"stop_grace": invalid}))
+
 
 def test_explicit_development_selection_rejects_mutable_symlinked_and_wrong_target_binaries(
     tmp_path: Path,
