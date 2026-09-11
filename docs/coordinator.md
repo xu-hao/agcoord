@@ -166,7 +166,12 @@ wait without changing existing connections.
 
 Schema setup places every current-protocol spool in SQLite WAL journal mode, including an
 existing spool the next time a compatible client or broker opens it. Readers therefore do not
-block behind an ordinary writer. The configured timeout bounds each remaining lock wait;
+block behind an ordinary writer. A live owner also keeps one connection open for as long as
+it owns the spool. Closing the last connection to a WAL database checkpoints and removes the
+WAL under an exclusive lock that every opening reader must wait behind, so an owner whose own
+short-lived connections were the last would stall clients on a slow disk. The configured
+timeout bounds each remaining lock wait, and a lock that outlasts it is reported as the
+retryable `broker-database-busy`, never as a schema fault;
 transient busy or locked results in the broker pump and idle health check are retried, and a
 contended best-effort activity heartbeat never changes an already successful public operation
 into an apparent failure.

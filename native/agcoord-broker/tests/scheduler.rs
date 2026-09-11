@@ -1320,6 +1320,65 @@ fn scheduling_ticks_and_status_polls_do_not_pay_for_terminal_history() {
 }
 
 #[test]
+fn a_busy_protocol_read_is_refused_as_retryable_contention() {
+    let temporary = TestDirectory::new("busy-protocol-read");
+    let state = temporary.path().join("state");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("config.json"), r#"{"database_timeout":0.05}"#).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    assert!(broker.terminate().success());
+
+    // An exclusive-mode writer holds the database file lock, so any reader must wait for it.
+    let holder = Connection::open(state.join("queue.sqlite3")).unwrap();
+    holder
+        .execute_batch(
+            "PRAGMA locking_mode = EXCLUSIVE;
+             BEGIN IMMEDIATE;
+             UPDATE coordinator_meta SET value = value WHERE key = 'protocol';
+             COMMIT;",
+        )
+        .unwrap();
+    let refused = run(&[
+        "status",
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "no-such-run",
+    ]);
+    drop(holder);
+
+    assert!(!refused.status.success());
+    let refusal: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refusal["code"], "broker-database-busy", "{refusal}");
+}
+
+#[test]
+fn a_serving_broker_never_closes_the_last_spool_connection() {
+    // When the last connection to a WAL database closes, SQLite checkpoints and deletes the WAL
+    // under an exclusive lock that every opening reader waits behind; on a slow disk that wait
+    // outlasts a short database_timeout. A live owner must never be that last connection.
+    let temporary = TestDirectory::new("spool-anchor");
+    let state = temporary.path().join("state");
+    let broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let wal = state.join("queue.sqlite3-wal");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut samples = 0;
+    let mut absent = 0;
+    while Instant::now() < deadline {
+        samples += 1;
+        if !wal.exists() {
+            absent += 1;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(broker);
+    assert_eq!(
+        absent, 0,
+        "the spool WAL was missing in {absent} of {samples} samples while its owner idled"
+    );
+}
+
+#[test]
 fn queued_and_running_cancellation_are_durable() {
     let temporary = TestDirectory::new("cancel");
     let state = temporary.path().join("state");

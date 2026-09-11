@@ -54,6 +54,11 @@ pub struct Broker {
     cgroup_backend: Option<cgroup::CgroupBackend>,
     project_quota_backend: Option<project_quota::ProjectQuotaBackend>,
     _owner: OwnerLock,
+    /// Held for the owner's lifetime so its per-tick connections are never the spool's last.
+    /// Closing the last connection to a WAL database checkpoints and deletes the WAL under an
+    /// exclusive lock that every opening reader waits behind, which a slow disk stretches past
+    /// a short `database_timeout`.
+    _spool_anchor: Connection,
     children: HashMap<String, NativeWorker>,
     cancellation_started: HashMap<String, Instant>,
     group_drain_started: HashMap<String, Instant>,
@@ -367,7 +372,6 @@ impl Broker {
             }
         }
         let started_at = now(&connection)?;
-        drop(connection);
         let capacities_json = serde_json::to_string(&capacities).map_err(|error| {
             AppError::new(
                 "broker-config-invalid",
@@ -423,6 +427,7 @@ impl Broker {
             cgroup_backend,
             project_quota_backend,
             _owner: owner,
+            _spool_anchor: connection,
             children: HashMap::new(),
             cancellation_started: HashMap::new(),
             group_drain_started: HashMap::new(),
