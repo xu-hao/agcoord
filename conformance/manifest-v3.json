@@ -208,6 +208,19 @@
       }
     },
     {
+      "id": "cancellation.graceful-stop-drains",
+      "domain": "cancellation",
+      "description": "A graceful stop admits nothing new and lets running jobs finish; after the stop grace or a second stop signal it interrupts them as broker-stopped instead of cancelling.",
+      "tests": {
+        "rust_native": [
+          "scheduler::graceful_stop_lets_running_work_finish_and_leaves_queued_work_for_the_next_owner",
+          "scheduler::graceful_stop_interrupts_work_that_outlives_the_stop_grace",
+          "scheduler::a_second_stop_signal_interrupts_running_work_without_waiting_for_the_grace",
+          "scheduler::graceful_stop_retries_a_contended_interruption_commit"
+        ]
+      }
+    },
+    {
       "id": "recovery.adopt-without-duplicate",
       "domain": "recovery",
       "description": "A replacement owner adopts live work and its enforcement handle without duplicate execution.",

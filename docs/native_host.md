@@ -388,7 +388,16 @@ status agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
 
 `Restart=on-failure` recovers an unexpected broker exit without an idle shutdown. The durable
 spool remains the authority: the replacement adopts only identity-verified live workers and
-never reruns their command. A deliberate `systemctl stop` does not restart. If staging is
+never reruns their command. A deliberate `systemctl stop` does not restart.
+
+`systemctl --user stop` and `restart` are graceful: the broker stops admitting, lets running jobs
+finish, and exits, so the command returns when the last running job ends or `stop_grace` (600
+seconds unless configured) elapses and the broker interrupts the rest as `broker-stopped`. Queued
+jobs wait for the restarted owner. The unit's `TimeoutStopSec=infinity` keeps systemd from
+killing work during that wait. To interrupt running jobs at once, send the broker alone a second
+stop signal with `systemctl --user kill --kill-whom=main --signal=SIGTERM agcoord-broker.service`;
+a plain `systemctl kill` signals every process in the unit, including the jobs, and bypasses
+the broker's record of why they ended. If staging is
 interrupted, no live file changed; repeat it. If activation is interrupted, leave the service
 stopped and repeat activation for the same selected package, which revalidates every final
 file before start. Never delete or replace the state directory as host-package recovery.

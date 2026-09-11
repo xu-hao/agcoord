@@ -28,6 +28,7 @@ _CONFIG_KEYS = frozenset(
         "cgroup_io",
         "database_timeout",
         "land_gate_reuse_max_age",
+        "stop_grace",
         "native_broker",
     }
 )
@@ -56,6 +57,7 @@ class BrokerConfig:
     cgroup_io: Mapping[str, Any] | None
     database_timeout: float | None
     land_gate_reuse_max_age: float | None
+    stop_grace: float | None
     native_broker: NativeBrokerConfig
 
 
@@ -77,6 +79,7 @@ def load_broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
             cgroup_io=None,
             database_timeout=None,
             land_gate_reuse_max_age=None,
+            stop_grace=None,
             native_broker=NativeBrokerConfig(
                 path=DEFAULT_NATIVE_BROKER_PATH,
                 allow_development=False,
@@ -110,6 +113,7 @@ def parse_broker_config(
     cgroup_io = _cgroup_io_section(document, source=source)
     database_timeout = _database_timeout(document, source=source)
     land_gate_reuse_max_age = _land_gate_reuse_max_age(document, source=source)
+    stop_grace = _stop_grace(document, source=source)
     native_broker = _native_broker_section(document, source=source)
     cgroup_root = document.get("cgroup_root")
     if cgroup_root is not None and (
@@ -125,6 +129,7 @@ def parse_broker_config(
         cgroup_io=cgroup_io,
         database_timeout=database_timeout,
         land_gate_reuse_max_age=land_gate_reuse_max_age,
+        stop_grace=stop_grace,
         native_broker=native_broker,
     )
 
@@ -239,7 +244,25 @@ def _land_gate_reuse_max_age(
     source: str | os.PathLike[str],
 ) -> float | None:
     """How long a passed full receipt may stand in for a land gate; zero disables reuse."""
-    value = document.get("land_gate_reuse_max_age")
+    return _nonnegative_seconds(document, "land_gate_reuse_max_age", source=source)
+
+
+def _stop_grace(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> float | None:
+    """How long a stopping broker lets running work finish; zero interrupts it at once."""
+    return _nonnegative_seconds(document, "stop_grace", source=source)
+
+
+def _nonnegative_seconds(
+    document: Mapping[str, Any],
+    key: str,
+    *,
+    source: str | os.PathLike[str],
+) -> float | None:
+    value = document.get(key)
     if value is None:
         return None
     selected: float | None = None
@@ -255,7 +278,7 @@ def _land_gate_reuse_max_age(
         or selected > MAX_DATABASE_TIMEOUT
     ):
         raise BrokerConfigError(
-            f"broker configuration {source} land_gate_reuse_max_age must be "
+            f"broker configuration {source} {key} must be "
             f"a finite number of seconds from 0 to {MAX_DATABASE_TIMEOUT}"
         )
     return selected

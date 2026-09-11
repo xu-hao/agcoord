@@ -2343,6 +2343,21 @@ def _following_call(operation, run_id: str, state: dict[str, float | None]):
         return result
 
 
+def _report_interruption(row: Mapping[str, Any], err) -> None:
+    """Say that an interrupted job claims no verdict, so its exit status is not a result."""
+    run_id = row["run_id"]
+    reason = row.get("failure_reason") or "no reason recorded"
+    if reason == "broker-stopped":
+        advice = "the broker stopped before the job finished; submit it again"
+    else:
+        advice = f"read `agc log {run_id}` before submitting it again"
+    print(
+        f"\nGate queue: {run_id} was interrupted ({reason}) and claims no verdict; {advice}",
+        file=err,
+        flush=True,
+    )
+
+
 def follow(
     client: CoordinatorClient,
     run_id: str,
@@ -2397,6 +2412,8 @@ def follow(
                 print(page["text"], end="", file=out, flush=True)
             offset = page["next_offset"]
             if status in TERMINAL_STATUSES and page["eof"]:
+                if status == "interrupted":
+                    _report_interruption(row, err)
                 return int(row["exit_status"] if row["exit_status"] is not None else 70)
             time.sleep(FOLLOW_POLL_SECONDS)
     except CoordinatorUnreachable as lost:
