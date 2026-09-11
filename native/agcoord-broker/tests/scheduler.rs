@@ -412,6 +412,52 @@ fn process_state(pid: u64) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// User plus system CPU seconds a live process has consumed so far.
+fn process_cpu_seconds(pid: u32) -> f64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let closing = stat.rfind(')').unwrap();
+    let fields: Vec<&str> = stat[closing + 2..].split_whitespace().collect();
+    // utime and stime are stat fields 14 and 15; index 0 here is field 3.
+    let ticks = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    // SAFETY: sysconf reads one process-wide constant.
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    ticks as f64 / per_second as f64
+}
+
+/// Runs one `status` query and returns its row with the CPU seconds that process consumed.
+fn status_with_cpu_seconds(state_dir: &Path, run_id: &str) -> (Value, f64) {
+    let output = state_dir
+        .parent()
+        .unwrap()
+        .join(format!("{run_id}-status.json"));
+    let child = Command::new(BROKER)
+        .args([
+            "status",
+            "--state-dir",
+            state_argument(state_dir),
+            "--run-id",
+            run_id,
+        ])
+        .stdout(File::create(&output).unwrap())
+        .spawn()
+        .unwrap();
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    let mut wait_status = 0;
+    // SAFETY: rusage is plain data that wait4 overwrites.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: reaps this test's own child once, writing only into the locals above.
+    let reaped = unsafe { libc::wait4(pid, &mut wait_status, 0, &mut usage) };
+    assert_eq!(reaped, pid);
+    assert!(libc::WIFEXITED(wait_status) && libc::WEXITSTATUS(wait_status) == 0);
+    drop(child);
+    let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+    let cpu = seconds(usage.ru_utime) + seconds(usage.ru_stime);
+    (
+        serde_json::from_slice(&fs::read(&output).unwrap()).unwrap(),
+        cpu,
+    )
+}
+
 struct ProcessGuard {
     pid: u32,
     token: String,
@@ -1161,6 +1207,115 @@ fn repository_round_robin_preserves_queue_order_within_each_rotation() {
     wait_status(&state, "rotation-c", "passed");
     wait_status(&state, "rotation-a", "passed");
     assert_eq!(fs::read_to_string(&order).unwrap(), "z\nc\na\n");
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn scheduling_ticks_and_status_polls_do_not_pay_for_terminal_history() {
+    // Finished rows accumulate until `clear`. A host that has run thousands of gates must
+    // not decode them on every scheduling tick or on every waiting client's status poll.
+    const HISTORY: i64 = 5_000;
+    const WINDOW: Duration = Duration::from_secs(2);
+    let temporary = TestDirectory::new("history-polling");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+
+    let padding = "p".repeat(512);
+    let template = Submission {
+        run_id: "history-template",
+        kind: "check",
+        repository: "history",
+        checkout: &checkout,
+        command: touch_command(&temporary.path().join("template-ran")),
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &template,
+        submit_with_environment(
+            &state,
+            &template,
+            &[
+                ("PADDING_A", &padding),
+                ("PADDING_B", &padding),
+                ("PADDING_C", &padding),
+                ("PADDING_D", &padding),
+            ],
+        ),
+    );
+    wait_status(&state, "history-template", "passed");
+
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let running = Submission {
+        run_id: "history-running",
+        kind: "check",
+        repository: "live",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    submit_ok(&state, &running);
+    wait_for(Duration::from_secs(10), || entered.exists());
+    let waiting = Submission {
+        run_id: "history-waiting",
+        kind: "check",
+        repository: "live",
+        checkout: &checkout,
+        command: touch_command(&temporary.path().join("waiting-ran")),
+        gate_run_id: None,
+    };
+    submit_ok(&state, &waiting);
+
+    let writer = lock_queue_writes(&state);
+    let columns = writer
+        .prepare(
+            "SELECT name FROM pragma_table_info('runs')
+             WHERE name NOT IN ('sequence', 'run_id') ORDER BY cid",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join(", ");
+    writer
+        .execute(
+            &format!(
+                "WITH RECURSIVE copy(number) AS (
+                     SELECT 1 UNION ALL SELECT number + 1 FROM copy WHERE number < ?1
+                 )
+                 INSERT INTO runs (run_id, {columns})
+                 SELECT 'history-' || number, {columns} FROM runs, copy
+                 WHERE run_id = 'history-template'"
+            ),
+            params![HISTORY],
+        )
+        .unwrap();
+    writer.execute_batch("COMMIT").unwrap();
+    drop(writer);
+
+    let broker_pid = broker.child.as_ref().unwrap().id();
+    let before = process_cpu_seconds(broker_pid);
+    thread::sleep(WINDOW);
+    let broker_cpu = process_cpu_seconds(broker_pid) - before;
+    let (waiting_row, status_cpu) = status_with_cpu_seconds(&state, "history-waiting");
+    fs::write(&release, "").unwrap();
+
+    assert_eq!(waiting_row["status"], "queued");
+    assert_eq!(waiting_row["position"], 1);
+    assert!(
+        broker_cpu < WINDOW.as_secs_f64() / 4.0,
+        "the broker spent {broker_cpu:.2} CPU seconds in a {WINDOW:?} window beside \
+         {HISTORY} finished rows"
+    );
+    assert!(
+        status_cpu < 0.1,
+        "one status poll spent {status_cpu:.3} CPU seconds beside {HISTORY} finished rows"
+    );
+    assert_eq!(status(&state, "history-1")["status"], "passed");
+    wait_status(&state, "history-waiting", "passed");
     assert!(broker.terminate().success());
 }
 

@@ -51,6 +51,8 @@ DEFAULT_RECENT_LIMIT = 50
 DEFAULT_JOB_CAPACITY = 2
 DEFAULT_DATABASE_TIMEOUT = 10.0
 FOLLOW_RETRY_SECONDS = 5.0
+FOLLOW_POLL_SECONDS = 0.1
+WAIT_POLL_MAX_SECONDS = 1.0
 EXIT_COORDINATOR_UNREACHABLE = 75
 _TRANSIENT_SQLITE_WORDS = ("locked", "busy")
 MAX_LOG_BYTES = 64 * 1024
@@ -2359,12 +2361,14 @@ def follow(
     err = sys.stderr if err is None else err
     offset = 0
     previous_status = ""
+    interval = FOLLOW_POLL_SECONDS
     retry: dict[str, float | None] = {"deadline": None}
     try:
         while True:
             row = _following_call(lambda: client.status(run_id), run_id, retry)
             status = row["status"]
             if status != previous_status:
+                interval = FOLLOW_POLL_SECONDS
                 if status == "queued":
                     print(
                         f"Gate queue: {run_id} waiting at position {row['position']} "
@@ -2380,6 +2384,12 @@ def follow(
                         flush=True,
                     )
                 previous_status = status
+            if status == "queued":
+                # A queued job has no output yet. Waiting clients back off so a deep queue
+                # does not spend the host's CPU asking whether admission has happened.
+                time.sleep(interval)
+                interval = min(interval * 2, WAIT_POLL_MAX_SECONDS)
+                continue
             page = _following_call(
                 lambda: client.log(run_id, offset=offset), run_id, retry
             )
@@ -2388,7 +2398,7 @@ def follow(
             offset = page["next_offset"]
             if status in TERMINAL_STATUSES and page["eof"]:
                 return int(row["exit_status"] if row["exit_status"] is not None else 70)
-            time.sleep(0.1)
+            time.sleep(FOLLOW_POLL_SECONDS)
     except CoordinatorUnreachable as lost:
         print(f"\nGate queue: {lost}", file=err, flush=True)
         return EXIT_COORDINATOR_UNREACHABLE
@@ -2402,15 +2412,22 @@ def follow(
 
 
 def wait(client: CoordinatorClient, run_id: str, *, poll_interval: float = 0.1) -> dict[str, Any]:
-    """Wait without consuming the log, for a script that wants one strict final row."""
+    """Wait without consuming the log, for a script that wants one strict final row.
+
+    Nothing is streamed, so polls start at ``poll_interval`` and double up to
+    ``WAIT_POLL_MAX_SECONDS``, or stay at ``poll_interval`` when that is longer.
+    """
     if poll_interval <= 0:
         raise ValueError("poll_interval must be positive")
     retry: dict[str, float | None] = {"deadline": None}
+    interval = poll_interval
+    ceiling = max(poll_interval, WAIT_POLL_MAX_SECONDS)
     while True:
         row = _following_call(lambda: client.status(run_id), run_id, retry)
         if row["status"] in TERMINAL_STATUSES:
             return row
-        time.sleep(poll_interval)
+        time.sleep(interval)
+        interval = min(interval * 2, ceiling)
 
 
 def _build_parser() -> argparse.ArgumentParser:

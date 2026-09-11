@@ -6,8 +6,8 @@ use crate::platform::{
 };
 use crate::store::{
     Paths, RunRecord, allocations, blocked_by, commit_sha_valid, connect, initialize_native,
-    load_run, load_runs, maintain_child_cpu_leases, maintenance_record, map_database_error,
-    mark_maintenance_drained, now, validate_child_cpu_leases,
+    load_live_runs, load_run, load_runs, maintain_child_cpu_leases, maintenance_record,
+    map_database_error, mark_maintenance_drained, now, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
 use crate::{cgroup, project_quota, resources};
@@ -517,7 +517,7 @@ impl Broker {
     fn pump_once(&mut self) -> Result<()> {
         let connection = connect(&self.paths)?;
         maintain_child_cpu_leases(&connection)?;
-        let runs = load_runs(&connection)?;
+        let runs = load_live_runs(&connection)?;
         let active: Vec<_> = runs
             .iter()
             .filter(|run| run.status == "running")
@@ -532,7 +532,7 @@ impl Broker {
 
         loop {
             let connection = connect(&self.paths)?;
-            let runs = load_runs(&connection)?;
+            let runs = load_live_runs(&connection)?;
             let active: Vec<_> = runs
                 .iter()
                 .filter(|run| run.status == "running")
@@ -2181,7 +2181,7 @@ impl Broker {
 
     fn observe_active_once(&mut self) -> Result<i64> {
         let connection = connect(&self.paths)?;
-        let runs = load_runs(&connection)?;
+        let runs = load_live_runs(&connection)?;
         let active: Vec<_> = runs
             .iter()
             .filter(|run| run.status == "running")
