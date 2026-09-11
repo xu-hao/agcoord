@@ -63,14 +63,20 @@ Create the state directory as the broker user with mode `0700` and `config.json`
 `app.slice`, and `DelegateSubgroup=supervisor` make the configured service root deterministic
 and keep the broker process out of the inner node where it enables controllers.
 
-On a fresh `agc host install`, an absent configuration is created with `cpu` and `jobs` both set
-to the invoking process's available CPU-affinity count, plus the required cgroup-v2
-`cpu/logical-cpu` binding shown above. The scheduler greedily packs each job's complete declared
-resource vector against those totals; it does not divide the machine into a fixed number of
-equal CPU partitions. `jobs` remains a ceiling for submissions that omit other claims. To add
-memory, RAM-disk, persistent-disk, I/O, or project-defined capacities, create the owner-only
-configuration before first install; the command validates and preserves an existing safe
-configuration instead of overwriting it.
+On a fresh `agc host install`, an absent configuration is derived from the host: `cpu` and `jobs`
+both take the invoking process's available CPU-affinity count, `memory` takes `MemTotal` minus a
+reserve of the larger of 4 GiB or an eighth of RAM, and each of those kinds receives the required
+cgroup-v2 binding shown above only when its controller is delegated to the service's slice. A
+kind whose controller is missing keeps its capacity and stays admission-only, so the derived
+configuration is never one the broker refuses at startup. Run `agc host config` first to see
+exactly what this host would be given, and `agc host config --write` to install it before the
+first `agc host install`. The scheduler greedily packs each job's complete declared resource
+vector against those totals; it does not divide the machine into a fixed number of equal CPU
+partitions. `jobs` remains a ceiling for submissions that omit other claims. To add RAM-disk,
+persistent-disk, I/O, or project-defined capacities, or to choose your own memory reserve or a
+tmpfs scratch policy, write the owner-only configuration before first install, with
+`agc host config --tmpfs SIZE --write` or by hand; the command validates and preserves an
+existing safe configuration instead of overwriting it.
 
 On every managed start, the broker fails before acquiring the spool unless all of these match:
 
