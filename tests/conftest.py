@@ -237,7 +237,13 @@ class RunningCoordinator:
             return
         self.process = None
         if process.poll() is None:
+            # A first stop signal lets running work finish and a second interrupts it, so a
+            # test that stops its broker mid-job does not wait out the stop grace.
             process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.send_signal(signal.SIGTERM)
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:

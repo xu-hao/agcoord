@@ -21,6 +21,7 @@ pub const SCHEMA_FINGERPRINT: &str = "agcoord-spool-v5";
 pub const MAINTENANCE_REFUSAL: &str = "agcoord-maintenance-draining";
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const LAND_GATE_REUSE_MAX_AGE: Duration = Duration::from_secs(3600);
+const STOP_GRACE: Duration = Duration::from_secs(600);
 const RECENT_LIMIT: usize = 50;
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_MAINTENANCE_REASON: usize = 256;
@@ -387,6 +388,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
         "cgroup_io",
         "database_timeout",
         "land_gate_reuse_max_age",
+        "stop_grace",
         "native_broker",
     ];
     if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
@@ -520,6 +522,17 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             "land_gate_reuse_max_age must be a finite number of seconds from 0 to 2147483.647",
         ));
     }
+    if let Some(value) = object.get("stop_grace")
+        && value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= 2_147_483.647)
+            .is_none()
+    {
+        return Err(AppError::new(
+            "broker-config-invalid",
+            "stop_grace must be a finite number of seconds from 0 to 2147483.647",
+        ));
+    }
     let Some(value) = object.get("database_timeout") else {
         return Ok(DATABASE_TIMEOUT);
     };
@@ -530,6 +543,40 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             AppError::new(
                 "broker-config-invalid",
                 "database_timeout must be a positive finite number no greater than 2147483.647",
+            )
+        })?;
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+/// How long a gracefully stopping broker lets running jobs finish; zero interrupts them at once.
+pub fn configured_stop_grace(paths: &Paths) -> Result<Duration> {
+    let path = paths.state_dir.join("config.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(STOP_GRACE),
+        Err(error) => {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                format!("cannot read broker configuration: {error}"),
+            ));
+        }
+    };
+    let document: Value = serde_json::from_str(&text).map_err(|_| {
+        AppError::new(
+            "broker-config-invalid",
+            "broker configuration is not valid JSON",
+        )
+    })?;
+    let Some(value) = document.get("stop_grace") else {
+        return Ok(STOP_GRACE);
+    };
+    let seconds = value
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= 2_147_483.647)
+        .ok_or_else(|| {
+            AppError::new(
+                "broker-config-invalid",
+                "stop_grace must be a finite number of seconds from 0 to 2147483.647",
             )
         })?;
     Ok(Duration::from_secs_f64(seconds))

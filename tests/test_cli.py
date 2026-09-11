@@ -1162,6 +1162,34 @@ def test_json_wait_backs_off_to_one_second_polls_until_the_final_row(
     assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0])
 
 
+def test_follow_reports_a_broker_stopped_job_as_no_verdict_and_returns_its_exit_status(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+):
+    class StoppedClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "check-stopped"
+
+        def status(self, run_id):
+            row = _row(run_id, "interrupted", "check", "stopped", failure_reason="broker-stopped")
+            row["exit_status"] = 125
+            return row
+
+        def log(self, run_id, *, offset=0):
+            return {"run_id": run_id, "offset": offset, "next_offset": offset, "text": "", "eof": True}
+
+    monkeypatch.setattr(cli, "CoordinatorClient", StoppedClient)
+
+    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=StringIO()) == 125
+    err = capsys.readouterr().err
+    assert "check-stopped was interrupted (broker-stopped) and claims no verdict" in err
+    assert "submit it again" in err
+
+
 def test_json_wait_reports_a_lost_stream_as_a_coded_object_with_the_run_id(
     monkeypatch,
     tmp_path: Path,

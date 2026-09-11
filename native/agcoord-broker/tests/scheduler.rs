@@ -1553,8 +1553,41 @@ fn replacement_adopts_a_live_worker_without_duplicate_execution() {
 }
 
 #[test]
-fn graceful_sigterm_cancels_and_drains_active_work() {
-    let temporary = TestDirectory::new("shutdown");
+fn graceful_stop_interrupts_work_that_outlives_the_stop_grace() {
+    let temporary = TestDirectory::new("shutdown-grace");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("config.json"), r#"{"stop_grace":0.3}"#).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "shutdown-overdue",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&entered, &release, None),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let stopped_at = Instant::now();
+    broker.signal_terminate();
+    assert!(broker.wait().success());
+    assert!(stopped_at.elapsed() >= Duration::from_millis(300));
+    let row = status(&state, "shutdown-overdue");
+    assert_eq!(row["status"], "interrupted");
+    assert_eq!(row["exit_status"], 125);
+    assert_eq!(row["failure_reason"], "broker-stopped");
+}
+
+#[test]
+fn a_second_stop_signal_interrupts_running_work_without_waiting_for_the_grace() {
+    let temporary = TestDirectory::new("shutdown-second-signal");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
@@ -1564,7 +1597,7 @@ fn graceful_sigterm_cancels_and_drains_active_work() {
     submit_ok(
         &state,
         &Submission {
-            run_id: "shutdown-check",
+            run_id: "shutdown-forced",
             kind: "check",
             repository: "repo-a",
             checkout: &checkout,
@@ -1573,14 +1606,26 @@ fn graceful_sigterm_cancels_and_drains_active_work() {
         },
     );
     wait_for(Duration::from_secs(5), || entered.exists());
-    assert!(broker.terminate().success());
-    let row = status(&state, "shutdown-check");
-    assert_eq!(row["status"], "cancelled");
-    assert_eq!(row["exit_status"], 130);
+    broker.signal_terminate();
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        broker.is_running(),
+        "a first stop signal must wait for running work"
+    );
+    assert_eq!(status(&state, "shutdown-forced")["status"], "running");
+    broker.signal_terminate();
+    let forced_at = Instant::now();
+    assert!(broker.wait().success());
+    // The blocking command would only end by itself after ten seconds.
+    assert!(forced_at.elapsed() < Duration::from_secs(5));
+    let row = status(&state, "shutdown-forced");
+    assert_eq!(row["status"], "interrupted");
+    assert_eq!(row["exit_status"], 125);
+    assert_eq!(row["failure_reason"], "broker-stopped");
 }
 
 #[test]
-fn graceful_sigterm_leaves_queued_work_for_the_next_owner() {
+fn graceful_stop_lets_running_work_finish_and_leaves_queued_work_for_the_next_owner() {
     let temporary = TestDirectory::new("shutdown-queued");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
@@ -1613,19 +1658,34 @@ fn graceful_sigterm_leaves_queued_work_for_the_next_owner() {
         },
     );
 
-    assert!(broker.terminate().success());
-    assert_eq!(status(&state, "shutdown-active")["status"], "cancelled");
+    broker.signal_terminate();
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        broker.is_running(),
+        "a graceful stop must wait for running work"
+    );
+    assert_eq!(status(&state, "shutdown-active")["status"], "running");
+    fs::write(&release, "release").unwrap();
+    assert!(broker.wait().success());
+    let active = status(&state, "shutdown-active");
+    assert_eq!(active["status"], "passed");
+    assert_eq!(active["exit_status"], 0);
+    // Capacity freed while stopping, but a stopping owner admits nothing new.
     assert_eq!(status(&state, "shutdown-queued")["status"], "queued");
     assert!(!queued_marker.exists());
 }
 
 #[test]
-fn graceful_sigterm_retries_a_contended_cancellation_commit() {
+fn graceful_stop_retries_a_contended_interruption_commit() {
     let temporary = TestDirectory::new("shutdown-contention");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&state).unwrap();
-    fs::write(state.join("config.json"), r#"{"database_timeout":0.05}"#).unwrap();
+    fs::write(
+        state.join("config.json"),
+        r#"{"database_timeout":0.05,"stop_grace":0}"#,
+    )
+    .unwrap();
     fs::create_dir(&checkout).unwrap();
     let entered = temporary.path().join("entered");
     let release = temporary.path().join("release");
@@ -1647,13 +1707,14 @@ fn graceful_sigterm_retries_a_contended_cancellation_commit() {
     thread::sleep(Duration::from_millis(150));
     let retained_ownership = broker.is_running();
     locker.execute_batch("ROLLBACK").unwrap();
-    fs::write(&release, "release").unwrap();
     assert!(
         retained_ownership,
         "broker abandoned a clean shutdown on contention"
     );
     assert!(broker.wait().success());
-    assert_eq!(status(&state, "shutdown-contended")["status"], "cancelled");
+    let row = status(&state, "shutdown-contended");
+    assert_eq!(row["status"], "interrupted");
+    assert_eq!(row["failure_reason"], "broker-stopped");
 }
 
 #[test]
