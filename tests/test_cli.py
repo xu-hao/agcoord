@@ -1093,6 +1093,75 @@ def test_follow_reports_a_lost_stream_and_exits_75_without_claiming_a_verdict(
     assert "agc show full-locked" in captured.err
 
 
+def test_follow_backs_off_while_queued_and_streams_promptly_once_admitted(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord import queue as queue_module
+
+    statuses = ["queued"] * 7 + ["running", "running", "passed"]
+    polls = {"count": 0}
+    logged: list[str] = []
+    sleeps: list[tuple[str, float]] = []
+
+    def current() -> str:
+        return statuses[polls["count"] - 1]
+
+    class QueuedClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "check-queued"
+
+        def status(self, run_id):
+            polls["count"] += 1
+            return _row(run_id, current(), "check", "queued")
+
+        def log(self, run_id, *, offset=0):
+            logged.append(current())
+            return {"run_id": run_id, "offset": offset, "next_offset": offset, "text": "", "eof": True}
+
+    monkeypatch.setattr(cli, "CoordinatorClient", QueuedClient)
+    monkeypatch.setattr(queue_module.time, "sleep", lambda seconds: sleeps.append((current(), seconds)))
+
+    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=StringIO()) == 0
+    assert [seconds for status, seconds in sleeps if status == "queued"] == pytest.approx(
+        [0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0]
+    )
+    assert [seconds for status, seconds in sleeps if status == "running"] == pytest.approx([0.1, 0.1])
+    assert logged == ["running", "running", "passed"]
+
+
+def test_json_wait_backs_off_to_one_second_polls_until_the_final_row(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord import queue as queue_module
+
+    statuses = ["queued"] * 3 + ["running"] * 4 + ["passed"]
+    polls = {"count": 0}
+    sleeps: list[float] = []
+
+    class WaitingClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "check-waiting"
+
+        def status(self, run_id):
+            polls["count"] += 1
+            return _row(run_id, statuses[polls["count"] - 1], "check", "waiting")
+
+    monkeypatch.setattr(cli, "CoordinatorClient", WaitingClient)
+    monkeypatch.setattr(queue_module.time, "sleep", sleeps.append)
+
+    assert cli.main(["--json", "run", "--checkout", str(tmp_path), "--", "true"]) == 0
+    assert polls["count"] == len(statuses)
+    assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0])
+
+
 def test_json_wait_reports_a_lost_stream_as_a_coded_object_with_the_run_id(
     monkeypatch,
     tmp_path: Path,

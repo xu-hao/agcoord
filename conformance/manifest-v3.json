@@ -177,6 +177,16 @@
       }
     },
     {
+      "id": "contention.history-independent-polling",
+      "domain": "contention",
+      "description": "Scheduling ticks and status polls read only live rows, so the broker and its waiting clients spend no CPU in proportion to terminal history.",
+      "tests": {
+        "rust_native": [
+          "scheduler::scheduling_ticks_and_status_polls_do_not_pay_for_terminal_history"
+        ]
+      }
+    },
+    {
       "id": "contention.durable-maintenance-drain",
       "domain": "contention",
       "description": "Drain linearizes with submissions, preserves accepted work and authoritative publication, survives owner replacement, and resumes only by exact receipt.",

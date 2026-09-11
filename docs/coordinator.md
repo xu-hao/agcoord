@@ -1072,6 +1072,13 @@ for the configured `database_timeout` rather than aborting on the first busy loc
 broker committing a publication or checkpointing its WAL does not end a client that is only
 watching its own row.
 
+Watching costs the host little while work waits. A following client polls a queued job's row
+at an interval that doubles from a tenth of a second to one second, then streams the admitted
+job's log every tenth of a second; a `--json` wait, which streams nothing, backs off the same
+way for the job's whole life. The broker's scheduling tick and each `status` read only queued
+and running rows, so neither grows with the terminal history that accumulates until
+`agc clear`.
+
 The native owner authenticates a worker with its PID, Linux start token, and requirement that
 the PID lead its recorded process group. Replacement recovery adopts only that exact live
 identity. If the PID has been reused, its token changed, or it belongs to another group, the run
