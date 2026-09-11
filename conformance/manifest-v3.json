@@ -177,6 +177,17 @@
       }
     },
     {
+      "id": "contention.owner-holds-the-spool-open",
+      "domain": "contention",
+      "description": "A live owner keeps one spool connection open so readers never wait behind a last-connection WAL checkpoint, and a busy protocol read is refused as retryable contention rather than a schema fault.",
+      "tests": {
+        "rust_native": [
+          "scheduler::a_serving_broker_never_closes_the_last_spool_connection",
+          "scheduler::a_busy_protocol_read_is_refused_as_retryable_contention"
+        ]
+      }
+    },
+    {
       "id": "contention.history-independent-polling",
       "domain": "contention",
       "description": "Scheduling ticks and status polls read only live rows, so the broker and its waiting clients spend no CPU in proportion to terminal history.",

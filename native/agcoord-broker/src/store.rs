@@ -634,11 +634,19 @@ fn protocol(connection: &Connection) -> Result<u64> {
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| {
-            AppError::new(
-                "broker-schema-invalid",
-                "coordinator database has no readable protocol metadata",
-            )
+        .map_err(|error| {
+            // Contention is transient and retryable; only an unreadable table is a schema fault.
+            if matches!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            ) {
+                map_database_error(error)
+            } else {
+                AppError::new(
+                    "broker-schema-invalid",
+                    "coordinator database has no readable protocol metadata",
+                )
+            }
         })?;
     value
         .ok_or_else(|| {

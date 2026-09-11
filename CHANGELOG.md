@@ -21,6 +21,14 @@ versioning; dates use ISO 8601.
   `broker-stopped`, and a following client says it claims no verdict and should be submitted
   again. Previously such a job was recorded `cancelled` with exit 130, indistinguishable from a
   caller's own cancellation (#218).
+- Fix a client or a gate intermittently refused with `broker-schema-invalid: coordinator
+  database has no readable protocol metadata` while the spool was only busy. The broker's
+  own short-lived connections were often the spool's last, and closing the last connection to a
+  WAL database checkpoints and deletes the WAL under an exclusive lock that every opening reader
+  waits behind; on a slow disk that outlasted a short `database_timeout`, and the protocol read
+  reported the busy lock as a schema fault. A live broker now holds one connection for as long
+  as it owns the spool, and a busy protocol read is refused as the retryable
+  `broker-database-busy` (#223).
 
 ## 0.7.0 — 2026-09-06
 
