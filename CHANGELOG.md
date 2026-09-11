@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.1 — 2026-09-11
 
 - Fix the native broker and its waiting clients spending a host's CPU in proportion to the
   finished history in the spool. Every 25 ms scheduling tick and every `status` poll decoded
