@@ -3,6 +3,17 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Fix the native broker and its waiting clients spending a host's CPU in proportion to the
+  finished history in the spool. Every 25 ms scheduling tick and every `status` poll decoded
+  every terminal row ever recorded, so on a host with a few thousand finished gates the idle
+  broker held a whole core and each waiting `agc run` or `agc land` spent about a fifth of a
+  CPU-second per poll, leaving an admitted row a fraction of the CPU it claimed. Scheduling,
+  observation, and `status` now read only queued and running rows. A following client also
+  backs off from a tenth of a second to one second while its job is queued, and a `--json`
+  wait does the same for the job's whole life (#217).
+
 ## 0.7.0 — 2026-09-06
 
 - `agc land --reuse-full` lets one passed `agc full` receipt stand in for the land gate instead

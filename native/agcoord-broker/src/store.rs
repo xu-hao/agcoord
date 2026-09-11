@@ -1549,6 +1549,22 @@ pub fn load_runs(connection: &Connection) -> Result<Vec<RunRecord>> {
     Ok(selected)
 }
 
+/// Load queued and running rows in submission order.
+///
+/// Scheduling, observation, and a queued row's position depend only on live work, so these
+/// paths read it through the status index instead of decoding terminal history.
+pub fn load_live_runs(connection: &Connection) -> Result<Vec<RunRecord>> {
+    let mut statement = connection
+        .prepare("SELECT * FROM runs WHERE status IN ('queued', 'running') ORDER BY sequence")
+        .map_err(map_database_error)?;
+    let mut rows = statement.query([]).map_err(map_database_error)?;
+    let mut selected = Vec::new();
+    while let Some(row) = rows.next().map_err(map_database_error)? {
+        selected.push(run_from_row(row)?);
+    }
+    Ok(selected)
+}
+
 pub fn load_run(connection: &Connection, run_id: &str) -> Result<RunRecord> {
     let mut statement = connection
         .prepare("SELECT * FROM runs WHERE run_id = ?1")
@@ -1792,16 +1808,15 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
 
 pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
     let connection = open_protocol5(paths)?;
-    let runs = load_runs(&connection)?;
-    let run = runs
-        .iter()
-        .find(|run| run.run_id == run_id)
-        .ok_or_else(|| {
-            AppError::new(
-                "broker-run-unknown",
-                format!("unknown coordinator run {run_id}"),
-            )
-        })?;
+    // One read transaction ranks the row against the live work of the same instant.
+    connection
+        .execute_batch("BEGIN")
+        .map_err(map_database_error)?;
+    let runs = load_live_runs(&connection)?;
+    let run = match runs.iter().find(|run| run.run_id == run_id) {
+        Some(run) => run.clone(),
+        None => load_run(&connection, run_id)?,
+    };
     let active: Vec<_> = runs
         .iter()
         .filter(|candidate| candidate.status == "running")
@@ -1828,9 +1843,9 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
         .unwrap_or_default();
     Ok(public_run(
         paths,
-        run,
+        &run,
         position,
-        blocked_by(run, &active, &queued, &capacities),
+        blocked_by(&run, &active, &queued, &capacities),
     ))
 }
 
@@ -2272,6 +2287,21 @@ pub fn finish_child_cpu_lease(
 }
 
 pub fn maintain_child_cpu_leases(connection: &Connection) -> Result<()> {
+    // Every step below acts on a waiting or active lease. Without one, skip the write lock
+    // instead of taking it on every scheduling tick; a lease requested after this check is
+    // maintained on the next tick.
+    let live: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM child_cpu_leases WHERE status IN ('waiting', 'active')
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    if !live {
+        return Ok(());
+    }
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(map_database_error)?;
