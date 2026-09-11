@@ -41,8 +41,15 @@ the recorded process identity before classifying a live job; it never reruns an 
 spawned command merely because the old broker disappeared. An exception that ends the broker
 does not request cancellation or signal live process groups: ownership is released so a
 replacement can adopt each worker whose recorded PID and process-start token still match.
-An explicit broker close remains a graceful cancellation boundary and reaps safe workers
-before releasing ownership.
+A graceful stop — SIGTERM or SIGINT, which is what `systemctl --user stop` and `restart` send —
+drains instead of cancelling. The owner stops admitting work, leaves queued rows for the next
+owner, keeps observing running jobs and granting their child CPU leases, and releases ownership
+once none is running. If jobs are still running when `stop_grace` elapses, or when a second stop
+signal arrives, the owner ends each one that is not publishing as a complete process group and
+records it `interrupted` with exit status 125 and failure reason `broker-stopped`, so its agent
+can tell an operator stop from a verdict and submit it again. A publishing land or retained
+merge is never interrupted; the owner waits for its authoritative result. A caller's own
+`agc cancel` during a stop still records `cancelled`.
 
 A land worker reports its final overall status durably while its row is still running. After
 an unclean owner loss, a replacement preserves the live worker's lane and resources, never
@@ -105,7 +112,7 @@ the entire machine:
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
-`database_timeout`, `land_gate_reuse_max_age`, and `native_broker`; invalid JSON, a top-level
+`database_timeout`, `land_gate_reuse_max_age`, `stop_grace`, and `native_broker`; invalid JSON, a top-level
 value that is not an object,
 an unknown key, a section that is not an object, or an empty `cgroup_root` is refused when the
 client or broker loads its configuration. When present, `cgroup_io` contains exactly one
@@ -113,7 +120,9 @@ nonempty `paths` list of unique absolute strings. `database_timeout` is a positi
 of seconds no greater than `2147483.647` (SQLite's millisecond limit) and defaults to `10`.
 `land_gate_reuse_max_age` is a finite number of seconds from `0` to `2147483.647`, defaults to
 `3600`, and bounds how long a passed `full` receipt may stand in for a land gate; `0` refuses
-every reuse on that host even when a caller asks for one. An
+every reuse on that host even when a caller asks for one. `stop_grace` is a finite number of
+seconds from `0` to `2147483.647`, defaults to `600`, and bounds how long a gracefully stopping
+broker lets running jobs finish before it interrupts them; `0` interrupts them at once. An
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
 defaults capacity to `jobs=2`.
 
@@ -963,8 +972,9 @@ target update.
 
 A land request is cancellable while queued, preflighting, or gating. Once its durable phase
 is `publishing`, cancellation is refused because killing a client during an authenticated
-atomic mutation would leave the outcome indeterminate. Graceful broker stop cancels safe
-earlier phases but waits for publishing and records its authoritative result.
+atomic mutation would leave the outcome indeterminate. A graceful broker stop lets every phase
+finish; once `stop_grace` elapses it interrupts earlier phases as `broker-stopped` but still
+waits for publishing and records its authoritative result.
 
 ### Reusing a full receipt as the land gate
 

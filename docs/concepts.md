@@ -127,9 +127,10 @@ Exact rules: [durable job shape](coordinator.md#durable-job-shape).
 
 Every job is `queued` until the broker admits it, `running` while its command lives, and then
 exactly one of four terminal states. `passed` and `failed` carry the command's verdict.
-`cancelled` means someone asked, with `agc cancel` or a graceful broker stop; the whole process
-group is gone before the row becomes terminal. `interrupted` means the worker vanished before
-it could report, and the coordinator claims no verdict for it. Terminal rows are immutable
+`cancelled` means someone asked with `agc cancel`; the whole process group is gone before the
+row becomes terminal. `interrupted` means the coordinator claims no verdict: the worker vanished
+before it could report (`worker-result-lost`), or a stopping broker ended the job after its
+stop grace (`broker-stopped`). A graceful broker stop first lets running jobs finish. Terminal rows are immutable
 history until `agc clear` removes them while the queue is idle.
 
 A `land` moves through named phases inside `running`. *Preflight* checks the pull request,

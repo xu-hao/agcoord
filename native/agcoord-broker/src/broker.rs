@@ -5,9 +5,10 @@ use crate::platform::{
     worker_identity_conflicts,
 };
 use crate::store::{
-    Paths, RunRecord, allocations, blocked_by, commit_sha_valid, connect, initialize_native,
-    load_live_runs, load_run, load_runs, maintain_child_cpu_leases, maintenance_record,
-    map_database_error, mark_maintenance_drained, now, validate_child_cpu_leases,
+    Paths, RunRecord, allocations, blocked_by, commit_sha_valid, configured_stop_grace, connect,
+    initialize_native, load_live_runs, load_run, load_runs, maintain_child_cpu_leases,
+    maintenance_record, map_database_error, mark_maintenance_drained, now,
+    validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
 use crate::{cgroup, project_quota, resources};
@@ -27,6 +28,8 @@ const OWNER_LOCK_STARTUP_RETRY: Duration = Duration::from_millis(250);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// Failure reason of a job a stopping broker ended after its stop grace.
+const BROKER_STOPPED: &str = "broker-stopped";
 
 #[derive(Debug)]
 pub struct ServeOptions {
@@ -56,6 +59,8 @@ pub struct Broker {
     group_drain_started: HashMap<String, Instant>,
     last_repository: Option<String>,
     stopped: Arc<AtomicBool>,
+    stop_signals: usize,
+    stop_grace: Duration,
     idle_since: Option<Instant>,
 }
 
@@ -406,6 +411,7 @@ impl Broker {
             capabilities_json,
             started_at,
         ))?;
+        let stop_grace = configured_stop_grace(&paths)?;
         Ok(Self {
             paths,
             capacities,
@@ -422,6 +428,8 @@ impl Broker {
             group_drain_started: HashMap::new(),
             last_repository: None,
             stopped,
+            stop_signals: 0,
+            stop_grace,
             idle_since: None,
         })
     }
@@ -434,9 +442,8 @@ impl Broker {
 
     pub fn serve(mut self) -> Result<()> {
         loop {
-            if self.stopped.load(Ordering::Relaxed) {
-                self.graceful_shutdown()?;
-                return Ok(());
+            if self.stop_signalled() {
+                return self.graceful_shutdown();
             }
             match self.pump_once() {
                 Ok(()) => {}
@@ -446,9 +453,8 @@ impl Broker {
                 }
                 Err(error) => return Err(error),
             }
-            if self.stopped.load(Ordering::Relaxed) {
-                self.graceful_shutdown()?;
-                return Ok(());
+            if self.stop_signalled() {
+                return self.graceful_shutdown();
             }
             let connection = connect(&self.paths)?;
             let has_live: bool = connection
@@ -622,7 +628,7 @@ impl Broker {
                 exit_status
             };
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
-                ("cancelled", 130, None)
+                Self::requested_stop_outcome(&run)
             } else if observed_exit == 0 {
                 ("passed", 0, None)
             } else if Self::has_resource_observation(&run, "memory-oom") {
@@ -668,7 +674,7 @@ impl Broker {
         }
         let run = load_run(connection, &run.run_id)?;
         let (status, exit_status, failure_reason) = if run.cancel_requested {
-            ("cancelled", 130, None)
+            Self::requested_stop_outcome(&run)
         } else if run.kind == "land" && run.reported_exit_status == Some(0) {
             ("passed", 0, None)
         } else if let ("land", Some(exit_status)) = (run.kind.as_str(), run.reported_exit_status) {
@@ -757,7 +763,7 @@ impl Broker {
             ));
         }
         let (status, exit_status, failure_reason) = if current.cancel_requested {
-            ("cancelled", 130, None)
+            Self::requested_stop_outcome(&current)
         } else {
             (status, exit_status, failure_reason)
         };
@@ -2139,36 +2145,32 @@ impl Broker {
         Ok(())
     }
 
-    fn graceful_shutdown(&mut self) -> Result<()> {
-        loop {
-            let connection = connect(&self.paths)?;
-            let request_cancellation = (|| {
-                connection
-                    .execute_batch("BEGIN IMMEDIATE")
-                    .map_err(map_database_error)?;
-                let timestamp = now(&connection)?;
-                connection
-                    .execute(
-                        "UPDATE runs SET cancel_requested = 1, cancel_requested_at = ?1
-                         WHERE status = 'running'
-                           AND kind != 'merge'
-                           AND NOT (kind = 'land' AND phase = 'publishing')",
-                        params![timestamp],
-                    )
-                    .map_err(map_database_error)?;
-                connection
-                    .execute_batch("COMMIT")
-                    .map_err(map_database_error)
-            })();
-            match request_cancellation {
-                Ok(()) => break,
-                Err(error) if error.code == "broker-database-busy" => {
-                    thread::sleep(POLL_INTERVAL);
-                }
-                Err(error) => return Err(error),
-            }
+    /// Records any stop signal delivered since the last check and says whether one arrived.
+    fn stop_signalled(&mut self) -> bool {
+        if self.stopped.swap(false, Ordering::Relaxed) {
+            self.stop_signals += 1;
         }
+        self.stop_signals > 0
+    }
+
+    /// Drains after a stop signal: admits nothing, leaves queued rows for the next owner, and
+    /// releases ownership once no job is running. When `stop_grace` elapses or a second stop
+    /// signal arrives, every running job that is not publishing is ended and recorded
+    /// `interrupted` as `broker-stopped`.
+    fn graceful_shutdown(&mut self) -> Result<()> {
+        let stopping_since = Instant::now();
+        let mut interruption_committed = false;
         loop {
+            self.stop_signalled();
+            if !interruption_committed
+                && (self.stop_signals > 1 || stopping_since.elapsed() >= self.stop_grace)
+            {
+                match self.request_interruption() {
+                    Ok(()) => interruption_committed = true,
+                    Err(error) if error.code == "broker-database-busy" => {}
+                    Err(error) => return Err(error),
+                }
+            }
             match self.observe_active_once() {
                 Ok(0) => return Ok(()),
                 Ok(_) => {}
@@ -2179,8 +2181,42 @@ impl Broker {
         }
     }
 
+    fn request_interruption(&self) -> Result<()> {
+        let connection = connect(&self.paths)?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(map_database_error)?;
+        let timestamp = now(&connection)?;
+        connection
+            .execute(
+                "UPDATE runs SET cancel_requested = 1, cancel_requested_at = ?1,
+                     failure_reason = ?2
+                 WHERE status = 'running'
+                   AND cancel_requested = 0
+                   AND kind != 'merge'
+                   AND NOT (kind = 'land' AND phase = 'publishing')",
+                params![timestamp, BROKER_STOPPED],
+            )
+            .map_err(map_database_error)?;
+        connection
+            .execute_batch("COMMIT")
+            .map_err(map_database_error)
+    }
+
+    /// The terminal outcome of a job whose stop was requested. A broker stop is an
+    /// interruption that claims no verdict; any other request is the caller's cancellation.
+    fn requested_stop_outcome(run: &RunRecord) -> (&'static str, i64, Option<&'static str>) {
+        if run.failure_reason.as_deref() == Some(BROKER_STOPPED) {
+            ("interrupted", 125, Some(BROKER_STOPPED))
+        } else {
+            ("cancelled", 130, None)
+        }
+    }
+
     fn observe_active_once(&mut self) -> Result<i64> {
         let connection = connect(&self.paths)?;
+        // Running jobs keep their child CPU leases granted while the owner drains.
+        maintain_child_cpu_leases(&connection)?;
         let runs = load_live_runs(&connection)?;
         let active: Vec<_> = runs
             .iter()

@@ -13,6 +13,14 @@ versioning; dates use ISO 8601.
   observation, and `status` now read only queued and running rows. A following client also
   backs off from a tenth of a second to one second while its job is queued, and a `--json`
   wait does the same for the job's whole life (#217).
+- Stopping the native broker, including `systemctl --user stop` and `restart`, now drains instead
+  of cancelling in-flight work. The broker stops admitting, lets running jobs finish, and exits;
+  queued jobs wait for the next owner. A job still running when the new `stop_grace`
+  configuration elapses (600 seconds by default; `0` interrupts at once), or when a second stop
+  signal arrives, is ended and recorded `interrupted` with exit status 125 and failure reason
+  `broker-stopped`, and a following client says it claims no verdict and should be submitted
+  again. Previously such a job was recorded `cancelled` with exit 130, indistinguishable from a
+  caller's own cancellation (#218).
 
 ## 0.7.0 — 2026-09-06
 
