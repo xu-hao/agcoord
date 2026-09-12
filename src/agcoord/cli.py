@@ -6,12 +6,18 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Callable, Iterable, TextIO
 
 from . import __version__
-from .native_host import install_native_host, install_user_broker, upgrade_native_host
+from .native_host import (
+    host_config,
+    install_native_host,
+    install_user_broker,
+    upgrade_native_host,
+)
 from .queue import (
     RUN_ID_ENV,
     CoordinatorClient,
@@ -28,6 +34,37 @@ from .resources import resource_enforcement_summary
 
 def _resources(values: list[str]) -> dict[str, int]:
     return parse_resource_claims(values)
+
+
+_SIZE = re.compile(r"(\d+)\s*(|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib)", re.IGNORECASE)
+_SIZE_SCALE = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+
+
+def _bytes(value: str | None, option: str) -> int | None:
+    """Read one byte count, with an optional 1024-based K, M, G, or T suffix."""
+    if value is None:
+        return None
+    match = _SIZE.fullmatch(value.strip())
+    if match is None:
+        raise CoordinatorError(
+            f"{option} must be a byte count with an optional K, M, G, or T suffix, "
+            f"not {value!r}",
+            code="native-host-state-invalid",
+        )
+    return int(match.group(1)) * _SIZE_SCALE[match.group(2)[:1].lower()]
+
+
+def _count(value: str | None, option: str) -> int | None:
+    """Read one positive whole count."""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text.isdigit() or int(text) < 1:
+        raise CoordinatorError(
+            f"{option} must be a positive whole number, not {value!r}",
+            code="native-host-state-invalid",
+        )
+    return int(text)
 
 
 def _table(rows: list[dict]) -> str:
@@ -171,6 +208,57 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     _bundle_source(host_upgrade)
+    host_configuration = state(
+        host_commands.add_parser(
+            "config",
+            help="print the broker configuration derived for this host",
+        )
+    )
+    host_configuration.add_argument(
+        "--user",
+        action="store_true",
+        help="derive for an unmanaged user-owned broker instead of the managed service",
+    )
+    host_configuration.add_argument(
+        "--managed",
+        action="store_true",
+        help="derive for the managed service (the default)",
+    )
+    host_configuration.add_argument("--cpu", help="cpu capacity (default: this host's CPUs)")
+    host_configuration.add_argument("--jobs", help="job-slot ceiling (default: the cpu capacity)")
+    host_configuration.add_argument(
+        "--memory",
+        metavar="SIZE",
+        help="memory capacity (default: MemTotal minus --reserve)",
+    )
+    host_configuration.add_argument(
+        "--reserve",
+        metavar="SIZE",
+        help="memory held back from capacity (default: 4GiB or an eighth of RAM)",
+    )
+    host_configuration.add_argument(
+        "--tmpfs",
+        metavar="SIZE",
+        help="add an enforced tmpfs scratch capacity, bounded by the memory capacity",
+    )
+    host_configuration.add_argument(
+        "--tmpfs-inodes",
+        help="inode capacity for that scratch (default: one per 8KiB)",
+    )
+    host_configuration.add_argument(
+        "--cgroup-root",
+        help="slice whose delegated controllers decide the bindings",
+    )
+    host_configuration.add_argument(
+        "--write",
+        action="store_true",
+        help="write the configuration into the state directory",
+    )
+    host_configuration.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing configuration when writing",
+    )
 
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
         command = state(commands.add_parser(name, help=help_text))
@@ -389,6 +477,33 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             )
         return 0
 
+    if args.command == "host" and args.host_command == "config":
+        if args.user and args.managed:
+            raise CoordinatorError(
+                "choose either --managed or --user, not both",
+                code="native-host-state-invalid",
+            )
+        selected_state_dir = getattr(args, "state_dir", None)
+        if selected_state_dir is None:
+            selected_state_dir = queue_paths(state_dir=None).state_dir
+        result = host_config(
+            state_dir=selected_state_dir,
+            managed=not args.user,
+            write=args.write,
+            force=args.force,
+            cpu=_count(args.cpu, "--cpu"),
+            jobs=_count(args.jobs, "--jobs"),
+            memory=_bytes(args.memory, "--memory"),
+            reserve=_bytes(args.reserve, "--reserve"),
+            tmpfs=_bytes(args.tmpfs, "--tmpfs"),
+            tmpfs_inodes=_count(args.tmpfs_inodes, "--tmpfs-inodes"),
+            cgroup_root=args.cgroup_root,
+        )
+        print(json.dumps(result["configuration"], indent=2, sort_keys=True), file=out)
+        if result["written"]:
+            print(f"AGCoord: wrote {result['path']}", file=sys.stderr)
+        return 0
+
     if args.command == "host" and args.host_command in {"install", "upgrade"}:
         operation = (
             install_native_host if args.host_command == "install" else upgrade_native_host
@@ -584,7 +699,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return run(args)
+        return run(args, out=sys.stdout)
     except CoordinatorError as exc:
         if args.json and exc.code is not None:
             print(

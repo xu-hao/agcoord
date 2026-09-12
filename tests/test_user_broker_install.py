@@ -117,7 +117,11 @@ def test_user_install_places_verifies_and_configures_an_unmanaged_spool(
         managed_service=False,
     )
     capacity = native_host._cpu_capacity()
-    assert config.capacities == {"cpu": capacity, "jobs": capacity}
+    assert config.capacities == {
+        "cpu": capacity,
+        "jobs": capacity,
+        "memory": native_host._memory_capacity(),
+    }
     assert NativeBrokerCommand.select(config.native_broker).path == placed
 
     again = native_host.install_user_broker(

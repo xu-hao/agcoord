@@ -580,6 +580,8 @@ def test_install_prepares_a_fresh_greedy_capacity_and_activates_without_a_drain(
     checkout.mkdir()
     monkeypatch.setattr(native_host, "MANAGED_STATE_DIR", state_dir.resolve())
     monkeypatch.setattr(native_host, "_cpu_capacity", lambda: 6)
+    monkeypatch.setattr(native_host, "_memory_capacity", lambda **_options: 16 * 1024**3)
+    monkeypatch.setattr(native_host, "_delegated_controllers", lambda _root: {"cpu", "memory"})
 
     result = native_host.install_native_host(
         package,
@@ -646,7 +648,13 @@ def test_install_prepares_a_fresh_greedy_capacity_and_activates_without_a_drain(
     assert all(client.autostart is False for client in clients)
     assert not any(kind in {"drain", "resume"} for kind, _value in timeline)
     configuration = json.loads((state_dir / "config.json").read_text())
-    assert configuration["capacities"] == {"cpu": 6, "jobs": 6}
+    assert configuration["capacities"] == {"cpu": 6, "jobs": 6, "memory": 16 * 1024**3}
+    assert configuration["bindings"]["memory"] == {
+        "kind": "memory",
+        "unit": "bytes",
+        "mode": "required",
+        "backend": "cgroup-v2",
+    }
     assert configuration["bindings"]["cpu"] == {
         "kind": "cpu",
         "unit": "logical-cpu",
