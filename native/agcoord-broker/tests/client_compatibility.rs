@@ -1127,6 +1127,9 @@ fn a_stale_selected_binary_cannot_replace_or_command_the_live_owner() {
         env!("CARGO_PKG_VERSION"),
         "0".repeat(64),
     );
+    // A stale binary is a working broker whose build digest differs from the live owner's,
+    // so it answers every other command exactly as the installed one does. What must refuse
+    // it is the owner-identity mismatch, not an executable that cannot run a command.
     fs::write(
         &stale,
         format!(
@@ -1136,9 +1139,10 @@ fn a_stale_selected_binary_cannot_replace_or_command_the_live_owner() {
                 "  printf '%s\\n' '{}'\n",
                 "  exit 0\n",
                 "fi\n",
-                "exit 97\n",
+                "exec '{}' \"$@\"\n",
             ),
             stale_identity,
+            selected_broker.display(),
         ),
     )
     .unwrap();

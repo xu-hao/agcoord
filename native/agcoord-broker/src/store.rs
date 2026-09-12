@@ -177,6 +177,9 @@ impl Paths {
 #[derive(Clone, Debug)]
 pub struct OwnerInfo {
     pub pid: u32,
+    pub implementation: String,
+    pub version: String,
+    pub build: String,
     pub capacities: BTreeMap<String, u64>,
     pub resource_bindings: BTreeMap<String, Binding>,
     pub resource_capabilities: Value,
@@ -1370,12 +1373,69 @@ pub fn owner_info(paths: &Paths) -> Result<OwnerInfo> {
                 "live owner resource capabilities are missing",
             )
         })?)?;
+    let identity = |key: &str| -> Result<String> {
+        fields
+            .get(key)
+            .map(|value| (*value).to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-owner-metadata-invalid",
+                    format!("live owner {key} is missing"),
+                )
+            })
+    };
     Ok(OwnerInfo {
         pid,
+        implementation: identity("implementation")?,
+        version: identity("version")?,
+        build: identity("build")?,
         capacities,
         resource_bindings,
         resource_capabilities,
     })
+}
+
+/// Answer what a client needs to know about a spool without letting it read the spool.
+///
+/// Unlike `snapshot`, this succeeds when nothing owns the state directory, because "no owner"
+/// is one of the answers a client asks for. The generation is reported by refusing a spool
+/// this broker does not own, with the same codes every other command uses.
+pub fn inspect(paths: &Paths) -> Result<Value> {
+    let connection = open_protocol5(paths)?;
+    let maintenance = maintenance_record(&connection)?;
+    let owner = if live_owner_metadata(&paths.state_dir)?.is_some() {
+        Some(owner_info(paths)?)
+    } else {
+        None
+    };
+    let live: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    Ok(json!({
+        "protocol": PROTOCOL,
+        "owner": owner.as_ref().map(|owner| json!({
+            "pid": owner.pid,
+            "protocol": PROTOCOL,
+            "implementation": owner.implementation,
+            "version": owner.version,
+            "build": owner.build,
+            "capacities": owner.capacities,
+            "resource_bindings": crate::resources::bindings_value(&owner.resource_bindings),
+            "resource_capabilities": owner.resource_capabilities,
+        })),
+        "maintenance": maintenance.as_ref().map(|record| maintenance_value(
+            record,
+            PROTOCOL,
+            live,
+            owner.as_ref().map(|owner| owner.pid),
+        )),
+        "live": live,
+    }))
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(

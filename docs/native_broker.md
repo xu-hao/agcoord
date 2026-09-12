@@ -33,9 +33,9 @@ audit.
 
 ```text
 Python clients                 private state directory
-agc / TUI / xdist  ──SQLite──> queue.sqlite3 + logs
+agc / TUI / xdist              queue.sqlite3 + logs
        │                                ▲
-       │ starts or observes             │ owns authoritative transitions
+       │ broker commands                │ sole opener; owns authoritative transitions
        ▼                                │
 root-owned Rust broker ─────────────────┘
        │ fork/clone; never execs a setup helper
@@ -49,8 +49,10 @@ submitted command (including an optional Python land adapter)
 
 The broker owns one state directory by holding an exclusive `flock` on `broker.lock`. It is the
 only process allowed to perform scheduler transitions, resource lifecycle operations, worker
-release, publication-phase authority, recovery, and terminal receipt updates. Clients submit
-and observe through the private durable spool; there is no network listener.
+release, publication-phase authority, recovery, and terminal receipt updates. It is also the
+only process that opens the spool: clients submit, observe, and inspect by running its
+commands against the private state directory, never by reading or writing `queue.sqlite3` or
+`broker.lock` themselves. There is no network listener.
 
 Native startup retries acquisition for at most 250 milliseconds so a short ownership probe
 cannot make the selected broker abandon startup. A lock held through that bounded interval is
@@ -134,9 +136,10 @@ characters, and three named SQLite triggers guard run insertion and drained-owne
 Missing keys or triggers invalidate the marker. Successful `resume` removes the complete set
 and its triggers atomically; absence of those keys means the coordinator is open.
 
-The owner lock is newline-delimited UTF-8 with unique keys. Clients reject missing, duplicate,
-unknown-version, invalid-JSON, or oversized metadata while the lock is held. A canonical native
-owner record is:
+The owner lock is newline-delimited UTF-8 with unique keys. The broker rejects missing,
+duplicate, unknown-version, invalid-JSON, or oversized metadata while the lock is held, and
+reports the validated record to clients as `broker-owner-metadata-invalid` otherwise. A
+canonical native owner record is:
 
 ```text
 pid=12345
@@ -219,8 +222,11 @@ The native executable implements the protocol-5 owner lock, SQLite spool initial
 submission validation, admission, repository barriers, queue-order-preserving round-robin
 selection, generic capacity accounting, cancellation, land-phase authority, land gate-reuse
 authority, history reads,
-worker observation, child leases, durable drain/status/resume, and protocol-4-to-5 migration
-and rollback. The Python client, TUI, and pytest-xdist adapter use these native commands while
+worker observation, child leases, durable drain/status/resume, spool inspection, and
+protocol-4-to-5 migration and rollback. `inspect` answers what a client used to read out of
+the spool itself — the generation, the live owner's identity and capacities, and any durable
+drain — and unlike `snapshot` it succeeds when nothing owns the state directory, because "no
+owner" is one of the answers a client asks for. The Python client, TUI, and pytest-xdist adapter use these native commands while
 retaining their public JSON and environment contracts; migration and rollback are broker-internal
 and are no longer exposed as client commands.
 
@@ -309,7 +315,8 @@ unverified tree.
 
 ### Client-authored operations
 
-Clients continue to use short SQLite transactions rather than mutating live processes:
+Clients author these through the broker's commands, which commit one short SQLite transaction
+each rather than mutating live processes:
 
 - submission inserts one complete `runs` row in `queued` state with an immutable command,
   environment, checkout identity, resource request and contract;
