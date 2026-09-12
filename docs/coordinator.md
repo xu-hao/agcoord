@@ -126,6 +126,17 @@ broker lets running jobs finish before it interrupts them; `0` interrupts them a
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
 defaults capacity to `jobs=2`.
 
+`agc host config` prints the configuration this host would be given, and writes it with
+`--write`; it refuses to replace an existing file without `--force`, because a live owner keeps
+the configuration it acquired the spool with. The same derivation writes the configuration an
+install creates when a state directory has none: `cpu` and `jobs` from the available
+CPU-affinity count, `memory` from `MemTotal` minus a reserve, and a required cgroup-v2 binding
+for each of those kinds whose controller is delegated to the broker's slice, so a derived
+configuration is never one the broker refuses at startup. `--cpu`, `--jobs`, `--memory`, and
+`--reserve` override what is derived, `--cgroup-root` selects the slice to inspect, and
+`--tmpfs` with `--tmpfs-inodes` adds the scratch policy, which stays opt-in because its bytes
+are charged against the same memory capacity.
+
 ```json
 {
   "capacities": {"jobs": 4, "cpu": 8, "browser": 1},

@@ -3,6 +3,20 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- A fresh host install now declares the machine's memory as well as its CPUs, and enforces both
+  when the host allows it. The configuration written when a state directory has none derives
+  `memory` capacity from `MemTotal` minus a reserve (the larger of 4 GiB or an eighth of RAM) and
+  adds the required cgroup-v2 `memory` binding only when that controller is delegated to the
+  broker's slice, so an install can no longer write a configuration the broker refuses at
+  startup. A state directory that already holds a configuration keeps it (#226).
+- Add `agc host config`, which prints the configuration this host would be given and writes it
+  with `--write`, refusing to replace an existing file without `--force`. `--cpu`, `--jobs`,
+  `--memory`, and `--reserve` override what is derived, `--cgroup-root` selects the slice whose
+  delegated controllers decide the bindings, and `--tmpfs` with `--tmpfs-inodes` adds an
+  enforced scratch policy that stays opt-in because it is bounded by the memory capacity (#226).
+
 ## 0.7.1 — 2026-09-11
 
 - Fix the native broker and its waiting clients spending a host's CPU in proportion to the

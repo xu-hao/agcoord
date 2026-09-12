@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tarfile
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .config import (
@@ -22,6 +22,7 @@ from .config import (
     NativeBrokerConfig,
     config_path,
     load_broker_config,
+    parse_broker_config,
 )
 from .native_client import (
     NATIVE_IMPLEMENTATION,
@@ -41,6 +42,12 @@ from .queue import (
 )
 from .resources import ResourceContractError, validate_resource_bindings
 
+
+MIB = 1024**2
+MEMORY_RESERVE_FLOOR = 4 * 1024**3
+MEMORY_RESERVE_DIVISOR = 8
+TMPFS_BYTES_PER_INODE = 8192
+USER_BROKER_PATH = Path.home() / ".local" / "libexec" / "agcoord" / "agcoord-broker"
 
 SUDO = Path("/usr/bin/sudo")
 SYSTEMCTL = Path("/usr/bin/systemctl")
@@ -363,6 +370,190 @@ def _cpu_capacity() -> int:
     return max(1, available)
 
 
+def _total_memory() -> int:
+    """Total usable RAM this host reports, or zero when it reports none."""
+    try:
+        reported = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    for line in reported.splitlines():
+        if line.startswith("MemTotal:"):
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].isdigit():
+                return int(fields[1]) * 1024
+    return 0
+
+
+def _memory_capacity(*, total: int | None = None, reserve: int | None = None) -> int:
+    """Declarable memory: everything but a reserve for the host, rounded down to whole MiB."""
+    available = _total_memory() if total is None else total
+    if available <= 0:
+        return 0
+    held_back = (
+        max(MEMORY_RESERVE_FLOOR, available // MEMORY_RESERVE_DIVISOR)
+        if reserve is None
+        else reserve
+    )
+    return max(0, available - held_back) // MIB * MIB
+
+
+def _delegated_controllers(cgroup_root: str | os.PathLike[str]) -> set[str]:
+    """Controllers the broker's own leaf can enable, read from its parent's delegation."""
+    try:
+        delegated = (Path(cgroup_root).parent / "cgroup.controllers").read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return set(delegated.split())
+
+
+def _binding(kind: str, unit: str) -> dict[str, str]:
+    return {"kind": kind, "unit": unit, "mode": "required", "backend": "cgroup-v2"}
+
+
+def derive_host_config(
+    *,
+    managed: bool,
+    broker_path: str | os.PathLike[str] | None = None,
+    cgroup_root: str | os.PathLike[str] | None = None,
+    cpu: int | None = None,
+    jobs: int | None = None,
+    memory: int | None = None,
+    reserve: int | None = None,
+    tmpfs: int | None = None,
+    tmpfs_inodes: int | None = None,
+) -> dict[str, Any]:
+    """Describe this host as one broker configuration, enforcing only what it can.
+
+    A capacity is declared whether or not the host can enforce it, because admission is what
+    keeps agents from overcommitting the machine. A binding is added only for a kind whose
+    controller is delegated to the broker's slice, so the derived configuration is never one
+    the broker refuses at startup.
+    """
+    selected_cpu = _cpu_capacity() if cpu is None else cpu
+    selected_jobs = selected_cpu if jobs is None else jobs
+    if selected_cpu < 1 or selected_jobs < 1:
+        raise _state_error("cpu and jobs capacities must each be at least one")
+    selected_memory = _memory_capacity(reserve=reserve) if memory is None else memory
+    if selected_memory < 0:
+        raise _state_error("memory capacity cannot be negative")
+    capacities: dict[str, int] = {"cpu": selected_cpu, "jobs": selected_jobs}
+    if selected_memory > 0:
+        capacities["memory"] = selected_memory
+    root = str(_managed_cgroup_root() if cgroup_root is None else cgroup_root)
+    bindings: dict[str, dict[str, str]] = {}
+    if managed:
+        delegated = _delegated_controllers(root)
+        bindings["cpu"] = _binding("cpu", "logical-cpu")
+        if "memory" in delegated and "memory" in capacities:
+            bindings["memory"] = _binding("memory", "bytes")
+    if tmpfs is not None:
+        if "memory" not in bindings:
+            raise _state_error(
+                "tmpfs scratch needs an enforced memory binding, which this host does not "
+                "offer; its pages are charged against the same memory limit"
+            )
+        if tmpfs > capacities["memory"]:
+            raise _state_error("tmpfs capacity cannot exceed the memory capacity")
+        capacities["tmpfs"] = tmpfs
+        capacities["tmpfs_inodes"] = (
+            tmpfs // TMPFS_BYTES_PER_INODE if tmpfs_inodes is None else tmpfs_inodes
+        )
+        if capacities["tmpfs_inodes"] < 1:
+            raise _state_error("tmpfs inode capacity must be at least one")
+        bindings["tmpfs"] = _binding("tmpfs", "bytes")
+        bindings["tmpfs_inodes"] = _binding("inodes", "inodes")
+    document: dict[str, Any] = {"capacities": dict(sorted(capacities.items()))}
+    if bindings:
+        document["bindings"] = dict(sorted(bindings.items()))
+    if managed:
+        document["cgroup_root"] = root
+    default_broker = INSTALLED_BROKER if managed else USER_BROKER_PATH
+    document["native_broker"] = {
+        "path": str(default_broker if broker_path is None else broker_path),
+        "allow_development": False,
+        "managed_service": managed,
+    }
+    _validate_derived_config(document)
+    return document
+
+
+def _validate_derived_config(document: Mapping[str, Any]) -> None:
+    """Refuse a derived document the client or broker would reject when it loads it."""
+    encoded = json.dumps(document)
+    try:
+        configuration = parse_broker_config(encoded, source="derived configuration")
+        configured_capacities(configuration.capacities)
+        validate_resource_bindings(configuration.bindings)
+    except (BrokerConfigError, CoordinatorError, ResourceContractError) as exc:
+        raise _state_error(f"derived broker configuration is invalid: {exc}") from exc
+
+
+def host_config(
+    *,
+    state_dir: str | os.PathLike[str],
+    managed: bool = True,
+    write: bool = False,
+    force: bool = False,
+    cpu: int | None = None,
+    jobs: int | None = None,
+    memory: int | None = None,
+    reserve: int | None = None,
+    tmpfs: int | None = None,
+    tmpfs_inodes: int | None = None,
+    cgroup_root: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Derive this host's broker configuration, and write it when asked."""
+    document = derive_host_config(
+        managed=managed,
+        cgroup_root=cgroup_root,
+        cpu=cpu,
+        jobs=jobs,
+        memory=memory,
+        reserve=reserve,
+        tmpfs=tmpfs,
+        tmpfs_inodes=tmpfs_inodes,
+    )
+    directory = Path(state_dir).expanduser()
+    destination = config_path(directory)
+    if not write:
+        return {
+            "state_dir": str(directory),
+            "path": str(destination),
+            "written": False,
+            "configuration": document,
+        }
+    if (destination.exists() or destination.is_symlink()) and not force:
+        raise _state_error(
+            f"{destination} already exists; pass --force to replace it. A live broker keeps "
+            "the configuration it acquired the spool with, so restart it to adopt a new one"
+        )
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError as exc:
+        raise _state_error(f"cannot prepare state directory {directory}: {exc}") from exc
+    encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+    temporary = destination.with_name(f"{destination.name}.partial")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise _state_error(f"cannot write broker configuration {destination}: {exc}") from exc
+    return {
+        "state_dir": str(directory),
+        "path": str(destination),
+        "written": True,
+        "configuration": document,
+    }
+
+
 def _state_error(message: str) -> CoordinatorError:
     return CoordinatorError(message, code="native-host-state-invalid")
 
@@ -440,15 +631,7 @@ def _user_config_plan(state_dir: Path, target: Path) -> bool:
 
 
 def _write_user_config(state_dir: Path, target: Path) -> None:
-    capacity = _cpu_capacity()
-    configuration = {
-        "capacities": {"cpu": capacity, "jobs": capacity},
-        "native_broker": {
-            "path": str(target),
-            "allow_development": False,
-            "managed_service": False,
-        },
-    }
+    configuration = derive_host_config(managed=False, broker_path=target)
     destination = config_path(state_dir)
     encoded = (json.dumps(configuration, indent=2, sort_keys=True) + "\n").encode()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -561,24 +744,7 @@ def install_user_broker(
 
 
 def _default_managed_config() -> dict[str, Any]:
-    capacity = _cpu_capacity()
-    return {
-        "capacities": {"cpu": capacity, "jobs": capacity},
-        "bindings": {
-            "cpu": {
-                "kind": "cpu",
-                "unit": "logical-cpu",
-                "mode": "required",
-                "backend": "cgroup-v2",
-            }
-        },
-        "cgroup_root": _managed_cgroup_root(),
-        "native_broker": {
-            "path": str(INSTALLED_BROKER),
-            "allow_development": False,
-            "managed_service": True,
-        },
-    }
+    return derive_host_config(managed=True)
 
 
 def _managed_cgroup_root() -> str:
