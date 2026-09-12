@@ -188,6 +188,16 @@
       }
     },
     {
+      "id": "protocol.spool-inspection",
+      "domain": "protocol",
+      "description": "The broker reports its spool's generation, live owner identity, and durable drain through one command that succeeds when nothing owns the state directory, so a client never reads the spool itself.",
+      "tests": {
+        "rust_native": [
+          "scheduler::inspect_reports_the_spool_generation_and_its_owner_without_requiring_one"
+        ]
+      }
+    },
+    {
       "id": "contention.history-independent-polling",
       "domain": "contention",
       "description": "Scheduling ticks and status polls read only live rows, so the broker and its waiting clients spend no CPU in proportion to terminal history.",

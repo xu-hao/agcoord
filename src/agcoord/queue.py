@@ -9,16 +9,13 @@ module opens no network listener and has no dependency on a product repository.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -49,14 +46,11 @@ LIVE_STATUSES = frozenset({"queued", "running"})
 STATUSES = LIVE_STATUSES | TERMINAL_STATUSES
 DEFAULT_RECENT_LIMIT = 50
 DEFAULT_JOB_CAPACITY = 2
-DEFAULT_DATABASE_TIMEOUT = 10.0
 FOLLOW_RETRY_SECONDS = 5.0
 FOLLOW_POLL_SECONDS = 0.1
 WAIT_POLL_MAX_SECONDS = 1.0
 EXIT_COORDINATOR_UNREACHABLE = 75
-_TRANSIENT_SQLITE_WORDS = ("locked", "busy")
 MAX_LOG_BYTES = 64 * 1024
-MAX_OWNER_METADATA_BYTES = 1024 * 1024
 CANCEL_GRACE_SECONDS = 5.0
 RUN_ID_ENV = "AGCOORD_RUN_ID"
 RUN_KIND_ENV = "AGCOORD_RUN_KIND"
@@ -81,17 +75,6 @@ _MAINTENANCE_TIME = re.compile(
 )
 MAINTENANCE_REFUSAL = "agcoord-maintenance-draining"
 MAINTENANCE_STATES = frozenset({"draining", "drained"})
-MAINTENANCE_TRIGGER_NAMES = (
-    "agcoord_maintenance_reject_runs",
-    "agcoord_maintenance_reject_activity_insert",
-    "agcoord_maintenance_reject_activity_update",
-)
-MAINTENANCE_METADATA_KEYS = (
-    "maintenance_state",
-    "maintenance_id",
-    "maintenance_reason",
-    "maintenance_started_at",
-)
 MAX_MAINTENANCE_REASON = 256
 
 
@@ -101,7 +84,6 @@ class CoordinatorError(RuntimeError):
     def __init__(self, message: str, *, code: str | None = None):
         super().__init__(message)
         self.code = code
-
 
 
 class CoordinatorUnreachable(CoordinatorError):
@@ -120,25 +102,6 @@ class CoordinatorUnreachable(CoordinatorError):
             code="coordinator-unreachable",
         )
         self.run_id = run_id
-
-
-class _OwnerMetadataError(CoordinatorError):
-    """A live owner whose one startup metadata write is not readable yet or is invalid."""
-
-
-class _ResourceEnforcementError(CoordinatorError):
-    """A required backend contract failed before the blocked launcher was released."""
-
-
-def _transient_database_error(exc: sqlite3.OperationalError) -> bool:
-    code = getattr(exc, "sqlite_errorcode", None)
-    if isinstance(code, int) and code & 0xFF in {
-        getattr(sqlite3, "SQLITE_BUSY", 5),
-        getattr(sqlite3, "SQLITE_LOCKED", 6),
-    }:
-        return True
-    message = str(exc).lower()
-    return "locked" in message or "busy" in message
 
 
 def _agent_identity(agent: object) -> str:
@@ -565,86 +528,32 @@ def broker_config(state_dir: str | os.PathLike[str]) -> BrokerConfig:
         raise CoordinatorError(str(exc)) from exc
 
 
-def _configured_database_timeout(state_dir: Path) -> float:
-    """Return the spool's SQLite lock-wait limit, or the default when none is configured."""
-    try:
-        configured = load_broker_config(state_dir).database_timeout
-    except BrokerConfigError:
-        return DEFAULT_DATABASE_TIMEOUT
-    return DEFAULT_DATABASE_TIMEOUT if configured is None else float(configured)
+def _spool_starting(error: CoordinatorError) -> bool:
+    """Whether a refusal names one of the bounded windows a starting broker opens.
 
-
-def _spool_protocol(paths: CoordinatorPaths, *, timeout: float | None = None) -> int | None:
-    """Read an existing idle spool generation without creating or migrating it.
-
-    The read is read-only and waits through transient SQLite contention for ``timeout``
-    seconds, the configured ``database_timeout`` by default. A broker committing a
-    publication or checkpointing its WAL must not abort a client that is only inspecting
-    the spool; a lock that outlives the timeout is still reported.
+    A broker creates its spool before its schema transaction commits, and takes ownership a
+    few instructions before it publishes its own identity, so both are transient rather than
+    a damaged state directory.
     """
-    if not paths.database.exists():
-        return None
-    wait_for = (
-        _configured_database_timeout(paths.state_dir)
-        if timeout is None
-        else max(0.0, float(timeout))
-    )
-    deadline = time.monotonic() + wait_for
-    uri = paths.database.resolve().as_uri() + "?mode=ro"
-    while True:
-        try:
-            with closing(sqlite3.connect(uri, uri=True, timeout=wait_for)) as database:
-                row = database.execute(
-                    "SELECT value FROM coordinator_meta WHERE key = 'protocol'"
-                ).fetchone()
-            break
-        except sqlite3.OperationalError as exc:
-            detail = str(exc).lower()
-            transient = any(word in detail for word in _TRANSIENT_SQLITE_WORDS)
-            remaining = deadline - time.monotonic()
-            if not transient or remaining <= 0:
-                raise CoordinatorError(
-                    f"cannot inspect gate queue protocol in {paths.database}: {exc}"
-                ) from exc
-            time.sleep(min(0.05, remaining))
-        except sqlite3.Error as exc:
-            raise CoordinatorError(
-                f"cannot inspect gate queue protocol in {paths.database}: {exc}"
-            ) from exc
-    if row is None:
-        raise CoordinatorError(
-            f"gate queue database {paths.database} has no protocol metadata"
-        )
-    try:
-        return int(row[0])
-    except (TypeError, ValueError) as exc:
-        raise CoordinatorError(
-            f"gate queue database {paths.database} has invalid protocol metadata"
-        ) from exc
+    return error.code in {
+        "broker-schema-invalid",
+        "broker-owner-metadata-invalid",
+    }
 
 
-def _spool_initializing_error(error: CoordinatorError) -> bool:
-    detail = str(error)
-    return "no such table: coordinator_meta" in detail or (
-        "has no protocol metadata" in detail
-    )
+def _pre_native_spool_refusal(refused: CoordinatorError) -> CoordinatorError:
+    """Add the migration route to the broker's own pre-native generation refusal.
 
-
-def _pre_native_spool_refusal(
-    paths: CoordinatorPaths,
-    protocol: int,
-) -> CoordinatorError:
-    """Refuse a spool below the native protocol and name the release that migrates it.
-
-    The Python reference broker and its in-process migrations were retired in AGCoord
-    0.6.0. A spool at protocol 1 through 4 is migrated by the last release that still
-    shipped them, after which the native broker owns it at protocol 5.
+    The broker owns the generation check and names the protocol it found. Only the client
+    knows which AGCoord release still ships the in-process migration that raises such a
+    spool to the native protocol, so the route is added here. The broker's stable code is
+    kept so callers and adapters branch on it exactly as they do for every other refusal.
     """
     return CoordinatorError(
-        f"gate queue at {paths.database} uses protocol {protocol}; AGCoord owns only "
-        f"protocol {NATIVE_PROTOCOL} native spools and no longer migrates older ones — "
+        f"{refused}; AGCoord no longer migrates spools below protocol {NATIVE_PROTOCOL} — "
         f"install AGCoord {LAST_MIGRATING_RELEASE} to migrate this spool to the native "
-        "broker, then upgrade"
+        "broker, then upgrade",
+        code=refused.code,
     )
 
 
@@ -663,178 +572,6 @@ def _validate_resources(
                 f"resource {name!r} requests {units}, above capacity {capacities[name]}"
             )
     return selected
-
-
-def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
-    """Read either supported live flock owner, ignoring bytes from a dead broker."""
-    try:
-        descriptor = os.open(paths.owner_lock, os.O_RDWR)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise CoordinatorError(
-            f"cannot open gate broker ownership file {paths.owner_lock}: {exc}"
-        ) from exc
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            try:
-                raw = os.pread(
-                    descriptor,
-                    MAX_OWNER_METADATA_BYTES + 1,
-                    0,
-                ).decode("utf-8", errors="strict")
-            except (OSError, UnicodeDecodeError) as exc:
-                raise _OwnerMetadataError(
-                    f"live gate broker ownership metadata is unreadable in "
-                    f"{paths.owner_lock}"
-                ) from exc
-        else:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            return None
-    finally:
-        os.close(descriptor)
-    if len(raw.encode("utf-8")) > MAX_OWNER_METADATA_BYTES:
-        raise _OwnerMetadataError(
-            f"live gate broker ownership metadata is oversized in {paths.owner_lock}"
-        )
-    fields: dict[str, str] = {}
-    for line in raw.splitlines():
-        key, separator, value = line.partition("=")
-        if not separator or key in fields:
-            raise _OwnerMetadataError(
-                f"live gate broker wrote invalid ownership metadata in {paths.owner_lock}"
-            )
-        fields[key] = value
-    try:
-        protocol = int(fields["protocol"])
-        owner_pid = int(fields["pid"])
-        capacities = _positive_mapping(
-            json.loads(fields["capacities"]),
-            subject="owner capacity",
-            include_job=False,
-        )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError, CoordinatorError) as exc:
-        raise _OwnerMetadataError(
-            f"live gate broker wrote incomplete ownership metadata in {paths.owner_lock}"
-        ) from exc
-    try:
-        bindings = validate_resource_bindings(
-            json.loads(fields["resource_bindings"])
-        )
-        capabilities = validate_resource_capabilities(
-            json.loads(fields["resource_capabilities"])
-        )
-    except (
-        KeyError,
-        TypeError,
-        json.JSONDecodeError,
-        ResourceContractError,
-    ) as exc:
-        raise _OwnerMetadataError(
-            f"live gate broker wrote incomplete resource metadata in {paths.owner_lock}"
-        ) from exc
-    if owner_pid <= 0:
-        raise _OwnerMetadataError("live gate broker wrote invalid numeric metadata")
-    owner: dict[str, Any] = {
-        "pid": owner_pid,
-        "protocol": protocol,
-        "capacities": capacities,
-        "resource_bindings": bindings,
-        "resource_capabilities": capabilities,
-    }
-    if protocol == NATIVE_PROTOCOL:
-        try:
-            implementation = fields["implementation"]
-            version = fields["version"]
-            build = fields["build"]
-        except KeyError as exc:
-            raise _OwnerMetadataError(
-                f"live native broker wrote incomplete identity metadata in "
-                f"{paths.owner_lock}"
-            ) from exc
-        if (
-            implementation != NATIVE_IMPLEMENTATION
-            or not version
-            or not build
-            or any("\0" in value or "\n" in value for value in (version, build))
-        ):
-            raise _OwnerMetadataError(
-                f"live native broker wrote invalid identity metadata in {paths.owner_lock}"
-            )
-        owner.update(
-            implementation=implementation,
-            version=version,
-            build=build,
-        )
-    return owner
-
-
-
-
-
-
-
-
-def _maintenance_record(
-    db: sqlite3.Connection,
-) -> dict[str, str] | None:
-    """Read and strictly validate the durable maintenance marker."""
-    rows = db.execute(
-        "SELECT 'metadata', key, value FROM coordinator_meta "
-        "WHERE key IN (?, ?, ?, ?) "
-        "UNION ALL "
-        "SELECT 'trigger', name, NULL FROM sqlite_master WHERE type = 'trigger' "
-        "AND name IN (?, ?, ?)",
-        (*MAINTENANCE_METADATA_KEYS, *MAINTENANCE_TRIGGER_NAMES),
-    ).fetchall()
-    values = {
-        str(row[1]): str(row[2])
-        for row in rows
-        if row[0] == "metadata"
-    }
-    guards = {
-        str(row[1])
-        for row in rows
-        if row[0] == "trigger"
-    }
-    if not values:
-        if guards:
-            raise CoordinatorError(
-                "coordinator maintenance submission guards have no marker"
-            )
-        return None
-    if set(values) != set(MAINTENANCE_METADATA_KEYS):
-        raise CoordinatorError("coordinator maintenance metadata is incomplete")
-    if values["maintenance_state"] not in MAINTENANCE_STATES:
-        raise CoordinatorError("coordinator maintenance state is invalid")
-    if not _DRAIN_ID.fullmatch(values["maintenance_id"]):
-        raise CoordinatorError("coordinator maintenance drain ID is invalid")
-    reason = values["maintenance_reason"]
-    if not reason or len(reason) > MAX_MAINTENANCE_REASON or "\0" in reason:
-        raise CoordinatorError("coordinator maintenance reason is invalid")
-    started_at = values["maintenance_started_at"]
-    try:
-        parsed_start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise CoordinatorError("coordinator maintenance start time is invalid") from exc
-    if (
-        not _MAINTENANCE_TIME.fullmatch(started_at)
-        or parsed_start.utcoffset() != timezone.utc.utcoffset(None)
-    ):
-        raise CoordinatorError("coordinator maintenance start time is invalid")
-    if guards != set(MAINTENANCE_TRIGGER_NAMES):
-        raise CoordinatorError(
-            "coordinator maintenance submission guards are missing"
-        )
-    return values
-
-
-
-
-
-
 
 
 def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
@@ -893,19 +630,6 @@ def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
     ):
         raise CoordinatorError("coordinator returned an invalid maintenance broker PID")
     return value
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _validate_command(command: Any) -> list[str]:
@@ -1103,36 +827,39 @@ class CoordinatorClient:
                 "callback run does not match the admitted AGCoord context"
             )
 
-    def _database_timeout(self) -> float:
-        return _configured_database_timeout(self.paths.state_dir)
+    def _inspect(self) -> dict[str, Any]:
+        """Ask the broker what it owns: the generation, the live owner, and any drain.
+
+        The spool belongs to the broker. A client that read it directly would need a second
+        implementation of what its bytes mean, and could only invent refusals of its own for
+        contention or a generation this release does not own.
+        """
+        try:
+            result = self._native_invoke("inspect")
+        except CoordinatorError as exc:
+            if exc.code == "broker-protocol-unsupported":
+                raise _pre_native_spool_refusal(exc) from exc
+            raise
+        if (
+            not isinstance(result, dict)
+            or result.get("protocol") != NATIVE_PROTOCOL
+            or not isinstance(result.get("owner", None), (dict, type(None)))
+            or not isinstance(result.get("maintenance", None), (dict, type(None)))
+        ):
+            raise CoordinatorError("native broker returned an invalid spool inspection")
+        return result
 
     def _maintenance_if_active(self) -> dict[str, Any] | None:
-        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
-        if protocol is None:
-            return None
-        broker_config(self.paths.state_dir)
-        timeout = self._database_timeout()
-        with closing(sqlite3.connect(self.paths.database, timeout=timeout)) as db:
-            db.row_factory = sqlite3.Row
-            if _maintenance_record(db) is None:
+        try:
+            spool = self._inspect()
+        except CoordinatorError as exc:
+            if exc.code == "broker-state-missing":
                 return None
-        if protocol == NATIVE_PROTOCOL:
-            try:
-                result = self._native_invoke("drain-status")
-            except CoordinatorError as exc:
-                cause = exc.__cause__
-                if (
-                    isinstance(cause, NativeClientError)
-                    and cause.code == "broker-not-draining"
-                ):
-                    return None
-                raise
-            if not isinstance(result, dict):
-                raise CoordinatorError(
-                    "native broker returned an invalid maintenance status"
-                )
-            return _validated_maintenance_receipt(result)
-        return None
+            raise
+        maintenance = spool.get("maintenance")
+        if maintenance is None:
+            return None
+        return _validated_maintenance_receipt(maintenance)
 
     def _recover_native_drain(
         self,
@@ -1162,20 +889,29 @@ class CoordinatorClient:
         admitted_callback: bool = False,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + self.connect_timeout
-        last_metadata_error: _OwnerMetadataError | None = None
+        last_metadata_error: CoordinatorError | None = None
         maintenance: dict[str, Any] | None = None
         while True:
             try:
-                owner = _read_broker_owner(self.paths)
-            except _OwnerMetadataError as exc:
-                # flock ownership becomes visible a few instructions before its metadata
-                # write. Concurrent first clients wait through only that bounded interval;
-                # a persistently malformed live owner still fails closed.
-                last_metadata_error = exc
-                if time.monotonic() >= deadline:
-                    raise CoordinatorError(str(exc)) from exc
-                time.sleep(0.01)
-                continue
+                owner = self._inspect().get("owner")
+            except CoordinatorError as exc:
+                # A state directory holds no spool until its first broker creates one, so
+                # an absent spool is the ordinary state autostart exists to resolve rather
+                # than a refusal; it simply owns nothing and drains nothing.
+                if exc.code == "broker-state-missing":
+                    owner = None
+                # Ownership becomes visible a few instructions before the owner finishes
+                # publishing itself, and a starting broker creates its spool before its
+                # schema transaction commits. Concurrent first clients wait through only
+                # those bounded intervals; anything else still fails closed.
+                elif not _spool_starting(exc):
+                    raise
+                else:
+                    last_metadata_error = exc
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+                    continue
             if owner is not None:
                 break
             if admitted_callback:
@@ -1186,7 +922,7 @@ class CoordinatorClient:
             try:
                 maintenance = self._maintenance_if_active()
             except CoordinatorError as exc:
-                if _spool_initializing_error(exc) and time.monotonic() < deadline:
+                if _spool_starting(exc) and time.monotonic() < deadline:
                     time.sleep(0.01)
                     continue
                 raise
@@ -1205,8 +941,6 @@ class CoordinatorClient:
                         "until resume",
                         code="broker-draining",
                     )
-            if owner["protocol"] != NATIVE_PROTOCOL:
-                raise _pre_native_spool_refusal(self.paths, owner["protocol"])
             return self._public_owner(owner)
         if maintenance is not None:
             if (
@@ -1736,21 +1470,12 @@ class CoordinatorClient:
             raise CoordinatorError("maintenance wait must be boolean")
         if poll_interval <= 0:
             raise CoordinatorError("maintenance poll interval must be positive")
-        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
-        if protocol is None:
-            raise CoordinatorError(
-                f"no gate queue database exists at {self.paths.database}"
-            )
+        self._inspect()
         drain_id = f"drain-{uuid4().hex[:12]}"
-        if protocol == NATIVE_PROTOCOL:
-            result = self._native_invoke(
-                "drain",
-                ("--drain-id", drain_id, "--reason", reason.strip()),
-            )
-        else:
-            raise CoordinatorError(
-                f"durable draining does not support queue protocol {protocol}"
-            )
+        result = self._native_invoke(
+            "drain",
+            ("--drain-id", drain_id, "--reason", reason.strip()),
+        )
         result = _validated_maintenance_receipt(result)
         if not wait:
             return result
@@ -1764,37 +1489,18 @@ class CoordinatorClient:
 
     def drain_status(self) -> dict[str, Any]:
         """Return the validated durable drain status without starting a broker."""
-        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
-        if protocol == NATIVE_PROTOCOL:
-            result = self._native_invoke("drain-status")
-        elif protocol is None:
-            raise CoordinatorError(
-                f"no gate queue database exists at {self.paths.database}"
-            )
-        else:
-            raise CoordinatorError(
-                f"durable draining does not support queue protocol {protocol}"
-            )
-        return _validated_maintenance_receipt(result)
+        self._inspect()
+        return _validated_maintenance_receipt(self._native_invoke("drain-status"))
 
     def resume(self, drain_id: str) -> dict[str, Any]:
         """Remove one exact drained guard while holding exclusive spool ownership."""
         if not isinstance(drain_id, str) or not _DRAIN_ID.fullmatch(drain_id):
             raise CoordinatorError("maintenance drain ID is invalid")
-        protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
-        if protocol == NATIVE_PROTOCOL:
-            result = self._native_invoke(
-                "resume",
-                ("--drain-id", drain_id),
-            )
-        elif protocol is None:
-            raise CoordinatorError(
-                f"no gate queue database exists at {self.paths.database}"
-            )
-        else:
-            raise CoordinatorError(
-                f"durable draining does not support queue protocol {protocol}"
-            )
+        self._inspect()
+        result = self._native_invoke(
+            "resume",
+            ("--drain-id", drain_id),
+        )
         if result != {"state": "open", "drain_id": drain_id, "resumed": True}:
             raise CoordinatorError("coordinator returned an invalid resume receipt")
         return result
@@ -2170,35 +1876,34 @@ class CoordinatorClient:
         return result
 
     def ping(self) -> dict[str, Any]:
-        owner = _read_broker_owner(self.paths)
+        owner = self._inspect().get("owner")
         if owner is None:
             raise CoordinatorError(
                 f"no gate broker owns {self.paths.state_dir}"
             )
-        if owner["protocol"] != NATIVE_PROTOCOL:
-            raise _pre_native_spool_refusal(self.paths, owner["protocol"])
         self._validate_native_owner(owner)
         return self._public_owner(owner)
 
     def _start_broker(self) -> None:
         try:
-            existing_protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
+            self._inspect()
         except CoordinatorError as exc:
-            if not _spool_initializing_error(exc):
+            if exc.code == "broker-state-missing":
+                pass
+            elif _spool_starting(exc):
+                deadline = time.monotonic() + self.connect_timeout
+                while True:
+                    try:
+                        if self._inspect().get("owner") is not None:
+                            return
+                    except CoordinatorError as retried:
+                        if not _spool_starting(retried):
+                            raise
+                    if time.monotonic() >= deadline:
+                        raise exc
+                    time.sleep(0.01)
+            else:
                 raise
-            deadline = time.monotonic() + self.connect_timeout
-            while True:
-                try:
-                    starting_owner = _read_broker_owner(self.paths)
-                except _OwnerMetadataError:
-                    starting_owner = None
-                if starting_owner is not None:
-                    return
-                if time.monotonic() >= deadline:
-                    raise exc
-                time.sleep(0.01)
-        if existing_protocol is not None and existing_protocol != NATIVE_PROTOCOL:
-            raise _pre_native_spool_refusal(self.paths, existing_protocol)
         selected = self._native_command()
         config = broker_config(self.paths.state_dir)
         capacities = configured_capacities(config.capacities)
@@ -2296,7 +2001,7 @@ class CoordinatorClient:
                 try:
                     maintenance = self._maintenance_if_active()
                 except CoordinatorError as maintenance_error:
-                    if not _spool_initializing_error(maintenance_error):
+                    if not _spool_starting(maintenance_error):
                         raise
                     # The native process creates SQLite before its schema transaction
                     # commits. Treat only that bounded partial-spool window like the

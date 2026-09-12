@@ -2263,23 +2263,17 @@ def test_land_reserves_the_avoid_environment_name_for_the_coordinator(
     assert snapshot["active"] == [] and snapshot["queued"] == [] and snapshot["recent"] == []
 
 
-def _protocol_spool(state_dir: Path):
-    """Create a protocol-5 spool database the way the broker leaves it, with no owner."""
-    from agcoord.queue import queue_paths
+def _idle_native_spool(state_dir: Path, *, database_timeout: float) -> Path:
+    """Leave one real protocol-5 spool behind with no live owner.
 
-    state_dir.mkdir(mode=0o700)
-    paths = queue_paths(state_dir=state_dir)
-    database = sqlite3.connect(paths.database)
-    try:
-        database.execute("PRAGMA journal_mode=WAL")
-        database.execute(
-            "CREATE TABLE coordinator_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        database.execute("INSERT INTO coordinator_meta VALUES ('protocol', '5')")
-        database.commit()
-    finally:
-        database.close()
-    return paths
+    Only a broker creates a spool this release owns, so the fixture starts and stops one
+    instead of hand-writing metadata that a client is no longer allowed to interpret.
+    """
+    write_broker_config(state_dir, database_timeout=database_timeout)
+    running = RunningCoordinator(state_dir, capacities={"jobs": 1})
+    running.start()
+    running.stop()
+    return running.paths.database
 
 
 def _exclusive_holder(database: Path) -> sqlite3.Connection:
@@ -2291,11 +2285,19 @@ def _exclusive_holder(database: Path) -> sqlite3.Connection:
     return holder
 
 
-def test_spool_protocol_waits_through_a_transient_lock_instead_of_aborting(tmp_path: Path):
-    from agcoord import queue as queue_module
+def test_a_client_call_waits_through_a_transient_spool_lock_instead_of_aborting(
+    tmp_path: Path,
+):
+    """A broker committing a publication or checkpointing its WAL must not abort a client.
 
-    paths = _protocol_spool(tmp_path / "state")
-    holder = _exclusive_holder(paths.database)
+    The client no longer reads the spool, so the wait belongs to the broker command it
+    asks. Reaching that command's own answer, rather than the retryable busy refusal, is
+    what proves the contended read waited instead of aborting on the first locked result.
+    """
+    state_dir = tmp_path / "state"
+    database = _idle_native_spool(state_dir, database_timeout=10.0)
+    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    holder = _exclusive_holder(database)
     released = threading.Event()
 
     def release() -> None:
@@ -2308,22 +2310,28 @@ def test_spool_protocol_waits_through_a_transient_lock_instead_of_aborting(tmp_p
     thread.start()
     started = time.monotonic()
     try:
-        assert queue_module._spool_protocol(paths, timeout=5.0) == 5
+        with pytest.raises(CoordinatorError) as refused:
+            client.drain_status()
     finally:
-        thread.join(timeout=10)
+        thread.join(timeout=20)
     assert released.is_set()
-    assert time.monotonic() - started < 5.0
+    assert refused.value.code == "broker-not-draining", str(refused.value)
+    assert time.monotonic() - started < 10.0
 
 
-def test_spool_protocol_reports_a_persistent_lock_only_after_the_timeout(tmp_path: Path):
-    from agcoord import queue as queue_module
-
-    paths = _protocol_spool(tmp_path / "state")
-    holder = _exclusive_holder(paths.database)
+def test_a_client_call_reports_a_persistent_spool_lock_only_after_the_timeout(
+    tmp_path: Path,
+):
+    """A lock outliving `database_timeout` is the retryable busy code, not a schema fault."""
+    state_dir = tmp_path / "state"
+    database = _idle_native_spool(state_dir, database_timeout=0.3)
+    client = CoordinatorClient(state_dir=state_dir, autostart=False)
+    holder = _exclusive_holder(database)
     try:
         started = time.monotonic()
-        with pytest.raises(CoordinatorError, match="database is locked"):
-            queue_module._spool_protocol(paths, timeout=0.3)
+        with pytest.raises(CoordinatorError) as refused:
+            client.drain_status()
+        assert refused.value.code == "broker-database-busy", str(refused.value)
         assert time.monotonic() - started >= 0.3
     finally:
         holder.execute("COMMIT")

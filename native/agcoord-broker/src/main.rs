@@ -1037,6 +1037,10 @@ fn run_command(arguments: &[String]) -> Result<()> {
             let paths = Paths::new(&parse_state_only(rest)?).configured()?;
             emit_json(&store::snapshot(&paths)?)
         }
+        [command, rest @ ..] if command == "inspect" => {
+            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
+            emit_json(&store::inspect(&paths)?)
+        }
         [command, rest @ ..] if command == "status" => {
             let (paths, run_id, _) = parse_run_selector(rest, false)?;
             emit_json(&store::status(&paths, &run_id)?)

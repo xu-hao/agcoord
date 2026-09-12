@@ -25,9 +25,12 @@ the current checkout, so two unrelated repositories converge on one broker while
 different stable repository and worktree identities.
 
 The state directory, spool, lock, broker diagnostics, run logs, and transient sidecars are
-owner-only. An ownership lock elects exactly one broker. Simultaneous first clients either
-join that owner or fail without an accepted row; they never create two supervisors for the
-same spool. An unmanaged development configuration lets the first ordinary client start the
+owner-only, and the spool is private to the broker. Clients never open `queue.sqlite3` or
+`broker.lock`: they submit, observe, and inspect by running the broker's own commands, so
+the spool's generation, its live owner, and any durable drain are answered by the one
+component that defines them and every refusal carries a stable broker code. An ownership
+lock elects exactly one broker. Simultaneous first clients either join that owner or fail
+without an accepted row; they never create two supervisors for the same spool. An unmanaged development configuration lets the first ordinary client start the
 explicitly selected native executable as a detached owner on demand. A production managed
 configuration instead asks systemd to start the installed long-lived user service; clients
 never spawn that broker directly. Closing the submitting terminal does not cancel accepted
@@ -1092,11 +1095,12 @@ cancellation was requested, and with 75 when the client lost contact with the co
 after acceptance. In that last case the client first retries a transient error for five
 seconds, then prints that the job continues on the broker and how to keep following it
 (`agc log <id> --follow`, `agc show <id>`), and claims no verdict; `--json` reports the same
-case as `{"code": "coordinator-unreachable", "message": …, "run_id": …}`. The read-only
-protocol inspection every client command performs waits through transient SQLite contention
-for the configured `database_timeout` rather than aborting on the first busy lock, so a
-broker committing a publication or checkpointing its WAL does not end a client that is only
-watching its own row.
+case as `{"code": "coordinator-unreachable", "message": …, "run_id": …}`. The spool
+inspection every client command performs is itself a broker command, and the broker waits
+through transient SQLite contention for the configured `database_timeout` rather than
+aborting on the first busy lock, so a broker committing a publication or checkpointing its
+WAL does not end a client that is only watching its own row. A lock that outlives that
+timeout is reported as the retryable `broker-database-busy`.
 
 Watching costs the host little while work waits. A following client polls a queued job's row
 at an interval that doubles from a tenth of a second to one second, then streams the admitted

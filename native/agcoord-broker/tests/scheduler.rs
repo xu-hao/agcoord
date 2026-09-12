@@ -1379,6 +1379,41 @@ fn a_serving_broker_never_closes_the_last_spool_connection() {
 }
 
 #[test]
+fn inspect_reports_the_spool_generation_and_its_owner_without_requiring_one() {
+    // Clients must learn the protocol, the live owner, and any drain from the broker rather
+    // than by reading the spool themselves, including when nothing owns it.
+    let temporary = TestDirectory::new("inspect");
+    let state = temporary.path().join("state");
+
+    let missing = run(&["inspect", "--state-dir", state_argument(&state)]);
+    assert!(!missing.status.success());
+    let refusal: Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(refusal["code"], "broker-state-missing", "{refusal}");
+
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let served = json_output(&["inspect", "--state-dir", state_argument(&state)]);
+    assert_eq!(served["protocol"], 5);
+    assert_eq!(served["maintenance"], Value::Null);
+    let owner = &served["owner"];
+    assert_eq!(owner["pid"], json!(broker.child.as_ref().unwrap().id()));
+    assert_eq!(owner["implementation"], "rust-native");
+    assert_eq!(owner["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(owner["capacities"]["jobs"], 1);
+    assert!(
+        owner["build"]
+            .as_str()
+            .is_some_and(|build| !build.is_empty()),
+        "{owner}"
+    );
+
+    assert!(broker.terminate().success());
+    let idle = json_output(&["inspect", "--state-dir", state_argument(&state)]);
+    assert_eq!(idle["protocol"], 5);
+    assert_eq!(idle["owner"], Value::Null);
+    assert_eq!(idle["maintenance"], Value::Null);
+}
+
+#[test]
 fn queued_and_running_cancellation_are_durable() {
     let temporary = TestDirectory::new("cancel");
     let state = temporary.path().join("state");

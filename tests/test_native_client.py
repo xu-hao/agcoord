@@ -31,6 +31,8 @@ from agcoord.queue import (
     CoordinatorError,
 )
 
+from conftest import native_broker_executable, write_broker_config
+
 
 
 def _identity_executable(
@@ -52,11 +54,25 @@ def _identity_executable(
         },
         separators=(",", ":"),
     )
+    # A client now asks the broker about the spool before it does anything else, so a stub
+    # that only answers `identity` would fail selection tests for the wrong reason. This
+    # answers `inspect` the way a real broker answers for a state directory with no spool.
+    refusal = json.dumps(
+        {
+            "code": "broker-state-missing",
+            "message": "coordinator database does not exist",
+        },
+        separators=(",", ":"),
+    )
     path.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = identity ] && [ \"$2\" = --json ]; then\n"
         f"  printf '%s\\n' '{identity}'\n"
         "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = inspect ]; then\n"
+        f"  printf '%s\\n' '{refusal}' >&2\n"
+        "  exit 1\n"
         "fi\n"
         "exit 97\n",
         encoding="utf-8",
@@ -546,7 +562,11 @@ def test_client_routes_only_exact_admitted_status_through_the_callback_selector(
         "version": identity.version,
         "build": identity.build,
     }
-    monkeypatch.setattr(queue, "_read_broker_owner", lambda _paths: owner)
+    monkeypatch.setattr(
+        CoordinatorClient,
+        "_inspect",
+        lambda _self: {"protocol": NATIVE_PROTOCOL, "owner": owner, "maintenance": None},
+    )
 
     def refuse_ordinary_selection(_cls, _configured):
         raise NativeClientError("ordinary native selection was refused")
@@ -588,7 +608,11 @@ def test_admitted_callback_never_autostarts_a_missing_broker(
     state_dir = tmp_path / "state"
     monkeypatch.setenv("AGCOORD_RUN_ID", "land-callback")
     monkeypatch.setenv("AGCOORD_STATE_DIR", str(state_dir))
-    monkeypatch.setattr(queue, "_read_broker_owner", lambda _paths: None)
+    monkeypatch.setattr(
+        CoordinatorClient,
+        "_inspect",
+        lambda _self: {"protocol": NATIVE_PROTOCOL, "owner": None, "maintenance": None},
+    )
     client = CoordinatorClient(
         state_dir=state_dir,
         autostart=True,
@@ -704,8 +728,20 @@ def test_unsupported_platform_refusal_precedes_executable_discovery(
 
 
 def _write_pre_native_spool(state_dir: Path, protocol: int) -> None:
-    """Synthesise one idle spool at a retired protocol without a Python broker."""
+    """Synthesise one idle spool at a retired protocol without a Python broker.
+
+    The generation is the broker's answer now, so the state directory also selects the
+    development broker this suite drives. A client that cannot select any broker never
+    gets far enough to be told which release migrates the spool.
+    """
     state_dir.mkdir(parents=True, exist_ok=True)
+    write_broker_config(
+        state_dir,
+        native_broker={
+            "path": str(native_broker_executable()),
+            "allow_development": True,
+        },
+    )
     with sqlite3.connect(state_dir / "queue.sqlite3") as database:
         database.execute(
             "CREATE TABLE coordinator_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -767,8 +803,25 @@ def test_managed_native_autostart_uses_the_user_service_and_never_spawns_directl
     calls: list[list[str]] = []
 
     def fake_run(arguments, **_kwargs):
-        calls.append(list(arguments))
-        return __import__("subprocess").CompletedProcess(arguments, 0, b"", b"")
+        argv = list(arguments)
+        if "inspect" in argv:
+            # The client asks the broker about the spool before and while it starts one.
+            # Answer exactly as a real broker answers for a state directory that holds no
+            # spool, so this test keeps measuring how a broker is started, not how it is
+            # read, and the poll for a new owner stays uncounted.
+            return __import__("subprocess").CompletedProcess(
+                argv,
+                1,
+                b"",
+                json.dumps(
+                    {
+                        "code": "broker-state-missing",
+                        "message": "coordinator database does not exist",
+                    }
+                ).encode("utf-8"),
+            )
+        calls.append(argv)
+        return __import__("subprocess").CompletedProcess(argv, 0, b"", b"")
 
     def forbidden_spawn(*_args, **_kwargs):
         raise AssertionError("managed autostart spawned the broker directly")
