@@ -57,6 +57,12 @@ reruns its gate, waits for the exact process group to disappear, reclaims scratc
 exposes the reported passed or typed-failed result. If the worker disappears before it can
 report a result, `interrupted` is the only safe terminal classification.
 
+If systemd recreated the broker service's delegated cgroup root after every recorded worker
+using the old root disappeared, the replacement abandons only its private recovery metadata
+for that old root, records the dead rows `interrupted`, and prepares later work under the new
+root. It never removes or signals anything in the new root. A matching live worker, or any
+other identity mismatch, still refuses recovery rather than treating a reused path as owned.
+
 ## Durable maintenance drain
 
 Maintenance closes the submission race before waiting for an idle spool:

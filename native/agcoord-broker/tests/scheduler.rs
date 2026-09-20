@@ -3725,6 +3725,170 @@ fn replacement_recovers_a_live_cgroup_worker_and_cleans_its_durable_leaf() {
 }
 
 #[test]
+fn replacement_recovers_a_dead_worker_after_the_cgroup_root_is_recreated() {
+    let temporary = TestDirectory::new("cgroup-recreated-root-recovery");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let old_root = temporary.path().join("old-delegated");
+    let checkout = temporary.path().join("checkout");
+    let stale_marker = temporary.path().join("stale-must-not-run");
+    let fresh_marker = temporary.path().join("fresh-ran");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"required", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_argument = root.to_str().unwrap();
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &[
+            "--cgroup-fixture",
+            root_argument,
+            "--crash-after",
+            "worker-identity-commit",
+        ],
+    );
+    let stale = Submission {
+        run_id: "cgroup-recreated-root-stale",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&stale_marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &stale, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    let stale_pid = status(&state, stale.run_id)["worker_pid"].as_u64().unwrap();
+    wait_for(Duration::from_secs(5), || {
+        process_state(stale_pid).is_none()
+    });
+    assert!(!stale_marker.exists());
+
+    fs::rename(&root, &old_root).unwrap();
+    fs::create_dir(&root).unwrap();
+
+    let mut replacement = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &["--cgroup-fixture", root_argument],
+    );
+    let recovered = wait_status(&state, stale.run_id, "interrupted");
+    assert_eq!(recovered["failure_reason"], "worker-result-lost");
+    assert!(!stale_marker.exists());
+
+    let fresh = Submission {
+        run_id: "cgroup-recreated-root-fresh",
+        kind: "check",
+        repository: "repo-b",
+        checkout: &checkout,
+        command: touch_command(&fresh_marker),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &fresh, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    wait_status(&state, fresh.run_id, "passed");
+    assert!(fresh_marker.exists());
+    assert!(replacement.terminate().success());
+}
+
+#[test]
+fn replacement_refuses_a_recreated_cgroup_root_while_its_worker_is_live() {
+    let temporary = TestDirectory::new("cgroup-live-recreated-root");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let old_root = temporary.path().join("old-delegated");
+    let checkout = temporary.path().join("checkout");
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cgroup_slot": {"backend":"cgroup-v2", "kind":"generic", "mode":"required", "unit":"admission-unit"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_argument = root.to_str().unwrap();
+    let mut crashing = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 1), ("cgroup_slot", 1)],
+        &[
+            "--cgroup-fixture",
+            root_argument,
+            "--crash-after",
+            "worker-release",
+        ],
+    );
+    let submission = Submission {
+        run_id: "cgroup-live-recreated-root",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &[("cgroup_slot", 1)])
+            .status
+            .success()
+    );
+    assert_eq!(crashing.wait().code(), Some(86));
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let worker_pid = status(&state, submission.run_id)["worker_pid"]
+        .as_u64()
+        .unwrap();
+
+    fs::rename(&root, &old_root).unwrap();
+    fs::create_dir(&root).unwrap();
+    let refused = run(&[
+        "serve",
+        "--state-dir",
+        state_argument(&state),
+        "--capacity",
+        "jobs=1",
+        "--capacity",
+        "cgroup_slot=1",
+        "--cgroup-fixture",
+        root_argument,
+        "--idle-timeout",
+        "0.05",
+    ]);
+    assert!(!refused.status.success());
+    let refusal: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refusal["code"], "broker-row-invalid");
+    assert!(refusal["message"].as_str().unwrap().contains("root-reused"));
+    assert!(process_state(worker_pid).is_some_and(|state| state != "Z"));
+
+    fs::write(&release, "release").unwrap();
+    wait_for(Duration::from_secs(5), || {
+        process_state(worker_pid).is_none()
+    });
+}
+
+#[test]
 fn replacement_refuses_a_cgroup_handle_that_no_longer_matches_its_manifest() {
     let temporary = TestDirectory::new("cgroup-corrupt-recovery-handle");
     let state = temporary.path().join("state");

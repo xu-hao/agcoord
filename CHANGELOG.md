@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Recover when systemd recreates the managed broker's delegated cgroup root after every worker
+  recorded against the old root is gone. The replacement now abandons only its private recovery
+  metadata, records those dead rows `interrupted`, and admits later work against the new root;
+  a live worker or any other cgroup identity mismatch still fails closed (#235).
 - A fresh host install now declares the machine's memory as well as its CPUs, and enforces both
   when the host allows it. The configuration written when a state directory has none derives
   `memory` capacity from `MemTotal` minus a reserve (the larger of 4 GiB or an eighth of RAM) and
