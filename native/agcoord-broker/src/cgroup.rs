@@ -2623,6 +2623,32 @@ impl CgroupBackend {
         Ok(())
     }
 
+    /// Forget only this broker's private recovery metadata after systemd recreated the
+    /// delegated root. The caller has already proved that every worker recorded against
+    /// the old root is gone, so no process or cgroup in the new root may be touched.
+    pub fn abandon_reused_root(&self) -> CgroupResult<()> {
+        self.prepare_metadata()?;
+        let owner_record = self.read_json(&self.owner_record_path())?;
+        match self.validate_owner_record(&owner_record) {
+            Err(error) if error.code == "root-reused" => {}
+            Err(error) => return Err(error),
+            Ok(_) => return Err(CgroupError::new("root-not-reused")),
+        }
+        let abandoned = self
+            .metadata_dir
+            .with_file_name(format!("cgroup-v2-reused-{}", random_hex(16)?));
+        if abandoned.exists() {
+            return Err(CgroupError::new("metadata-invalid"));
+        }
+        fs::rename(&self.metadata_dir, &abandoned)
+            .map_err(|_| CgroupError::new("metadata-invalid"))?;
+        // The rename is the recovery boundary: later operations see no metadata that
+        // could name the recreated root. Removal is best effort because user-created
+        // scratch permissions must not put the broker back into a startup loop.
+        let _ = fs::remove_dir_all(abandoned);
+        Ok(())
+    }
+
     pub fn tmpfs_setup(
         &self,
         request: &CgroupRequest,

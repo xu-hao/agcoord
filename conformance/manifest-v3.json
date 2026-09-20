@@ -242,6 +242,17 @@
       }
     },
     {
+      "id": "recovery.recreated-cgroup-root",
+      "domain": "recovery",
+      "description": "A replacement owner abandons a reused cgroup root only for dead recorded workers and refuses while a matching worker is alive.",
+      "tests": {
+        "rust_native": [
+          "scheduler::replacement_recovers_a_dead_worker_after_the_cgroup_root_is_recreated",
+          "scheduler::replacement_refuses_a_recreated_cgroup_root_while_its_worker_is_live"
+        ]
+      }
+    },
+    {
       "id": "crash.database-transactions",
       "domain": "crash_database",
       "description": "Ownership and admission transaction crashes recover without orphaning or duplicating work.",
