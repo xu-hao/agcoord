@@ -332,23 +332,46 @@ impl Broker {
                 "stored project quota recovery state has no configured native backend",
             ));
         }
-        if let Some(backend) = &cgroup_backend {
+        if let Some(backend) = &mut cgroup_backend {
+            let mut abandon_reused_root = false;
             for run in &runs {
                 let Some(record) = run.resource_state.get(resources::CGROUP_BACKEND) else {
                     continue;
                 };
                 let request = Self::cgroup_request(run, &record.resources)?;
-                backend
-                    .validate_recovery(&request, &record.handle)
-                    .map_err(|error| {
-                        AppError::new(
+                match backend.validate_recovery(&request, &record.handle) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.code == "root-reused"
+                            && run.status == "running"
+                            && !same_worker_process(
+                                run.worker_pid,
+                                run.worker_start_token.as_deref(),
+                            ) =>
+                    {
+                        abandon_reused_root = true;
+                    }
+                    Err(error) => {
+                        return Err(AppError::new(
                             "broker-row-invalid",
                             format!(
                                 "run {} has invalid cgroup recovery state: {}",
                                 run.run_id, error.code
                             ),
-                        )
-                    })?;
+                        ));
+                    }
+                }
+            }
+            if abandon_reused_root {
+                backend.abandon_reused_root().map_err(|error| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!(
+                            "cannot abandon dead workers' reused cgroup root: {}",
+                            error.code
+                        ),
+                    )
+                })?;
             }
         }
         if let Some(backend) = &project_quota_backend {
