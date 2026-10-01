@@ -451,9 +451,6 @@ CPU proof, then returns the same open receipt without another proof or recovery 
 If completion still cannot be confirmed, the error says to inspect the durable receipt; it
 does not claim the guard remains when completion may already have cleared it.
 
-**Qualification pending:** this recovery implementation still requires CI qualification.
-These commands do not establish that any release was published or a host activated.
-
 ### Normal restart and rollback
 
 `Restart=on-failure` recovers an unexpected broker exit without an idle shutdown. The durable

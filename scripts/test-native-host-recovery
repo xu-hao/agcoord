@@ -87,19 +87,21 @@ def main():
             and prior["resource_receipt"]["peak"]["cpu"] >= 1,
             "a passed supported-host enforcement receipt is required")
     checkout = Path.cwd().resolve()
-    # Validate the shipped independent pin before submitting work or changing the service.
-    package, installer, probe, identity = native_host._release_inputs(
-        args.package.resolve(), require_pin=True)
     client = CoordinatorClient(state_dir=state, checkout=checkout, autostart=False)
     native = NativeBrokerCommand.select(load_broker_config(state).native_broker)
     scratch = Path(tempfile.mkdtemp(prefix=".agcoord-recovery-rehearsal-", dir=checkout))
-    evidence = {"state": "running", "identity": identity,
+    evidence = {"state": "running", "stage": "verify-release",
                 "prior_enforcement_run_id": prior["run_id"], "rounds": []}
     active_recovery = None
+    record = None
     try:
+        # Validate the independent pin before submitting work or changing the service.
+        package, installer, probe, identity = native_host._release_inputs(
+            args.package.resolve(), require_pin=True)
+        evidence["identity"] = identity
         for mode in ("native", "public-cli"):
             marker = scratch / mode
-            record = {"mode": mode, "marker": str(marker)}
+            record = {"mode": mode, "marker": str(marker), "stage": "submit-owned-work"}
             evidence["rounds"].append(record)
             running_id = client.submit(
                 ["/bin/sleep", "6"], checkout=str(checkout),
@@ -113,17 +115,27 @@ def main():
             record["queued_run_id"] = queued_id
             require(client.status(queued_id)["status"] == "queued" and not marker.exists(),
                     "owned marker must remain queued behind the cpu=2 allocation")
+            record["stage"] = "stop-service"
             process(["systemctl", "--user", "stop", native_host.SERVICE])
-            record["running_receipt"] = await_status(client, running_id, {"passed"})
-            require(client.status(queued_id)["status"] == "queued" and not marker.exists(),
+            record["stage"] = "inspect-stopped-work"
+            record["running_receipt"] = native.invoke(
+                "status", state_dir=state, arguments=["--run-id", running_id])
+            require(record["running_receipt"]["status"] == "passed",
+                    "graceful stop must finish the owned running command")
+            stopped_queued = native.invoke(
+                "status", state_dir=state, arguments=["--run-id", queued_id])
+            require(stopped_queued["status"] == "queued" and not marker.exists(),
                     "graceful service stop must retain queued work without executing it")
             if mode == "native":
+                record["stage"] = "stage-package"
                 process(["sudo", installer, "stage", package])
+                record["stage"] = "activate-guarded-recovery"
                 process(["sudo", installer, "recover", state, "--probe", probe])
                 guarded = native.invoke("host-recover-status", state_dir=state)
                 require(guarded["state"] == "recovering", "durable recovery guard missing")
                 active_recovery = guarded["recovery_id"]
                 record["guard"] = guarded
+                record["stage"] = "start-guarded-service"
                 process(["systemctl", "--user", "daemon-reload"])
                 process(["systemctl", "--user", "start", native_host.SERVICE])
                 await_owner(client)
@@ -133,6 +145,8 @@ def main():
                     checkout=str(checkout), repository=None, branch=None, head_sha=None,
                     caller_pid=None, environment=None, exact_head=False)
                 proof_id = "check-" + uuid4().hex[:12]
+                record["proof_run_id"] = proof_id
+                record["stage"] = "submit-enforcement-proof"
                 arguments = client._native_submission_arguments(
                     run_id=proof_id, kind="check", label="owned recovery rehearsal proof",
                     identity=prepared.identity, branch=prepared.branch, head_sha=prepared.head_sha,
@@ -151,11 +165,13 @@ def main():
 
                 submitted = await_condition(submit_proof, "retained allocation settlement")
                 require(submitted == {"run_id": proof_id}, "proof receipt changed its declared row")
+                record["stage"] = "await-enforcement-proof"
                 record["proof"] = await_status(client, proof_id, {"passed"})
                 native_host._validate_proof(record["proof"], proof_id, operation="recovery")
                 require(client.status(queued_id)["status"] == "queued" and not marker.exists(),
                         "passed proof must not release ordinary work before explicit completion")
                 record["queued_before_complete"] = client.status(queued_id)
+                record["stage"] = "complete-recovery"
                 record["completion"] = native.invoke(
                     "host-recover-complete", state_dir=state,
                     arguments=["--recovery-id", active_recovery])
@@ -164,6 +180,7 @@ def main():
                         "native completion did not acknowledge the guarded proof")
                 active_recovery = None
             else:
+                record["stage"] = "public-cli-recovery"
                 result = process(["agc", "--json", "--state-dir", state,
                                   "host", "recover", package])
                 record["recovery"] = json.loads(result.stdout)
@@ -171,10 +188,12 @@ def main():
                         "public recovery command did not complete")
                 native_host._validate_proof(record["recovery"]["proof"],
                                             record["recovery"]["proof_run_id"], operation="recovery")
+            record["stage"] = "await-retained-work"
             record["queued_after_complete"] = await_status(client, queued_id, {"passed"})
             require(marker.read_text(encoding="ascii") == "run\n",
                     "completed recovery must execute owned queued marker exactly once")
             if mode == "native":
+                record["stage"] = "replay-completion"
                 replay = native.invoke("host-recover-complete", state_dir=state,
                                        arguments=["--recovery-id", guarded["recovery_id"]])
                 require(replay == record["completion"],
@@ -185,11 +204,25 @@ def main():
                 require(client.status(queued_id) == record["queued_after_complete"]
                         and marker.read_text(encoding="ascii") == "run\n",
                         "completion replay must not rerun accepted ordinary work")
+            record["stage"] = "passed"
+        evidence["stage"] = "passed"
         evidence["state"] = "passed"
         return 0
     except Exception as error:
         evidence["state"] = "failed"
         evidence["incident"] = f"{type(error).__name__}: {error}"
+        if record is not None:
+            evidence["failed_round"] = record["mode"]
+            evidence["stage"] = record["stage"]
+            proof_id = record.get("proof_run_id")
+            if proof_id is not None:
+                try:
+                    record["proof_log"] = native.invoke(
+                        "log", state_dir=state,
+                        arguments=["--run-id", proof_id, "--offset", "0", "--limit", "16384"])
+                    print(json.dumps({"owned_proof_log": record["proof_log"]}), file=sys.stderr)
+                except Exception as log_error:
+                    record["proof_log_incident"] = str(log_error)
         # Retain the guard and rows for the CI-owned cleanup; never force-open a failed proof.
         if active_recovery is not None:
             try:
@@ -198,11 +231,13 @@ def main():
                                          "--reason", "owned-host-rehearsal-failed"])
             except Exception as park_error:
                 evidence["park_incident"] = str(park_error)
-        try:
-            process(["systemctl", "--user", "stop", native_host.SERVICE])
-        except Exception as stop_error:
-            evidence["stop_incident"] = str(stop_error)
-        print(evidence["incident"], file=sys.stderr)
+        if record is not None:
+            try:
+                process(["systemctl", "--user", "stop", native_host.SERVICE])
+            except Exception as stop_error:
+                evidence["stop_incident"] = str(stop_error)
+        print(f"round={evidence.get('failed_round', 'setup')} "
+              f"stage={evidence['stage']}: {evidence['incident']}", file=sys.stderr)
         return 1
     finally:
         args.receipt.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n",
