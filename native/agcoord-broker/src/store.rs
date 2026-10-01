@@ -664,7 +664,7 @@ fn protocol(connection: &Connection) -> Result<u64> {
         })
 }
 
-fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
+pub(crate) fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
     connection
         .query_row(
             "SELECT value FROM coordinator_meta WHERE key = ?1",
@@ -675,7 +675,7 @@ fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
         .map_err(map_database_error)
 }
 
-fn set_metadata(connection: &Connection, key: &str, value: &str) -> Result<()> {
+pub(crate) fn set_metadata(connection: &Connection, key: &str, value: &str) -> Result<()> {
     connection
         .execute(
             "INSERT INTO coordinator_meta(key, value) VALUES (?1, ?2)
@@ -825,8 +825,12 @@ pub fn maintenance_record(connection: &Connection) -> Result<Option<MaintenanceR
     let drain_id = values.remove("maintenance_id").unwrap();
     let reason = values.remove("maintenance_reason").unwrap();
     let started_at = values.remove("maintenance_started_at").unwrap();
-    if !matches!(state.as_str(), "draining" | "drained")
-        || !drain_id_valid(&drain_id)
+    if !matches!(state.as_str(), "draining" | "drained" | "recovering")
+        || !(if state == "recovering" {
+            crate::recovery::valid_id(&drain_id)
+        } else {
+            drain_id_valid(&drain_id)
+        })
         || reason.is_empty()
         || reason.chars().count() > MAX_MAINTENANCE_REASON
         || reason.contains('\0')
@@ -859,13 +863,19 @@ pub fn maintenance_record(connection: &Connection) -> Result<Option<MaintenanceR
 pub fn mark_maintenance_drained(connection: &Connection) -> Result<()> {
     let record = maintenance_record(connection)?
         .ok_or_else(|| AppError::new("broker-not-draining", "coordinator is not draining"))?;
+    if record.state == "recovering" {
+        return Err(AppError::new(
+            "host-recovery-required",
+            "guarded host recovery cannot drain or resume",
+        ));
+    }
     if record.state != "drained" {
         set_metadata(connection, "maintenance_state", "drained")?;
     }
     Ok(())
 }
 
-fn install_maintenance_guards(connection: &Connection) -> Result<()> {
+pub(crate) fn install_maintenance_guards(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(&format!(
             r#"
@@ -874,7 +884,7 @@ fn install_maintenance_guards(connection: &Connection) -> Result<()> {
             WHEN EXISTS (
                 SELECT 1 FROM coordinator_meta
                 WHERE key = 'maintenance_state'
-                  AND value IN ('draining', 'drained')
+                  AND value IN ('draining', 'drained', 'recovering')
             )
             BEGIN
                 SELECT RAISE(ABORT, '{}');
@@ -912,7 +922,7 @@ fn install_maintenance_guards(connection: &Connection) -> Result<()> {
         .map_err(map_database_error)
 }
 
-fn remove_maintenance_guards(connection: &Connection) -> Result<()> {
+pub(crate) fn remove_maintenance_guards(connection: &Connection) -> Result<()> {
     for name in MAINTENANCE_TRIGGERS {
         connection
             .execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))
@@ -1077,6 +1087,12 @@ pub fn resume(state_dir: &Path, drain_id: &str) -> Result<Value> {
         .map_err(map_database_error)?;
     let record = maintenance_record(&connection)?
         .ok_or_else(|| AppError::new("broker-not-draining", "coordinator is not draining"))?;
+    if record.state == "recovering" {
+        return Err(AppError::new(
+            "host-recovery-required",
+            "complete verified host recovery instead of resume",
+        ));
+    }
     if record.drain_id != drain_id {
         return Err(AppError::new(
             "broker-drain-id-mismatch",
@@ -2510,7 +2526,7 @@ fn validate_identifier(value: &str, subject: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
+pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
     validate_identifier(&request.run_id, "run ID")?;
     validate_identifier(&request.repository_id, "repository ID")?;
     validate_identifier(&request.worktree_id, "worktree ID")?;
@@ -2645,6 +2661,72 @@ fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
     Ok(())
 }
 
+fn insert_request(
+    connection: &Connection,
+    request: &SubmitRequest,
+    owner: &OwnerInfo,
+    gate_run_id: Option<String>,
+) -> Result<()> {
+    let timestamp = now(connection)?;
+    let contract = resource_contract(&request.resources, &owner.resource_bindings)?;
+    let receipt = initial_receipt(&request.resources);
+    connection
+        .execute(
+            "INSERT INTO runs (
+                run_id, status, kind, phase, label, agent, repository_id, repository,
+                worktree_id, checkout, branch, head_sha, barrier, resources_json,
+                resource_contract_json, resource_receipt_json, resource_state_json,
+                gate_run_id, publication_adapter, publication_request, caller_pid,
+                command_json, environment_json, created_at
+             ) VALUES (
+                ?1, 'queued', ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, '{}', ?15, ?16, ?17, ?18, ?19, ?20, ?21
+             )",
+            params![
+                request.run_id,
+                request.kind,
+                request.label.trim(),
+                request.agent,
+                request.repository_id,
+                request.repository,
+                request.worktree_id,
+                request.checkout.to_string_lossy(),
+                request.branch,
+                request.head_sha,
+                i64::from(matches!(request.kind.as_str(), "merge" | "land")),
+                serde_json::to_string(&request.resources).unwrap(),
+                serde_json::to_string(&contract).unwrap(),
+                serde_json::to_string(&receipt).unwrap(),
+                gate_run_id,
+                request.publication_adapter,
+                request
+                    .publication_request
+                    .as_ref()
+                    .map(|value| serde_json::to_string(value).unwrap()),
+                i64::from(request.caller_pid),
+                serde_json::to_string(&request.command).unwrap(),
+                serde_json::to_string(&request.environment).unwrap(),
+                timestamp,
+            ],
+        )
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
+pub(crate) fn insert_check(
+    connection: &Connection,
+    request: &SubmitRequest,
+    owner: &OwnerInfo,
+) -> Result<()> {
+    if request.kind != "check" {
+        return Err(AppError::new(
+            "broker-submission-invalid",
+            "recovery proof must be a check",
+        ));
+    }
+    insert_request(connection, request, owner, None)
+}
+
 pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
     let owner = owner_info(paths)?;
     validate_submit(request, &owner)?;
@@ -2734,49 +2816,7 @@ pub fn submit(paths: &Paths, request: &SubmitRequest) -> Result<Value> {
             ));
         }
     }
-    let timestamp = now(&connection)?;
-    let contract = resource_contract(&request.resources, &owner.resource_bindings)?;
-    let receipt = initial_receipt(&request.resources);
-    connection
-        .execute(
-            "INSERT INTO runs (
-                run_id, status, kind, phase, label, agent, repository_id, repository,
-                worktree_id, checkout, branch, head_sha, barrier, resources_json,
-                resource_contract_json, resource_receipt_json, resource_state_json,
-                gate_run_id, publication_adapter, publication_request, caller_pid,
-                command_json, environment_json, created_at
-             ) VALUES (
-                ?1, 'queued', ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, '{}', ?15, ?16, ?17, ?18, ?19, ?20, ?21
-             )",
-            params![
-                request.run_id,
-                request.kind,
-                request.label.trim(),
-                request.agent,
-                request.repository_id,
-                request.repository,
-                request.worktree_id,
-                request.checkout.to_string_lossy(),
-                request.branch,
-                request.head_sha,
-                i64::from(matches!(request.kind.as_str(), "merge" | "land")),
-                serde_json::to_string(&request.resources).unwrap(),
-                serde_json::to_string(&contract).unwrap(),
-                serde_json::to_string(&receipt).unwrap(),
-                selected_gate_run_id,
-                request.publication_adapter,
-                request
-                    .publication_request
-                    .as_ref()
-                    .map(|value| serde_json::to_string(value).unwrap()),
-                i64::from(request.caller_pid),
-                serde_json::to_string(&request.command).unwrap(),
-                serde_json::to_string(&request.environment).unwrap(),
-                timestamp,
-            ],
-        )
-        .map_err(map_database_error)?;
+    insert_request(&connection, request, &owner, selected_gate_run_id)?;
     set_metadata(&connection, "last_activity", &now(&connection)?)?;
     connection
         .execute_batch("COMMIT")
