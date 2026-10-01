@@ -286,6 +286,7 @@ impl Broker {
             std::process::exit(86);
         }
         let connection = initialize_native(&paths, &capacities)?;
+        crate::recovery::record(&connection)?;
         let runs = load_runs(&connection)?;
         if let Some(maintenance) = maintenance_record(&connection)? {
             let live = runs
@@ -298,7 +299,7 @@ impl Broker {
                     "coordinator maintenance state is drained but live rows remain",
                 ));
             }
-            if live == 0 {
+            if live == 0 && maintenance.state != "recovering" {
                 mark_maintenance_drained(&connection)?;
                 return Err(AppError::new(
                     "broker-drained",
@@ -494,7 +495,9 @@ impl Broker {
                     |row| row.get(0),
                 )
                 .map_err(map_database_error)?;
-            if !has_live && maintenance_record(&connection)?.is_some() {
+            if !has_live
+                && maintenance_record(&connection)?.is_some_and(|m| m.state != "recovering")
+            {
                 mark_maintenance_drained(&connection)?;
                 return Ok(());
             }
@@ -572,11 +575,12 @@ impl Broker {
                 .filter(|run| run.status == "running")
                 .cloned()
                 .collect();
-            let queued: Vec<_> = runs
+            let mut queued: Vec<_> = runs
                 .iter()
                 .filter(|run| run.status == "queued")
                 .cloned()
                 .collect();
+            crate::recovery::filter_queued(&connection, &mut queued)?;
             self.validate_active(&active)?;
             let Some(next) = self.next_admissible(&active, &queued) else {
                 return Ok(());
@@ -834,7 +838,10 @@ impl Broker {
         Ok(bindings)
     }
 
-    fn cgroup_request(run: &RunRecord, names: &[String]) -> Result<cgroup::CgroupRequest> {
+    pub(crate) fn cgroup_request(
+        run: &RunRecord,
+        names: &[String],
+    ) -> Result<cgroup::CgroupRequest> {
         let bindings = Self::run_bindings(run)?;
         let selected_resources = names
             .iter()

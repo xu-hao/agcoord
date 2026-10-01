@@ -4,6 +4,7 @@ mod error;
 mod host;
 mod platform;
 mod project_quota;
+mod recovery;
 mod resources;
 mod store;
 mod worker;
@@ -54,6 +55,8 @@ fn print_help() {
             "  host-preflight   Verify the managed host trust boundary\n",
             "  host-client-preflight Verify admitted client calls stay restricted\n",
             "  host-drain-check Prove a spool is idle and unowned before activation\n",
+            "  host-recover-hold Prepare guarded recovery and hold exclusive ownership\n",
+            "  host-recover-status|proof|complete|park  Inspect or advance guarded recovery\n",
             "  host-drain-hold  Hold the verified maintenance lock until input closes\n",
             "  drain            Atomically refuse new work and retain a durable receipt\n",
             "  drain-status     Read one durable drain without starting a broker\n",
@@ -126,6 +129,31 @@ fn insert_mapping(mapping: &mut BTreeMap<String, u64>, value: &str, subject: &st
         .ok_or_else(|| AppError::usage(format!("{subject} units must be a positive integer")))?;
     mapping.insert(name.to_owned(), units);
     Ok(())
+}
+
+fn take_option(arguments: &[String], name: &str) -> Result<(Vec<String>, String)> {
+    let mut remaining = Vec::new();
+    let mut selected = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--" {
+            remaining.extend_from_slice(&arguments[index..]);
+            break;
+        }
+        if arguments[index] == name {
+            if selected.is_some() {
+                return Err(AppError::usage(format!("duplicate {name}")));
+            }
+            selected = Some(option_value(arguments, &mut index, name)?);
+        } else {
+            remaining.push(arguments[index].clone());
+        }
+        index += 1;
+    }
+    Ok((
+        remaining,
+        selected.ok_or_else(|| AppError::usage(format!("{name} is required")))?,
+    ))
 }
 
 fn parse_state_only(arguments: &[String]) -> Result<PathBuf> {
@@ -1057,6 +1085,30 @@ fn run_command(arguments: &[String]) -> Result<()> {
             emit_json(&host::preflight(&parse_host_preflight(rest)?)?)
         }
         [command] if command == "host-client-preflight" => emit_json(&host::client_preflight()?),
+        [command, rest @ ..] if command == "host-recover-hold" => {
+            let (rest, probe) = take_option(rest, "--probe")?;
+            host::recover_hold(&parse_state_only(&rest)?, PathBuf::from(probe).as_path())
+        }
+        [command, rest @ ..] if command == "host-recover-status" => {
+            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
+            emit_json(&recovery::status(&paths)?)
+        }
+        [command, rest @ ..] if command == "host-recover-proof" => {
+            let (rest, id) = take_option(rest, "--recovery-id")?;
+            let (paths, request) = parse_submit(&rest)?;
+            emit_json(&recovery::submit_proof(&paths, &id, &request)?)
+        }
+        [command, rest @ ..] if command == "host-recover-complete" => {
+            let (rest, id) = take_option(rest, "--recovery-id")?;
+            let paths = Paths::new(&parse_state_only(&rest)?).configured()?;
+            emit_json(&recovery::complete(&paths, &id)?)
+        }
+        [command, rest @ ..] if command == "host-recover-park" => {
+            let (rest, id) = take_option(rest, "--recovery-id")?;
+            let (rest, reason) = take_option(&rest, "--reason")?;
+            let paths = Paths::new(&parse_state_only(&rest)?).configured()?;
+            emit_json(&recovery::park(&paths, &id, &reason)?)
+        }
         [command, rest @ ..] if command == "host-drain-check" => {
             emit_json(&host::drain_check(&parse_state_only(rest)?)?)
         }
