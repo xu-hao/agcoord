@@ -998,6 +998,12 @@ pub fn begin_drain(state_dir: &Path, drain_id: &str, reason: &str) -> Result<Val
             format!("durable draining does not support protocol {selected}"),
         ));
     }
+    if maintenance_record(&connection)?.is_some_and(|m| m.state == "recovering") {
+        return Err(AppError::new(
+            "host-recovery-required",
+            "guarded recovery cannot be replaced by a normal drain",
+        ));
+    }
     if maintenance_record(&connection)?.is_none() {
         connection
             .execute(
@@ -1064,6 +1070,12 @@ pub fn drain_status(state_dir: &Path) -> Result<Value> {
 }
 
 pub fn resume(state_dir: &Path, drain_id: &str) -> Result<Value> {
+    if crate::recovery::valid_id(drain_id) {
+        return Err(AppError::new(
+            "host-recovery-required",
+            "complete verified host recovery instead of resume",
+        ));
+    }
     if !drain_id_valid(drain_id) {
         return Err(AppError::new(
             "broker-drain-id-invalid",

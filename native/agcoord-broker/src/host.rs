@@ -744,16 +744,16 @@ pub fn recover_hold(state_dir: &Path, probe: &Path) -> Result<()> {
     // The privileged installer's child drops to the spool owner before opening SQLite.
     // This preserves WAL ownership; the parent installer alone retains host-write authority.
     // SAFETY: credential changes affect this standalone maintenance child only.
-    if unsafe { libc::geteuid() } == 0 && state.uid() != 0 {
-        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+    if unsafe { libc::geteuid() } == 0
+        && state.uid() != 0
+        && (unsafe { libc::setgroups(0, std::ptr::null()) } != 0
             || unsafe { libc::setgid(state.gid()) } != 0
-            || unsafe { libc::setuid(state.uid()) } != 0
-        {
-            return Err(refusal(
-                "host-recovery-owner-invalid",
-                "cannot become the spool owner",
-            ));
-        }
+            || unsafe { libc::setuid(state.uid()) } != 0)
+    {
+        return Err(refusal(
+            "host-recovery-owner-invalid",
+            "cannot become the spool owner",
+        ));
     }
     let paths = crate::store::Paths::new(state_dir).configured()?;
     let result = crate::recovery::prepare(&paths, probe)?;

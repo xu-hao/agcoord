@@ -1377,7 +1377,14 @@ def recover_native_host(
             time.sleep(0.1)
         proof = _validate_proof(proof, proof_id, operation="recovery")
         phase = "completion"
-        completed = _recovery_invoke("host-recover-complete", paths.state_dir, ["--recovery-id", recovery_id])
+        for attempt in range(3):
+            try:
+                completed = _recovery_invoke("host-recover-complete", paths.state_dir, ["--recovery-id", recovery_id])
+                break
+            except CoordinatorError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
         if completed != {"state":"open", "recovery_id":recovery_id, "proof_run_id":proof_id}:
             raise CoordinatorError("invalid recovery completion receipt", code="host-recovery-invalid")
     except CoordinatorError as exc:
@@ -1397,8 +1404,9 @@ def recover_native_host(
         except CoordinatorError as stop_error:
             service = f"service stop unconfirmed: {stop_error}"
         retained = f"recovery {recovery_id}" if recovery_id else "any established recovery guard"
+        guard_state = "completion could not be confirmed; inspect its durable receipt" if incident == "completion" else f"{retained} remains retained"
         raise CoordinatorError(
-            f"native-host recovery failed at {incident}: {exc}; {retained} remains retained; "
+            f"native-host recovery failed at {incident}: {exc}; {guard_state}; "
             f"{service}; retry the same verified package after addressing the incident"
             + ("; " + "; ".join(details) if details else ""),
             code="native-host-recovery-incomplete",
