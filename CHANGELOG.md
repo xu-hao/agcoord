@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Define the guarded managed-host recovery contract for an outgoing broker that cannot drain:
+  exclusive ownership and verified dead worker identities, interrupted dead running rows,
+  preserved queued IDs and history, and a durable submission/admission guard until replacement
+  identity and enforcement are proven. Live or ambiguous workers and invalid packages refuse;
+  bounded retries retain the same recovery identity and interrupted recovery parks safely.
+  Runtime command and receipt implementation remains pending (#242).
 - Recover when systemd recreates the managed broker's delegated cgroup root after every worker
   recorded against the old root is gone. The replacement now abandons only its private recovery
   metadata, records those dead rows `interrupted`, and admits later work against the new root;
