@@ -11,11 +11,13 @@ versioning; dates use ISO 8601.
 remain separate steps; this entry records the candidate contents.
 
 - Add `agc host recover PACKAGE` and `agc host recover --download` for a dead managed owner
-  that cannot drain. Recovery always verifies a pinned replacement, refuses live or ambiguous
-  workers, and preserves queued IDs and history behind a durable guard. Only the bound
+  that cannot drain. Recovery always verifies a pinned replacement; a new recovery refuses live
+  or ambiguous workers, and preserves queued IDs and history behind a durable guard. Only the bound
   `cpu=1` enforcement proof can run before successful completion reopens ordinary work. Dead
   running rows become `interrupted`; bounded failures park under the same recovery identity.
   Three proof attempts persist across retries, which require the same replacement and helper.
+  A running replacement under the exact matching guard can continue its existing proof without
+  reactivation; exact-ID completion retries return the validated durable result after a lost reply.
   CI qualification remains pending; no publication or host activation is claimed (#242).
 - Recover when systemd recreates the managed broker's delegated cgroup root after every worker
   recorded against the old root is gone. The replacement now abandons only its private recovery

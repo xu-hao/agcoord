@@ -213,9 +213,9 @@ def _names(recovery):
     return [name for name, _ in recovery.events]
 
 
-def _assert_parked(recovery):
+def _assert_parked(recovery, *, completion_attempts=0):
     assert recovery.guarded and recovery.parked
-    assert "host-recover-complete" not in _names(recovery)
+    assert _names(recovery).count("host-recover-complete") == completion_attempts
     assert recovery.events[-1] == (
         "process", [str(native_host.SYSTEMCTL), "--user", "stop", native_host.SERVICE])
     assert recovery.queue.read_bytes() == b"owned retained queue fixture"
@@ -399,4 +399,4 @@ def test_completion_transport_failure_has_bounded_retry_then_parks(recovery):
     completions = [arguments for name, arguments in recovery.events if name == "host-recover-complete"]
     assert completions == [["--recovery-id", RECOVERY_ID]] * 3
     assert _names(recovery).count("host-recover-proof") == 1
-    _assert_parked(recovery)
+    _assert_parked(recovery, completion_attempts=3)

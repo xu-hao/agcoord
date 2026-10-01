@@ -405,10 +405,10 @@ agc host recover /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.ta
 agc host recover --download
 ```
 
-Recovery always requires a broker pin, including a bundle supplied by path. It refuses a live
-owner, live or ambiguous recorded workers, unavailable identity evidence, and an invalid
-package. It never substitutes a forced activation or deletion of the spool. Normal
-`agc host upgrade` and its drain flow remain unchanged.
+Recovery always requires a broker pin, including a bundle supplied by path. Starting a new
+recovery refuses a live owner, live or ambiguous recorded workers, unavailable identity
+evidence, and an invalid package. It never substitutes a forced activation or deletion of the
+spool. Normal `agc host upgrade` and its drain flow remain unchanged.
 
 The command stages the verified replacement and stops the failed service. The staged native
 holder takes the exclusive owner/maintenance lock, proves every recorded worker identity is
@@ -425,6 +425,12 @@ status zero, a receipt with requested and applied CPU both 1 and observed peak C
 the unchanged helper digest, and no running rows. Only successful completion clears the guard.
 A process exit, service restart, normal `agc drain`, or `agc resume` cannot clear it.
 
+If the verified replacement is already running under the same active recovery guard, rerunning
+`agc host recover` continues that guard instead of stopping or reactivating the service. The
+replacement identity and helper path and digest must match exactly. An ordinary live owner or
+a mismatched guard still refuses. Continuation reuses a queued, running, or passed proof while
+that recovery is verifying; it does not submit a duplicate or spend another proof attempt.
+
 The native hold, status, proof, completion, and park operations retain the exact recovery ID,
 replacement identity, helper path and digest, proof job ID, attempt count, phase, and incident.
 Each host phase and enforcement proof is bounded to 120 seconds; owner acquisition and dead-row
@@ -433,10 +439,17 @@ across retries. Retrying must use the same exact verified replacement package an
 it continues the same recovery identity and never resets the attempt budget. Exhausted proof
 attempts require operator repair, with no reset bypass.
 
-A failed or interrupted operation parks safely with the guard intact and nonsecret evidence
-of the failed phase. The command stops the service on failure or explicitly reports that the
-stop is unconfirmed; it does not silently resume work or claim an unproved host is ready.
-Preserve the recovery ID and address the reported incident before retrying the same package.
+Before completion, a failed or interrupted operation parks safely with the guard intact and
+nonsecret evidence of the failed phase. If the service was touched, failure stops it or
+explicitly reports that the stop is unconfirmed; an earlier staging failure leaves it unchanged.
+The command does not silently resume work or claim an unproved host is ready. Preserve the
+recovery ID and address the reported incident before retrying the same package.
+
+Completion retries up to three times with the exact recovery ID. If completion committed but
+its reply was lost, the native operation validates the retained completed identity and passed
+CPU proof, then returns the same open receipt without another proof or recovery operation.
+If completion still cannot be confirmed, the error says to inspect the durable receipt; it
+does not claim the guard remains when completion may already have cleared it.
 
 **Qualification pending:** this recovery implementation still requires CI qualification.
 These commands do not establish that any release was published or a host activated.
