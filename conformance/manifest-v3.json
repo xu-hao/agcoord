@@ -373,6 +373,17 @@
           "scheduler::required_cgroup_binding_refuses_before_user_code_when_delegation_is_unavailable"
         ]
       }
+    },
+    {
+      "id": "recovery.guarded-managed-host",
+      "domain": "recovery",
+      "description": "A dead managed owner can be replaced while queued identities and history remain guarded; live owners or workers refuse recovery and ordinary work stays blocked across restarts.",
+      "tests": {
+        "rust_native": [
+          "host_recovery::recovery_preserves_queued_work_and_guards_admission_across_restarts",
+          "host_recovery::recovery_refuses_a_live_owner_and_a_live_retained_worker"
+        ]
+      }
     }
   ],
   "intentional_differences": [

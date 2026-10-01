@@ -386,7 +386,8 @@ and coordinator drained unless the resume step had already succeeded.
 
 For manual upgrade or recovery where the outgoing broker can drain, run `stage` while the
 current service remains available. Inspect the staged package digest, run `agc drain`, retain
-its exact ID, and stop the user service after the receipt says `drained`. Run `activate --drain-id ID`, `daemon-reload`, any required `migrate`,
+its exact ID, and stop the user service after the receipt says `drained`. Run
+`activate --drain-id ID`, `daemon-reload`, any required `migrate`,
 exact-ID `resume`, and `start` in that order. An explicitly chosen cancellation policy may shorten
 the drain, but cancellation never replaces its durable submission guard. Never replace the live
 binary and ask systemd to restart while work remains. After start, inspect `systemctl --user
@@ -395,27 +396,50 @@ status agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
 ### Guarded recovery when the outgoing broker cannot drain
 
 The normal drain flow depends on a functioning outgoing broker. It cannot produce a completed
-drain when that broker is dead or cannot start. Recovery in that condition must establish the
-following boundary; it must never substitute a forced activation or deletion of the spool.
-This is the approved recovery contract; its command and receipt mechanics remain to be
-implemented.
+drain when that broker is dead or cannot start. Use the separate managed recovery operation
+with the exact matching client and a pinned replacement:
 
-Under the exclusive owner/maintenance lock, recovery must verify the selected package and
-prove that every recorded worker identity is gone before changing host files or worker state.
-A live worker, an ambiguous identity, unavailable identity evidence, or an invalid package
-refuses recovery. Only running rows whose workers are proven dead become `interrupted`, with
-no execution verdict. Queued job IDs and their work, terminal history, and the spool remain
-intact; recovery never reruns an interrupted or terminal command.
+```bash
+agc host recover /path/to/native-host-bundle/agcoord-native-host-x86_64-linux.tar.gz
+# Or fetch the matching release bundle:
+agc host recover --download
+```
 
-A durable recovery guard must block new submissions and admission of ordinary queued jobs
-through activation and restart, until the replacement host's exact identity and enforcement
-are proven. The enforcement proof must not release ordinary work early. A process exit or
-service restart cannot clear that guard or count as successful recovery.
+Recovery always requires a broker pin, including a bundle supplied by path. It refuses a live
+owner, live or ambiguous recorded workers, unavailable identity evidence, and an invalid
+package. It never substitutes a forced activation or deletion of the spool. Normal
+`agc host upgrade` and its drain flow remain unchanged.
 
-Recovery must retain its exact durable identity across bounded retries and restarts. An
-interrupted operation or exhausted retry budget parks safely with the guard intact and
-nonsecret evidence of the failed step; it must not silently resume work. Retrying continues
-the same recovery operation rather than manufacturing a new identity or weakening the proof.
+The command stages the verified replacement and stops the failed service. The staged native
+holder takes the exclusive owner/maintenance lock, proves every recorded worker identity is
+gone, and establishes a durable `recovery-` ID followed by 12 hexadecimal digits. It holds the
+lock through activation and installed-identity verification. The restarted replacement
+settles dead running rows as `interrupted`, without an execution verdict. Queued job IDs and
+their work, terminal history, and the spool remain intact; recovery never reruns an interrupted
+or terminal command.
+
+The durable guard blocks new submissions and ordinary queued-job admission through activation
+and restart. Recovery admits only the exact bound enforcement helper, with `cpu=1` and
+`jobs=1`, while ordinary work stays blocked. Completion requires that proof to pass with exit
+status zero, a receipt with requested and applied CPU both 1 and observed peak CPU at least 1,
+the unchanged helper digest, and no running rows. Only successful completion clears the guard.
+A process exit, service restart, normal `agc drain`, or `agc resume` cannot clear it.
+
+The native hold, status, proof, completion, and park operations retain the exact recovery ID,
+replacement identity, helper path and digest, proof job ID, attempt count, phase, and incident.
+Each host phase and enforcement proof is bounded to 120 seconds; owner acquisition and dead-row
+settlement waits are each bounded to 30 seconds. At most three proof attempts are allowed
+across retries. Retrying must use the same exact verified replacement package and helper path;
+it continues the same recovery identity and never resets the attempt budget. Exhausted proof
+attempts require operator repair, with no reset bypass.
+
+A failed or interrupted operation parks safely with the guard intact and nonsecret evidence
+of the failed phase. The command stops the service on failure or explicitly reports that the
+stop is unconfirmed; it does not silently resume work or claim an unproved host is ready.
+Preserve the recovery ID and address the reported incident before retrying the same package.
+
+**Qualification pending:** this recovery implementation still requires CI qualification.
+These commands do not establish that any release was published or a host activated.
 
 ### Normal restart and rollback
 

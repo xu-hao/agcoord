@@ -2633,10 +2633,10 @@ impl CgroupBackend {
             Err(error) if error.code == "root-reused" => return Ok(()),
             result => result?,
         }
-        if let Some(leaf) = self.resolve(request, handle, true)? {
-            if self.system.populated(&leaf)? {
-                return Err(CgroupError::new("leaf-populated"));
-            }
+        if let Some(leaf) = self.resolve(request, handle, true)?
+            && self.system.populated(&leaf)?
+        {
+            return Err(CgroupError::new("leaf-populated"));
         }
         Ok(())
     }

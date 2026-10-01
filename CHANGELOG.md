@@ -5,12 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
-- Define the guarded managed-host recovery contract for an outgoing broker that cannot drain:
-  exclusive ownership and verified dead worker identities, interrupted dead running rows,
-  preserved queued IDs and history, and a durable submission/admission guard until replacement
-  identity and enforcement are proven. Live or ambiguous workers and invalid packages refuse;
-  bounded retries retain the same recovery identity and interrupted recovery parks safely.
-  Runtime command and receipt implementation remains pending (#242).
+- Add `agc host recover PACKAGE` and `agc host recover --download` for a dead managed owner
+  that cannot drain. Recovery always verifies a pinned replacement, refuses live or ambiguous
+  workers, and preserves queued IDs and history behind a durable guard. Only the bound
+  `cpu=1` enforcement proof can run before successful completion reopens ordinary work. Dead
+  running rows become `interrupted`; bounded failures park under the same recovery identity.
+  Three proof attempts persist across retries, which require the same replacement and helper.
+  CI qualification remains pending; no publication or host activation is claimed (#242).
 - Recover when systemd recreates the managed broker's delegated cgroup root after every worker
   recorded against the old root is gone. The replacement now abandons only its private recovery
   metadata, records those dead rows `interrupted`, and admits later work against the new root;

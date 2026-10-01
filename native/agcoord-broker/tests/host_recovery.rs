@@ -70,7 +70,14 @@ impl Fixture {
     fn start(&self) -> OwnedProcess {
         let mut process = OwnedProcess(
             self.command("serve")
-                .args(["--capacity", "jobs=1", "--idle-timeout", "30"])
+                .args([
+                    "--capacity",
+                    "jobs=1",
+                    "--capacity",
+                    "cpu=1",
+                    "--idle-timeout",
+                    "30",
+                ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -97,7 +104,21 @@ impl Fixture {
     }
 
     fn submit(&self, id: &str, arguments: &[&str]) -> Output {
-        self.command("submit")
+        self.submit_request(self.command("submit"), id, arguments)
+    }
+
+    fn proof(&self, recovery_id: &str, run_id: &str) -> Output {
+        let mut command = self.command("host-recover-proof");
+        command.args(["--recovery-id", recovery_id, "--resource", "cpu=1"]);
+        self.submit_request(
+            command,
+            run_id,
+            &[self.root.join("enforcement-probe").to_str().unwrap()],
+        )
+    }
+
+    fn submit_request(&self, mut command: Command, id: &str, arguments: &[&str]) -> Output {
+        command
             .args([
                 "--run-id",
                 id,
@@ -175,6 +196,34 @@ impl Fixture {
         wait_for(|| process_identity(pid).is_none_or(|(state, _)| state == "Z"));
     }
 
+    fn recovery_status(&self) -> Value {
+        parsed(self.command("host-recover-status").output().unwrap())
+    }
+
+    fn guarded_replacement(&mut self) -> (OwnedProcess, String) {
+        let mut old = self.queue_behind_worker();
+        old.kill();
+        self.stop_worker();
+        let (mut holder, receipt) = self.hold();
+        drop(holder.0.stdin.take());
+        assert!(holder.0.wait().unwrap().success());
+        let replacement = self.start();
+        wait_for(|| self.status("retained-running")["status"] == "interrupted");
+        (
+            replacement,
+            receipt["recovery_id"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    fn assert_queue_guarded(&self) {
+        assert_eq!(self.status("retained-queued")["status"], "queued");
+        assert!(!self.root.join("executed").exists());
+        assert_eq!(
+            refused(self.submit("ordinary-new-job", &["/bin/true"]))["code"],
+            "broker-draining"
+        );
+    }
+
     fn hold(&self) -> (OwnedProcess, Value) {
         let output = self.root.join("holder-output");
         let error = self.root.join("holder-error");
@@ -235,6 +284,37 @@ fn parsed(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn assert_retained_queue(actual: &Value, original: &Value) {
+    assert_eq!(actual["status"], "queued");
+    for field in [
+        "run_id",
+        "sequence",
+        "kind",
+        "label",
+        "repository_id",
+        "worktree_id",
+        "checkout",
+        "branch",
+        "head_sha",
+        "resources",
+        "command",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "worker_pid",
+        "cancel_requested",
+    ] {
+        assert_eq!(actual[field], original[field], "retained field {field}");
+    }
+    assert_eq!(actual["run_id"], "retained-queued");
+    assert!(
+        actual["command"]
+            .as_array()
+            .is_some_and(|args| !args.is_empty())
+    );
+    assert!(actual["created_at"].is_string());
+}
+
 fn refused(output: Output) -> Value {
     assert!(!output.status.success(), "operation unexpectedly succeeded");
     serde_json::from_slice(&output.stderr).unwrap()
@@ -255,7 +335,7 @@ fn recovery_preserves_queued_work_and_guards_admission_across_restarts() {
     let suffix = recovery_id.strip_prefix("recovery-").unwrap();
     assert_eq!(suffix.len(), 12);
     assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_eq!(fixture.status("retained-queued"), queued);
+    assert_retained_queue(&fixture.status("retained-queued"), &queued);
     let owner = refused(fixture.command("serve").output().unwrap());
     assert_eq!(owner["code"], "broker-already-owned");
     drop(holder.0.stdin.take());
@@ -270,7 +350,7 @@ fn recovery_preserves_queued_work_and_guards_admission_across_restarts() {
         );
         // Observe multiple scheduling ticks while the otherwise runnable row is guarded.
         thread::sleep(Duration::from_millis(300));
-        assert_eq!(fixture.status("retained-queued"), queued);
+        assert_retained_queue(&fixture.status("retained-queued"), &queued);
         assert!(!fixture.root.join("executed").exists());
         replacement.kill();
     }
@@ -305,6 +385,166 @@ fn recovery_refuses_a_live_owner_and_a_live_retained_worker() {
         "host-recovery-worker-live"
     );
     assert_eq!(fixture.status("retained-running")["status"], "running");
-    assert_eq!(fixture.status("retained-queued"), queued);
+    assert_retained_queue(&fixture.status("retained-queued"), &queued);
     assert!(!fixture.root.join("executed").exists());
+}
+
+#[test]
+fn a_successful_unenforced_proof_cannot_complete_or_resume_recovery() {
+    let mut fixture = Fixture::new();
+    let (_replacement, id) = fixture.guarded_replacement();
+    assert_eq!(fixture.recovery_status()["recovery_id"], id);
+    parsed(fixture.proof(&id, "unenforced-proof"));
+    wait_for(|| fixture.status("unenforced-proof")["status"] == "passed");
+    let proof = fixture.status("unenforced-proof");
+    assert_eq!(proof["resource_receipt"]["requested"]["cpu"], 1);
+    assert!(proof["resource_receipt"]["applied"]["cpu"].is_null());
+    assert_eq!(
+        refused(
+            fixture
+                .command("host-recover-complete")
+                .args(["--recovery-id", &id])
+                .output()
+                .unwrap()
+        )["code"],
+        "host-recovery-proof-failed"
+    );
+    refused(
+        fixture
+            .command("resume")
+            .args(["--drain-id", &id])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fixture.recovery_status()["recovery_id"], id);
+    fixture.assert_queue_guarded();
+}
+
+#[test]
+fn mismatched_recovery_identity_and_changed_helper_preserve_the_guard() {
+    let mut fixture = Fixture::new();
+    let (_replacement, id) = fixture.guarded_replacement();
+    let wrong = if id == "recovery-000000000000" {
+        "recovery-111111111111"
+    } else {
+        "recovery-000000000000"
+    };
+    assert_eq!(
+        refused(fixture.proof(wrong, "wrong-id-proof"))["code"],
+        "host-recovery-invalid"
+    );
+    assert_eq!(
+        refused(
+            fixture
+                .command("host-recover-complete")
+                .args(["--recovery-id", wrong])
+                .output()
+                .unwrap()
+        )["code"],
+        "host-recovery-invalid"
+    );
+    assert_eq!(
+        refused(
+            fixture
+                .command("host-recover-park")
+                .args(["--recovery-id", wrong, "--reason", "test-wrong-identity"])
+                .output()
+                .unwrap()
+        )["code"],
+        "host-recovery-invalid"
+    );
+    let mut command = fixture.command("host-recover-proof");
+    command.args(["--recovery-id", &id, "--resource", "cpu=1"]);
+    assert_eq!(
+        refused(fixture.submit_request(command, "other-command-proof", &["/bin/true"]))["code"],
+        "host-recovery-invalid"
+    );
+    fs::write(
+        fixture.root.join("enforcement-probe"),
+        "#!/bin/sh\nexit 7\n",
+    )
+    .unwrap();
+    assert_eq!(
+        refused(fixture.proof(&id, "changed-helper-proof"))["code"],
+        "host-recovery-invalid"
+    );
+    assert_eq!(fixture.recovery_status()["attempts"], 0);
+    assert_eq!(fixture.recovery_status()["recovery_id"], id);
+    fixture.assert_queue_guarded();
+}
+
+#[test]
+fn failed_proofs_retry_with_the_same_identity_and_park_at_the_attempt_bound() {
+    let mut fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("enforcement-probe"),
+        "#!/bin/sh\nexit 7\n",
+    )
+    .unwrap();
+    let (mut replacement, id) = fixture.guarded_replacement();
+    for attempt in 1..=3 {
+        let run_id = format!("failed-proof-{attempt}");
+        parsed(fixture.proof(&id, &run_id));
+        wait_for(|| fixture.status(&run_id)["status"] == "failed");
+        assert_eq!(fixture.status(&run_id)["exit_status"], 7);
+        assert_eq!(fixture.recovery_status()["attempts"], attempt);
+        assert_eq!(fixture.recovery_status()["recovery_id"], id);
+        fixture.assert_queue_guarded();
+        if attempt == 1 {
+            replacement.kill();
+            replacement = fixture.start();
+        }
+    }
+    assert_eq!(
+        refused(fixture.proof(&id, "excess-proof"))["code"],
+        "host-recovery-exhausted"
+    );
+    assert_eq!(fixture.recovery_status()["phase"], "parked");
+    assert_eq!(fixture.recovery_status()["attempts"], 3);
+    fixture.assert_queue_guarded();
+}
+
+#[test]
+fn parking_cancels_only_the_active_proof_and_allows_a_bounded_retry() {
+    let mut fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("enforcement-probe"),
+        "#!/bin/sh\nwhile [ ! -f release-proof ]; do sleep 0.02; done\n",
+    )
+    .unwrap();
+    let (_replacement, id) = fixture.guarded_replacement();
+    parsed(fixture.proof(&id, "parked-proof"));
+    wait_for(|| {
+        let row = fixture.status("parked-proof");
+        if row["status"] != "running" {
+            return false;
+        }
+        let Some(pid) = row["worker_pid"].as_u64() else {
+            return false;
+        };
+        let Some((_, token)) = process_identity(pid as u32) else {
+            return false;
+        };
+        fixture.worker = Some((pid as u32, token));
+        true
+    });
+    let parked = parsed(
+        fixture
+            .command("host-recover-park")
+            .args(["--recovery-id", &id, "--reason", "test-enforcement-timeout"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(parked["phase"], "parked");
+    assert_eq!(parked["incident"], "test-enforcement-timeout");
+    wait_for(|| fixture.status("parked-proof")["status"] == "cancelled");
+    fixture.stop_worker();
+    fixture.assert_queue_guarded();
+    fs::write(fixture.root.join("release-proof"), "release").unwrap();
+    parsed(fixture.proof(&id, "retry-after-park"));
+    wait_for(|| fixture.status("retry-after-park")["status"] == "passed");
+    assert_eq!(fixture.recovery_status()["recovery_id"], id);
+    assert_eq!(fixture.recovery_status()["attempts"], 2);
+    assert_eq!(fixture.status("parked-proof")["status"], "cancelled");
+    fixture.assert_queue_guarded();
 }

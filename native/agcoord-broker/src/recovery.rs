@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const KEY: &str = "host_recovery";
@@ -104,9 +104,7 @@ pub fn record(connection: &Connection) -> Result<Option<Value>> {
             || value["proof_run_id"]
                 .as_str()
                 .is_some_and(|s| !s.is_empty()))
-        || !value["attempts"]
-            .as_u64()
-            .is_some_and(|n| n <= MAX_ATTEMPTS)
+        || value["attempts"].as_u64().is_none_or(|n| n > MAX_ATTEMPTS)
         || !matches!(
             value["phase"].as_str(),
             Some("guarded" | "verifying" | "parked")
@@ -341,11 +339,19 @@ pub fn submit_proof(paths: &Paths, recovery_id: &str, request: &SubmitRequest) -
     }
     if let Some(id) = value["proof_run_id"].as_str() {
         let prior = load_run(&connection, id)?;
-        if matches!(prior.status.as_str(), "queued" | "running" | "passed") {
+        if value["phase"] == "verifying"
+            && matches!(prior.status.as_str(), "queued" | "running" | "passed")
+        {
             return Ok(json!({"run_id":id}));
         }
     }
     if value["attempts"].as_u64().unwrap() >= MAX_ATTEMPTS {
+        value["phase"] = json!("parked");
+        value["incident"] = json!("proof-attempts-exhausted");
+        save(&connection, &value)?;
+        connection
+            .execute_batch("COMMIT")
+            .map_err(map_database_error)?;
         return Err(AppError::new(
             "host-recovery-exhausted",
             "three enforcement attempts exhausted; recovery remains parked",
@@ -381,6 +387,34 @@ pub fn complete(paths: &Paths, recovery_id: &str) -> Result<Value> {
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(map_database_error)?;
+    if record(&connection)?.is_none() {
+        let raw = store::metadata(&connection, "host_recovery_last")?
+            .ok_or_else(|| refused("no matching completed recovery exists"))?;
+        let last: Value =
+            serde_json::from_str(&raw).map_err(|_| refused("invalid completed recovery record"))?;
+        if last["format"] != 1
+            || last["phase"] != "complete"
+            || last["recovery_id"] != recovery_id
+            || last["identity"] != identity()
+        {
+            return Err(refused("completed recovery identity does not match"));
+        }
+        let proof_id = last["proof_run_id"]
+            .as_str()
+            .ok_or_else(|| refused("completed recovery has no proof"))?;
+        let proof = load_run(&connection, proof_id)?;
+        if proof.status != "passed"
+            || proof.exit_status != Some(0)
+            || proof.resource_receipt["requested"]["cpu"] != 1
+            || proof.resource_receipt["applied"]["cpu"] != 1
+            || proof.resource_receipt["peak"]["cpu"]
+                .as_u64()
+                .is_none_or(|n| n < 1)
+        {
+            return Err(refused("completed recovery proof is invalid"));
+        }
+        return Ok(json!({"state":"open","recovery_id":recovery_id,"proof_run_id":proof_id}));
+    }
     let mut value = required(&connection, recovery_id)?;
     let proof_id = value["proof_run_id"]
         .as_str()
@@ -391,9 +425,9 @@ pub fn complete(paths: &Paths, recovery_id: &str) -> Result<Value> {
         || proof.exit_status != Some(0)
         || proof.resource_receipt["requested"]["cpu"] != 1
         || proof.resource_receipt["applied"]["cpu"] != 1
-        || !proof.resource_receipt["peak"]["cpu"]
+        || proof.resource_receipt["peak"]["cpu"]
             .as_u64()
-            .is_some_and(|n| n >= 1)
+            .is_none_or(|n| n < 1)
         || probe_digest(Path::new(value["probe"].as_str().unwrap()))? != value["probe_sha256"]
         || load_live_runs(&connection)?
             .iter()
