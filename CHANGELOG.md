@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.7.2 — 2026-10-01
+
+**Release candidate preparation.** Artifact qualification, publication, and host installation
+remain separate steps; this entry records the candidate contents.
+
 - Recover when systemd recreates the managed broker's delegated cgroup root after every worker
   recorded against the old root is gone. The replacement now abandons only its private recovery
   metadata, records those dead rows `interrupted`, and admits later work against the new root;
