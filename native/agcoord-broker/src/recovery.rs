@@ -46,7 +46,7 @@ fn probe_digest(path: &Path) -> Result<String> {
         ));
     }
     let bytes = fs::read(path).map_err(|e| refused(format!("cannot read proof helper: {e}")))?;
-    Ok(sha256_prefix(&bytes, 64))
+    Ok(sha256_prefix(&bytes, 32))
 }
 
 pub fn record(connection: &Connection) -> Result<Option<Value>> {
