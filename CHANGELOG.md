@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.7.2 — 2026-10-01
+
+**Release candidate preparation.** Artifact qualification, publication, and host installation
+remain separate steps; this entry records the candidate contents.
+
 - Add `agc host recover PACKAGE` and `agc host recover --download` for a dead managed owner
   that cannot drain. Recovery always verifies a pinned replacement, refuses live or ambiguous
   workers, and preserves queued IDs and history behind a durable guard. Only the bound
