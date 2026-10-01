@@ -381,7 +381,11 @@
       "tests": {
         "rust_native": [
           "host_recovery::recovery_preserves_queued_work_and_guards_admission_across_restarts",
-          "host_recovery::recovery_refuses_a_live_owner_and_a_live_retained_worker"
+          "host_recovery::recovery_refuses_a_live_owner_and_a_live_retained_worker",
+          "host_recovery::a_successful_unenforced_proof_cannot_complete_or_resume_recovery",
+          "host_recovery::mismatched_recovery_identity_and_changed_helper_preserve_the_guard",
+          "host_recovery::failed_proofs_retry_with_the_same_identity_and_park_at_the_attempt_bound",
+          "host_recovery::parking_cancels_only_the_active_proof_and_allows_a_bounded_retry"
         ]
       }
     }

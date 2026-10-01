@@ -59,7 +59,7 @@ DIFFERENCE_KEYS = {
 }
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
 NATIVE_SELECTOR = re.compile(
-    r"^(client_compatibility|identity|scheduler)::[a-z][a-z0-9_]+$"
+    r"^(client_compatibility|identity|scheduler|host_recovery)::[a-z][a-z0-9_]+$"
 )
 
 
