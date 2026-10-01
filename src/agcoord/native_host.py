@@ -1316,9 +1316,23 @@ def recover_native_host(
     checkout_path = Path(checkout or ".").expanduser().resolve()
     paths = queue_paths(state_dir=state_dir, checkout=checkout_path)
     _prepare_state(paths.state_dir, operation="recover")
-    _refuse_live_broker(paths)
     recovery_id: str | None = None
+    continuing = False
+    try:
+        _refuse_live_broker(paths)
+    except CoordinatorError as live_owner:
+        if live_owner.code != "native-host-user-live-broker":
+            raise
+        try:
+            active = _recovery_receipt(_recovery_invoke("host-recover-status", paths.state_dir), expected_identity)
+            if active["probe"] != str(probe) or active["probe_sha256"] != _sha256(probe):
+                raise CoordinatorError("running recovery uses a different proof helper", code="host-recovery-invalid")
+        except CoordinatorError:
+            raise live_owner from None
+        recovery_id = active["recovery_id"]
+        continuing = True
     phase = "staging"
+    service_touched = continuing
 
     def run(arguments: Sequence[str | os.PathLike[str]], selected_phase: str) -> subprocess.CompletedProcess[str]:
         nonlocal phase
@@ -1326,16 +1340,17 @@ def recover_native_host(
         return _run_checked(arguments, phase=selected_phase, code="native-host-recovery-incomplete", timeout=RECOVERY_PHASE_TIMEOUT)
 
     try:
-        run([SUDO, installer, "stage", selected], "staging")
-        run([SUDO, "-v"], "authorization")
-        run([SYSTEMCTL, "--user", "stop", SERVICE], "service-stop")
-        # The installer takes the exclusive owner lock, proves worker absence, installs the
-        # durable guard, and retains that lock through package activation and identity checks.
-        run([SUDO, installer, "recover", paths.state_dir, "--probe", probe], "guarded-activation")
-        receipt = _recovery_receipt(_recovery_invoke("host-recover-status", paths.state_dir), expected_identity)
-        recovery_id = receipt["recovery_id"]
-        run([SYSTEMCTL, "--user", "daemon-reload"], "service-reload")
-        run([SYSTEMCTL, "--user", "start", SERVICE], "service-start")
+        if not continuing:
+            run([SUDO, installer, "stage", selected], "staging")
+            run([SUDO, "-v"], "authorization")
+            service_touched = True
+            run([SYSTEMCTL, "--user", "stop", SERVICE], "service-stop")
+            # Exclusive maintenance ownership spans the guard commit and host activation.
+            run([SUDO, installer, "recover", paths.state_dir, "--probe", probe], "guarded-activation")
+            receipt = _recovery_receipt(_recovery_invoke("host-recover-status", paths.state_dir), expected_identity)
+            recovery_id = receipt["recovery_id"]
+            run([SYSTEMCTL, "--user", "daemon-reload"], "service-reload")
+            run([SYSTEMCTL, "--user", "start", SERVICE], "service-start")
         run([SYSTEMCTL, "--user", "is-active", "--quiet", SERVICE], "service-verification")
         identity_result = run([INSTALLED_BROKER, "identity", "--json"], "identity-verification")
         identity = _decode_installed_identity(identity_result.stdout, expected_identity, operation="recovery")
@@ -1398,11 +1413,13 @@ def recover_native_host(
                 details.append(f"park report: {park_error}")
         # Stopping never clears the durable guard. A stop timeout is itself reported rather
         # than claiming the service stopped or releasing accepted work.
-        try:
-            run([SYSTEMCTL, "--user", "stop", SERVICE], "failure-stop")
-            service = "service stopped"
-        except CoordinatorError as stop_error:
-            service = f"service stop unconfirmed: {stop_error}"
+        service = "service was not changed"
+        if service_touched:
+            try:
+                run([SYSTEMCTL, "--user", "stop", SERVICE], "failure-stop")
+                service = "service stopped"
+            except CoordinatorError as stop_error:
+                service = f"service stop unconfirmed: {stop_error}"
         retained = f"recovery {recovery_id}" if recovery_id else "any established recovery guard"
         guard_state = "completion could not be confirmed; inspect its durable receipt" if incident == "completion" else f"{retained} remains retained"
         raise CoordinatorError(

@@ -91,6 +91,7 @@ def recovery(monkeypatch, tmp_path):
         events=[], guarded=False, parked=False, proof_seen=False,
         proof_statuses=["running", "passed"], applied_cpu=1, settling=0,
         timeout_phase=None, owner_unavailable=False, now=0.0,
+        guard_overrides={}, completion_lost_responses=0, completion_refusals=0,
     )
 
     def run(arguments, **options):
@@ -110,13 +111,16 @@ def recovery(monkeypatch, tmp_path):
     def invoke(command, state_dir, arguments=()):
         assert state_dir == state
         observed.events.append((command, list(arguments)))
-        assert observed.guarded
         if command == "host-recover-status":
+            if not observed.guarded:
+                raise CoordinatorError("no guarded recovery is active", code="host-recovery-invalid")
+            probe = package.parent / "test-native-host-enforcement"
             return {"format": 1, "recovery_id": RECOVERY_ID, "identity": IDENTITY,
-                    "probe": str(package.parent / "test-native-host-enforcement"),
-                    "probe_sha256": "b" * 64, "proof_run_id": None,
-                    "attempts": 1, "phase": "guarded", "incident": None,
-                    "state": "recovering", "protocol": 5}
+                    "probe": str(probe),
+                    "probe_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
+                    "proof_run_id": None, "attempts": 1, "phase": "guarded", "incident": None,
+                    "state": "recovering", "protocol": 5, **observed.guard_overrides}
+        assert observed.guarded or command == "host-recover-complete"
         assert arguments[:2] == ["--recovery-id", RECOVERY_ID]
         if command == "host-recover-proof":
             if observed.settling:
@@ -127,7 +131,13 @@ def recovery(monkeypatch, tmp_path):
         if command == "host-recover-complete":
             assert observed.proof_seen
             assert not observed.parked
+            if observed.completion_refusals:
+                observed.completion_refusals -= 1
+                raise CoordinatorError("owned completion transport unavailable")
             observed.guarded = False
+            if observed.completion_lost_responses:
+                observed.completion_lost_responses -= 1
+                raise CoordinatorError("owned completion committed but response lost")
             return {"state": "open", "recovery_id": RECOVERY_ID,
                     "proof_run_id": "check-owned-recovery-proof"}
         if command == "host-recover-park":
@@ -286,8 +296,8 @@ def test_live_owner_is_refused_before_privileged_phase(recovery):
         with pytest.raises(CoordinatorError) as error:
             _recover(recovery)
     assert error.value.code == "native-host-user-live-broker"
-    assert recovery.events == [("process", [str(recovery.package.parent / "check-native-host-package"),
-                                           str(recovery.package)])]
+    assert [event for event in recovery.events if event[0] == "process"] == [
+        ("process", [str(recovery.package.parent / "check-native-host-package"), str(recovery.package)])]
     assert not recovery.guarded
 
 
@@ -329,3 +339,64 @@ def test_cli_recovery_selects_bundle_without_running_an_upgrade(monkeypatch, tmp
     assert json.loads(output.getvalue()) == result
     assert calls == [(package, {"state_dir": None, "checkout": Path.cwd(),
                                "require_pin": download, "broker_sha256": None})]
+
+
+def test_matching_live_recovery_guard_continues_without_reactivation(recovery):
+    recovery.guarded = True
+    with (recovery.state / "broker.lock").open("w") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _recover(recovery)
+    assert result["state"] == "complete" and result["recovery_id"] == RECOVERY_ID
+    processes = [command for name, command in recovery.events if name == "process"]
+    assert processes == [
+        [str(recovery.package.parent / "check-native-host-package"), str(recovery.package)],
+        [str(native_host.SYSTEMCTL), "--user", "is-active", "--quiet", native_host.SERVICE],
+        [str(native_host.INSTALLED_BROKER), "identity", "--json"],
+    ]
+    names = _names(recovery)
+    assert names.index("host-recover-status") < names.index("host-recover-proof")
+    assert names[-1] == "host-recover-complete"
+    assert names.count("host-recover-proof") == 1
+    assert not recovery.guarded and not recovery.parked
+
+
+@pytest.mark.parametrize("overrides", [
+    {"identity": {**IDENTITY, "build": "sha256:" + "f" * 64}},
+    {"probe_sha256": "f" * 64},
+    {"probe": "/owned-but-different/proof-helper"},
+    {"state": "open"},
+])
+def test_mismatched_live_recovery_guard_refused_without_privileged_phase(recovery, overrides):
+    recovery.guarded = True
+    recovery.guard_overrides = overrides
+    with (recovery.state / "broker.lock").open("w") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(CoordinatorError):
+            _recover(recovery)
+    assert [event for event in recovery.events if event[0] == "process"] == [
+        ("process", [str(recovery.package.parent / "check-native-host-package"), str(recovery.package)])]
+    assert "host-recover-proof" not in _names(recovery)
+    assert "host-recover-complete" not in _names(recovery)
+    assert recovery.guarded and not recovery.parked
+
+
+def test_completion_response_loss_retries_same_id_without_rerunning_proof(recovery):
+    recovery.completion_lost_responses = 1
+    result = _recover(recovery)
+    assert result["state"] == "complete"
+    completions = [arguments for name, arguments in recovery.events if name == "host-recover-complete"]
+    assert completions == [["--recovery-id", RECOVERY_ID]] * 2
+    assert _names(recovery).count("host-recover-proof") == 1
+    assert _names(recovery).count("proof-metadata") == 1
+    assert not recovery.guarded and not recovery.parked
+    assert recovery.queue.read_bytes() == b"owned retained queue fixture"
+
+
+def test_completion_transport_failure_has_bounded_retry_then_parks(recovery):
+    recovery.completion_refusals = 100
+    with pytest.raises(CoordinatorError):
+        _recover(recovery)
+    completions = [arguments for name, arguments in recovery.events if name == "host-recover-complete"]
+    assert completions == [["--recovery-id", RECOVERY_ID]] * 3
+    assert _names(recovery).count("host-recover-proof") == 1
+    _assert_parked(recovery)
