@@ -60,7 +60,9 @@ impl Fixture {
         let mut command = Command::new(BROKER);
         command.arg(operation).arg("--state-dir").arg(&self.state);
         if operation == "host-recover-hold" {
-            command.arg("--probe").arg(self.root.join("enforcement-probe"));
+            command
+                .arg("--probe")
+                .arg(self.root.join("enforcement-probe"));
         }
         command
     }
@@ -152,7 +154,10 @@ impl Fixture {
         });
         parsed(self.submit(
             "retained-queued",
-            &["/usr/bin/touch", self.root.join("executed").to_str().unwrap()],
+            &[
+                "/usr/bin/touch",
+                self.root.join("executed").to_str().unwrap(),
+            ],
         ));
         assert_eq!(self.status("retained-queued")["status"], "queued");
         broker
@@ -212,7 +217,10 @@ fn process_identity(pid: u32) -> Option<(String, String)> {
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting for test state");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for test state"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
