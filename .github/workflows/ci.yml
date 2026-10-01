@@ -180,6 +180,7 @@ jobs:
             --enforcement-receipt native-host-receipt.json \
             --receipt native-host-recovery-receipt.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: native-host-enforcement-receipt
           if-no-files-found: error
