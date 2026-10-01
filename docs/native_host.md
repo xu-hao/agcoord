@@ -384,13 +384,40 @@ a nondefault, unsafe, fresh, or pre-protocol-5 spool. A failure before activatio
 host unchanged; a failure after stop reports the exact drain ID and leaves the service stopped
 and coordinator drained unless the resume step had already succeeded.
 
-For manual upgrade or recovery, run `stage` while the current service remains available. Inspect
-the staged package digest, run `agc drain`, retain its exact ID, and stop the user service after
-the receipt says `drained`. Run `activate --drain-id ID`, `daemon-reload`, any required `migrate`,
+For manual upgrade or recovery where the outgoing broker can drain, run `stage` while the
+current service remains available. Inspect the staged package digest, run `agc drain`, retain
+its exact ID, and stop the user service after the receipt says `drained`. Run `activate --drain-id ID`, `daemon-reload`, any required `migrate`,
 exact-ID `resume`, and `start` in that order. An explicitly chosen cancellation policy may shorten
 the drain, but cancellation never replaces its durable submission guard. Never replace the live
 binary and ask systemd to restart while work remains. After start, inspect `systemctl --user
 status agcoord-broker.service`, `agc list`, and rerun the enforced-host proof.
+
+### Guarded recovery when the outgoing broker cannot drain
+
+The normal drain flow depends on a functioning outgoing broker. It cannot produce a completed
+drain when that broker is dead or cannot start. Recovery in that condition must establish the
+following boundary; it must never substitute a forced activation or deletion of the spool.
+This is the approved recovery contract; its command and receipt mechanics remain to be
+implemented.
+
+Under the exclusive owner/maintenance lock, recovery must verify the selected package and
+prove that every recorded worker identity is gone before changing host files or worker state.
+A live worker, an ambiguous identity, unavailable identity evidence, or an invalid package
+refuses recovery. Only running rows whose workers are proven dead become `interrupted`, with
+no execution verdict. Queued job IDs and their work, terminal history, and the spool remain
+intact; recovery never reruns an interrupted or terminal command.
+
+A durable recovery guard must block new submissions and admission of ordinary queued jobs
+through activation and restart, until the replacement host's exact identity and enforcement
+are proven. The enforcement proof must not release ordinary work early. A process exit or
+service restart cannot clear that guard or count as successful recovery.
+
+Recovery must retain its exact durable identity across bounded retries and restarts. An
+interrupted operation or exhausted retry budget parks safely with the guard intact and
+nonsecret evidence of the failed step; it must not silently resume work. Retrying continues
+the same recovery operation rather than manufacturing a new identity or weakening the proof.
+
+### Normal restart and rollback
 
 `Restart=on-failure` recovers an unexpected broker exit without an idle shutdown. The durable
 spool remains the authority: the replacement adopts only identity-verified live workers and
