@@ -253,7 +253,7 @@ autostart until exact-ID `resume` holds the owner lock and removes every guard.
 
 Guarded managed-host recovery may temporarily suspend a stranded normal drain's accepted-job
 admission to verify a pinned replacement, without relaxing its submission guards. It retains
-the original drain ID, state, reason, start time, and protocol in its durable recovery audit.
+the original drain ID, state, reason, and start time in its durable recovery audit.
 Successful host proof restores that drain atomically instead of opening submissions: accepted
 queued rows finish normally and the owner yields when the drain completes. Only explicit
 `resume` with the exact original drain ID after maintenance reopens submissions. Completion retries preserve

@@ -411,9 +411,9 @@ evidence, and an invalid package. It never substitutes a forced activation or de
 spool. Normal `agc host upgrade` and its drain flow remain unchanged.
 
 An existing normal drain is maintenance intent, not permission to reopen submissions. Recovery
-preserves its original drain ID, state, reason, start time, and protocol as durable audit
-metadata. Its submission guards remain continuous while the recovery guard temporarily blocks
-ordinary accepted-job admission for host verification. Malformed original maintenance metadata
+preserves its original drain ID, state, reason, and start time as durable audit
+metadata within the shared protocol-5 recovery contract. Its submission guards remain continuous
+while the recovery guard temporarily blocks ordinary accepted-job admission for host verification. Malformed original maintenance metadata
 refuses recovery; neither a retry nor repair may replace its identity or reset proof attempts.
 
 The command stages the verified replacement and stops the failed service. The staged native
@@ -462,8 +462,13 @@ recovery ID and address the reported incident before retrying the same package.
 Completion retries up to three times with the exact recovery ID. If completion committed but
 its reply was lost, the native operation validates the retained completed identity and passed
 CPU proof, then returns the same completion receipt without another proof or recovery
-operation. That receipt reports the retained original maintenance state when a drain was
-inherited; it is not always `open`. It does not implicitly resume a retained drain on retry.
+operation. The completion receipt carries `state`, `recovery_id`, `proof_run_id`, and `drain_id`.
+Without an inherited drain, its state is `open` and `drain_id` is null. With an inherited drain,
+it retains that original ID and reports `draining` if accepted work remains, or `drained` if
+none remains. Completion retries return that recorded result and never implicitly resume it.
+The public host result reports service `verified` for a retained drain, since the broker may
+finish the accepted work and yield before the command returns; `active` applies to recovery
+that opens the spool.
 If completion still cannot be confirmed, inspect the durable recovery and original drain
 receipts. Do not assume submissions reopened or that the verification-only guard remains.
 
