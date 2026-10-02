@@ -154,8 +154,15 @@ interface and must be smoke-tested from the built wheel.
    `0755` on only the fixed broker and three fixed helper names before running this verifier;
    content sidecars and the host archive's internal modes remain independently checked.
 7. Install the host bundle on the supported Ubuntu configuration through the staged runbook.
-   For an existing spool, retain the exact durable drain receipt, require activation to match its
-   ID and resume only after owner-locked maintenance completes.
+   For an existing spool with a functioning outgoing owner, retain the exact durable drain
+   receipt, require activation to match its ID, and resume only after owner-locked maintenance
+   completes. If the outgoing owner is dead or cannot start, use the
+   [guarded managed recovery path](native_host.md#guarded-recovery-when-the-outgoing-broker-cannot-drain)
+   with the exact pinned replacement. Retain its recovery ID and proof receipt; ordinary work
+   stays blocked until verified completion, and normal drain/resume cannot clear that guard.
+   If recovery inherited a normal drain, completion restores its original ID and metadata;
+   accepted work finishes under that drain while new submissions remain blocked. Retain both
+   receipts and resume the exact original drain only after its intended maintenance succeeds.
    Keep `kernel.apparmor_restrict_unprivileged_userns=1`, start the ordinary unprivileged managed
    service, and retain the shipped `cpu=1` receipt proving its AppArmor transition, cgroup
    namespace root, exact CPU control, and durable applied/peak evidence. A spool left below

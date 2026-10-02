@@ -5,6 +5,27 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.7.3 — 2026-10-02
+
+- Recover a normal drain stranded behind a dead or unstartable managed broker without losing
+  accepted work or maintenance intent. Host repair preserves the original drain ID and
+  metadata, keeps submissions continuously guarded, and restores the drain after the bound
+  replacement-host proof. Accepted queued jobs finish normally; new submissions remain blocked
+  until explicit resume with the original drain ID after maintenance. Completion retries retain
+  that restoration result and audit instead of always opening the spool; malformed metadata
+  and live or ambiguous workers refuse, and proof attempts are never reset (#244).
+
+## 0.7.2 — 2026-10-01
+
+- Add `agc host recover PACKAGE` and `agc host recover --download` for a dead managed owner
+  that cannot drain. Recovery always verifies a pinned replacement; a new recovery refuses live
+  or ambiguous workers, and preserves queued IDs and history behind a durable guard. Only the bound
+  `cpu=1` enforcement proof can run before successful completion reopens ordinary work. Dead
+  running rows become `interrupted`; bounded failures park under the same recovery identity.
+  Three proof attempts persist across retries, which require the same replacement and helper.
+  A running replacement under the exact matching guard can continue its existing proof without
+  reactivation; exact-ID completion retries return the validated durable result after a lost reply
+  (#242).
 - Recover when systemd recreates the managed broker's delegated cgroup root after every worker
   recorded against the old root is gone. The replacement now abandons only its private recovery
   metadata, records those dead rows `interrupted`, and admits later work against the new root;

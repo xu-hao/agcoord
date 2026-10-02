@@ -170,13 +170,24 @@ jobs:
             findmnt /sys/fs/cgroup
             cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
           } >native-host-platform.txt
+      - name: Rehearse guarded recovery with retained queued work
+        env:
+          AGCOORD_CI_DISPOSABLE_HOST: "1"
+        run: |
+          ./scripts/test-native-host-recovery \
+            --ci-disposable-state "$HOME/.local/state/agcoord" \
+            --package dist/host/agcoord-native-host-x86_64-linux.tar.gz \
+            --enforcement-receipt native-host-receipt.json \
+            --receipt native-host-recovery-receipt.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: native-host-enforcement-receipt
           if-no-files-found: error
           path: |
             native-host-receipt.json
             native-host-platform.txt
+            native-host-recovery-receipt.json
       - name: Stop and remove the disposable host boundary
         if: always()
         run: |

@@ -738,10 +738,36 @@ pub fn drain_check(state_dir: &Path) -> Result<Value> {
     drained_database(state_dir)
 }
 
+pub fn recover_hold(state_dir: &Path, probe: &Path) -> Result<()> {
+    let state = validate_state_directory(state_dir)?;
+    let _lock = maintenance_lock(state_dir, &state)?;
+    // The privileged installer's child drops to the spool owner before opening SQLite.
+    // This preserves WAL ownership; the parent installer alone retains host-write authority.
+    // SAFETY: credential changes affect this standalone maintenance child only.
+    if unsafe { libc::geteuid() } == 0
+        && state.uid() != 0
+        && (unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+            || unsafe { libc::setgid(state.gid()) } != 0
+            || unsafe { libc::setuid(state.uid()) } != 0)
+    {
+        return Err(refusal(
+            "host-recovery-owner-invalid",
+            "cannot become the spool owner",
+        ));
+    }
+    let paths = crate::store::Paths::new(state_dir).configured()?;
+    let result = crate::recovery::prepare(&paths, probe)?;
+    hold_report(&result)
+}
+
 pub fn drain_hold(state_dir: &Path) -> Result<()> {
     let state = validate_state_directory(state_dir)?;
     let _lock = maintenance_lock(state_dir, &state)?;
     let result = drained_database(state_dir)?;
+    hold_report(&result)
+}
+
+fn hold_report(result: &Value) -> Result<()> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{result}").map_err(|error| {
         refusal(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -14,6 +15,7 @@ import subprocess
 import tarfile
 import time
 from typing import Any, Mapping, Sequence
+from uuid import uuid4
 
 from . import __version__
 from .config import (
@@ -870,6 +872,7 @@ def _run_checked(
     *,
     phase: str,
     code: str,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [str(value) for value in arguments]
     try:
@@ -879,7 +882,10 @@ def _run_checked(
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            **({"timeout": timeout} if timeout is not None else {}),
         )
+    except subprocess.TimeoutExpired as exc:
+        raise CoordinatorError(f"native-host {phase} exceeded {timeout}s; inspect the retained recovery guard", code=code) from exc
     except OSError as exc:
         raise CoordinatorError(
             f"native-host {phase} could not run: {exc}",
@@ -1262,3 +1268,201 @@ def upgrade_native_host(
         "proof_run_id": proof_run_id,
         "proof": proof,
     }
+
+
+RECOVERY_PHASE_TIMEOUT = 120.0
+RECOVERY_PROOF_TIMEOUT = 120.0
+_RECOVERY_ID = re.compile(r"^recovery-[0-9a-f]{12}$")
+
+
+def _recovery_invoke(command: str, state_dir: Path, arguments: Sequence[str] = ()) -> Any:
+    try:
+        selected = NativeBrokerCommand.select(load_broker_config(state_dir).native_broker)
+        return selected.invoke(command, state_dir=state_dir, arguments=arguments)
+    except (NativeClientError, BrokerConfigError) as exc:
+        raise CoordinatorError(str(exc), code=getattr(exc, "code", "host-recovery-invalid")) from exc
+
+
+def _recovery_original_drain(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict)
+        or set(value) != {"state", "drain_id", "reason", "started_at"}
+        or value["state"] not in ("draining", "drained")
+        or not isinstance(value["drain_id"], str) or not _DRAIN_ID.fullmatch(value["drain_id"])
+        or not isinstance(value["reason"], str) or not 1 <= len(value["reason"]) <= 256
+        or "\0" in value["reason"] or not isinstance(value["started_at"], str)):
+        raise CoordinatorError("invalid retained recovery drain", code="host-recovery-invalid")
+    try:
+        started = datetime.fromisoformat(value["started_at"].replace("Z", "+00:00"))
+        if started.tzinfo is None or started.utcoffset() != timezone.utc.utcoffset(started):
+            raise ValueError("maintenance time must be UTC")
+    except ValueError as exc:
+        raise CoordinatorError("invalid retained recovery drain time", code="host-recovery-invalid") from exc
+    return value
+
+
+def _recovery_completion(value: object, recovery_id: str, proof_id: str,
+                         original_drain: dict[str, Any] | None) -> dict[str, Any]:
+    if (not isinstance(value, dict)
+        or set(value) != {"state", "recovery_id", "proof_run_id", "drain_id"}
+        or value["recovery_id"] != recovery_id or value["proof_run_id"] != proof_id
+        or (original_drain is None and (value["state"] != "open" or value["drain_id"] is not None))
+        or (original_drain is not None and (
+            value["state"] not in ("draining", "drained")
+            or value["drain_id"] != original_drain["drain_id"]))):
+        raise CoordinatorError("invalid recovery completion receipt", code="host-recovery-invalid")
+    return value
+
+
+def _recovery_receipt(value: object, expected_identity: dict[str, Any]) -> dict[str, Any]:
+    keys = {"format", "recovery_id", "identity", "probe", "probe_sha256", "proof_run_id",
+            "attempts", "phase", "incident", "state", "protocol", "original_drain"}
+    if (not isinstance(value, dict) or set(value) != keys or type(value["format"]) is not int or value["format"] != 2
+        or value["state"] != "recovering" or value["protocol"] != NATIVE_PROTOCOL
+        or value["identity"] != expected_identity
+        or not isinstance(value["recovery_id"], str) or not _RECOVERY_ID.fullmatch(value["recovery_id"])
+        or type(value["attempts"]) is not int or not 0 <= value["attempts"] <= 3
+        or value["phase"] not in {"guarded", "verifying", "parked"}
+        or not isinstance(value["probe"], str) or not Path(value["probe"]).is_absolute()
+        or not isinstance(value["probe_sha256"], str) or not _DIGEST.fullmatch(value["probe_sha256"])
+        or not (value["proof_run_id"] is None or isinstance(value["proof_run_id"], str))
+        or not (value["incident"] is None or isinstance(value["incident"], str))):
+        raise CoordinatorError("invalid guarded recovery receipt", code="host-recovery-invalid")
+    _recovery_original_drain(value["original_drain"])
+    return value
+
+
+def recover_native_host(
+    package: str | os.PathLike[str],
+    *,
+    state_dir: str | os.PathLike[str] | None = None,
+    checkout: str | os.PathLike[str] | None = None,
+    require_pin: bool = True,
+    broker_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Recover a dead managed owner without admitting retained jobs before proof."""
+    _operator_context()
+    # Recovery always requires a pinned replacement, including bundles supplied by path.
+    selected, installer, probe, expected_identity = _release_inputs(
+        package, require_pin=True, broker_sha256=broker_sha256,
+    )
+    checkout_path = Path(checkout or ".").expanduser().resolve()
+    paths = queue_paths(state_dir=state_dir, checkout=checkout_path)
+    _prepare_state(paths.state_dir, operation="recover")
+    recovery_id: str | None = None
+    continuing = False
+    try:
+        _refuse_live_broker(paths)
+    except CoordinatorError as live_owner:
+        if live_owner.code != "native-host-user-live-broker":
+            raise
+        try:
+            active = _recovery_receipt(_recovery_invoke("host-recover-status", paths.state_dir), expected_identity)
+            if active["probe"] != str(probe) or active["probe_sha256"] != _sha256(probe):
+                raise CoordinatorError("running recovery uses a different proof helper", code="host-recovery-invalid")
+        except CoordinatorError:
+            raise live_owner from None
+        recovery_id = active["recovery_id"]
+        original_drain = active["original_drain"]
+        continuing = True
+    phase = "staging"
+    service_touched = continuing
+
+    def run(arguments: Sequence[str | os.PathLike[str]], selected_phase: str) -> subprocess.CompletedProcess[str]:
+        nonlocal phase
+        phase = selected_phase
+        return _run_checked(arguments, phase=selected_phase, code="native-host-recovery-incomplete", timeout=RECOVERY_PHASE_TIMEOUT)
+
+    try:
+        if not continuing:
+            run([SUDO, installer, "stage", selected], "staging")
+            run([SUDO, "-v"], "authorization")
+            service_touched = True
+            run([SYSTEMCTL, "--user", "stop", SERVICE], "service-stop")
+            # Exclusive maintenance ownership spans the guard commit and host activation.
+            run([SUDO, installer, "recover", paths.state_dir, "--probe", probe], "guarded-activation")
+            receipt = _recovery_receipt(_recovery_invoke("host-recover-status", paths.state_dir), expected_identity)
+            recovery_id = receipt["recovery_id"]
+            original_drain = receipt["original_drain"]
+            run([SYSTEMCTL, "--user", "daemon-reload"], "service-reload")
+            run([SYSTEMCTL, "--user", "start", SERVICE], "service-start")
+        run([SYSTEMCTL, "--user", "is-active", "--quiet", SERVICE], "service-verification")
+        identity_result = run([INSTALLED_BROKER, "identity", "--json"], "identity-verification")
+        identity = _decode_installed_identity(identity_result.stdout, expected_identity, operation="recovery")
+        client = CoordinatorClient(state_dir=paths.state_dir, checkout=checkout_path, autostart=False)
+        phase = "owner-verification"
+        _await_spool_ownership(client, operation="recovery", state_dir=paths.state_dir)
+        # Reuse the ordinary client preparation policy; the native recovery boundary alone
+        # authorizes the one fixed proof command while regular submit remains guarded.
+        prepared = client._prepare_submission(checkout=str(checkout_path), repository=None, branch=None,
+            head_sha=None, caller_pid=None, environment=None, exact_head=False)
+        proof_id = "check-" + uuid4().hex[:12]
+        arguments = client._native_submission_arguments(run_id=proof_id, kind="check",
+            label="native host recovery enforcement", identity=prepared.identity,
+            branch=prepared.branch, head_sha=prepared.head_sha, resources={"jobs":1,"cpu":1},
+            agent="host-recovery", caller_pid=prepared.caller_pid, environment=prepared.environment,
+            command=[str(probe)])
+        phase = "proof-submission"
+        settlement_deadline = time.monotonic() + OWNERSHIP_TIMEOUT
+        while True:
+            try:
+                submitted = _recovery_invoke("host-recover-proof", paths.state_dir,
+                    ["--recovery-id", recovery_id, *arguments])
+                break
+            except CoordinatorError as settlement_error:
+                if settlement_error.code != "host-recovery-settling" or time.monotonic() >= settlement_deadline:
+                    raise
+                time.sleep(OWNERSHIP_POLL_INTERVAL)
+        if not isinstance(submitted, dict) or set(submitted) != {"run_id"} or not isinstance(submitted["run_id"], str):
+            raise CoordinatorError("invalid recovery proof submission receipt", code="host-recovery-invalid")
+        proof_id = submitted["run_id"]
+        phase = "enforcement-proof"
+        deadline = time.monotonic() + RECOVERY_PROOF_TIMEOUT
+        while True:
+            proof = client.status(proof_id)
+            if proof["status"] not in {"queued", "running"}:
+                break
+            if time.monotonic() >= deadline:
+                raise CoordinatorError("enforcement proof exceeded its deadline", code="host-recovery-proof-timeout")
+            time.sleep(0.1)
+        proof = _validate_proof(proof, proof_id, operation="recovery")
+        phase = "completion"
+        for attempt in range(3):
+            try:
+                completed = _recovery_invoke("host-recover-complete", paths.state_dir, ["--recovery-id", recovery_id])
+                break
+            except CoordinatorError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
+        completed = _recovery_completion(completed, recovery_id, proof_id, original_drain)
+    except CoordinatorError as exc:
+        incident = phase
+        details: list[str] = []
+        if recovery_id is not None:
+            try:
+                _recovery_invoke("host-recover-park", paths.state_dir,
+                    ["--recovery-id", recovery_id, "--reason", incident])
+            except CoordinatorError as park_error:
+                details.append(f"park report: {park_error}")
+        # Stopping never clears the durable guard. A stop timeout is itself reported rather
+        # than claiming the service stopped or releasing accepted work.
+        service = "service was not changed"
+        if service_touched:
+            try:
+                run([SYSTEMCTL, "--user", "stop", SERVICE], "failure-stop")
+                service = "service stopped"
+            except CoordinatorError as stop_error:
+                service = f"service stop unconfirmed: {stop_error}"
+        retained = f"recovery {recovery_id}" if recovery_id else "any established recovery guard"
+        guard_state = "completion could not be confirmed; inspect its durable receipt" if incident == "completion" else f"{retained} remains retained"
+        raise CoordinatorError(
+            f"native-host recovery failed at {incident}: {exc}; {guard_state}; "
+            f"{service}; retry the same verified package after addressing the incident"
+            + ("; " + "; ".join(details) if details else ""),
+            code="native-host-recovery-incomplete",
+        ) from exc
+    return {"state":"complete", "operation":"recover", "version":expected_identity["version"],
+        "package":str(selected), "recovery_id":recovery_id, "service":"active" if completed["state"] == "open" else "verified", "identity":identity,
+        "proof_run_id":proof_id, "proof":proof, "completion":completed}
