@@ -49,9 +49,105 @@ fn probe_digest(path: &Path) -> Result<String> {
     Ok(sha256_prefix(&bytes, 32))
 }
 
+fn original_drain_valid(value: &Value) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    let keys = ["state", "drain_id", "reason", "started_at"];
+    value.as_object().is_some_and(|o| {
+        o.keys().map(String::as_str).collect::<BTreeSet<_>>() == keys.into_iter().collect()
+    }) && matches!(value["state"].as_str(), Some("draining" | "drained"))
+        && value["drain_id"]
+            .as_str()
+            .is_some_and(store::drain_id_valid)
+        && value["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty() && r.chars().count() <= 256 && !r.contains('\0'))
+        && value["started_at"]
+            .as_str()
+            .is_some_and(store::maintenance_time_valid)
+}
+
+fn validate_record(value: &Value, completed: bool) -> Result<()> {
+    let mut keys = BTreeSet::from([
+        "format",
+        "recovery_id",
+        "identity",
+        "probe",
+        "probe_sha256",
+        "proof_run_id",
+        "attempts",
+        "phase",
+        "incident",
+        "original_drain",
+    ]);
+    if completed {
+        keys.insert("completion");
+    }
+    if !value
+        .as_object()
+        .is_some_and(|o| o.keys().map(String::as_str).collect::<BTreeSet<_>>() == keys)
+        || value["format"] != 2
+        || !value["recovery_id"].as_str().is_some_and(valid_id)
+        || value["identity"] != identity()
+        || !value["probe"]
+            .as_str()
+            .is_some_and(|p| Path::new(p).is_absolute())
+        || !value["probe_sha256"].as_str().is_some_and(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        || !(value["proof_run_id"].is_null()
+            || value["proof_run_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()))
+        || value["attempts"].as_u64().is_none_or(|n| n > MAX_ATTEMPTS)
+        || !(if completed {
+            value["phase"] == "complete"
+        } else {
+            matches!(
+                value["phase"].as_str(),
+                Some("guarded" | "verifying" | "parked")
+            )
+        })
+        || !(value["incident"].is_null()
+            || value["incident"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s.len() <= 256))
+        || !original_drain_valid(&value["original_drain"])
+    {
+        return Err(refused(
+            "recovery record or replacement identity does not match",
+        ));
+    }
+    if completed {
+        let receipt = &value["completion"];
+        let keys = BTreeSet::from(["state", "recovery_id", "proof_run_id", "drain_id"]);
+        let drain = &value["original_drain"];
+        if !receipt
+            .as_object()
+            .is_some_and(|o| o.keys().map(String::as_str).collect::<BTreeSet<_>>() == keys)
+            || receipt["recovery_id"] != value["recovery_id"]
+            || receipt["proof_run_id"] != value["proof_run_id"]
+            || !(if drain.is_null() {
+                receipt["state"] == "open" && receipt["drain_id"].is_null()
+            } else {
+                matches!(receipt["state"].as_str(), Some("draining" | "drained"))
+                    && receipt["drain_id"] == drain["drain_id"]
+            })
+        {
+            return Err(refused(
+                "completed recovery receipt does not match its retained drain",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn record(connection: &Connection) -> Result<Option<Value>> {
     // Read the marker, its guards, and its target from one snapshot even when completion
-    // concurrently removes them. Existing write transactions already provide that snapshot.
+    // concurrently restores the drain or removes them.
     let _snapshot = if connection.is_autocommit() {
         Some(
             connection
@@ -73,49 +169,10 @@ pub fn record(connection: &Connection) -> Result<Option<Value>> {
         return Ok(None);
     };
     let value: Value = serde_json::from_str(&raw).map_err(|_| refused("invalid recovery JSON"))?;
-    let keys = [
-        "format",
-        "recovery_id",
-        "identity",
-        "probe",
-        "probe_sha256",
-        "proof_run_id",
-        "attempts",
-        "phase",
-        "incident",
-    ];
-    if !recovering
-        || !value.as_object().is_some_and(|o| {
-            o.keys().map(String::as_str).collect::<BTreeSet<_>>() == keys.into_iter().collect()
-        })
-        || value["format"] != 1
-        || !value["recovery_id"].as_str().is_some_and(valid_id)
-        || value["recovery_id"] != maintenance.unwrap().drain_id
-        || value["identity"] != identity()
-        || !value["probe"]
-            .as_str()
-            .is_some_and(|p| Path::new(p).is_absolute())
-        || !value["probe_sha256"].as_str().is_some_and(|s| {
-            s.len() == 64
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-        || !(value["proof_run_id"].is_null()
-            || value["proof_run_id"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()))
-        || value["attempts"].as_u64().is_none_or(|n| n > MAX_ATTEMPTS)
-        || !matches!(
-            value["phase"].as_str(),
-            Some("guarded" | "verifying" | "parked")
-        )
-        || !(value["incident"].is_null()
-            || value["incident"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty() && s.len() <= 256))
-    {
+    validate_record(&value, false)?;
+    if !recovering || value["recovery_id"] != maintenance.unwrap().drain_id {
         return Err(refused(
-            "recovery record or replacement identity does not match",
+            "recovery record does not match its maintenance guard",
         ));
     }
     Ok(Some(value))
@@ -255,11 +312,16 @@ pub fn prepare(paths: &Paths, probe: &Path) -> Result<Value> {
             .map_err(map_database_error)?;
         return Ok(receipt(&value));
     }
-    if store::maintenance_record(&connection)?.is_some() {
-        return Err(refused(
-            "normal maintenance is active; recovery cannot replace its identity",
-        ));
-    }
+    let original_drain = match store::maintenance_record(&connection)? {
+        Some(drain) => {
+            if drain.state == "drained" && !load_live_runs(&connection)?.is_empty() {
+                return Err(refused("drained maintenance still contains accepted work"));
+            }
+            json!({"state":drain.state,"drain_id":drain.drain_id,
+                "reason":drain.reason,"started_at":drain.started_at})
+        }
+        None => Value::Null,
+    };
     let mut random = [0u8; 6];
     fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut random))
@@ -271,8 +333,10 @@ pub fn prepare(paths: &Paths, probe: &Path) -> Result<Value> {
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
-    let value = json!({"format":1,"recovery_id":recovery_id,"identity":identity(),"probe":probe,"probe_sha256":digest,"proof_run_id":null,"attempts":0,"phase":"guarded","incident":null});
-    store::install_maintenance_guards(&connection)?;
+    let value = json!({"format":2,"recovery_id":recovery_id,"identity":identity(),"probe":probe,"probe_sha256":digest,"proof_run_id":null,"attempts":0,"phase":"guarded","incident":null,"original_drain":original_drain});
+    if original_drain.is_null() {
+        store::install_maintenance_guards(&connection)?;
+    }
     for (key, value) in [
         ("maintenance_state", "recovering".to_owned()),
         ("maintenance_id", recovery_id),
@@ -382,7 +446,6 @@ pub fn submit_proof(paths: &Paths, recovery_id: &str, request: &SubmitRequest) -
 }
 
 pub fn complete(paths: &Paths, recovery_id: &str) -> Result<Value> {
-    store::owner_info(paths)?;
     let connection = store::open_protocol5(paths)?;
     connection
         .execute_batch("BEGIN IMMEDIATE")
@@ -392,11 +455,8 @@ pub fn complete(paths: &Paths, recovery_id: &str) -> Result<Value> {
             .ok_or_else(|| refused("no matching completed recovery exists"))?;
         let last: Value =
             serde_json::from_str(&raw).map_err(|_| refused("invalid completed recovery record"))?;
-        if last["format"] != 1
-            || last["phase"] != "complete"
-            || last["recovery_id"] != recovery_id
-            || last["identity"] != identity()
-        {
+        validate_record(&last, true)?;
+        if last["recovery_id"] != recovery_id {
             return Err(refused("completed recovery identity does not match"));
         }
         let proof_id = last["proof_run_id"]
@@ -413,8 +473,9 @@ pub fn complete(paths: &Paths, recovery_id: &str) -> Result<Value> {
         {
             return Err(refused("completed recovery proof is invalid"));
         }
-        return Ok(json!({"state":"open","recovery_id":recovery_id,"proof_run_id":proof_id}));
+        return Ok(last["completion"].clone());
     }
+    store::owner_info(paths)?;
     let mut value = required(&connection, recovery_id)?;
     let proof_id = value["proof_run_id"]
         .as_str()
@@ -438,14 +499,43 @@ pub fn complete(paths: &Paths, recovery_id: &str) -> Result<Value> {
             "a passed enforced cpu=1 receipt is required; recovery remains guarded",
         ));
     }
+    let drain = &value["original_drain"];
+    let completed = if drain.is_null() {
+        store::remove_maintenance_guards(&connection)?;
+        connection.execute("DELETE FROM coordinator_meta WHERE key IN ('maintenance_state','maintenance_id','maintenance_reason','maintenance_started_at')", []).map_err(map_database_error)?;
+        json!({"state":"open","recovery_id":recovery_id,"proof_run_id":proof.run_id,"drain_id":null})
+    } else {
+        let state = if load_live_runs(&connection)?.is_empty() {
+            "drained"
+        } else {
+            "draining"
+        };
+        for (key, retained) in [
+            ("maintenance_state", state),
+            ("maintenance_id", drain["drain_id"].as_str().unwrap()),
+            ("maintenance_reason", drain["reason"].as_str().unwrap()),
+            (
+                "maintenance_started_at",
+                drain["started_at"].as_str().unwrap(),
+            ),
+        ] {
+            store::set_metadata(&connection, key, retained)?;
+        }
+        json!({"state":state,"recovery_id":recovery_id,"proof_run_id":proof.run_id,"drain_id":drain["drain_id"]})
+    };
     value["phase"] = json!("complete");
+    value["completion"] = completed.clone();
     store::set_metadata(&connection, "host_recovery_last", &value.to_string())?;
-    store::remove_maintenance_guards(&connection)?;
-    connection.execute("DELETE FROM coordinator_meta WHERE key IN ('host_recovery','maintenance_state','maintenance_id','maintenance_reason','maintenance_started_at')", []).map_err(map_database_error)?;
+    connection
+        .execute(
+            "DELETE FROM coordinator_meta WHERE key = 'host_recovery'",
+            [],
+        )
+        .map_err(map_database_error)?;
     connection
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
-    Ok(json!({"state":"open","recovery_id":recovery_id,"proof_run_id":proof.run_id}))
+    Ok(completed)
 }
 
 pub fn park(paths: &Paths, recovery_id: &str, reason: &str) -> Result<Value> {

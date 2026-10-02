@@ -5,6 +5,16 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.7.3 — 2026-10-02
+
+- Recover a normal drain stranded behind a dead or unstartable managed broker without losing
+  accepted work or maintenance intent. Host repair preserves the original drain ID and
+  metadata, keeps submissions continuously guarded, and restores the drain after the bound
+  replacement-host proof. Accepted queued jobs finish normally; new submissions remain blocked
+  until explicit resume with the original drain ID after maintenance. Completion retries retain
+  that restoration result and audit instead of always opening the spool; malformed metadata
+  and live or ambiguous workers refuse, and proof attempts are never reset (#244).
+
 ## 0.7.2 — 2026-10-01
 
 - Add `agc host recover PACKAGE` and `agc host recover --download` for a dead managed owner

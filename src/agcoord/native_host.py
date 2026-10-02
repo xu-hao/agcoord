@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -1282,10 +1283,42 @@ def _recovery_invoke(command: str, state_dir: Path, arguments: Sequence[str] = (
         raise CoordinatorError(str(exc), code=getattr(exc, "code", "host-recovery-invalid")) from exc
 
 
+def _recovery_original_drain(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict)
+        or set(value) != {"state", "drain_id", "reason", "started_at"}
+        or value["state"] not in ("draining", "drained")
+        or not isinstance(value["drain_id"], str) or not _DRAIN_ID.fullmatch(value["drain_id"])
+        or not isinstance(value["reason"], str) or not 1 <= len(value["reason"]) <= 256
+        or "\0" in value["reason"] or not isinstance(value["started_at"], str)):
+        raise CoordinatorError("invalid retained recovery drain", code="host-recovery-invalid")
+    try:
+        started = datetime.fromisoformat(value["started_at"].replace("Z", "+00:00"))
+        if started.tzinfo is None or started.utcoffset() != timezone.utc.utcoffset(started):
+            raise ValueError("maintenance time must be UTC")
+    except ValueError as exc:
+        raise CoordinatorError("invalid retained recovery drain time", code="host-recovery-invalid") from exc
+    return value
+
+
+def _recovery_completion(value: object, recovery_id: str, proof_id: str,
+                         original_drain: dict[str, Any] | None) -> dict[str, Any]:
+    if (not isinstance(value, dict)
+        or set(value) != {"state", "recovery_id", "proof_run_id", "drain_id"}
+        or value["recovery_id"] != recovery_id or value["proof_run_id"] != proof_id
+        or (original_drain is None and (value["state"] != "open" or value["drain_id"] is not None))
+        or (original_drain is not None and (
+            value["state"] not in ("draining", "drained")
+            or value["drain_id"] != original_drain["drain_id"]))):
+        raise CoordinatorError("invalid recovery completion receipt", code="host-recovery-invalid")
+    return value
+
+
 def _recovery_receipt(value: object, expected_identity: dict[str, Any]) -> dict[str, Any]:
     keys = {"format", "recovery_id", "identity", "probe", "probe_sha256", "proof_run_id",
-            "attempts", "phase", "incident", "state", "protocol"}
-    if (not isinstance(value, dict) or set(value) != keys or value["format"] != 1
+            "attempts", "phase", "incident", "state", "protocol", "original_drain"}
+    if (not isinstance(value, dict) or set(value) != keys or type(value["format"]) is not int or value["format"] != 2
         or value["state"] != "recovering" or value["protocol"] != NATIVE_PROTOCOL
         or value["identity"] != expected_identity
         or not isinstance(value["recovery_id"], str) or not _RECOVERY_ID.fullmatch(value["recovery_id"])
@@ -1296,6 +1329,7 @@ def _recovery_receipt(value: object, expected_identity: dict[str, Any]) -> dict[
         or not (value["proof_run_id"] is None or isinstance(value["proof_run_id"], str))
         or not (value["incident"] is None or isinstance(value["incident"], str))):
         raise CoordinatorError("invalid guarded recovery receipt", code="host-recovery-invalid")
+    _recovery_original_drain(value["original_drain"])
     return value
 
 
@@ -1330,6 +1364,7 @@ def recover_native_host(
         except CoordinatorError:
             raise live_owner from None
         recovery_id = active["recovery_id"]
+        original_drain = active["original_drain"]
         continuing = True
     phase = "staging"
     service_touched = continuing
@@ -1349,6 +1384,7 @@ def recover_native_host(
             run([SUDO, installer, "recover", paths.state_dir, "--probe", probe], "guarded-activation")
             receipt = _recovery_receipt(_recovery_invoke("host-recover-status", paths.state_dir), expected_identity)
             recovery_id = receipt["recovery_id"]
+            original_drain = receipt["original_drain"]
             run([SYSTEMCTL, "--user", "daemon-reload"], "service-reload")
             run([SYSTEMCTL, "--user", "start", SERVICE], "service-start")
         run([SYSTEMCTL, "--user", "is-active", "--quiet", SERVICE], "service-verification")
@@ -1400,8 +1436,7 @@ def recover_native_host(
                 if attempt == 2:
                     raise
                 time.sleep(0.1)
-        if completed != {"state":"open", "recovery_id":recovery_id, "proof_run_id":proof_id}:
-            raise CoordinatorError("invalid recovery completion receipt", code="host-recovery-invalid")
+        completed = _recovery_completion(completed, recovery_id, proof_id, original_drain)
     except CoordinatorError as exc:
         incident = phase
         details: list[str] = []
@@ -1429,5 +1464,5 @@ def recover_native_host(
             code="native-host-recovery-incomplete",
         ) from exc
     return {"state":"complete", "operation":"recover", "version":expected_identity["version"],
-        "package":str(selected), "recovery_id":recovery_id, "service":"active", "identity":identity,
+        "package":str(selected), "recovery_id":recovery_id, "service":"active" if completed["state"] == "open" else "verified", "identity":identity,
         "proof_run_id":proof_id, "proof":proof, "completion":completed}

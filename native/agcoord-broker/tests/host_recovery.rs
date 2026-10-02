@@ -33,6 +33,7 @@ struct Fixture {
     root: PathBuf,
     state: PathBuf,
     worker: Option<(u32, String)>,
+    cgroup_fixture: Option<PathBuf>,
 }
 
 impl Fixture {
@@ -53,6 +54,7 @@ impl Fixture {
             state: root.join("state"),
             root,
             worker: None,
+            cgroup_fixture: None,
         }
     }
 
@@ -68,8 +70,12 @@ impl Fixture {
     }
 
     fn start(&self) -> OwnedProcess {
+        let mut command = self.command("serve");
+        if let Some(root) = &self.cgroup_fixture {
+            command.arg("--cgroup-fixture").arg(root);
+        }
         let mut process = OwnedProcess(
-            self.command("serve")
+            command
                 .args([
                     "--capacity",
                     "jobs=1",
@@ -194,6 +200,74 @@ impl Fixture {
             unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
         }
         wait_for(|| process_identity(pid).is_none_or(|(state, _)| state == "Z"));
+    }
+
+    fn configure_cpu_fixture(&mut self) {
+        let root = self.root.join("delegated");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(&self.state).unwrap();
+        fs::set_permissions(&self.state, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(self.state.join("config.json"), serde_json::to_vec(&json!({
+            "bindings": {"cpu": {"backend": "cgroup-v2", "kind": "cpu", "mode": "required", "unit": "logical-cpu"}},
+            "cgroup_root": root,
+        })).unwrap()).unwrap();
+        fs::set_permissions(
+            self.state.join("config.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(
+            self.root.join("enforcement-probe"),
+            "#!/bin/sh\nwhile [ ! -e proof-release ]; do sleep 0.02; done\n",
+        )
+        .unwrap();
+        self.cgroup_fixture = Some(root);
+    }
+
+    fn finish_enforced_fixture_proof(&mut self, recovery_id: &str) -> Value {
+        parsed(self.proof(recovery_id, "fixture-enforcement-proof"));
+        wait_for(|| {
+            let row = self.status("fixture-enforcement-proof");
+            if let Some(pid) = row["worker_pid"].as_u64()
+                && let Some((_, token)) = process_identity(pid as u32)
+            {
+                self.worker = Some((pid as u32, token));
+                row["resource_receipt"]["applied"]["cpu"] == 1
+            } else {
+                false
+            }
+        });
+        let root = self.cgroup_fixture.as_ref().unwrap();
+        let owner = fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("agcoord-u")
+            })
+            .unwrap();
+        let leaf = fs::read_dir(owner)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("run-"))
+            .unwrap();
+        // This is the existing deterministic kernel seam, not a fabricated run receipt.
+        fs::write(
+            leaf.join("cpu.stat"),
+            "usage_usec 100\nnr_throttled 0\nthrottled_usec 0\n",
+        )
+        .unwrap();
+        fs::write(self.root.join("proof-release"), "release").unwrap();
+        wait_for(|| self.status("fixture-enforcement-proof")["status"] == "passed");
+        self.stop_worker();
+        let proof = self.status("fixture-enforcement-proof");
+        assert_eq!(proof["resource_receipt"]["applied"]["cpu"], 1);
+        assert!(proof["resource_receipt"]["peak"]["cpu"].as_u64().unwrap() >= 1);
+        proof
     }
 
     fn recovery_status(&self) -> Value {
@@ -589,4 +663,175 @@ fn stranded_normal_drain_can_enter_recovery_without_releasing_accepted_work() {
     );
     assert_retained_queue(&fixture.status("retained-queued"), &queued);
     fixture.assert_queue_guarded();
+}
+
+#[test]
+fn verified_recovery_restores_original_drain_and_replays_without_an_owner() {
+    for retain_queue in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.configure_cpu_fixture();
+        let mut old = fixture.queue_behind_worker();
+        // The stranded worker claims only jobs; CPU enforcement starts with the proof.
+        assert!(fixture.status("retained-running")["resource_receipt"]["applied"]["cpu"].is_null());
+        if !retain_queue {
+            parsed(
+                fixture
+                    .command("cancel")
+                    .args(["--run-id", "retained-queued"])
+                    .output()
+                    .unwrap(),
+            );
+        }
+        let drain = parsed(
+            fixture
+                .command("drain")
+                .args([
+                    "--drain-id",
+                    "drain-0123456789ab",
+                    "--reason",
+                    "owned maintenance intent",
+                ])
+                .output()
+                .unwrap(),
+        );
+        old.kill();
+        fixture.stop_worker();
+        let (mut holder, guard) = fixture.hold();
+        assert_eq!(guard["format"], 2);
+        assert_eq!(
+            guard["original_drain"],
+            json!({
+                "state": drain["state"], "drain_id": drain["drain_id"],
+                "reason": drain["reason"], "started_at": drain["started_at"],
+            })
+        );
+        let recovery_id = guard["recovery_id"].as_str().unwrap();
+        drop(holder.0.stdin.take());
+        assert!(holder.0.wait().unwrap().success());
+        let mut replacement = fixture.start();
+        wait_for(|| fixture.status("retained-running")["status"] == "interrupted");
+        let proof = fixture.finish_enforced_fixture_proof(recovery_id);
+        if retain_queue {
+            fixture.assert_queue_guarded();
+        }
+        for id in ["drain-ffffffffffff", recovery_id] {
+            refused(
+                fixture
+                    .command("resume")
+                    .args(["--drain-id", id])
+                    .output()
+                    .unwrap(),
+            );
+        }
+        let completed = parsed(
+            fixture
+                .command("host-recover-complete")
+                .args(["--recovery-id", recovery_id])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            completed,
+            json!({
+                "state": if retain_queue { "draining" } else { "drained" },
+                "recovery_id": recovery_id, "proof_run_id": proof["run_id"],
+                "drain_id": drain["drain_id"],
+            })
+        );
+        if retain_queue {
+            wait_for(|| fixture.status("retained-queued")["status"] == "passed");
+            assert!(fixture.root.join("executed").exists());
+        }
+        wait_for(|| replacement.0.try_wait().unwrap().is_some());
+        let restored = parsed(fixture.command("drain-status").output().unwrap());
+        assert_eq!(restored["state"], "drained");
+        assert_eq!(restored["live"], 0);
+        assert!(restored["broker_pid"].is_null());
+        for field in ["drain_id", "reason", "started_at"] {
+            assert_eq!(restored[field], drain[field]);
+        }
+        assert_eq!(
+            parsed(
+                fixture
+                    .command("host-recover-complete")
+                    .args(["--recovery-id", recovery_id])
+                    .output()
+                    .unwrap()
+            ),
+            completed
+        );
+        refused(fixture.submit("new-during-restored-drain", &["/bin/true"]));
+        for id in ["drain-ffffffffffff", recovery_id] {
+            refused(
+                fixture
+                    .command("resume")
+                    .args(["--drain-id", id])
+                    .output()
+                    .unwrap(),
+            );
+        }
+        let resumed = parsed(
+            fixture
+                .command("resume")
+                .args(["--drain-id", drain["drain_id"].as_str().unwrap()])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(resumed["state"], "open");
+        assert_eq!(
+            parsed(
+                fixture
+                    .command("host-recover-complete")
+                    .args(["--recovery-id", recovery_id])
+                    .output()
+                    .unwrap()
+            ),
+            completed
+        );
+    }
+}
+
+#[test]
+fn malformed_original_drain_cannot_be_read_or_reused_as_a_recovery_guard() {
+    for invalid in [
+        json!({"state": "draining"}),
+        json!({"state": "open", "drain_id": "drain-0123456789ab", "reason": "owned", "started_at": "2026-10-02T00:00:00Z"}),
+        json!({"state": "draining", "drain_id": "recovery-0123456789ab", "reason": "owned", "started_at": "2026-10-02T00:00:00Z"}),
+    ] {
+        let mut fixture = Fixture::new();
+        let mut old = fixture.queue_behind_worker();
+        old.kill();
+        fixture.stop_worker();
+        let (mut holder, _) = fixture.hold();
+        drop(holder.0.stdin.take());
+        assert!(holder.0.wait().unwrap().success());
+        // Corrupt only this fixture's persisted boundary to exercise fail-closed reads.
+        let connection = rusqlite::Connection::open(fixture.state.join("queue.sqlite3")).unwrap();
+        let raw: String = connection
+            .query_row(
+                "SELECT value FROM coordinator_meta WHERE key='host_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut guard: Value = serde_json::from_str(&raw).unwrap();
+        guard["original_drain"] = invalid;
+        connection
+            .execute(
+                "UPDATE coordinator_meta SET value=?1 WHERE key='host_recovery'",
+                [guard.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            refused(fixture.command("host-recover-status").output().unwrap())["code"],
+            "host-recovery-invalid"
+        );
+        assert_eq!(
+            refused(fixture.command("host-recover-hold").output().unwrap())["code"],
+            "host-recovery-invalid"
+        );
+        assert_eq!(fixture.status("retained-queued")["status"], "queued");
+        assert!(!fixture.root.join("executed").exists());
+    }
 }

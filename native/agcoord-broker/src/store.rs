@@ -686,7 +686,7 @@ pub(crate) fn set_metadata(connection: &Connection, key: &str, value: &str) -> R
     Ok(())
 }
 
-fn drain_id_valid(value: &str) -> bool {
+pub(crate) fn drain_id_valid(value: &str) -> bool {
     value.len() == 18
         && value.starts_with("drain-")
         && value[6..]
@@ -694,7 +694,7 @@ fn drain_id_valid(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn maintenance_time_valid(value: &str) -> bool {
+pub(crate) fn maintenance_time_valid(value: &str) -> bool {
     let bytes = value.as_bytes();
     let zone_start = if bytes.ends_with(b"Z") {
         bytes.len().checked_sub(1)

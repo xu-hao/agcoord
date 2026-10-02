@@ -99,6 +99,20 @@ in one transaction and returns the spool to `open`; a wrong or stale identifier 
 submissions. Migration and rollback preserve the current marker across the protocol boundary
 and never resurrect a marker already removed by a successful resume.
 
+A normal drain stranded behind a dead or unstartable managed owner may be repaired through
+[guarded managed host recovery](native_host.md#guarded-recovery-when-the-outgoing-broker-cannot-drain).
+The original drain ID, state, reason, start time, and protocol remain durable maintenance
+intent. Submission guards stay continuous while the temporary recovery guard admits only its
+bound host proof. After verification, recovery atomically restores the original drain;
+accepted queued work finishes normally, and the owner yields after the last accepted row
+becomes terminal. New submissions remain refused until explicit `resume` with the exact
+original drain ID after the intended maintenance succeeds. Repair and proof do not authorize that resume.
+Recovery completion and its retry receipt retain the original drain audit rather than always
+reporting `open`. Invalid maintenance metadata or live/ambiguous worker identities refuse;
+retries never reset proof attempts. Repeating a stranded drain alone cannot make an
+unstartable broker progress, and raw spool edits or cancellation of accepted work are not a
+repair path.
+
 ## Repository lanes and resources
 
 Each submission belongs to a stable repository lane and records its resolved worktree. A

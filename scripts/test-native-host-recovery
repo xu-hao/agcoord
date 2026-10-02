@@ -99,7 +99,7 @@ def main():
         package, installer, probe, identity = native_host._release_inputs(
             args.package.resolve(), require_pin=True)
         evidence["identity"] = identity
-        for mode in ("native", "public-cli"):
+        for mode in ("native", "public-cli", "public-cli-drain"):
             marker = scratch / mode
             record = {"mode": mode, "marker": str(marker), "stage": "submit-owned-work"}
             evidence["rounds"].append(record)
@@ -115,6 +115,15 @@ def main():
             record["queued_run_id"] = queued_id
             require(client.status(queued_id)["status"] == "queued" and not marker.exists(),
                     "owned marker must remain queued behind the cpu=2 allocation")
+            if mode == "public-cli-drain":
+                record["stage"] = "begin-normal-drain"
+                original_drain_id = "drain-" + uuid4().hex[:12]
+                record["original_drain"] = native.invoke(
+                    "drain", state_dir=state,
+                    arguments=["--drain-id", original_drain_id,
+                               "--reason", "owned recovery rehearsal maintenance"])
+                require(record["original_drain"]["state"] == "draining",
+                        "normal drain must retain the owned running and queued rows")
             record["stage"] = "stop-service"
             process(["systemctl", "--user", "stop", native_host.SERVICE])
             record["stage"] = "inspect-stopped-work"
@@ -176,7 +185,7 @@ def main():
                     "host-recover-complete", state_dir=state,
                     arguments=["--recovery-id", active_recovery])
                 require(record["completion"] == {"state": "open", "recovery_id": active_recovery,
-                                                 "proof_run_id": proof_id},
+                                                 "proof_run_id": proof_id, "drain_id": None},
                         "native completion did not acknowledge the guarded proof")
                 active_recovery = None
             else:
@@ -188,6 +197,14 @@ def main():
                         "public recovery command did not complete")
                 native_host._validate_proof(record["recovery"]["proof"],
                                             record["recovery"]["proof_run_id"], operation="recovery")
+            if mode == "public-cli-drain":
+                completion = record["recovery"]["completion"]
+                require(completion == {
+                    "state": "draining", "recovery_id": record["recovery"]["recovery_id"],
+                    "proof_run_id": record["recovery"]["proof_run_id"],
+                    "drain_id": original_drain_id,
+                }, "verified repair must restore the original unfinished drain")
+                record["completion"] = completion
             record["stage"] = "await-retained-work"
             record["queued_after_complete"] = await_status(client, queued_id, {"passed"})
             require(marker.read_text(encoding="ascii") == "run\n",
@@ -204,6 +221,39 @@ def main():
                 require(client.status(queued_id) == record["queued_after_complete"]
                         and marker.read_text(encoding="ascii") == "run\n",
                         "completion replay must not rerun accepted ordinary work")
+            if mode == "public-cli-drain":
+                record["stage"] = "await-original-drain"
+
+                def original_drain_finished():
+                    receipt = native.invoke("drain-status", state_dir=state)
+                    return receipt if receipt["state"] == "drained" and receipt["broker_pid"] is None else None
+
+                drained = await_condition(original_drain_finished, "restored drain with no live owner")
+                record["restored_drain"] = drained
+                require(drained["live"] == 0, "accepted work must finish under restored drain")
+                for key in ("drain_id", "reason", "started_at"):
+                    require(drained[key] == record["original_drain"][key],
+                            f"restored drain changed its original {key}")
+                record["stage"] = "replay-without-owner"
+                replay = native.invoke("host-recover-complete", state_dir=state,
+                                       arguments=["--recovery-id", completion["recovery_id"]])
+                require(replay == completion, "replay must preserve the original completion receipt")
+                record["completion_replay"] = replay
+                record["stage"] = "explicit-resume"
+                for wrong_id in ("drain-" + uuid4().hex[:12], completion["recovery_id"]):
+                    try:
+                        native.invoke("resume", state_dir=state, arguments=["--drain-id", wrong_id])
+                    except NativeClientError:
+                        pass
+                    else:
+                        raise RuntimeError("wrong drain or recovery identity opened ordinary admission")
+                require(native.invoke("drain-status", state_dir=state)["drain_id"] == original_drain_id,
+                        "failed resume changed original drain identity")
+                record["resume"] = native.invoke("resume", state_dir=state,
+                                                 arguments=["--drain-id", original_drain_id])
+                require(record["resume"]["state"] == "open", "explicit original drain resume must reopen")
+                require(marker.read_text(encoding="ascii") == "run\n",
+                        "drain restoration and replay must not rerun accepted work")
             record["stage"] = "passed"
         evidence["stage"] = "passed"
         evidence["state"] = "passed"

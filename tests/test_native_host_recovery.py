@@ -19,6 +19,9 @@ from agcoord.queue import CoordinatorError, RUN_ID_ENV, STATE_DIR_ENV
 
 
 RECOVERY_ID = "recovery-0123456789ab"
+DRAIN_ID = "drain-0123456789ab"
+ORIGINAL_DRAIN = {"state": "draining", "drain_id": DRAIN_ID,
+                  "reason": "owned maintenance window", "started_at": "2026-10-02T00:00:00Z"}
 BROKER_BYTES = b"owned recovery broker fixture\n"
 BROKER_DIGEST = hashlib.sha256(BROKER_BYTES).hexdigest()
 IDENTITY = {
@@ -92,6 +95,9 @@ def recovery(monkeypatch, tmp_path):
         proof_statuses=["running", "passed"], applied_cpu=1, settling=0,
         timeout_phase=None, owner_unavailable=False, now=0.0,
         guard_overrides={}, completion_lost_responses=0, completion_refusals=0,
+        original_drain=None, completion_state=None, completion_overrides={},
+        completion_missing=set(), completion_receipt=None,
+        drain_state_after_lost_response=None, current_drain_state=None,
     )
 
     def run(arguments, **options):
@@ -115,11 +121,12 @@ def recovery(monkeypatch, tmp_path):
             if not observed.guarded:
                 raise CoordinatorError("no guarded recovery is active", code="host-recovery-invalid")
             probe = package.parent / "test-native-host-enforcement"
-            return {"format": 1, "recovery_id": RECOVERY_ID, "identity": IDENTITY,
+            return {"format": 2, "recovery_id": RECOVERY_ID, "identity": IDENTITY,
                     "probe": str(probe),
                     "probe_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
                     "proof_run_id": None, "attempts": 1, "phase": "guarded", "incident": None,
-                    "state": "recovering", "protocol": 5, **observed.guard_overrides}
+                    "state": "recovering", "protocol": 5,
+                    "original_drain": observed.original_drain, **observed.guard_overrides}
         assert observed.guarded or command == "host-recover-complete"
         assert arguments[:2] == ["--recovery-id", RECOVERY_ID]
         if command == "host-recover-proof":
@@ -134,12 +141,24 @@ def recovery(monkeypatch, tmp_path):
             if observed.completion_refusals:
                 observed.completion_refusals -= 1
                 raise CoordinatorError("owned completion transport unavailable")
-            observed.guarded = False
+            if observed.completion_receipt is None:
+                original = observed.original_drain
+                observed.completion_receipt = {
+                    "state": observed.completion_state or (original["state"] if original else "open"),
+                    "recovery_id": RECOVERY_ID,
+                    "proof_run_id": "check-owned-recovery-proof",
+                    "drain_id": original["drain_id"] if original else None,
+                    **observed.completion_overrides,
+                }
+                for key in observed.completion_missing:
+                    observed.completion_receipt.pop(key)
+            if not observed.completion_overrides and not observed.completion_missing:
+                observed.guarded = False
             if observed.completion_lost_responses:
                 observed.completion_lost_responses -= 1
+                observed.current_drain_state = observed.drain_state_after_lost_response
                 raise CoordinatorError("owned completion committed but response lost")
-            return {"state": "open", "recovery_id": RECOVERY_ID,
-                    "proof_run_id": "check-owned-recovery-proof"}
+            return dict(observed.completion_receipt)
         if command == "host-recover-park":
             observed.parked = True
             return {"state": "recovering"}
@@ -226,6 +245,8 @@ def test_recovery_opens_queue_only_after_enforcement_proof(recovery):
     assert result["state"] == "complete" and result["operation"] == "recover"
     assert result["recovery_id"] == RECOVERY_ID
     assert result["proof_run_id"] == "check-owned-recovery-proof"
+    assert result["completion"] == {"state": "open", "recovery_id": RECOVERY_ID,
+                                    "proof_run_id": "check-owned-recovery-proof", "drain_id": None}
     names = _names(recovery)
     assert names.index("host-recover-status") < names.index("ping")
     assert names.index("host-recover-proof") < names.index("proof-status")
@@ -400,3 +421,102 @@ def test_completion_transport_failure_has_bounded_retry_then_parks(recovery):
     assert completions == [["--recovery-id", RECOVERY_ID]] * 3
     assert _names(recovery).count("host-recover-proof") == 1
     _assert_parked(recovery, completion_attempts=3)
+
+
+@pytest.mark.parametrize("original_state", ["draining", "drained"])
+@pytest.mark.parametrize("restored_state", ["draining", "drained"])
+@pytest.mark.parametrize("live_guard", [False, True])
+def test_recovery_preserves_original_drain_without_resuming_queue(
+    recovery, original_state, restored_state, live_guard,
+):
+    original = {**ORIGINAL_DRAIN, "state": original_state}
+    recovery.original_drain = original
+    recovery.completion_state = restored_state
+    recovery.guarded = live_guard
+    with (recovery.state / "broker.lock").open("w") as owner:
+        if live_guard:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _recover(recovery)
+    assert result["state"] == "complete"
+    assert result["completion"] == {
+        "state": restored_state, "recovery_id": RECOVERY_ID,
+        "proof_run_id": "check-owned-recovery-proof", "drain_id": DRAIN_ID,
+    }
+    assert recovery.original_drain == {**ORIGINAL_DRAIN, "state": original_state}
+    assert _names(recovery)[-1] == "host-recover-complete"
+    assert recovery.queue.read_bytes() == b"owned retained queue fixture"
+
+
+@pytest.mark.parametrize("original", [None, ORIGINAL_DRAIN])
+@pytest.mark.parametrize("overrides,missing", [
+    ({"recovery_id": "recovery-fedcba987654"}, set()),
+    ({"proof_run_id": "check-wrong-proof"}, set()),
+    ({"drain_id": "drain-fedcba987654"}, set()),
+    ({"drain_id": False}, set()),
+    ({"state": "recovering"}, set()),
+    ({"state": False}, set()),
+    ({"unexpected": "field"}, set()),
+    ({}, {"drain_id"}),
+])
+def test_invalid_completion_identity_state_or_schema_is_refused(recovery, original, overrides, missing):
+    recovery.original_drain = original
+    recovery.completion_overrides = overrides
+    recovery.completion_missing = missing
+    with pytest.raises(CoordinatorError) as error:
+        _recover(recovery)
+    assert error.value.code == "native-host-recovery-incomplete"
+    assert error.value.__cause__.code == "host-recovery-invalid"
+    assert _names(recovery).count("host-recover-proof") == 1
+    assert "host-recover-park" in _names(recovery)
+
+
+@pytest.mark.parametrize("original,completed", [
+    (None, {"state": "draining", "drain_id": DRAIN_ID}),
+    (None, {"state": "drained", "drain_id": DRAIN_ID}),
+    (ORIGINAL_DRAIN, {"state": "open", "drain_id": DRAIN_ID}),
+    (ORIGINAL_DRAIN, {"state": "open", "drain_id": None}),
+    (ORIGINAL_DRAIN, {"state": "draining", "drain_id": None}),
+])
+def test_completion_must_restore_the_active_original_drain(recovery, original, completed):
+    recovery.original_drain = original
+    recovery.completion_overrides = completed
+    with pytest.raises(CoordinatorError) as error:
+        _recover(recovery)
+    assert error.value.__cause__.code == "host-recovery-invalid"
+    assert "host-recover-park" in _names(recovery)
+
+
+@pytest.mark.parametrize("original", [
+    False, [], {}, {**ORIGINAL_DRAIN, "state": "open"},
+    {**ORIGINAL_DRAIN, "drain_id": "other"},
+    {key: value for key, value in ORIGINAL_DRAIN.items() if key != "reason"},
+    {**ORIGINAL_DRAIN, "reason": None},
+    {**ORIGINAL_DRAIN, "started_at": 123},
+    {**ORIGINAL_DRAIN, "unexpected": "field"},
+])
+def test_malformed_original_drain_is_refused_before_proof(recovery, original):
+    recovery.original_drain = original
+    with pytest.raises(CoordinatorError) as error:
+        _recover(recovery)
+    assert error.value.__cause__.code == "host-recovery-invalid"
+    assert "host-recover-proof" not in _names(recovery)
+    assert "host-recover-complete" not in _names(recovery)
+    assert recovery.events[-1] == (
+        "process", [str(native_host.SYSTEMCTL), "--user", "stop", native_host.SERVICE])
+
+
+def test_lost_completion_response_replays_durable_drain_state_after_settlement(recovery):
+    recovery.original_drain = dict(ORIGINAL_DRAIN)
+    recovery.completion_state = "draining"
+    recovery.completion_lost_responses = 1
+    recovery.drain_state_after_lost_response = "drained"
+    result = _recover(recovery)
+    assert recovery.current_drain_state == "drained"
+    assert result["completion"] == {
+        "state": "draining", "recovery_id": RECOVERY_ID,
+        "proof_run_id": "check-owned-recovery-proof", "drain_id": DRAIN_ID,
+    }
+    assert [args for name, args in recovery.events if name == "host-recover-complete"] == [
+        ["--recovery-id", RECOVERY_ID], ["--recovery-id", RECOVERY_ID]]
+    assert _names(recovery).count("host-recover-proof") == 1
+    assert not recovery.guarded and not recovery.parked
