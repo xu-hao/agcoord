@@ -373,6 +373,24 @@
           "scheduler::required_cgroup_binding_refuses_before_user_code_when_delegation_is_unavailable"
         ]
       }
+    },
+    {
+      "id": "recovery.guarded-managed-host",
+      "domain": "recovery",
+      "description": "A dead managed owner can be replaced while queued identities and history remain guarded; live owners or workers refuse recovery and ordinary work stays blocked across restarts.",
+      "tests": {
+        "rust_native": [
+          "host_recovery::recovery_preserves_queued_work_and_guards_admission_across_restarts",
+          "host_recovery::recovery_refuses_a_live_owner_and_a_live_retained_worker",
+          "host_recovery::a_successful_unenforced_proof_cannot_complete_or_resume_recovery",
+          "host_recovery::mismatched_recovery_identity_and_changed_helper_preserve_the_guard",
+          "host_recovery::failed_proofs_retry_with_the_same_identity_and_park_at_the_attempt_bound",
+          "host_recovery::parking_cancels_only_the_active_proof_and_allows_a_bounded_retry",
+          "host_recovery::stranded_normal_drain_can_enter_recovery_without_releasing_accepted_work",
+          "host_recovery::verified_recovery_restores_original_drain_and_replays_without_an_owner",
+          "host_recovery::malformed_original_drain_cannot_be_read_or_reused_as_a_recovery_guard"
+        ]
+      }
     }
   ],
   "intentional_differences": [

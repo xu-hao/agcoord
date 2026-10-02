@@ -2623,6 +2623,24 @@ impl CgroupBackend {
         Ok(())
     }
 
+    /// Read-only proof that no process remains in a retained allocation.
+    pub fn prove_recovery_empty(
+        &self,
+        request: &CgroupRequest,
+        handle: &Value,
+    ) -> CgroupResult<()> {
+        match self.validate_recovery(request, handle) {
+            Err(error) if error.code == "root-reused" => return Ok(()),
+            result => result?,
+        }
+        if let Some(leaf) = self.resolve(request, handle, true)?
+            && self.system.populated(&leaf)?
+        {
+            return Err(CgroupError::new("leaf-populated"));
+        }
+        Ok(())
+    }
+
     /// Forget only this broker's private recovery metadata after systemd recreated the
     /// delegated root. The caller has already proved that every worker recorded against
     /// the old root is gone, so no process or cgroup in the new root may be touched.

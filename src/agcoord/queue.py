@@ -80,7 +80,7 @@ _MAINTENANCE_TIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$"
 )
 MAINTENANCE_REFUSAL = "agcoord-maintenance-draining"
-MAINTENANCE_STATES = frozenset({"draining", "drained"})
+MAINTENANCE_STATES = frozenset({"draining", "drained", "recovering"})
 MAINTENANCE_TRIGGER_NAMES = (
     "agcoord_maintenance_reject_runs",
     "agcoord_maintenance_reject_activity_insert",
@@ -809,7 +809,8 @@ def _maintenance_record(
         raise CoordinatorError("coordinator maintenance metadata is incomplete")
     if values["maintenance_state"] not in MAINTENANCE_STATES:
         raise CoordinatorError("coordinator maintenance state is invalid")
-    if not _DRAIN_ID.fullmatch(values["maintenance_id"]):
+    id_pattern = r"recovery-[0-9a-f]{12}" if values["maintenance_state"] == "recovering" else _DRAIN_ID
+    if not re.fullmatch(id_pattern, values["maintenance_id"]):
         raise CoordinatorError("coordinator maintenance drain ID is invalid")
     reason = values["maintenance_reason"]
     if not reason or len(reason) > MAX_MAINTENANCE_REASON or "\0" in reason:
@@ -851,9 +852,8 @@ def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
         raise CoordinatorError("coordinator returned an invalid maintenance receipt")
     if value["state"] not in MAINTENANCE_STATES:
         raise CoordinatorError("coordinator returned an invalid maintenance state")
-    if not isinstance(value["drain_id"], str) or not _DRAIN_ID.fullmatch(
-        value["drain_id"]
-    ):
+    id_pattern = r"recovery-[0-9a-f]{12}" if value["state"] == "recovering" else _DRAIN_ID
+    if not isinstance(value["drain_id"], str) or not re.fullmatch(id_pattern, value["drain_id"]):
         raise CoordinatorError("coordinator returned an invalid maintenance drain ID")
     reason = value["reason"]
     if (

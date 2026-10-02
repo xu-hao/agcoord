@@ -17,6 +17,7 @@ from .native_host import (
     install_native_host,
     install_user_broker,
     upgrade_native_host,
+    recover_native_host,
 )
 from .queue import (
     RUN_ID_ENV,
@@ -208,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     _bundle_source(host_upgrade)
+    host_recover = state(host_commands.add_parser("recover", help="recover a dead managed owner while preserving queued work behind verification"))
+    _bundle_source(host_recover)
     host_configuration = state(
         host_commands.add_parser(
             "config",
@@ -504,10 +507,8 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             print(f"AGCoord: wrote {result['path']}", file=sys.stderr)
         return 0
 
-    if args.command == "host" and args.host_command in {"install", "upgrade"}:
-        operation = (
-            install_native_host if args.host_command == "install" else upgrade_native_host
-        )
+    if args.command == "host" and args.host_command in {"install", "upgrade", "recover"}:
+        operation = {"install":install_native_host,"upgrade":upgrade_native_host,"recover":recover_native_host}[args.host_command]
         package = _bundle_path(args)
         result = operation(
             package,
@@ -519,7 +520,9 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         if emit:
             emit(result)
         else:
-            if args.host_command == "upgrade":
+            if args.host_command == "recover":
+                summary = f"recovered native host to {result['version']}; verified {result['recovery_id']}"
+            elif args.host_command == "upgrade":
                 summary = (
                     f"upgraded native host to {result['version']}; "
                     f"resumed {result['drain_id']}"
