@@ -84,9 +84,9 @@ fn validate_record(value: &Value, completed: bool) -> Result<()> {
     if completed {
         keys.insert("completion");
     }
-    if !value
+    if value
         .as_object()
-        .is_some_and(|o| o.keys().map(String::as_str).collect::<BTreeSet<_>>() == keys)
+        .is_none_or(|o| o.keys().map(String::as_str).collect::<BTreeSet<_>>() != keys)
         || value["format"] != 2
         || !value["recovery_id"].as_str().is_some_and(valid_id)
         || value["identity"] != identity()
@@ -125,9 +125,9 @@ fn validate_record(value: &Value, completed: bool) -> Result<()> {
         let receipt = &value["completion"];
         let keys = BTreeSet::from(["state", "recovery_id", "proof_run_id", "drain_id"]);
         let drain = &value["original_drain"];
-        if !receipt
+        if receipt
             .as_object()
-            .is_some_and(|o| o.keys().map(String::as_str).collect::<BTreeSet<_>>() == keys)
+            .is_none_or(|o| o.keys().map(String::as_str).collect::<BTreeSet<_>>() != keys)
             || receipt["recovery_id"] != value["recovery_id"]
             || receipt["proof_run_id"] != value["proof_run_id"]
             || !(if drain.is_null() {

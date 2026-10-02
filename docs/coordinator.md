@@ -101,7 +101,7 @@ and never resurrect a marker already removed by a successful resume.
 
 A normal drain stranded behind a dead or unstartable managed owner may be repaired through
 [guarded managed host recovery](native_host.md#guarded-recovery-when-the-outgoing-broker-cannot-drain).
-The original drain ID, state, reason, start time, and protocol remain durable maintenance
+The original drain ID, state, reason, and start time remain durable maintenance
 intent. Submission guards stay continuous while the temporary recovery guard admits only its
 bound host proof. After verification, recovery atomically restores the original drain;
 accepted queued work finishes normally, and the owner yields after the last accepted row
