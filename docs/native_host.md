@@ -410,6 +410,12 @@ recovery refuses a live owner, live or ambiguous recorded workers, unavailable i
 evidence, and an invalid package. It never substitutes a forced activation or deletion of the
 spool. Normal `agc host upgrade` and its drain flow remain unchanged.
 
+An existing normal drain is maintenance intent, not permission to reopen submissions. Recovery
+preserves its original drain ID, state, reason, start time, and protocol as durable audit
+metadata. Its submission guards remain continuous while the recovery guard temporarily blocks
+ordinary accepted-job admission for host verification. Malformed original maintenance metadata
+refuses recovery; neither a retry nor repair may replace its identity or reset proof attempts.
+
 The command stages the verified replacement and stops the failed service. The staged native
 holder takes the exclusive owner/maintenance lock, proves every recorded worker identity is
 gone, and establishes a durable `recovery-` ID followed by 12 hexadecimal digits. It holds the
@@ -422,8 +428,15 @@ The durable guard blocks new submissions and ordinary queued-job admission throu
 and restart. Recovery admits only the exact bound enforcement helper, with `cpu=1` and
 `jobs=1`, while ordinary work stays blocked. Completion requires that proof to pass with exit
 status zero, a receipt with requested and applied CPU both 1 and observed peak CPU at least 1,
-the unchanged helper digest, and no running rows. Only successful completion clears the guard.
-A process exit, service restart, normal `agc drain`, or `agc resume` cannot clear it.
+the unchanged helper digest, and no running rows. Only successful completion ends the
+verification-only guard. If no normal drain existed, completion returns the spool to `open`.
+If recovery inherited a normal drain, completion atomically restores that original drain and
+its submission guards. Accepted queued jobs then finish through their normal state machines;
+proven-dead running rows remain interrupted. The owner reaches `drained` and yields when no
+accepted work remains. New submissions stay blocked until explicit `agc resume` with the exact
+original drain ID after the intended maintenance succeeds. Host proof never performs that
+resume. A process exit, service restart, normal `agc drain`, or `agc resume` cannot clear an
+active recovery guard.
 
 If the verified replacement is already running under the same active recovery guard, rerunning
 `agc host recover` continues that guard instead of stopping or reactivating the service. The
@@ -432,7 +445,8 @@ a mismatched guard still refuses. Continuation reuses a queued, running, or pass
 that recovery is verifying; it does not submit a duplicate or spend another proof attempt.
 
 The native hold, status, proof, completion, and park operations retain the exact recovery ID,
-replacement identity, helper path and digest, proof job ID, attempt count, phase, and incident.
+replacement identity, helper path and digest, proof job ID, attempt count, phase, incident,
+and any original drain metadata. The completed recovery audit retains that original drain.
 Each host phase and enforcement proof is bounded to 120 seconds; owner acquisition and dead-row
 settlement waits are each bounded to 30 seconds. At most three proof attempts are allowed
 across retries. Retrying must use the same exact verified replacement package and helper path;
@@ -447,9 +461,18 @@ recovery ID and address the reported incident before retrying the same package.
 
 Completion retries up to three times with the exact recovery ID. If completion committed but
 its reply was lost, the native operation validates the retained completed identity and passed
-CPU proof, then returns the same open receipt without another proof or recovery operation.
-If completion still cannot be confirmed, the error says to inspect the durable receipt; it
-does not claim the guard remains when completion may already have cleared it.
+CPU proof, then returns the same completion receipt without another proof or recovery
+operation. That receipt reports the retained original maintenance state when a drain was
+inherited; it is not always `open`. It does not implicitly resume a retained drain on retry.
+If completion still cannot be confirmed, inspect the durable recovery and original drain
+receipts. Do not assume submissions reopened or that the verification-only guard remains.
+
+A stranded drain has an original marker plus accepted queued or running rows, while the
+outgoing broker is dead or cannot start. Repeating the normal drain returns the same marker
+but cannot make those rows progress. Earlier recovery refused this state with `normal
+maintenance is active; recovery cannot replace its identity`. Use the verified recovery path
+above; retain both IDs and the original maintenance metadata. Raw database edits, premature
+resume, or cancelling accepted work are not repair workarounds.
 
 ### Normal restart and rollback
 
