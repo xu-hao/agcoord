@@ -548,3 +548,45 @@ fn parking_cancels_only_the_active_proof_and_allows_a_bounded_retry() {
     assert_eq!(fixture.status("parked-proof")["status"], "cancelled");
     fixture.assert_queue_guarded();
 }
+
+#[test]
+fn stranded_normal_drain_can_enter_recovery_without_releasing_accepted_work() {
+    let mut fixture = Fixture::new();
+    let mut old = fixture.queue_behind_worker();
+    let queued = fixture.status("retained-queued");
+    let drain = parsed(
+        fixture
+            .command("drain")
+            .args([
+                "--drain-id",
+                "drain-0123456789ab",
+                "--reason",
+                "owned host maintenance",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(drain["state"], "draining");
+    assert_eq!(drain["live"], 2);
+    old.kill();
+    fixture.stop_worker();
+    assert_eq!(
+        parsed(fixture.command("drain-status").output().unwrap())["state"],
+        "draining"
+    );
+
+    let (mut holder, receipt) = fixture.hold();
+    assert_eq!(receipt["state"], "recovering");
+    assert_retained_queue(&fixture.status("retained-queued"), &queued);
+    drop(holder.0.stdin.take());
+    assert!(holder.0.wait().unwrap().success());
+
+    let _replacement = fixture.start();
+    wait_for(|| fixture.status("retained-running")["status"] == "interrupted");
+    assert_eq!(
+        fixture.recovery_status()["recovery_id"],
+        receipt["recovery_id"]
+    );
+    assert_retained_queue(&fixture.status("retained-queued"), &queued);
+    fixture.assert_queue_guarded();
+}
