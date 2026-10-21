@@ -14,6 +14,7 @@ UNIT = ROOT / "packaging/systemd/agcoord-broker.service"
 PROFILE = ROOT / "packaging/apparmor/usr.libexec.agcoord.agcoord-broker"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 WORKER = ROOT / "native/agcoord-broker/src/worker.rs"
+PROBE = ROOT / "scripts/test-native-host-enforcement"
 
 
 def test_native_user_service_passes_systemd_verification(tmp_path: Path):
@@ -154,3 +155,28 @@ def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
         in workflow
     )
     assert "grep -iE 'apparmor|agcoord'" in workflow
+
+
+def test_enforcement_probe_expects_apparmor_rendering_of_the_bubblewrap_child_stack():
+    # AppArmor stores and prints a stacked label with its profiles sorted by name, so the label a
+    # sandboxed process reports is the sorted rendering of the agcoord-bwrap exec target, not the
+    # order the policy rule happens to list.
+    policy = PROFILE.read_text(encoding="utf-8")
+    bwrap = policy.split("profile agcoord-bwrap ", 1)[1].split("\n}", 1)[0]
+    target = bwrap.split("/** px -> ", 1)[1].split(",", 1)[0]
+    rendered = "//&".join(sorted(target.split("//&"))) + " (enforce)"
+    probe = PROBE.read_text(encoding="utf-8")
+
+    assert rendered == "agcoord-admitted//&agcoord-bwrap-child//&agcoord-job (enforce)"
+    assert f"expected='{rendered}'" in probe
+    assert 'bwrap=/usr/bin/bwrap' in probe
+    assert "printf 'bubblewrap sandbox widening verified\\n'" in probe
+
+
+def test_ci_installs_bubblewrap_and_requires_the_exercised_sandbox_widening():
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    enforcement = workflow.split("native-host-enforcement:", 1)[1].split("\n  test:", 1)[0]
+
+    assert "apparmor jq bubblewrap" in enforcement
+    assert "test -x /usr/bin/bwrap" in enforcement
+    assert "grep -qx 'bubblewrap sandbox widening verified'" in enforcement

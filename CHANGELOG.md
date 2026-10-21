@@ -22,7 +22,9 @@ versioning; dates use ISO 8601.
   program of that name reached through another mount namespace is named under a disconnected
   prefix and never matches. Activation refuses unless all six domains are loaded in enforce mode.
   The observable admitted label an admitted job reports changes from `agcoord-admitted (enforce)`
-  to `agcoord-admitted//&agcoord-job (enforce)`.
+  to `agcoord-admitted//&agcoord-job (enforce)`. Bubblewrap stays an optional host package: the
+  enforced-host probe exercises the sandbox widening when `/usr/bin/bwrap` is installed and
+  reports that it was not exercised otherwise.
 
 ## 0.7.3 — 2026-10-02
 
