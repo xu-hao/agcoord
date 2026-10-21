@@ -10,7 +10,9 @@ permissions:
 jobs:
   native-broker:
     name: native-broker (x86_64-unknown-linux-musl)
-    runs-on: ubuntu-latest
+    # The C toolchain is a declared build input (native/build-toolchain.json), so the native
+    # build runs on a fixed image with exact musl packages rather than ubuntu-latest.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,7 +23,8 @@ jobs:
       - name: Install static-link audit prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends apparmor musl-tools
+          sudo apt-get install --yes --no-install-recommends apparmor \
+            musl=1.2.4-2 musl-dev=1.2.4-2 musl-tools=1.2.4-2
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-musl
       - run: cargo fetch --locked

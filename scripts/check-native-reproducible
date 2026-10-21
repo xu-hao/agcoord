@@ -41,6 +41,12 @@ for builder_path in \
         exit 1
     fi
 done
+# Two builds on one runner also share its C toolchain, so the digest is only pinnable when that
+# toolchain is the declared one (#250).
+if ! "$repository/scripts/native-toolchain" check "$temporary/a/dist/$artifact.provenance.json"; then
+    printf 'refusing to report a reproducible digest built with an undeclared C toolchain\n' >&2
+    exit 1
+fi
 
 "$repository/scripts/audit-native-broker" "$temporary/a/dist/$artifact"
 printf 'reproducible native artifact: '
