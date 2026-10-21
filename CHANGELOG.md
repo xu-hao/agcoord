@@ -5,6 +5,27 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.7.4 — 2026-10-21
+
+- Let admitted jobs build unprivileged Bubblewrap sandboxes to isolate their own test
+  processes, while every other submitted program keeps the user-namespace denial. The packaged
+  AppArmor policy enters a permissive `agcoord-admitted` anchor before `no_new_privs`; the
+  anchor's exec rule then stacks a restricting `agcoord-job` profile at `execve` (denying
+  capabilities and user-namespace creation), so submitted code runs as
+  `agcoord-admitted//&agcoord-job`. Stacking onto the retained anchor is always permitted under
+  `no_new_privs`, and the transition fails closed — the command cannot start — if `agcoord-job`
+  is not loaded. A static rule routes the fixed system executable `/usr/bin/bwrap` to
+  `agcoord-admitted//&agcoord-bwrap`, which may create a user namespace and use in-namespace
+  capabilities to assemble a sandbox, and routes everything it launches to the sticky, capability-
+  and namespace-denied `agcoord-bwrap-child`. The widening needs no per-job flag, operator
+  allowlist, or executable digest, so an ordinary Bubblewrap package upgrade keeps working; a
+  program of that name reached through another mount namespace is named under a disconnected
+  prefix and never matches. Activation refuses unless all six domains are loaded in enforce mode.
+  The observable admitted label an admitted job reports changes from `agcoord-admitted (enforce)`
+  to `agcoord-admitted//&agcoord-job (enforce)`. Bubblewrap stays an optional host package: the
+  enforced-host probe exercises the sandbox widening when `/usr/bin/bwrap` is installed and
+  reports that it was not exercised otherwise.
+
 ## 0.7.3 — 2026-10-02
 
 - Recover a normal drain stranded behind a dead or unstartable managed broker without losing

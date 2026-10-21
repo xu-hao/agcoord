@@ -275,7 +275,11 @@ Between the releases, the child resets inherited broker signal handlers and comp
 and scratch setup. When it inherited the managed `agcoord-broker` AppArmor domain, it makes the
 one-way transition into `agcoord-admitted` and verifies that domain before clearing effective,
 permitted, inheritable, and ambient capabilities, setting `no_new_privs`, and verifying those
-values from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the
+values from `/proc/self/status`. The `agcoord-admitted` anchor's exec rule then confines the
+submitted command: its `execve` transitions, at exec, to the stack `agcoord-admitted//&agcoord-job`
+(`agcoord-job` is the restriction that denies namespace creation and capabilities). Stacking onto
+the retained anchor is always allowed under `no_new_privs`, and the exec fails closed if
+`agcoord-job` is not loaded. It closes every inherited descriptor except standard I/O and the
 two private channels, reports the token-bound setup result, waits for final release, closes those
 channels, verifies the final descriptor set, and calls `execve`. Under an applied tmpfs policy it
 instead forks once more, supervises the command from those namespaces while sampling the mount for
@@ -445,14 +449,25 @@ this resource boundary does not prevent the command from explicitly naming paths
 The setup-only `agcoord-broker` AppArmor profile attaches to the immutable root-owned executable,
 not to a user-editable service directive. Its public command parser exposes no worker mode or
 arbitrary setup-domain exec path. The authenticated worker makes a one-way transition into
-`agcoord-admitted` before setting `no_new_privs` and before reporting successful setup. Arbitrary
-interpreters inherit that domain. When admitted work invokes the broker, AppArmor stacks
-`agcoord-broker-client` onto the admitted domain; adding confinement is compatible with
-`no_new_privs` and cannot regain setup permission. Both restricted profiles deny user-namespace
-creation and changing back to the setup domain. Every domain is compiled in explicit enforce
-mode rather than Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded
-setup profile, service cgroup, global restriction, or backend namespace probe makes required work
-unavailable.
+`agcoord-admitted` and sets `no_new_privs`; `agcoord-admitted` is therefore the kernel's recorded
+anchor, which every later transition retains. The anchor's `/** px -> agcoord-admitted//&agcoord-job`
+exec rule confines submitted code at `execve`: the command runs as `agcoord-admitted//&agcoord-job`.
+Stacking onto the retained anchor is always allowed under `no_new_privs` (it only removes
+permission), and the exec fails closed if `agcoord-job` is not loaded; the anchor alone permits
+user-namespace creation, but submitted code always runs with `agcoord-job` stacked, which denies
+it. When admitted work invokes the broker, AppArmor substitutes `agcoord-broker-client` for
+`agcoord-job` on the anchor; adding confinement is compatible with `no_new_privs` and cannot regain
+setup permission. The one deliberate widening is the fixed system Bubblewrap
+executable `/usr/bin/bwrap`, which transitions to `agcoord-admitted//&agcoord-bwrap` and may build
+an unprivileged sandbox; everything it launches runs as
+`agcoord-admitted//&agcoord-bwrap-child//&agcoord-job` (AppArmor's sorted rendering of the stack),
+which is capability- and user-namespace-denied and sticky across further execs, so no other
+submitted code gains namespace permission. Bubblewrap is an optional host package; without
+`/usr/bin/bwrap` these domains are inert. Every one of the six domains is compiled in explicit enforce mode rather than
+Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded setup profile, the
+service cgroup, the global restriction, or the backend namespace probe makes required work
+unavailable; a missing `agcoord-job` profile makes the submitted command's exec transition fail
+closed so the command cannot start.
 The complete package and transition contract is in [the native host runbook](native_host.md).
 
 ## Compatibility and migration
