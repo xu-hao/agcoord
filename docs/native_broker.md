@@ -275,7 +275,9 @@ Between the releases, the child resets inherited broker signal handlers and comp
 and scratch setup. When it inherited the managed `agcoord-broker` AppArmor domain, it makes the
 one-way transition into `agcoord-admitted` and verifies that domain before clearing effective,
 permitted, inheritable, and ambient capabilities, setting `no_new_privs`, and verifying those
-values from `/proc/self/status`. It closes every inherited descriptor except standard I/O and the
+values from `/proc/self/status`. It then stacks the restricting `agcoord-job` profile — the step
+that confines submitted code — and verifies the exact `agcoord-admitted//&agcoord-job` label,
+failing closed if the stack cannot be verified. It closes every inherited descriptor except standard I/O and the
 two private channels, reports the token-bound setup result, waits for final release, closes those
 channels, verifies the final descriptor set, and calls `execve`. Under an applied tmpfs policy it
 instead forks once more, supervises the command from those namespaces while sampling the mount for
@@ -445,14 +447,22 @@ this resource boundary does not prevent the command from explicitly naming paths
 The setup-only `agcoord-broker` AppArmor profile attaches to the immutable root-owned executable,
 not to a user-editable service directive. Its public command parser exposes no worker mode or
 arbitrary setup-domain exec path. The authenticated worker makes a one-way transition into
-`agcoord-admitted` before setting `no_new_privs` and before reporting successful setup. Arbitrary
-interpreters inherit that domain. When admitted work invokes the broker, AppArmor stacks
-`agcoord-broker-client` onto the admitted domain; adding confinement is compatible with
-`no_new_privs` and cannot regain setup permission. Both restricted profiles deny user-namespace
-creation and changing back to the setup domain. Every domain is compiled in explicit enforce
-mode rather than Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded
-setup profile, service cgroup, global restriction, or backend namespace probe makes required work
-unavailable.
+`agcoord-admitted`, sets `no_new_privs`, and only then stacks the restricting `agcoord-job`
+profile, verifying the exact `agcoord-admitted//&agcoord-job` label before reporting successful
+setup. Stacking after `no_new_privs` keeps the kernel's recorded anchor at the permissive
+`agcoord-admitted` domain, which every later transition retains; the anchor alone permits
+user-namespace creation, but submitted code always runs with `agcoord-job` stacked, which denies
+it. When admitted work invokes the broker, AppArmor replaces `agcoord-job` with
+`agcoord-broker-client` on the anchor; adding confinement is compatible with `no_new_privs` and
+cannot regain setup permission. The one deliberate widening is the fixed system Bubblewrap
+executable `/usr/bin/bwrap`, which transitions to `agcoord-admitted//&agcoord-bwrap` and may build
+an unprivileged sandbox; everything it launches runs as
+`agcoord-admitted//&agcoord-job//&agcoord-bwrap-child`, which is capability- and
+user-namespace-denied and sticky across further execs, so no other submitted code gains namespace
+permission. Every one of the six domains is compiled in explicit enforce mode rather than
+Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded setup profile, the
+admitted job stack, the service cgroup, the global restriction, or the backend namespace probe
+makes required work unavailable.
 The complete package and transition contract is in [the native host runbook](native_host.md).
 
 ## Compatibility and migration

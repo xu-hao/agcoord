@@ -36,6 +36,13 @@ const APPARMOR_CURRENT: &str = "/proc/self/attr/current";
 const APPARMOR_SETUP_PROFILE: &str = "agcoord-broker (enforce)";
 const APPARMOR_ADMITTED_PROFILE: &str = "agcoord-admitted (enforce)";
 const APPARMOR_CHANGE_ADMITTED: &[u8] = b"changeprofile agcoord-admitted";
+// The admitted anchor is entered before no_new_privs, so the kernel records it as the only
+// confinement every later transition must retain. The job restriction is stacked onto it only
+// after no_new_privs, which the kernel always permits because stacking cannot add permission; it
+// is the profile the fixed /usr/bin/bwrap exec rule replaces so a sandbox builder gets namespace
+// and in-namespace capability permission while all other submitted code keeps the denial.
+const APPARMOR_JOB_PROFILE: &str = "agcoord-admitted//&agcoord-job (enforce)";
+const APPARMOR_STACK_JOB: &[u8] = b"stack agcoord-job";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerFault {
@@ -92,6 +99,8 @@ enum SetupCode {
     TmpfsReportFailed = 17,
     ProfileTransitionFailed = 18,
     ProfileTransitionUnverified = 19,
+    JobStackFailed = 20,
+    JobStackUnverified = 21,
 }
 
 impl SetupCode {
@@ -117,6 +126,8 @@ impl SetupCode {
             17 => Some(Self::TmpfsReportFailed),
             18 => Some(Self::ProfileTransitionFailed),
             19 => Some(Self::ProfileTransitionUnverified),
+            20 => Some(Self::JobStackFailed),
+            21 => Some(Self::JobStackUnverified),
             _ => None,
         }
     }
@@ -143,6 +154,14 @@ impl SetupCode {
             Self::ProfileTransitionUnverified => Some(AppError::new(
                 "worker-profile-transition-unverified",
                 "native worker AppArmor profile could not be verified",
+            )),
+            Self::JobStackFailed => Some(AppError::new(
+                "worker-job-stack-failed",
+                "native worker could not stack its restricted job AppArmor profile",
+            )),
+            Self::JobStackUnverified => Some(AppError::new(
+                "worker-job-stack-unverified",
+                "native worker restricted job AppArmor profile could not be verified",
             )),
             code => Some(AppError::new(
                 code.stable_code().unwrap(),
@@ -173,6 +192,8 @@ impl SetupCode {
             Self::TmpfsReportFailed => Some("tmpfs-report-failed"),
             Self::ProfileTransitionFailed => Some("worker-profile-transition-failed"),
             Self::ProfileTransitionUnverified => Some("worker-profile-transition-unverified"),
+            Self::JobStackFailed => Some("worker-job-stack-failed"),
+            Self::JobStackUnverified => Some("worker-job-stack-unverified"),
         }
     }
 
@@ -208,7 +229,9 @@ impl SetupCode {
             | Self::PrivilegeDropUnverified
             | Self::DescriptorLeak
             | Self::ProfileTransitionFailed
-            | Self::ProfileTransitionUnverified => None,
+            | Self::ProfileTransitionUnverified
+            | Self::JobStackFailed
+            | Self::JobStackUnverified => None,
             code => code.stable_code(),
         }
     }
@@ -659,6 +682,48 @@ fn enter_admitted_profile(required: bool) -> SetupCode {
     )
 }
 
+fn stack_job_profile_with(
+    required: bool,
+    mut read_current: impl FnMut() -> io::Result<String>,
+    stack_profile: impl FnOnce() -> io::Result<()>,
+) -> SetupCode {
+    let current = match read_current() {
+        Ok(current) => current,
+        Err(_) if !required => return SetupCode::Ok,
+        Err(_) => return SetupCode::JobStackUnverified,
+    };
+    // Only an anchor that is exactly the admitted domain is widened to stack the job restriction.
+    // Any other label means the launcher is not on the managed path and must gain nothing.
+    if current.trim() != APPARMOR_ADMITTED_PROFILE {
+        return if required {
+            SetupCode::JobStackUnverified
+        } else {
+            SetupCode::Ok
+        };
+    }
+    if stack_profile().is_err() {
+        return SetupCode::JobStackFailed;
+    }
+    match read_current() {
+        Ok(current) if current.trim() == APPARMOR_JOB_PROFILE => SetupCode::Ok,
+        _ => SetupCode::JobStackUnverified,
+    }
+}
+
+fn stack_job_profile(required: bool) -> SetupCode {
+    stack_job_profile_with(
+        required,
+        || fs::read_to_string(APPARMOR_CURRENT),
+        || {
+            let mut current = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(APPARMOR_CURRENT)?;
+            current.write_all(APPARMOR_STACK_JOB)
+        },
+    )
+}
+
 fn drop_privileges() -> SetupCode {
     // SAFETY: prctl is called with the documented scalar operations and zeroed unused
     // arguments; capset receives two initialized version-3 capability words.
@@ -1033,6 +1098,15 @@ fn child_main(
     if privilege_code != SetupCode::Ok {
         code = privilege_code;
     }
+    // Stack the job restriction only after no_new_privs, so the kernel's recorded anchor stays the
+    // permissive admitted domain and the fixed /usr/bin/bwrap exec rule can still widen a sandbox
+    // builder. Fail closed before any user code if the restricted stack cannot be verified.
+    if code == SetupCode::Ok {
+        let job_code = stack_job_profile(plan.setup.apparmor_admitted);
+        if job_code != SetupCode::Ok {
+            code = job_code;
+        }
+    }
     if plan.fault == Some(WorkerFault::PrivilegeVerification) {
         code = SetupCode::PrivilegeDropUnverified;
     }
@@ -1361,7 +1435,10 @@ impl Drop for PendingWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecPlan, SetupCode, WorkerSetup, enter_admitted_profile_with, supervise_tmpfs};
+    use super::{
+        ExecPlan, SetupCode, WorkerSetup, enter_admitted_profile_with, stack_job_profile_with,
+        supervise_tmpfs,
+    };
     use crate::cgroup::{TmpfsBaseline, TmpfsSetup};
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
@@ -1433,6 +1510,88 @@ mod tests {
             enter_admitted_profile_with(true, || Ok("unconfined\n".to_owned()), || Ok(()),),
             SetupCode::ProfileTransitionUnverified,
         );
+    }
+
+    #[test]
+    fn managed_worker_stacks_and_verifies_the_restricted_job_profile() {
+        let profiles = RefCell::new(VecDeque::from([
+            "agcoord-admitted (enforce)\n".to_owned(),
+            "agcoord-admitted//&agcoord-job (enforce)\n".to_owned(),
+        ]));
+        let stacked = Cell::new(false);
+
+        assert_eq!(
+            stack_job_profile_with(
+                true,
+                || {
+                    profiles
+                        .borrow_mut()
+                        .pop_front()
+                        .ok_or_else(|| io::Error::other("missing profile observation"))
+                },
+                || {
+                    stacked.set(true);
+                    Ok(())
+                },
+            ),
+            SetupCode::Ok,
+        );
+        assert!(stacked.get());
+    }
+
+    #[test]
+    fn job_stack_refuses_when_the_anchor_is_not_exactly_admitted() {
+        let stacked = Cell::new(false);
+        assert_eq!(
+            stack_job_profile_with(
+                true,
+                || Ok("agcoord-admitted//&agcoord-job (enforce)\n".to_owned()),
+                || {
+                    stacked.set(true);
+                    Ok(())
+                },
+            ),
+            SetupCode::JobStackUnverified,
+        );
+        assert!(!stacked.get());
+    }
+
+    #[test]
+    fn job_stack_refuses_an_unverified_restricted_label() {
+        let profiles = RefCell::new(VecDeque::from([
+            "agcoord-admitted (enforce)\n".to_owned(),
+            "agcoord-admitted (enforce)\n".to_owned(),
+        ]));
+        assert_eq!(
+            stack_job_profile_with(
+                true,
+                || {
+                    profiles
+                        .borrow_mut()
+                        .pop_front()
+                        .ok_or_else(|| io::Error::other("missing profile observation"))
+                },
+                || Ok(()),
+            ),
+            SetupCode::JobStackUnverified,
+        );
+    }
+
+    #[test]
+    fn unmanaged_worker_does_not_stack_a_job_profile() {
+        let stacked = Cell::new(false);
+        assert_eq!(
+            stack_job_profile_with(
+                false,
+                || Ok("unconfined\n".to_owned()),
+                || {
+                    stacked.set(true);
+                    Ok(())
+                },
+            ),
+            SetupCode::Ok,
+        );
+        assert!(!stacked.get());
     }
 
     /// A tmpfs-backed command runs below a supervising launcher that has already dropped
