@@ -341,18 +341,18 @@ the quota when short parallel bursts are rounded upward.
 The setup-only `agcoord-broker` profile attaches only to the fixed root-owned executable; it is
 not selected by the user-editable systemd unit. The public binary has no internal-worker or
 arbitrary setup-domain exec command. The broker's authenticated in-process worker makes a one-way
-transition into `agcoord-admitted`, verifies it, clears capabilities and sets `no_new_privs`, and
-only then stacks the restricting `agcoord-job` profile and verifies the exact
-`agcoord-admitted//&agcoord-job` label before release. Because the stack is applied after
-`no_new_privs`, the kernel's recorded anchor is the pre-stack `agcoord-admitted` domain, which
-every later transition must retain. The stack is the step that confines submitted code: the
-`agcoord-admitted` anchor on its own permits user-namespace creation and capabilities, but
-submitted code never runs as the bare anchor, and `agcoord-job` — like the inner profile of every
-other stack — denies both. If the restricting stack cannot be verified the worker fails closed
-with `worker-job-stack-unverified` before any submitted code runs. Arbitrary interpreter execution
-inherits the admitted job stack. When admitted work invokes the fixed broker, AppArmor replaces
-`agcoord-job` with `agcoord-broker-client` on the admitted anchor; this keeps the anchor without
-requesting a replacement domain after `no_new_privs`.
+transition into `agcoord-admitted`, verifies it, clears capabilities, and sets `no_new_privs`
+before release. The `agcoord-admitted` anchor is the domain the kernel records at `no_new_privs`,
+so every later transition must retain it. The anchor never runs submitted code as itself: its
+`/** px -> agcoord-admitted//&agcoord-job` exec rule means every program it runs transitions, at
+`execve`, to the stack `agcoord-admitted//&agcoord-job`. Stacking a profile onto the retained
+anchor is always permitted under `no_new_privs` (it only removes permission), and the transition
+fails closed — the command cannot start — if `agcoord-job` is not loaded. `agcoord-job` is the
+step that confines submitted code: the anchor alone permits user-namespace creation and
+capabilities, but submitted code always runs as `agcoord-admitted//&agcoord-job`, and `agcoord-job`
+— like the inner profile of every other stack — denies both. When admitted work invokes the fixed
+broker, AppArmor substitutes `agcoord-broker-client` for `agcoord-job` on the anchor; this keeps
+the anchor without requesting a replacement domain after `no_new_privs`.
 
 One exec is widened on purpose: when admitted work runs the fixed system Bubblewrap executable
 `/usr/bin/bwrap`, AppArmor transitions it to `agcoord-admitted//&agcoord-bwrap`, which may create a
