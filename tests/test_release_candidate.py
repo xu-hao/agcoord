@@ -235,7 +235,9 @@ def _tar_file(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> No
     archive.addfile(member, io.BytesIO(data))
 
 
-def _write_sdist(path: Path, *, executable: bool = True) -> None:
+def _write_sdist(
+    path: Path, *, executable: bool = True, toolchain_declaration: bool = True
+) -> None:
     prefix = "agcoord-0.3.0/"
     with tarfile.open(path, "w:gz") as archive:
         root = tarfile.TarInfo(prefix.rstrip("/"))
@@ -254,6 +256,13 @@ def _write_sdist(path: Path, *, executable: bool = True) -> None:
             (ROOT / "docs/native_migration.md").read_bytes(),
             0o644,
         )
+        if toolchain_declaration:
+            _tar_file(
+                archive,
+                f"{prefix}native/build-toolchain.json",
+                (ROOT / "native/build-toolchain.json").read_bytes(),
+                0o644,
+            )
         for script in ("verify-release-candidate",):
             _tar_file(
                 archive,
@@ -270,6 +279,15 @@ def test_sdist_contract_requires_executable_release_procedures(tmp_path: Path):
 
     _write_sdist(sdist, executable=False)
     with pytest.raises(CandidateError, match="not executable"):
+        RELEASE["_sdist_metadata"](sdist, "0.3.0")
+
+
+def test_sdist_must_carry_the_declared_native_build_toolchain(tmp_path: Path):
+    # The declaration is a native source-identity input; an sdist without it cannot rebuild the
+    # pinned broker.
+    sdist = tmp_path / "agcoord-0.3.0.tar.gz"
+    _write_sdist(sdist, toolchain_declaration=False)
+    with pytest.raises(CandidateError, match="native/build-toolchain.json"):
         RELEASE["_sdist_metadata"](sdist, "0.3.0")
 
 

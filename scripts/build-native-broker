@@ -30,7 +30,19 @@ if [[ -z "$musl_cc" ]] || ! command -v "$musl_cc" >/dev/null 2>&1; then
     exit 2
 fi
 musl_cc_path=$(command -v "$musl_cc")
-musl_cc_version=$("$musl_cc" --version | head -n 1)
+# The C compiler and musl headers build the bundled C sources, so they are build inputs declared in
+# native/build-toolchain.json (#250). AGCOORD_MUSL_CC remains a local compatibility escape hatch:
+# such a build records its actual toolchain, and the reproducibility check and release verifier
+# refuse it.
+toolchain=$("$repository/scripts/native-toolchain" describe "$musl_cc")
+musl_cc_version=$(jq -r '.c_compiler_version' <<<"$toolchain")
+musl_version=$(jq -r '.musl_version' <<<"$toolchain")
+if [[ -z ${AGCOORD_MUSL_CC:-} ]] \
+    && ! "$repository/scripts/native-toolchain" check - <<<"$toolchain"; then
+    printf '%s\n' \
+        'native broker builds require the C toolchain declared in native/build-toolchain.json' >&2
+    exit 2
+fi
 
 output_directory=${1:-"$repository/dist/native"}
 mkdir -p "$output_directory"
@@ -93,6 +105,7 @@ jq -n \
     --arg c_compiler_version "$musl_cc_version" \
     --arg cargo "$cargo_version" \
     --argjson identity "$identity" \
+    --arg musl_version "$musl_version" \
     --arg rustc "$rustc_version" \
     --arg source_date_epoch "$SOURCE_DATE_EPOCH" \
     --arg source_sha256 "$source_id" \
@@ -106,6 +119,7 @@ jq -n \
         cargo: $cargo,
         identity: $identity,
         license_inventory: "THIRD_PARTY_LICENSES.tsv",
+        musl_version: $musl_version,
         protocol: 5,
         rustc: $rustc,
         source_date_epoch: $source_date_epoch,
