@@ -28,6 +28,19 @@ if ! cmp -s "$temporary/a/dist/$artifact" "$temporary/b/dist/$artifact"; then
     sha256sum "$temporary/a/dist/$artifact" "$temporary/b/dist/$artifact" >&2
     exit 1
 fi
+# Two builds on one host share its Cargo home, so byte identity alone cannot show that the
+# artifact is independent of the builder; refuse any embedded builder path (#249).
+cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
+for builder_path in \
+    "$(CDPATH= cd -- "$cargo_home" && pwd)" \
+    "$(CDPATH= cd -- "$cargo_home" && pwd -P)" \
+    "$repository" \
+    "$temporary"; do
+    if grep -aqF -- "$builder_path" "$temporary/a/dist/$artifact"; then
+        printf 'native broker embeds a builder-specific path: %s\n' "$builder_path" >&2
+        exit 1
+    fi
+done
 
 "$repository/scripts/audit-native-broker" "$temporary/a/dist/$artifact"
 printf 'reproducible native artifact: '
