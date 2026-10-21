@@ -94,15 +94,19 @@ fi
 
 if command -v apparmor_parser >/dev/null 2>&1; then
     profile_names=$(apparmor_parser --skip-kernel-load --skip-cache --names "$profile" | LC_ALL=C sort)
-    expected_profiles=$(printf '%s\n' agcoord-admitted agcoord-broker agcoord-broker-client)
+    expected_profiles=$(printf '%s\n' \
+        agcoord-admitted agcoord-broker agcoord-broker-client \
+        agcoord-bwrap agcoord-bwrap-child agcoord-job)
     if [[ "$profile_names" != "$expected_profiles" ]]; then
         printf 'host package has an unexpected AppArmor profile set\n' >&2
         exit 1
     fi
     profile_debug=$(apparmor_parser --skip-kernel-load --skip-cache --debug "$profile" 2>&1)
-    enforce_modes=$(awk '$0 == "Mode: enforce" { count += 1 } END { print count + 0 }' \
-        <<<"$profile_debug")
-    if [[ "$enforce_modes" != 3 ]] || grep -q '^Mode: default_allow$' <<<"$profile_debug"; then
+    # A domain with an extra flag such as attach_disconnected.path prints
+    # "Mode: enforce, <flags>", so match the enforce prefix rather than the whole line.
+    enforce_modes=$(awk '$0 == "Mode: enforce" || $0 ~ /^Mode: enforce,/ { count += 1 } \
+        END { print count + 0 }' <<<"$profile_debug")
+    if [[ "$enforce_modes" != 6 ]] || grep -q '^Mode: default_allow$' <<<"$profile_debug"; then
         printf 'host package AppArmor domains are not all in enforce mode\n' >&2
         printf '%s\n' "$profile_debug" >&2
         exit 1

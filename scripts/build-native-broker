@@ -39,13 +39,28 @@ target_directory=${CARGO_TARGET_DIR:-"$repository/target/native-release"}
 source_id=$("$repository/scripts/native-source-id")
 build_id="sha256:$source_id"
 
+# Dependency sources live under the builder's Cargo home and their paths are embedded as panic
+# locations, so remap that home as well as the checkout; the artifact then does not depend on
+# where either lives (#249).
+cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
+cargo_home=$(CDPATH= cd -- "$cargo_home" && pwd)
+cargo_home_physical=$(CDPATH= cd -- "$cargo_home" && pwd -P)
+remap_flags="--remap-path-prefix=$repository=/usr/src/agcoord"
+remap_flags+=" --remap-path-prefix=$cargo_home=/usr/local/cargo"
+prefix_maps="-ffile-prefix-map=$repository=/usr/src/agcoord"
+prefix_maps+=" -ffile-prefix-map=$cargo_home=/usr/local/cargo"
+if [[ "$cargo_home_physical" != "$cargo_home" ]]; then
+    remap_flags+=" --remap-path-prefix=$cargo_home_physical=/usr/local/cargo"
+    prefix_maps+=" -ffile-prefix-map=$cargo_home_physical=/usr/local/cargo"
+fi
+
 export AGCOORD_BUILD_ID=$build_id
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR=$target_directory
 export CC_x86_64_unknown_linux_musl=$musl_cc
-export CFLAGS_x86_64_unknown_linux_musl="-ffile-prefix-map=$repository=/usr/src/agcoord"
+export CFLAGS_x86_64_unknown_linux_musl="$prefix_maps"
 export LC_ALL=C
-export RUSTFLAGS="--remap-path-prefix=$repository=/usr/src/agcoord -C link-arg=-Wl,--build-id=sha1"
+export RUSTFLAGS="$remap_flags -C link-arg=-Wl,--build-id=sha1"
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
 export TZ=UTC
 

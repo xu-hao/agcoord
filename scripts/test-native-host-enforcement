@@ -9,13 +9,41 @@ if [[ -z ${AGCOORD_RUN_ID:-} || -z ${AGCOORD_STATE_DIR:-} ]]; then
 fi
 
 profile=$(tr -d '\n' </proc/self/attr/current)
-if [[ "$profile" != 'agcoord-admitted (enforce)' ]]; then
+if [[ "$profile" != 'agcoord-admitted//&agcoord-job (enforce)' ]]; then
     printf 'submitted command has the wrong AppArmor profile: %s\n' "$profile" >&2
     exit 1
 fi
 if unshare --user --map-root-user true 2>/dev/null; then
     printf 'submitted command unexpectedly created a user namespace\n' >&2
     exit 1
+fi
+
+# The fixed system bubblewrap executable may build an unprivileged sandbox, and everything it
+# launches stays confined: no user namespace, no capability, and the restriction is sticky across
+# further execs. Any other program still cannot create a user namespace at all (checked above).
+# Bubblewrap is an optional host package: without it the widening is inert and not exercised.
+# AppArmor renders a stacked label with its profiles in sorted order.
+bwrap=/usr/bin/bwrap
+if [[ -x "$bwrap" ]]; then
+    if ! "$bwrap" --unshare-user --ro-bind / / true; then
+        printf 'the fixed bubblewrap executable could not build an unprivileged sandbox\n' >&2
+        exit 1
+    fi
+    sandbox_profile=$("$bwrap" --unshare-user --ro-bind / / \
+        cat /proc/self/attr/current 2>/dev/null | tr -d '\n')
+    expected='agcoord-admitted//&agcoord-bwrap-child//&agcoord-job (enforce)'
+    if [[ "$sandbox_profile" != "$expected" ]]; then
+        printf 'a bubblewrap sandbox child has the wrong AppArmor profile: %s\n' \
+            "$sandbox_profile" >&2
+        exit 1
+    fi
+    if "$bwrap" --unshare-user --ro-bind / / unshare --user --map-root-user true 2>/dev/null; then
+        printf 'a bubblewrap sandbox child unexpectedly created a nested user namespace\n' >&2
+        exit 1
+    fi
+    printf 'bubblewrap sandbox widening verified\n'
+else
+    printf 'bubblewrap is not installed; sandbox widening not exercised\n'
 fi
 
 if [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) != 1 ]]; then

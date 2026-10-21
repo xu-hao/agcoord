@@ -14,6 +14,7 @@ UNIT = ROOT / "packaging/systemd/agcoord-broker.service"
 PROFILE = ROOT / "packaging/apparmor/usr.libexec.agcoord.agcoord-broker"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 WORKER = ROOT / "native/agcoord-broker/src/worker.rs"
+PROBE = ROOT / "scripts/test-native-host-enforcement"
 
 
 def test_native_user_service_passes_systemd_verification(tmp_path: Path):
@@ -68,6 +69,9 @@ def test_native_apparmor_policy_compiles_with_all_three_domains():
         "agcoord-admitted",
         "agcoord-broker",
         "agcoord-broker-client",
+        "agcoord-bwrap",
+        "agcoord-bwrap-child",
+        "agcoord-job",
     }
 
 
@@ -83,7 +87,7 @@ def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
     )
     assert completed.returncode == 0, completed.stderr
     diagnostics = completed.stdout + completed.stderr
-    assert diagnostics.count("Mode: enforce") == 3, diagnostics
+    assert diagnostics.count("Mode: enforce") == 6, diagnostics
     assert "Mode: default_allow" not in diagnostics
 
 
@@ -92,17 +96,41 @@ def test_native_apparmor_transitions_are_safe_after_no_new_privileges():
     broker = policy.split("profile agcoord-broker ", 1)[1].split("\n}", 1)[0]
     client = policy.split("profile agcoord-broker-client ", 1)[1].split("\n}", 1)[0]
     admitted = policy.split("profile agcoord-admitted ", 1)[1].split("\n}", 1)[0]
+    job = policy.split("profile agcoord-job ", 1)[1].split("\n}", 1)[0]
+    bwrap = policy.split("profile agcoord-bwrap ", 1)[1].split("\n}", 1)[0]
+    child = policy.split("profile agcoord-bwrap-child ", 1)[1].split("\n}", 1)[0]
     worker = WORKER.read_text(encoding="utf-8").split("fn child_main(", 1)[1]
 
+    # The launcher enters the permissive admitted anchor and sets no_new_privs; the kernel records
+    # that anchor, so every later exec keeps it. The anchor's exec rule applies the job restriction
+    # by stacking at exec (the mechanism Ubuntu's bwrap profile uses), which is permitted under
+    # no_new_privs and fails closed if the job profile is not loaded. Submitted code therefore runs
+    # as agcoord-admitted//&agcoord-job and never as the bare anchor.
     assert "change_profile -> agcoord-admitted," in broker
-    assert "/** ix," in client
-    assert (
-        "/usr/libexec/agcoord/agcoord-broker px -> "
-        "agcoord-admitted//&agcoord-broker-client,"
-        in admitted
-    )
-    assert "/** ix," in admitted
+    assert "/** px -> agcoord-admitted//&agcoord-job," in admitted
+    assert "/** px -> agcoord-admitted//&agcoord-job," in broker
+    assert "/** ix," not in admitted
     assert worker.index("enter_admitted_profile(") < worker.index("drop_privileges()")
+
+    # Submitted code keeps the admitted job restriction, which denies namespace creation and
+    # capabilities; only the fixed system bubblewrap path replaces that restriction, and nothing
+    # reached through another mount namespace can match it.
+    for restricted in (client, job, child):
+        assert "deny userns," in restricted
+        assert "deny capability," in restricted
+        assert "/** ix," in restricted
+    assert "allow userns create," in admitted
+    assert "allow userns create," in bwrap
+    assert (
+        "/usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap," in admitted
+    )
+    assert "/usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap," in job
+    assert (
+        "/** px -> agcoord-admitted//&agcoord-job//&agcoord-bwrap-child," in bwrap
+    )
+    assert "attach_disconnected.path=/agcoord-disconnected" in (
+        policy.split("profile agcoord-job ", 1)[1].split("{", 1)[0]
+    )
 
 
 def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
@@ -118,3 +146,37 @@ def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
     assert ".resource_receipt.applied.cpu == 1" in workflow
     assert ".resource_receipt.peak.cpu >= 1" in workflow
     assert ".resource_receipt.peak.cpu == 1" not in workflow
+    # On an enforcement failure the job also retains the AppArmor transition diagnostics that make
+    # a stack/exec-transition refusal legible: the loaded domains, the admitted anchor's rules, and
+    # the agcoord/apparmor audit lines.
+    assert "sudo aa-status" in workflow
+    assert (
+        "apparmor_parser --skip-kernel-load --skip-cache --debug"
+        in workflow
+    )
+    assert "grep -iE 'apparmor|agcoord'" in workflow
+
+
+def test_enforcement_probe_expects_apparmor_rendering_of_the_bubblewrap_child_stack():
+    # AppArmor stores and prints a stacked label with its profiles sorted by name, so the label a
+    # sandboxed process reports is the sorted rendering of the agcoord-bwrap exec target, not the
+    # order the policy rule happens to list.
+    policy = PROFILE.read_text(encoding="utf-8")
+    bwrap = policy.split("profile agcoord-bwrap ", 1)[1].split("\n}", 1)[0]
+    target = bwrap.split("/** px -> ", 1)[1].split(",", 1)[0]
+    rendered = "//&".join(sorted(target.split("//&"))) + " (enforce)"
+    probe = PROBE.read_text(encoding="utf-8")
+
+    assert rendered == "agcoord-admitted//&agcoord-bwrap-child//&agcoord-job (enforce)"
+    assert f"expected='{rendered}'" in probe
+    assert 'bwrap=/usr/bin/bwrap' in probe
+    assert "printf 'bubblewrap sandbox widening verified\\n'" in probe
+
+
+def test_ci_installs_bubblewrap_and_requires_the_exercised_sandbox_widening():
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    enforcement = workflow.split("native-host-enforcement:", 1)[1].split("\n  test:", 1)[0]
+
+    assert "apparmor jq bubblewrap" in enforcement
+    assert "test -x /usr/bin/bwrap" in enforcement
+    assert "grep -qx 'bubblewrap sandbox widening verified'" in enforcement
