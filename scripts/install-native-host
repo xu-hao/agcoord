@@ -160,6 +160,18 @@ case "$action" in
         if [[ "$install_root" == / ]]; then
             chown root:root "$profile_target"
             apparmor_parser --replace --skip-cache "$profile_target"
+            # Fail closed unless every packaged domain is loaded in enforce mode. A partial load
+            # would leave admitted work either unable to start or, worse, running under a missing
+            # restriction, so refuse the activation rather than report success.
+            loaded=$(sed -n 's/ (enforce)$//p' \
+                /sys/kernel/security/apparmor/profiles | LC_ALL=C sort -u)
+            for domain in agcoord-admitted agcoord-broker agcoord-broker-client \
+                agcoord-bwrap agcoord-bwrap-child agcoord-job; do
+                if ! grep -qxF "$domain" <<<"$loaded"; then
+                    printf 'AppArmor domain %s is not loaded in enforce mode\n' "$domain" >&2
+                    exit 1
+                fi
+            done
         fi
         install -D -m 0644 "$unit_source" "$unit_target"
         install -D -m 0644 "$checksum_source" "$checksum_target"

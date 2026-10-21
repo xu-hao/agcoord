@@ -341,14 +341,36 @@ the quota when short parallel bursts are rounded upward.
 The setup-only `agcoord-broker` profile attaches only to the fixed root-owned executable; it is
 not selected by the user-editable systemd unit. The public binary has no internal-worker or
 arbitrary setup-domain exec command. The broker's authenticated in-process worker makes a one-way
-transition into `agcoord-admitted`, verifies it, and only then clears capabilities and sets
-`no_new_privs` before release. Arbitrary interpreter execution inherits that profile. When
-admitted work invokes the fixed broker, AppArmor stacks `agcoord-broker-client` onto the existing
-admitted confinement; this adds restrictions without requesting a replacement domain after
-`no_new_privs`. Both restricted profiles deny user-namespace creation and changing back to setup.
-All three profiles use explicit enforce mode and broad enumerated host permissions;
-`default_allow` is not accepted because Ubuntu 24.04 implements it as an unconfined profile that
-does not apply these denials.
+transition into `agcoord-admitted`, verifies it, clears capabilities and sets `no_new_privs`, and
+only then stacks the restricting `agcoord-job` profile and verifies the exact
+`agcoord-admitted//&agcoord-job` label before release. Because the stack is applied after
+`no_new_privs`, the kernel's recorded anchor is the pre-stack `agcoord-admitted` domain, which
+every later transition must retain. The stack is the step that confines submitted code: the
+`agcoord-admitted` anchor on its own permits user-namespace creation and capabilities, but
+submitted code never runs as the bare anchor, and `agcoord-job` — like the inner profile of every
+other stack — denies both. If the restricting stack cannot be verified the worker fails closed
+with `worker-job-stack-unverified` before any submitted code runs. Arbitrary interpreter execution
+inherits the admitted job stack. When admitted work invokes the fixed broker, AppArmor replaces
+`agcoord-job` with `agcoord-broker-client` on the admitted anchor; this keeps the anchor without
+requesting a replacement domain after `no_new_privs`.
+
+One exec is widened on purpose: when admitted work runs the fixed system Bubblewrap executable
+`/usr/bin/bwrap`, AppArmor transitions it to `agcoord-admitted//&agcoord-bwrap`, which may create a
+user namespace and use capabilities inside that namespace to assemble and pivot into an
+unprivileged sandbox. This is a static rule in the packaged policy, not a per-job flag, operator
+allowlist, or executable digest, so an ordinary distribution upgrade of Bubblewrap keeps working.
+Everything `/usr/bin/bwrap` launches transitions to
+`agcoord-admitted//&agcoord-job//&agcoord-bwrap-child`, which denies capabilities and user-namespace
+creation and stays confined across every further exec, so the sandbox builder cannot hand its
+namespace permission to arbitrary code — the pattern of Ubuntu's `bwrap-userns-restrict` profile.
+Only the fixed `/usr/bin/bwrap` path is widened: a program of that name reached through another
+mount namespace is named under a distinct disconnected prefix and never matches the rule, and
+submitted code that is not `/usr/bin/bwrap` still cannot create a user namespace at all. The
+`/usr/bin/bwrap` transition scrubs no environment variables (matching the upstream profile), so a
+sandbox that needs a specific `TMPDIR` or similar should set it inside the sandbox explicitly. All
+six profiles use explicit enforce mode and broad enumerated host permissions; `default_allow` is
+not accepted because Ubuntu 24.04 implements it as an unconfined profile that does not apply these
+denials. Activation fails closed unless every one of the six domains is loaded in enforce mode.
 
 Within the admitted user namespace, `stat(2)` reports the host-root-owned installed binary with
 the overflow UID because host root is intentionally absent from the one-entry identity map. The

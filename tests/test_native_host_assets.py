@@ -68,6 +68,9 @@ def test_native_apparmor_policy_compiles_with_all_three_domains():
         "agcoord-admitted",
         "agcoord-broker",
         "agcoord-broker-client",
+        "agcoord-bwrap",
+        "agcoord-bwrap-child",
+        "agcoord-job",
     }
 
 
@@ -83,7 +86,7 @@ def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
     )
     assert completed.returncode == 0, completed.stderr
     diagnostics = completed.stdout + completed.stderr
-    assert diagnostics.count("Mode: enforce") == 3, diagnostics
+    assert diagnostics.count("Mode: enforce") == 6, diagnostics
     assert "Mode: default_allow" not in diagnostics
 
 
@@ -92,17 +95,38 @@ def test_native_apparmor_transitions_are_safe_after_no_new_privileges():
     broker = policy.split("profile agcoord-broker ", 1)[1].split("\n}", 1)[0]
     client = policy.split("profile agcoord-broker-client ", 1)[1].split("\n}", 1)[0]
     admitted = policy.split("profile agcoord-admitted ", 1)[1].split("\n}", 1)[0]
+    job = policy.split("profile agcoord-job ", 1)[1].split("\n}", 1)[0]
+    bwrap = policy.split("profile agcoord-bwrap ", 1)[1].split("\n}", 1)[0]
+    child = policy.split("profile agcoord-bwrap-child ", 1)[1].split("\n}", 1)[0]
     worker = WORKER.read_text(encoding="utf-8").split("fn child_main(", 1)[1]
 
+    # The launcher enters the permissive admitted anchor, sets no_new_privs, and only then stacks
+    # the restricting job profile; the kernel records the pre-stack anchor, so every later
+    # transition keeps it and the fixed bwrap exec rule may still widen a sandbox builder.
     assert "change_profile -> agcoord-admitted," in broker
-    assert "/** ix," in client
-    assert (
-        "/usr/libexec/agcoord/agcoord-broker px -> "
-        "agcoord-admitted//&agcoord-broker-client,"
-        in admitted
-    )
-    assert "/** ix," in admitted
+    assert "change_profile -> agcoord-job," in admitted
     assert worker.index("enter_admitted_profile(") < worker.index("drop_privileges()")
+    assert worker.index("drop_privileges()") < worker.index("stack_job_profile(")
+
+    # Submitted code keeps the admitted job restriction, which denies namespace creation and
+    # capabilities; only the fixed system bubblewrap path replaces that restriction, and nothing
+    # reached through another mount namespace can match it.
+    for restricted in (client, job, child):
+        assert "deny userns," in restricted
+        assert "deny capability," in restricted
+        assert "/** ix," in restricted
+    assert "allow userns create," in admitted
+    assert "allow userns create," in bwrap
+    assert (
+        "/usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap," in admitted
+    )
+    assert "/usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap," in job
+    assert (
+        "/** px -> agcoord-admitted//&agcoord-job//&agcoord-bwrap-child," in bwrap
+    )
+    assert "attach_disconnected.path=/agcoord-disconnected" in (
+        policy.split("profile agcoord-job ", 1)[1].split("{", 1)[0]
+    )
 
 
 def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():

@@ -21,15 +21,14 @@ profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(enforce,attach
   change_profile -> agcoord-admitted,
 
   # The trusted launcher changes to admitted before no_new_privs. Any setup-domain exec fallback
-  # still leaves this profile rather than lending namespace setup to the new program.
+  # still leaves this profile, and never for the unstacked admitted anchor.
   /usr/libexec/agcoord/agcoord-broker px -> agcoord-broker-client,
-  /** px -> agcoord-admitted,
+  /** px -> agcoord-admitted//&agcoord-job,
 }
 
-# Calls from admitted work retain that profile and stack this restriction instead of reattaching
-# to the setup profile.
+# Calls from admitted work keep the admitted anchor and replace the job restriction with this one
+# instead of reattaching to the setup profile.
 profile agcoord-broker-client flags=(enforce,attach_disconnected,mediate_deleted) {
-  allow capability,
   allow network,
   allow signal,
   allow dbus,
@@ -41,16 +40,22 @@ profile agcoord-broker-client flags=(enforce,attach_disconnected,mediate_deleted
   allow pivot_root,
   allow io_uring,
   allow ptrace,
+  deny capability,
   deny userns,
   deny change_profile -> agcoord-broker,
-  deny /proc/@{pid}/attr/{current,exec} w,
-  deny /proc/self/attr/{current,exec} w,
-  deny /proc/thread-self/attr/{current,exec} w,
+  deny /proc/@{pid}/attr/{,apparmor/}{current,exec} w,
+  deny /proc/self/attr/{,apparmor/}{current,exec} w,
+  deny /proc/thread-self/attr/{,apparmor/}{current,exec} w,
 
   /** ix,
 }
 
-profile agcoord-admitted flags=(enforce,attach_disconnected,mediate_deleted) {
+# The admitted anchor: the launcher enters it before setting no_new_privs, so the kernel records
+# it as the confinement every later transition must keep. It never runs submitted code on its own:
+# the launcher stacks agcoord-job immediately after no_new_privs, and every exec it allows stacks
+# a restricting profile. It permits user-namespace creation and capabilities only so that the
+# agcoord-bwrap stack can build a sandbox; every other stack containing it denies both.
+profile agcoord-admitted flags=(enforce,attach_disconnected,attach_disconnected.path=/agcoord-disconnected,mediate_deleted) {
   allow capability,
   allow network,
   allow signal,
@@ -63,12 +68,91 @@ profile agcoord-admitted flags=(enforce,attach_disconnected,mediate_deleted) {
   allow pivot_root,
   allow io_uring,
   allow ptrace,
-  deny userns,
+  allow userns create,
+  change_profile -> agcoord-job,
   deny change_profile -> agcoord-broker,
-  deny /proc/@{pid}/attr/{current,exec} w,
-  deny /proc/self/attr/{current,exec} w,
-  deny /proc/thread-self/attr/{current,exec} w,
 
   /usr/libexec/agcoord/agcoord-broker px -> agcoord-admitted//&agcoord-broker-client,
+  /usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap,
+  /** ix,
+}
+
+# Submitted code runs as agcoord-admitted//&agcoord-job. Only the exec of the fixed system
+# Bubblewrap executable replaces this restriction. The transition keeps the environment (like
+# the upstream bwrap profile) so a sandbox still sees the broker-provided variables. A file
+# reached through another mount namespace is named under /agcoord-disconnected, so it can never
+# match that fixed path.
+profile agcoord-job flags=(enforce,attach_disconnected,attach_disconnected.path=/agcoord-disconnected,mediate_deleted) {
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow ptrace,
+  deny capability,
+  deny userns,
+  deny change_profile -> agcoord-broker,
+  deny /{,agcoord-disconnected/}proc/@{pid}/attr/{,apparmor/}{current,exec} w,
+  deny /{,agcoord-disconnected/}proc/self/attr/{,apparmor/}{current,exec} w,
+  deny /{,agcoord-disconnected/}proc/thread-self/attr/{,apparmor/}{current,exec} w,
+
+  /usr/libexec/agcoord/agcoord-broker px -> agcoord-admitted//&agcoord-broker-client,
+  /usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap,
+  /** ix,
+}
+
+# Bubblewrap itself, stacked on the admitted anchor: it may create its user namespace and use
+# capabilities inside it to mount and pivot into the sandbox. Nothing else can trace it or read
+# its memory, and everything it executes leaves this profile for the sticky child restriction.
+profile agcoord-bwrap flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow capability,
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow userns create,
+  allow ptrace (read, trace),
+  deny ptrace (readby, tracedby),
+  deny change_profile -> agcoord-broker,
+  deny /proc/@{pid}/attr/{,apparmor/}{current,exec} w,
+  deny /proc/self/attr/{,apparmor/}{current,exec} w,
+  deny /proc/thread-self/attr/{,apparmor/}{current,exec} w,
+
+  /** px -> agcoord-admitted//&agcoord-job//&agcoord-bwrap-child,
+}
+
+# Everything Bubblewrap launches keeps this restriction across every later exec, including an exec
+# of a file at the Bubblewrap path, so the sandbox can never regain namespace creation or
+# capabilities.
+profile agcoord-bwrap-child flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow network,
+  allow signal,
+  allow dbus,
+  allow file rwlkm /{,**},
+  allow unix,
+  allow mqueue,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow io_uring,
+  allow ptrace,
+  deny capability,
+  deny userns,
+  deny change_profile -> agcoord-broker,
+  deny /proc/@{pid}/attr/{,apparmor/}{current,exec} w,
+  deny /proc/self/attr/{,apparmor/}{current,exec} w,
+  deny /proc/thread-self/attr/{,apparmor/}{current,exec} w,
+
   /** ix,
 }
