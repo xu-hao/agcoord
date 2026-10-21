@@ -155,6 +155,12 @@ jobs:
             agc log "$run_id" >&2 || true
             journalctl --user --unit agcoord-broker.service --no-pager >&2 || true
             sudo journalctl --dmesg --no-pager >&2 || true
+            # AppArmor transition diagnostics: the loaded domains, the admitted anchor's rules,
+            # and any agcoord/apparmor audit lines, so a stack/exec-transition refusal is legible.
+            sudo aa-status >&2 || true
+            sudo apparmor_parser --skip-kernel-load --skip-cache --debug \
+              /etc/apparmor.d/usr.libexec.agcoord.agcoord-broker >&2 || true
+            sudo journalctl --dmesg --no-pager | grep -iE 'apparmor|agcoord' >&2 || true
             exit 1
           fi
           jq -e '

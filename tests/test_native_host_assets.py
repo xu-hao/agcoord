@@ -100,13 +100,16 @@ def test_native_apparmor_transitions_are_safe_after_no_new_privileges():
     child = policy.split("profile agcoord-bwrap-child ", 1)[1].split("\n}", 1)[0]
     worker = WORKER.read_text(encoding="utf-8").split("fn child_main(", 1)[1]
 
-    # The launcher enters the permissive admitted anchor, sets no_new_privs, and only then stacks
-    # the restricting job profile; the kernel records the pre-stack anchor, so every later
-    # transition keeps it and the fixed bwrap exec rule may still widen a sandbox builder.
+    # The launcher enters the permissive admitted anchor and sets no_new_privs; the kernel records
+    # that anchor, so every later exec keeps it. The anchor's exec rule applies the job restriction
+    # by stacking at exec (the mechanism Ubuntu's bwrap profile uses), which is permitted under
+    # no_new_privs and fails closed if the job profile is not loaded. Submitted code therefore runs
+    # as agcoord-admitted//&agcoord-job and never as the bare anchor.
     assert "change_profile -> agcoord-admitted," in broker
-    assert "change_profile -> agcoord-job," in admitted
+    assert "/** px -> agcoord-admitted//&agcoord-job," in admitted
+    assert "/** px -> agcoord-admitted//&agcoord-job," in broker
+    assert "/** ix," not in admitted
     assert worker.index("enter_admitted_profile(") < worker.index("drop_privileges()")
-    assert worker.index("drop_privileges()") < worker.index("stack_job_profile(")
 
     # Submitted code keeps the admitted job restriction, which denies namespace creation and
     # capabilities; only the fixed system bubblewrap path replaces that restriction, and nothing
@@ -142,3 +145,12 @@ def test_host_enforcement_startup_probe_is_bounded_and_retains_diagnostics():
     assert ".resource_receipt.applied.cpu == 1" in workflow
     assert ".resource_receipt.peak.cpu >= 1" in workflow
     assert ".resource_receipt.peak.cpu == 1" not in workflow
+    # On an enforcement failure the job also retains the AppArmor transition diagnostics that make
+    # a stack/exec-transition refusal legible: the loaded domains, the admitted anchor's rules, and
+    # the agcoord/apparmor audit lines.
+    assert "sudo aa-status" in workflow
+    assert (
+        "apparmor_parser --skip-kernel-load --skip-cache --debug"
+        in workflow
+    )
+    assert "grep -iE 'apparmor|agcoord'" in workflow

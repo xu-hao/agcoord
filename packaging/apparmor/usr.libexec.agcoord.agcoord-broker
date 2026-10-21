@@ -52,9 +52,13 @@ profile agcoord-broker-client flags=(enforce,attach_disconnected,mediate_deleted
 
 # The admitted anchor: the launcher enters it before setting no_new_privs, so the kernel records
 # it as the confinement every later transition must keep. It never runs submitted code on its own:
-# the launcher stacks agcoord-job immediately after no_new_privs, and every exec it allows stacks
-# a restricting profile. It permits user-namespace creation and capabilities only so that the
-# agcoord-bwrap stack can build a sandbox; every other stack containing it denies both.
+# every program it execs transitions to a stack that adds a restricting profile. Submitted code
+# goes to agcoord-admitted//&agcoord-job, applied by the exec rule below — the mechanism Ubuntu's
+# bwrap profile uses and which is proven to work under no_new_privs, because stacking onto the
+# retained anchor is always permitted and the bare anchor is never a label submitted code runs
+# under. The anchor permits user-namespace creation and capabilities only so the agcoord-bwrap
+# stack can build a sandbox; every other stack containing it (job, broker-client, bwrap-child)
+# denies both.
 profile agcoord-admitted flags=(enforce,attach_disconnected,attach_disconnected.path=/agcoord-disconnected,mediate_deleted) {
   allow capability,
   allow network,
@@ -69,12 +73,11 @@ profile agcoord-admitted flags=(enforce,attach_disconnected,attach_disconnected.
   allow io_uring,
   allow ptrace,
   allow userns create,
-  change_profile -> agcoord-job,
   deny change_profile -> agcoord-broker,
 
   /usr/libexec/agcoord/agcoord-broker px -> agcoord-admitted//&agcoord-broker-client,
   /usr/bin/bwrap px -> agcoord-admitted//&agcoord-bwrap,
-  /** ix,
+  /** px -> agcoord-admitted//&agcoord-job,
 }
 
 # Submitted code runs as agcoord-admitted//&agcoord-job. Only the exec of the fixed system
