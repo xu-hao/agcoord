@@ -48,8 +48,12 @@ the crates.io registry or workspace source, and contain only the reviewed licens
 
 Reproducibility CI builds two fresh checkout copies with separate Cargo target directories,
 path remapping, disabled incremental compilation, a fixed source epoch, and the same recorded
-toolchains; their executable bytes must match. This proves reproducibility for the declared
-runner and compiler inputs. It does not claim byte identity across different C compilers or
+toolchains; their executable bytes must match. The build remaps both the checkout and the Cargo
+home (where dependency sources live), so the artifact does not depend on where either sits on
+the builder, and the check refuses an artifact that still embeds the builder's Cargo home,
+checkout, or temporary build path. This proves reproducibility for the declared compiler inputs:
+the same Rust toolchain, `musl` package, and C compiler produce the same bytes on a maintainer
+host as on the release runner. It does not claim byte identity across different C compilers or
 host toolchain builds. `AGCOORD_MUSL_CC=cc` is an explicit local compatibility escape hatch for
 an audited x86_64 compiler when `musl-gcc` cannot be installed; release CI never uses it.
 
