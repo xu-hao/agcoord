@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.4 — 2026-10-21
 
 - Make the pinned native broker digest a property of the source and a declared toolchain. The
   C compiler and musl versions that build the bundled SQLite are now declared in
@@ -13,8 +13,6 @@ versioning; dates use ISO 8601.
   Native CI and tag builds run on a fixed `ubuntu-24.04` runner with exact musl packages instead
   of `ubuntu-latest`, whose image change had produced different broker bytes from identical
   source (#250).
-
-## 0.7.4 — 2026-10-21
 
 - Let admitted jobs build unprivileged Bubblewrap sandboxes to isolate their own test
   processes, while every other submitted program keeps the user-namespace denial. The packaged
