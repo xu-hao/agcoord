@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The bundled C sources in the native broker are compiled by the musl C toolchain, so its compiler
+# and musl versions are build inputs alongside the pinned Rust toolchain. They are declared in
+# native/build-toolchain.json, which is part of the native source identity.
+#
+#   native-toolchain describe CC   print the toolchain CC provides as JSON
+#   native-toolchain check FILE    compare a JSON toolchain description or broker provenance
+#                                  ("-" for standard input) with the declaration
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+declaration="$repository/native/build-toolchain.json"
+
+usage() {
+    printf '%s\n' 'usage: native-toolchain describe CC | native-toolchain check FILE' >&2
+    exit 2
+}
+
+describe() {
+    local compiler=$1 compiler_version specs libc musl_version
+    if ! command -v "$compiler" >/dev/null 2>&1; then
+        printf 'C compiler is not executable: %s\n' "$compiler" >&2
+        exit 2
+    fi
+    compiler_version=$("$compiler" --version | head -n 1)
+    # The musl compiler wrapper names its specs file; musl's libc.so in that directory reports
+    # the library version when executed.
+    specs=$("$compiler" -v -x c -E - </dev/null 2>&1 \
+        | sed -n 's/^Reading specs from \(.*musl.*\.specs\)$/\1/p' | head -n 1)
+    if [[ -z "$specs" ]]; then
+        printf 'C compiler does not use a musl specs file: %s\n' "$compiler" >&2
+        exit 2
+    fi
+    libc="$(dirname -- "$specs")/libc.so"
+    musl_version=$({ "$libc" 2>&1 || true; } | sed -n 's/^Version \([0-9][0-9.]*\)$/\1/p' \
+        | head -n 1)
+    if [[ -z "$musl_version" ]]; then
+        printf 'cannot determine the musl version from %s\n' "$libc" >&2
+        exit 2
+    fi
+    jq -n --arg c_compiler_version "$compiler_version" --arg musl_version "$musl_version" \
+        '{c_compiler_version: $c_compiler_version, musl_version: $musl_version}'
+}
+
+check() {
+    local source=$1 actual
+    if [[ "$source" == - ]]; then
+        actual=$(cat)
+    else
+        actual=$(cat -- "$source")
+    fi
+    if ! jq -e '.format == 1 and (.c_compiler_version | type == "string")
+            and (.musl_version | type == "string")' "$declaration" >/dev/null; then
+        printf 'native build toolchain declaration is malformed: %s\n' "$declaration" >&2
+        exit 2
+    fi
+    local mismatches
+    mismatches=$(jq -r --slurpfile declared "$declaration" '
+        [ "c_compiler_version", "musl_version" ][] as $field
+        | select(.[$field] != $declared[0][$field])
+        | "\($field): declared \($declared[0][$field] | tojson), built with \(.[$field] | tojson)"
+    ' <<<"$actual")
+    if [[ -n "$mismatches" ]]; then
+        printf 'native broker C toolchain differs from native/build-toolchain.json:\n%s\n' \
+            "$mismatches" >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    describe) (($# == 2)) || usage; describe "$2" ;;
+    check) (($# == 2)) || usage; check "$2" ;;
+    *) usage ;;
+esac

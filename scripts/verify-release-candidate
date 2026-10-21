@@ -198,6 +198,7 @@ def _sdist_metadata(sdist: Path, version: str) -> None:
     required = {
         f"{prefix}PKG-INFO",
         f"{prefix}docs/native_migration.md",
+        f"{prefix}native/build-toolchain.json",
         f"{prefix}scripts/verify-release-candidate",
     }
     with tarfile.open(sdist, "r:gz") as archive:
@@ -241,6 +242,17 @@ def _sdist_metadata(sdist: Path, version: str) -> None:
                 raise CandidateError(f"sdist release script is not executable: {script}")
 
 
+def _declared_c_toolchain(provenance: Path) -> None:
+    """Refuse a broker whose recorded C toolchain differs from the source's declaration."""
+    try:
+        _run([ROOT / "scripts/native-toolchain", "check", provenance])
+    except CandidateError as exc:
+        raise CandidateError(
+            "native broker was built with a C toolchain other than native/build-toolchain.json "
+            f"declares, so its digest is not a property of this source: {exc}"
+        ) from exc
+
+
 def _native_artifacts(directory: Path, version: str) -> dict[str, Any]:
     _require_exact_files(directory, NATIVE_FILES, "native artifact directory")
     artifact = directory / NATIVE_NAME
@@ -261,6 +273,7 @@ def _native_artifacts(directory: Path, version: str) -> dict[str, Any]:
         raise CandidateError(f"native identity or provenance is invalid: {exc}") from exc
     if identity.get("version") != version or provenance.get("identity") != identity:
         raise CandidateError("native artifact version or provenance does not match the release")
+    _declared_c_toolchain(directory / f"{NATIVE_NAME}.provenance.json")
     source_sha256 = _run([ROOT / "scripts/native-source-id"]).stdout.strip()
     if (
         not re.fullmatch(r"[0-9a-f]{64}", source_sha256)

@@ -7,7 +7,8 @@ cd "$repository"
 mapfile -t inputs < <(
     {
         printf '%s\n' \
-            Cargo.lock Cargo.toml LICENSE native/THIRD_PARTY_LICENSES.tsv rust-toolchain.toml
+            Cargo.lock Cargo.toml LICENSE native/THIRD_PARTY_LICENSES.tsv \
+            native/build-toolchain.json rust-toolchain.toml
         find native/agcoord-broker -type f -print
         find scripts -maxdepth 1 -type f -name '*native*' -print
     } | LC_ALL=C sort -u

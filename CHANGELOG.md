@@ -5,6 +5,15 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Make the pinned native broker digest a property of the source and a declared toolchain. The
+  C compiler and musl versions that build the bundled SQLite are now declared in
+  `native/build-toolchain.json`, included in the native source identity, and recorded in broker
+  provenance. `build-native-broker` refuses an undeclared C toolchain, and both
+  `check-native-reproducible` and the release-candidate verifier refuse a broker built with one.
+  Native CI and tag builds run on a fixed `ubuntu-24.04` runner with exact musl packages instead
+  of `ubuntu-latest`, whose image change had produced different broker bytes from identical
+  source (#250).
+
 ## 0.7.4 — 2026-10-21
 
 - Let admitted jobs build unprivileged Bubblewrap sandboxes to isolate their own test
