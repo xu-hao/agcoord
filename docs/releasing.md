@@ -23,10 +23,19 @@ has one target: `x86_64-unknown-linux-musl`. Other architectures remain unsuppor
 have a native CI runner and the same kernel conformance coverage.
 
 Build inputs are pinned by `rust-toolchain.toml`, `Cargo.lock`, exact direct dependency
-requirements, and the source digest produced by `scripts/native-source-id`. The artifact embeds
-that digest as its build identity and reports protocol, implementation, target, and bundled
-SQLite version through `identity --json`. Install Rust 1.94.1 with the declared musl target and
-Ubuntu's `musl-tools`, then run:
+requirements, `native/build-toolchain.json`, and the source digest produced by
+`scripts/native-source-id`. The C compiler and musl headers compile the bundled SQLite, so they
+are build inputs too: `native/build-toolchain.json` declares the exact C compiler version line and
+musl version, and it is part of the source digest. `scripts/native-toolchain describe CC` reports
+the toolchain a compiler provides. `build-native-broker` refuses an undeclared C toolchain, and both
+`check-native-reproducible` and the release-candidate verifier refuse a broker whose provenance
+records one, so a different compiler or musl can never silently change a pinned digest. Changing the
+C toolchain is a deliberate source change: update the declaration, which gives a new build
+identity, and re-pin. The artifact embeds the source digest as its build identity and reports
+protocol, implementation, target, and bundled SQLite version through `identity --json`. The
+declared toolchain is Ubuntu 24.04's: install Rust 1.94.1 with the declared musl target and
+`musl=1.2.4-2 musl-dev=1.2.4-2 musl-tools=1.2.4-2` on Ubuntu 24.04, as the native CI and tag
+jobs do on their fixed `ubuntu-24.04` runner, then run:
 
 ```bash
 ./scripts/build-native-broker
@@ -40,7 +49,8 @@ Ubuntu's `musl-tools`, then run:
 ```
 
 The build emits the executable, a SHA-256 sidecar, and JSON provenance recording the artifact
-and source digests, Rust and Cargo versions, C compiler, target, protocol, and source epoch. The
+and source digests, Rust and Cargo versions, C compiler and musl versions, target, protocol, and
+source epoch. The
 audit requires a static or static-PIE ELF, no program interpreter, no `DT_NEEDED` entry, a valid
 checksum, and an exact release identity from an empty environment. Bundled SQLite is part of
 that ELF. The dependency graph must exactly match `native/THIRD_PARTY_LICENSES.tsv`, use only
@@ -54,8 +64,10 @@ the builder, and the check refuses an artifact that still embeds the builder's C
 checkout, or temporary build path. This proves reproducibility for the declared compiler inputs:
 the same Rust toolchain, `musl` package, and C compiler produce the same bytes on a maintainer
 host as on the release runner. It does not claim byte identity across different C compilers or
-host toolchain builds. `AGCOORD_MUSL_CC=cc` is an explicit local compatibility escape hatch for
-an audited x86_64 compiler when `musl-gcc` cannot be installed; release CI never uses it.
+host toolchain builds; the declaration makes that limit explicit rather than leaving it to the
+runner image. `AGCOORD_MUSL_CC=cc` is an explicit local compatibility escape hatch for an audited
+x86_64 compiler when `musl-gcc` cannot be installed: such a build records its actual toolchain and
+is never accepted by the reproducibility check or the release verifier; release CI never uses it.
 
 The host-package build emits a deterministic root-owned tar archive, package checker, staged
 installer, enforced-host probe, and their SHA-256 sidecars under `dist/host/`. CI retains these
