@@ -460,9 +460,10 @@ it. When admitted work invokes the broker, AppArmor substitutes `agcoord-broker-
 setup permission. The one deliberate widening is the fixed system Bubblewrap
 executable `/usr/bin/bwrap`, which transitions to `agcoord-admitted//&agcoord-bwrap` and may build
 an unprivileged sandbox; everything it launches runs as
-`agcoord-admitted//&agcoord-job//&agcoord-bwrap-child`, which is capability- and
-user-namespace-denied and sticky across further execs, so no other submitted code gains namespace
-permission. Every one of the six domains is compiled in explicit enforce mode rather than
+`agcoord-admitted//&agcoord-bwrap-child//&agcoord-job` (AppArmor's sorted rendering of the stack),
+which is capability- and user-namespace-denied and sticky across further execs, so no other
+submitted code gains namespace permission. Bubblewrap is an optional host package; without
+`/usr/bin/bwrap` these domains are inert. Every one of the six domains is compiled in explicit enforce mode rather than
 Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded setup profile, the
 service cgroup, the global restriction, or the backend namespace probe makes required work
 unavailable; a missing `agcoord-job` profile makes the submitted command's exec transition fail

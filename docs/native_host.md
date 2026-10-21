@@ -318,7 +318,9 @@ machine to the managed host later needs an empty default spool: drain the user s
 Run the shipped probe as an ordinary coordinated job with exactly one CPU unit; do not invoke
 it from a nested coordinator. It proves the admitted AppArmor transition, user-namespace
 denial, cgroup namespace root, exact `cpu.max`, release owner identity, and the restricted
-profile reached when admitted work invokes the broker. It also calls the installed Python
+profile reached when admitted work invokes the broker. When `/usr/bin/bwrap` is installed it also
+proves that Bubblewrap can build an unprivileged sandbox whose processes keep the
+capability- and user-namespace-denied restriction. It also calls the installed Python
 client's operation-specific callback by showing the exact admitted run while it is live; this
 guards the complete `agc`-to-native path used by land reporting and pytest-xdist child leases.
 The final assertion proves that the durable public receipt records the enforced allocation:
@@ -359,18 +361,27 @@ One exec is widened on purpose: when admitted work runs the fixed system Bubblew
 user namespace and use capabilities inside that namespace to assemble and pivot into an
 unprivileged sandbox. This is a static rule in the packaged policy, not a per-job flag, operator
 allowlist, or executable digest, so an ordinary distribution upgrade of Bubblewrap keeps working.
-Everything `/usr/bin/bwrap` launches transitions to
-`agcoord-admitted//&agcoord-job//&agcoord-bwrap-child`, which denies capabilities and user-namespace
-creation and stays confined across every further exec, so the sandbox builder cannot hand its
-namespace permission to arbitrary code — the pattern of Ubuntu's `bwrap-userns-restrict` profile.
-Only the fixed `/usr/bin/bwrap` path is widened: a program of that name reached through another
-mount namespace is named under a distinct disconnected prefix and never matches the rule, and
-submitted code that is not `/usr/bin/bwrap` still cannot create a user namespace at all. The
-`/usr/bin/bwrap` transition scrubs no environment variables (matching the upstream profile), so a
-sandbox that needs a specific `TMPDIR` or similar should set it inside the sandbox explicitly. All
-six profiles use explicit enforce mode and broad enumerated host permissions; `default_allow` is
-not accepted because Ubuntu 24.04 implements it as an unconfined profile that does not apply these
-denials. Activation fails closed unless every one of the six domains is loaded in enforce mode.
+Everything `/usr/bin/bwrap` launches transitions to the stack of `agcoord-admitted`,
+`agcoord-job`, and `agcoord-bwrap-child`, which denies capabilities and user-namespace creation and
+stays confined across every further exec, so the sandbox builder cannot hand its namespace
+permission to arbitrary code — the pattern of Ubuntu's `bwrap-userns-restrict` profile. AppArmor
+renders a stacked label with its profiles in sorted order, so a sandboxed process reports
+`agcoord-admitted//&agcoord-bwrap-child//&agcoord-job (enforce)`. Only the fixed `/usr/bin/bwrap`
+path is widened: a program of that name reached through another mount namespace is named under a
+distinct disconnected prefix and never matches the rule, and submitted code that is not
+`/usr/bin/bwrap` still cannot create a user namespace at all. The `/usr/bin/bwrap` transition keeps
+the environment (matching the upstream profile), so the sandbox sees the job's variables such as
+`TMPDIR` unless Bubblewrap is told otherwise. All six profiles use explicit enforce mode and broad
+enumerated host permissions; `default_allow` is not accepted because Ubuntu 24.04 implements it as
+an unconfined profile that does not apply these denials. Activation fails closed unless every one of
+the six domains is loaded in enforce mode.
+
+Bubblewrap itself is an optional host package. AGCoord neither requires nor installs it; without
+`/usr/bin/bwrap` the `agcoord-bwrap` domains are inert and every other boundary is unchanged.
+Install it (`sudo apt-get install bubblewrap`) only on hosts whose admitted jobs build sandboxes.
+The enforced-host probe exercises the widening when `/usr/bin/bwrap` is present and prints
+`bubblewrap sandbox widening verified`; otherwise it prints that the widening was not exercised
+and still proves the user-namespace denial.
 
 Within the admitted user namespace, `stat(2)` reports the host-root-owned installed binary with
 the overflow UID because host root is intentionally absent from the one-entry identity map. The
