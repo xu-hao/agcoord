@@ -1818,11 +1818,18 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
         .filter(|run| run.status == "queued")
         .cloned()
         .collect();
-    let terminal: Vec<_> = runs
+    let mut terminal: Vec<_> = runs
         .iter()
         .filter(|run| is_terminal(&run.status))
         .cloned()
         .collect();
+    terminal.sort_by(|run_a, run_b| {
+        let finish_a = run_a.finished_at.as_deref().unwrap_or(&run_a.created_at);
+        let finish_b = run_b.finished_at.as_deref().unwrap_or(&run_b.created_at);
+        finish_b
+            .cmp(finish_a)
+            .then_with(|| run_b.sequence.cmp(&run_a.sequence))
+    });
     let capacities = if let Some(owner) = &owner {
         owner.capacities.clone()
     } else {
@@ -1865,7 +1872,6 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
         .collect();
     let recent: Vec<_> = terminal
         .iter()
-        .rev()
         .take(RECENT_LIMIT)
         .map(|run| public_run(paths, run, None, Vec::new()))
         .collect();
