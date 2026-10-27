@@ -364,6 +364,23 @@ def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_
     assert "3" in cleared.getvalue()
 
 
+def test_cli_table_visually_distinguishes_queued_and_completed_statuses(fake_client):
+    snapshot = fake_client["snapshot"][0]
+    all_runs = [*snapshot["active"], *snapshot["queued"], *snapshot["recent"]]
+
+    plain = cli._table(all_runs, color=False)
+    assert "\033[" not in plain
+    assert "queued" in plain
+    assert "running" in plain
+    assert "passed" in plain
+
+    colored = cli._table(all_runs, color=True)
+    assert "\033[1;33mqueued" in colored
+    assert "\033[1;36mrunning" in colored
+    assert "\033[32mpassed" in colored
+    assert "\033[2m" in colored
+
+
 def test_human_list_shows_the_durable_maintenance_receipt(fake_client):
     snapshot = fake_client["snapshot"][0]
     snapshot["broker_pid"] = None
