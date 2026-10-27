@@ -147,6 +147,13 @@ def _compact_cell(value: object, style: str | None = None) -> Text:
     return Text(str(value), style=style, no_wrap=True, overflow="ellipsis")
 
 
+def _cell_equal(a: object, b: object) -> bool:
+    """Compare table cells by both content and formatting."""
+    if isinstance(a, Text) and isinstance(b, Text):
+        return a.plain == b.plain and a.style == b.style and a._spans == b._spans
+    return a == b
+
+
 def _repository_label(repository: object) -> str:
     """Keep the compact REPO column readable across remote and local identities."""
     identity = str(repository).strip().rstrip("/")
@@ -588,21 +595,19 @@ def build_app(
                 sum(column.get_render_width(table) for column in table.ordered_columns)
             )
             now = _moment(snapshot["captured_at"]) or datetime.now(timezone.utc)
-            rendered = {}
-            for row in ordered:
-                is_terminal = row["status"] in TERMINAL_STATUSES
-                cell_style = "dim" if is_terminal else None
-                status_style = _STATUS_STYLES.get(row["status"])
-                rendered[row["run_id"]] = (
-                    _compact_cell(row["status"], style=status_style),
-                    _compact_cell(row["kind"], style=cell_style),
-                    _compact_cell(_repository_label(row["repository"]), style=cell_style),
-                    _compact_cell(row["run_id"], style=cell_style),
-                    _compact_cell(row["branch"], style=cell_style),
-                    _compact_cell(row["label"], style=cell_style),
-                    _compact_cell(_age(row, now), style=cell_style),
-                    _compact_cell(_duration(row, now), style=cell_style),
+            rendered = {
+                row["run_id"]: (
+                    _compact_cell(row["status"], style=_STATUS_STYLES.get(row["status"])),
+                    _compact_cell(row["kind"]),
+                    _compact_cell(_repository_label(row["repository"])),
+                    _compact_cell(row["run_id"]),
+                    _compact_cell(row["branch"]),
+                    _compact_cell(row["label"]),
+                    _compact_cell(_age(row, now)),
+                    _compact_cell(_duration(row, now)),
                 )
+                for row in ordered
+            }
 
             existing = [str(row.key.value) for row in table.ordered_rows]
             existing_set = set(existing)
@@ -624,7 +629,7 @@ def build_app(
             for run_id in desired:
                 current = table.get_row(run_id)
                 for column, old, new in zip(columns, current, rendered[run_id]):
-                    if old != new:
+                    if not _cell_equal(old, new):
                         table.update_cell(run_id, column.key, new)
 
             current_order = [str(row.key.value) for row in table.ordered_rows]

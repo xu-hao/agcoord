@@ -335,12 +335,37 @@ async def test_queued_and_completed_tasks_are_visually_distinguished():
         assert str(completed_cells[0]) == "failed"
         assert completed_cells[0].style == "bold red"
 
-        # Queued/running row cells are full brightness (not dim)
+        # Queued/running/completed row cells are full brightness (not dim)
         assert queued_cells[1].style is None
+        assert running_cells[1].style is None
+        assert completed_cells[1].style is None
+        assert completed_cells[3].style is None
 
-        # Completed history row cells are dimmed
-        assert completed_cells[1].style == "dim"
-        assert completed_cells[3].style == "dim"
+
+@pytest.mark.asyncio
+async def test_tui_cell_reconciliation_updates_status_style_on_transition():
+    snapshot = _snapshot()
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        table = _table(app)
+        assert table.get_row("check-active")[0].style == "bold cyan"
+
+        # Update snapshot: check-active completes as passed
+        active_row = client.result["active"].pop(0)
+        active_row["status"] = "passed"
+        active_row["finished_at"] = active_row["created_at"]
+        client.result["recent"].insert(0, active_row)
+
+        app.action_refresh()
+        await _settled(pilot)
+
+        updated_row = table.get_row("check-active")
+        assert str(updated_row[0]) == "passed"
+        assert updated_row[0].style == "bold green"
+        assert updated_row[1].style is None
 
 
 @pytest.mark.asyncio
