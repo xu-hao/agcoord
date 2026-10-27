@@ -14,6 +14,8 @@ versioning; dates use ISO 8601.
   (`agc tui`). Statuses are rendered with semantic colors (bold yellow for queued, bold cyan for
   running, green for passed, bold red for failed, magenta for cancelled), and completed history
   rows are visually dimmed so live and queued tasks stand out at a glance (#252).
+- Document installation, upgrade, and uninstallation workflows across user and managed modes in a
+  dedicated guide and README summary (#256).
 
 ## 0.7.4 — 2026-10-21
 
