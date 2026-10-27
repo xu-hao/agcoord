@@ -25,7 +25,6 @@ from .queue import (
     CoordinatorError,
     CoordinatorUnreachable,
     EXIT_COORDINATOR_UNREACHABLE,
-    TERMINAL_STATUSES,
     follow,
     parse_resource_claims,
     queue_paths,
@@ -78,7 +77,6 @@ _CLI_STATUS_COLORS = {
     "interrupted": "\033[1;35m",
 }
 _RESET = "\033[0m"
-_DIM = "\033[2m"
 
 
 def _table(rows: list[dict], *, color: bool = False) -> str:
@@ -115,15 +113,11 @@ def _table(rows: list[dict], *, color: bool = False) -> str:
         "  ".join("-" * width for width in widths),
     ]
     for row in display:
-        is_terminal = row["status"] in TERMINAL_STATUSES
         row_cells = []
         for name, width in zip(columns, widths):
             text = str(row[name]).ljust(width)
-            if color:
-                if name == "status" and row["status"] in _CLI_STATUS_COLORS:
-                    text = f"{_CLI_STATUS_COLORS[row['status']]}{text}{_RESET}"
-                elif is_terminal:
-                    text = f"{_DIM}{text}{_RESET}"
+            if color and name == "status" and row["status"] in _CLI_STATUS_COLORS:
+                text = f"{_CLI_STATUS_COLORS[row['status']]}{text}{_RESET}"
             row_cells.append(text)
         lines.append("  ".join(row_cells))
     return "\n".join(lines)
