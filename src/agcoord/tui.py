@@ -132,9 +132,19 @@ def _duration(row: dict, now: datetime | None = None) -> str:
     return _elapsed(started, _moment(row["finished_at"]) or now)
 
 
-def _compact_cell(value: object) -> Text:
+_STATUS_STYLES = {
+    "running": "bold cyan",
+    "queued": "bold yellow",
+    "passed": "bold green",
+    "failed": "bold red",
+    "cancelled": "magenta",
+    "interrupted": "bold magenta",
+}
+
+
+def _compact_cell(value: object, style: str | None = None) -> Text:
     """Render one fixed-width table value with an explicit overflow marker."""
-    return Text(str(value), no_wrap=True, overflow="ellipsis")
+    return Text(str(value), style=style, no_wrap=True, overflow="ellipsis")
 
 
 def _repository_label(repository: object) -> str:
@@ -578,19 +588,22 @@ def build_app(
                 sum(column.get_render_width(table) for column in table.ordered_columns)
             )
             now = _moment(snapshot["captured_at"]) or datetime.now(timezone.utc)
-            rendered = {
-                row["run_id"]: (
-                    _compact_cell(row["status"]),
-                    _compact_cell(row["kind"]),
-                    _compact_cell(_repository_label(row["repository"])),
-                    _compact_cell(row["run_id"]),
-                    _compact_cell(row["branch"]),
-                    _compact_cell(row["label"]),
-                    _compact_cell(_age(row, now)),
-                    _compact_cell(_duration(row, now)),
+            rendered = {}
+            for row in ordered:
+                is_terminal = row["status"] in TERMINAL_STATUSES
+                cell_style = "dim" if is_terminal else None
+                status_style = _STATUS_STYLES.get(row["status"])
+                rendered[row["run_id"]] = (
+                    _compact_cell(row["status"], style=status_style),
+                    _compact_cell(row["kind"], style=cell_style),
+                    _compact_cell(_repository_label(row["repository"]), style=cell_style),
+                    _compact_cell(row["run_id"], style=cell_style),
+                    _compact_cell(row["branch"], style=cell_style),
+                    _compact_cell(row["label"], style=cell_style),
+                    _compact_cell(_age(row, now), style=cell_style),
+                    _compact_cell(_duration(row, now), style=cell_style),
                 )
-                for row in ordered
-            }
+
             existing = [str(row.key.value) for row in table.ordered_rows]
             existing_set = set(existing)
             desired = [row["run_id"] for row in ordered]

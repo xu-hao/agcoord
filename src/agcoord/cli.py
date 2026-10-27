@@ -25,6 +25,7 @@ from .queue import (
     CoordinatorError,
     CoordinatorUnreachable,
     EXIT_COORDINATOR_UNREACHABLE,
+    TERMINAL_STATUSES,
     follow,
     parse_resource_claims,
     queue_paths,
@@ -68,7 +69,19 @@ def _count(value: str | None, option: str) -> int | None:
     return int(text)
 
 
-def _table(rows: list[dict]) -> str:
+_CLI_STATUS_COLORS = {
+    "queued": "\033[1;33m",
+    "running": "\033[1;36m",
+    "passed": "\033[32m",
+    "failed": "\033[1;31m",
+    "cancelled": "\033[35m",
+    "interrupted": "\033[1;35m",
+}
+_RESET = "\033[0m"
+_DIM = "\033[2m"
+
+
+def _table(rows: list[dict], *, color: bool = False) -> str:
     if not rows:
         return "(nothing)"
     display = [
@@ -101,10 +114,18 @@ def _table(rows: list[dict]) -> str:
         "  ".join(name.ljust(width) for name, width in zip(columns, widths)),
         "  ".join("-" * width for width in widths),
     ]
-    lines.extend(
-        "  ".join(str(row[name]).ljust(width) for name, width in zip(columns, widths))
-        for row in display
-    )
+    for row in display:
+        is_terminal = row["status"] in TERMINAL_STATUSES
+        row_cells = []
+        for name, width in zip(columns, widths):
+            text = str(row[name]).ljust(width)
+            if color:
+                if name == "status" and row["status"] in _CLI_STATUS_COLORS:
+                    text = f"{_CLI_STATUS_COLORS[row['status']]}{text}{_RESET}"
+                elif is_terminal:
+                    text = f"{_DIM}{text}{_RESET}"
+            row_cells.append(text)
+        lines.append("  ".join(row_cells))
     return "\n".join(lines)
 
 
@@ -607,9 +628,15 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
                     f"{broker_pid if broker_pid is not None else 'none'}",
                     file=out,
                 )
+            color = (
+                getattr(out, "isatty", lambda: False)()
+                and "NO_COLOR" not in os.environ
+                and os.environ.get("TERM") != "dumb"
+            )
             print(
                 _table(
-                    [*snapshot["active"], *snapshot["queued"], *snapshot["recent"]]
+                    [*snapshot["active"], *snapshot["queued"], *snapshot["recent"]],
+                    color=color,
                 ),
                 file=out,
             )
