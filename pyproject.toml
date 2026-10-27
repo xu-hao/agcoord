@@ -74,4 +74,5 @@ version = {attr = "agcoord.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 asyncio_mode = "strict"

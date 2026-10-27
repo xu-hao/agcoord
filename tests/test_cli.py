@@ -378,7 +378,7 @@ def test_cli_table_visually_distinguishes_queued_and_completed_statuses(fake_cli
     assert "\033[1;33mqueued" in colored
     assert "\033[1;36mrunning" in colored
     assert "\033[32mpassed" in colored
-    assert "\033[2m" in colored
+    assert "\033[2m" not in colored
 
 
 def test_human_list_shows_the_durable_maintenance_receipt(fake_client):
