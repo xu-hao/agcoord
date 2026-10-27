@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.6 — 2026-10-27
 
 - Remove row-wide dimming of completed tasks across TUI and CLI in favor of the colorized
   `STATUS` column, keeping all table cells at high contrast and preventing washed-out or
