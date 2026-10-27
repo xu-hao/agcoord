@@ -312,6 +312,38 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
 
 
 @pytest.mark.asyncio
+async def test_queued_and_completed_tasks_are_visually_distinguished():
+    snapshot = _snapshot()
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        table = _table(app)
+
+        running_cells = table.get_row("check-active")
+        queued_cells = table.get_row("full-waiting")
+        completed_cells = table.get_row("merge-recent")
+
+        # Status column styles
+        assert str(running_cells[0]) == "running"
+        assert running_cells[0].style == "bold cyan"
+
+        assert str(queued_cells[0]) == "queued"
+        assert queued_cells[0].style == "bold yellow"
+
+        assert str(completed_cells[0]) == "failed"
+        assert completed_cells[0].style == "bold red"
+
+        # Queued/running row cells are full brightness (not dim)
+        assert queued_cells[1].style is None
+
+        # Completed history row cells are dimmed
+        assert completed_cells[1].style == "dim"
+        assert completed_cells[3].style == "dim"
+
+
+@pytest.mark.asyncio
 async def test_resource_enforcement_failure_is_inspectable_without_backend_paths():
     snapshot = _snapshot()
     row = _row("check-resource-failed", 1, "failed")

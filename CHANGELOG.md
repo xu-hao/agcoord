@@ -10,6 +10,10 @@ versioning; dates use ISO 8601.
   which caused runs that finished out of submission order (such as long-running gates finishing after
   quicker checks submitted later) to appear below earlier-finished work or be prematurely evicted
   from the retention window (#252).
+- Visually distinguish queued, running, and completed tasks across CLI (`agc list`) and TUI
+  (`agc tui`). Statuses are rendered with semantic colors (bold yellow for queued, bold cyan for
+  running, green for passed, bold red for failed, magenta for cancelled), and completed history
+  rows are visually dimmed so live and queued tasks stand out at a glance (#252).
 
 ## 0.7.4 — 2026-10-21
 
