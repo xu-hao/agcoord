@@ -87,6 +87,18 @@ Memory, tmpfs, persistent scratch, process, and block-I/O bindings live in the s
 `config.json`. The [native host runbook](docs/native_host.md) has the full host contract,
 offline installation from a bundle, upgrades, recovery, and rollback.
 
+## Installation, upgrades, and removal
+
+| Lifecycle | User mode (no root) | Managed host (enforced cgroups & AppArmor) |
+|---|---|---|
+| **Install client** | `pip install agcoord` | `pip install agcoord` |
+| **Install broker** | `agc host install --user` | `agc host install --download` *(requires sudo)* |
+| **Upgrade** | `pip install -U agcoord`<br>`agc host install --user` | `pip install -U agcoord`<br>`agc host upgrade --download` |
+| **Uninstall** | `agc drain --reason "uninstalling"`<br>`rm -rf ~/.local/state/agcoord ~/.local/libexec/agcoord`<br>`pip uninstall agcoord` | `agc drain --reason "uninstalling"`<br>`systemctl --user disable --now agcoord-broker`<br>`sudo rm -rf /etc/apparmor.d/usr.libexec.agcoord.agcoord-broker /usr/lib/systemd/user/agcoord-broker.service /usr/libexec/agcoord /var/lib/agcoord`<br>`rm -rf ~/.local/state/agcoord`<br>`pip uninstall agcoord` |
+
+The [installation and upgrade guide](docs/installation.md) covers preflight requirements,
+air-gapped bundle deployments, the `agcoord[xdist]` extra, and complete cleanup.
+
 ## Tell your agents
 
 Agents follow the tools they are given. Paste this into your repository's `CLAUDE.md` or

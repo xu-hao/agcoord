@@ -8,6 +8,8 @@
   machine, why the gate and the merge are one step, and what AGCoord deliberately does not do.
 - [Quickstart](quickstart.md) — the no-root try-out step by step: install, first job,
   watching jobs queue, cleanup, enforcement, and a first landing.
+- [Installation, upgrades, and uninstallation](installation.md) — install, upgrade, or
+  uninstall AGCoord in user mode or on a managed host.
 - [Changelog](changelog.md) — published user-facing changes by version.
 
 ## Integrate
@@ -64,6 +66,7 @@ These are the canonical contracts. Every guarantee the other pages mention is de
 overview
 why
 quickstart
+installation
 changelog
 ```
 
