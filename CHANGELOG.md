@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.5 — 2026-10-27
 
 - Order completed runs in recent snapshot history by completion time (`finished_at` descending),
   tie-breaking by sequence. Previously, terminal history was ordered by reverse submission sequence,
