@@ -7544,3 +7544,51 @@ fn a_configuration_that_misuses_exec_is_refused_naming_the_binding() {
         assert!(stderr.contains(expected), "{name}: {stderr}");
     }
 }
+
+#[test]
+fn recent_terminal_runs_are_ordered_by_completion_time_descending() {
+    let temporary = TestDirectory::new("recent-terminal-ordering");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let _broker = RunningBroker::start(&state, &[("jobs", 2)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
+
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "check-first-completes-second",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&first_entered, &first_release, None),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "check-second-completes-first",
+            kind: "check",
+            repository: "repo-b",
+            checkout: &checkout,
+            command: vec!["/bin/true".to_owned()],
+            gate_run_id: None,
+        },
+    );
+    let second = wait_status(&state, "check-second-completes-first", "passed");
+
+    fs::write(&first_release, "release").unwrap();
+    let first = wait_status(&state, "check-first-completes-second", "passed");
+
+    assert!(first["finished_at"].as_str().unwrap() > second["finished_at"].as_str().unwrap());
+
+    let snap = snapshot(&state).expect("broker snapshot");
+    let recent = snap["recent"].as_array().expect("recent array");
+    assert!(recent.len() >= 2);
+    assert_eq!(recent[0]["run_id"], "check-first-completes-second");
+    assert_eq!(recent[1]["run_id"], "check-second-completes-first");
+}

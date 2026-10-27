@@ -3,6 +3,14 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Order completed runs in recent snapshot history by completion time (`finished_at` descending),
+  tie-breaking by sequence. Previously, terminal history was ordered by reverse submission sequence,
+  which caused runs that finished out of submission order (such as long-running gates finishing after
+  quicker checks submitted later) to appear below earlier-finished work or be prematurely evicted
+  from the retention window (#252).
+
 ## 0.7.4 — 2026-10-21
 
 - Make the pinned native broker digest a property of the source and a declared toolchain. The
