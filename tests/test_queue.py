@@ -688,6 +688,41 @@ def test_unrelated_repositories_share_state_but_keep_stable_distinct_identities(
     assert len(client.snapshot()["recent"]) == 3
 
 
+def test_recent_terminal_runs_are_ordered_by_completion_time(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    first = _repository(tmp_path / "checkout-a")
+    second = _repository(tmp_path / "checkout-b", content="second\n")
+    entered_first = tmp_path / "entered-first"
+    release_first = tmp_path / "release-first"
+
+    first_run = _submit(
+        client,
+        _blocking_command(entered_first, release_first, "first"),
+        first,
+        label="first-created-finishes-second",
+    )
+    wait_for(entered_first.exists, "first run never started")
+
+    second_run = _submit(
+        client,
+        _python("print('second')"),
+        second,
+        label="second-created-finishes-first",
+    )
+    second_row = _row(client, second_run, "passed")
+
+    release_first.write_text("go", encoding="utf-8")
+    first_row = _row(client, first_run, "passed")
+
+    assert first_row["finished_at"] > second_row["finished_at"]
+    recent = client.snapshot()["recent"]
+    recent_ids = [row["run_id"] for row in recent]
+    assert recent_ids[:2] == [first_run, second_run]
+
+
 def test_explicit_repository_identity_joins_distinct_git_worktrees_to_one_lane(
     coordinator,
     tmp_path: Path,

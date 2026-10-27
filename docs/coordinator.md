@@ -706,7 +706,8 @@ the nonnegative units currently held. `resource_bindings` is the exact machine b
 frozen by the live broker. `resource_capabilities` maps each installed or referenced backend to
 its `available`, `kinds`, `units`, `operations`, and stable `reason` fields. It contains no host
 paths or backend exception text. Active and queued jobs appear in scheduling order; recent
-contains retained terminal history.
+contains retained terminal history ordered by completion time (`finished_at` descending, tie-broken
+by sequence descending).
 
 Each row contains exactly:
 
