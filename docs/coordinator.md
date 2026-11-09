@@ -1155,6 +1155,7 @@ The expected key map is:
 | `l` | read the selected job log |
 | `c` | request cancellation; a publishing land explains why it cannot be cancelled |
 | `h` | hide or restore terminal history without deleting it or rereading the spool |
+| `k` | open the searchable kind picker |
 | `p` | open the searchable repository picker |
 | `a` | open the searchable agent picker |
 | `?` | show context-sensitive help |
@@ -1162,9 +1163,10 @@ The expected key map is:
 
 Each filter picker starts in a focused search field. Typing narrows the complete snapshot's
 choices, `Tab` moves into the scrollable result menu, and `Enter` applies the highlighted
-choice. `All repositories` or `All agents` clears that filter directly; `Esc` closes the picker
+choice. `All repositories`, `All agents`, or `All kinds` clears that filter directly; `Esc` closes the picker
 without changing the current filter. Repository choices show their complete readable remote or
 local identity rather than the internal hashed lane key.
+The kind picker includes the distinct kinds present in the current coordinator snapshot.
 The agent picker includes stable named identities and the single `unnamed` value. It omits
 legacy `pid:<positive integer>` fallback choices from older retained history; those rows remain
 visible in the unfiltered snapshot with their separate caller PID diagnostic intact.

@@ -439,6 +439,7 @@ def build_app(
             Binding("l", "log", "log"),
             Binding("c", "cancel", "cancel"),
             Binding("h", "history", "hide/show history"),
+            Binding("k", "kind", "kind filter"),
             Binding("p", "repository", "repository filter"),
             Binding("a", "agent", "agent filter"),
             Binding("r", "refresh", "refresh"),
@@ -457,6 +458,7 @@ def build_app(
             self._message = "loading …"
             self._snapshot: dict | None = None
             self._show_history = True
+            self._kind_filter: str | None = None
             self._repository_filter: str | None = None
             self._agent_filter: str | None = None
 
@@ -577,6 +579,8 @@ def build_app(
             ordered = [*snapshot["active"], *snapshot["queued"]]
             if self._show_history:
                 ordered.extend(snapshot["recent"])
+            if self._kind_filter is not None:
+                ordered = [row for row in ordered if row.get("kind") == self._kind_filter]
             if self._repository_filter is not None:
                 ordered = [
                     row for row in ordered
@@ -662,6 +666,7 @@ def build_app(
             active = len(snapshot["active"])
             queued = len(snapshot["queued"])
             history = "shown · h hide" if self._show_history else "hidden · h show"
+            kind = self._kind_filter or "all kinds"
             repository = "all repos"
             if self._repository_filter is not None:
                 repository = next(
@@ -675,7 +680,7 @@ def build_app(
             agent = self._agent_filter or "all agents"
             self.query_one("#gate-subject", Static).update(
                 f"MACHINE │ AGCOORD │ {active} active · {queued} queued · "
-                f"{repository} · {agent} · history {history}"
+                f"{kind} · {repository} · {agent} · history {history}"
             )
             allocation = ", ".join(
                 f"{name} {snapshot['allocations'].get(name, 0)}/{capacity}"
@@ -710,6 +715,34 @@ def build_app(
                 *self._snapshot["queued"],
                 *self._snapshot["recent"],
             ]
+
+        def action_kind(self) -> None:
+            kinds = sorted(
+                {
+                    str(row["kind"])
+                    for row in self._filter_rows()
+                    if row.get("kind")
+                },
+                key=str.casefold,
+            )
+            choices = [(kind, kind) for kind in kinds]
+            self.push_screen(
+                FilterPicker(
+                    "Kind filter",
+                    "All kinds",
+                    choices,
+                    self._kind_filter,
+                ),
+                self._kind_picked,
+            )
+
+        def _kind_picked(self, result: tuple[bool, str | None]) -> None:
+            accepted, kind = result
+            if not accepted:
+                return
+            self._kind_filter = kind
+            if self._snapshot is not None:
+                self._render_snapshot(self._snapshot)
 
         def action_repository(self) -> None:
             repositories: dict[str, str] = {}

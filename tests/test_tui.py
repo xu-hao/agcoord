@@ -943,3 +943,91 @@ async def test_land_remains_one_selected_run_across_gate_publish_and_transcript(
         assert not app.screen.query(Button)
         refusal = _screen_text(app).lower()
         assert "publishing" in refusal and "cannot be cancelled" in refusal
+
+
+@pytest.mark.asyncio
+async def test_kind_filter_uses_searchable_cancelable_picker_menu():
+    snapshot = _snapshot()
+    app = build_app(lambda: FakeClient(snapshot), refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+        assert _table_ids(app) == ["check-active", "full-waiting", "merge-recent"]
+        assert "all kinds" in _screen_text(app)
+
+        await pilot.press("?")
+        await pilot.pause()
+        assert "k  kind filter" in _screen_text(app)
+        await pilot.press("escape")
+        await _settled(pilot)
+
+        await pilot.press("k")
+        await pilot.pause()
+        query = app.screen.query_one("#filter-query", Input)
+        options = app.screen.query_one("#filter-options", OptionList)
+        assert query.has_focus
+        assert str(options.get_option_at_index(0).prompt) == "All kinds"
+        prompts = [
+            str(options.get_option_at_index(i).prompt)
+            for i in range(options.option_count)
+        ]
+        assert prompts == ["All kinds", "check", "full", "merge"]
+
+        for key in "full":
+            await pilot.press(key)
+        await pilot.pause()
+        assert options.option_count == 2
+        assert str(options.get_option_at_index(1).prompt) == "full"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert _table_ids(app) == ["full-waiting"]
+        assert "full" in _screen_text(app)
+        assert "all kinds" not in _screen_text(app)
+
+        await pilot.press("k")
+        await pilot.pause()
+        for key in "check":
+            await pilot.press(key)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert _table_ids(app) == ["full-waiting"]
+
+        await pilot.press("k")
+        await pilot.pause()
+        await pilot.press("tab", "home", "enter")
+        await pilot.pause()
+        assert _table_ids(app) == ["check-active", "full-waiting", "merge-recent"]
+        assert "all kinds" in _screen_text(app)
+
+        await pilot.press("k")
+        await pilot.pause()
+        for key in "merge":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _table_ids(app) == ["merge-recent"]
+        assert "merge" in _screen_text(app)
+
+        # Hiding history when filtered by a recent-only kind empties the table cleanly
+        await pilot.press("h")
+        await pilot.pause()
+        assert _table_ids(app) == []
+        assert "no coordinated runs" in _screen_text(app)
+        assert "merge" in _screen_text(app)
+        assert "history hidden" in _screen_text(app)
+
+        # Restoring history brings back the filtered row
+        await pilot.press("h")
+        await pilot.pause()
+        assert _table_ids(app) == ["merge-recent"]
+
+        # Resetting kind filter restores all history rows
+        await pilot.press("k")
+        await pilot.pause()
+        await pilot.press("tab", "home", "enter")
+        await pilot.pause()
+        assert _table_ids(app) == ["check-active", "full-waiting", "merge-recent"]
+        assert "all kinds" in _screen_text(app)
+
+
