@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.7 — 2026-11-09
 
 - Add an interactive kind filter (`k`) to `agc tui`, allowing users to filter active,
   queued, and historical jobs by kind (`check`, `full`, `merge`, `land`) with a searchable
