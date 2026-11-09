@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Add an interactive kind filter (`k`) to `agc tui`, allowing users to filter active,
+  queued, and historical jobs by kind (`check`, `full`, `merge`, `land`) with a searchable
+  picker menu and reflected header and help key bindings (#262).
+
 ## 0.7.6 — 2026-10-27
 
 - Remove row-wide dimming of completed tasks across TUI and CLI in favor of the colorized
