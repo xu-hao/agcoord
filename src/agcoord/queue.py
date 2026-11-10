@@ -1632,16 +1632,40 @@ class CoordinatorClient:
             raise CoordinatorError("native broker returned an invalid land receipt")
         return run_id
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        repository: str | None = None,
+        agent: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        arguments: list[str] = []
+        if repository is not None:
+            if not isinstance(repository, str) or not repository.strip():
+                raise CoordinatorError("repository filter must be a non-empty string")
+            arguments.extend(["--repository", repository.strip()])
+        if agent is not None:
+            if not isinstance(agent, str) or not agent.strip():
+                raise CoordinatorError("agent filter must be a non-empty string")
+            arguments.extend(["--agent", agent.strip()])
+        if kind is not None:
+            if not isinstance(kind, str) or not kind.strip():
+                raise CoordinatorError("kind filter must be a non-empty string")
+            arguments.extend(["--kind", kind.strip()])
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise CoordinatorError("limit must be a positive integer")
+            arguments.extend(["--limit", str(limit)])
         maintenance = self._maintenance_if_active()
         if maintenance is not None:
             maintenance = self._recover_native_drain(maintenance)
-            result = self._native_invoke("snapshot")
+            result = self._native_invoke("snapshot", arguments)
             if not isinstance(result, dict):
                 raise CoordinatorError("native broker returned an invalid snapshot")
             return result
         self._ensure_broker()
-        result = self._native_invoke("snapshot")
+        result = self._native_invoke("snapshot", arguments)
         if not isinstance(result, dict):
             raise CoordinatorError("native broker returned an invalid snapshot")
         return result

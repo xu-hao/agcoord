@@ -23,6 +23,36 @@ const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const LAND_GATE_REUSE_MAX_AGE: Duration = Duration::from_secs(3600);
 const STOP_GRACE: Duration = Duration::from_secs(600);
 const RECENT_LIMIT: usize = 50;
+
+#[derive(Debug, Default, Clone)]
+pub struct SnapshotFilter {
+    pub repository: Option<String>,
+    pub agent: Option<String>,
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+}
+
+fn matches_snapshot_filter(run: &RunRecord, filter: &SnapshotFilter) -> bool {
+    if let Some(expected_repo) = &filter.repository {
+        let repo_matched = run.repository == *expected_repo
+            || run.repository_id == *expected_repo
+            || run.repository.trim_end_matches("/.git") == expected_repo.trim_end_matches("/.git");
+        if !repo_matched {
+            return false;
+        }
+    }
+    if let Some(expected_agent) = &filter.agent {
+        if run.agent != *expected_agent {
+            return false;
+        }
+    }
+    if let Some(expected_kind) = &filter.kind {
+        if run.kind != *expected_kind {
+            return false;
+        }
+    }
+    true
+}
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_MAINTENANCE_REASON: usize = 256;
 const MAINTENANCE_TRIGGERS: [&str; 3] = [
@@ -1793,7 +1823,7 @@ pub fn public_run(
     })
 }
 
-pub fn snapshot(paths: &Paths) -> Result<Value> {
+pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     let connection = open_protocol5(paths)?;
     let maintenance = maintenance_record(&connection)?;
     let owner = if live_owner_metadata(&paths.state_dir)?.is_some() {
@@ -1808,19 +1838,41 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
         ));
     }
     let runs = load_runs(&connection)?;
-    let active: Vec<_> = runs
+    let mut known_repositories = BTreeMap::new();
+    let mut known_agents = BTreeSet::new();
+    let mut known_kinds = BTreeSet::new();
+    for run in &runs {
+        known_repositories.insert(run.repository_id.clone(), run.repository.clone());
+        if !run.agent.is_empty() {
+            known_agents.insert(run.agent.clone());
+        }
+        if !run.kind.is_empty() {
+            known_kinds.insert(run.kind.clone());
+        }
+    }
+    let all_active: Vec<_> = runs
         .iter()
         .filter(|run| run.status == "running")
         .cloned()
         .collect();
-    let queued: Vec<_> = runs
+    let all_queued: Vec<_> = runs
         .iter()
         .filter(|run| run.status == "queued")
         .cloned()
         .collect();
+    let active: Vec<_> = all_active
+        .iter()
+        .filter(|run| matches_snapshot_filter(run, filter))
+        .cloned()
+        .collect();
+    let queued: Vec<_> = all_queued
+        .iter()
+        .filter(|run| matches_snapshot_filter(run, filter))
+        .cloned()
+        .collect();
     let mut terminal: Vec<_> = runs
         .iter()
-        .filter(|run| is_terminal(&run.status))
+        .filter(|run| is_terminal(&run.status) && matches_snapshot_filter(run, filter))
         .cloned()
         .collect();
     terminal.sort_by(|run_a, run_b| {
@@ -1854,7 +1906,7 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
         .map(|owner| owner.resource_capabilities.clone())
         .unwrap_or_else(|| json!({}));
     let mut selected_allocations = BTreeMap::new();
-    let used = allocations(&active);
+    let used = allocations(&all_active);
     for name in capacities.keys() {
         selected_allocations.insert(name.clone(), used.get(name).copied().unwrap_or(0));
     }
@@ -1866,13 +1918,14 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
                 paths,
                 run,
                 Some(index + 1),
-                blocked_by(run, &active, &queued, &capacities),
+                blocked_by(run, &all_active, &all_queued, &capacities),
             )
         })
         .collect();
+    let limit = filter.limit.unwrap_or(RECENT_LIMIT);
     let recent: Vec<_> = terminal
         .iter()
-        .take(RECENT_LIMIT)
+        .take(limit)
         .map(|run| public_run(paths, run, None, Vec::new()))
         .collect();
     Ok(json!({
@@ -1886,9 +1939,14 @@ pub fn snapshot(paths: &Paths) -> Result<Value> {
         "maintenance": maintenance.as_ref().map(|record| maintenance_value(
             record,
             PROTOCOL,
-            (active.len() + queued.len()) as i64,
+            (all_active.len() + all_queued.len()) as i64,
             owner.as_ref().map(|owner| owner.pid),
         )),
+        "available_filters": json!({
+            "repositories": known_repositories,
+            "agents": known_agents,
+            "kinds": known_kinds,
+        }),
         "active": active.iter().map(|run| public_run(paths, run, None, Vec::new())).collect::<Vec<_>>(),
         "queued": queued_public,
         "recent": recent,

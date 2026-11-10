@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 use store::{
     AdmissionRequest, ChildLeaseOwnerRequest, ChildLeaseRequest, LandResultRequest, PROTOCOL,
-    Paths, PhaseRequest, ReuseRequest, SubmitRequest,
+    Paths, PhaseRequest, ReuseRequest, SnapshotFilter, SubmitRequest,
 };
 use worker::WorkerFault;
 
@@ -161,6 +161,51 @@ fn parse_state_only(arguments: &[String]) -> Result<PathBuf> {
         return Ok(PathBuf::from(&arguments[1]));
     }
     Err(AppError::usage("command requires exactly --state-dir PATH"))
+}
+
+fn parse_snapshot(arguments: &[String]) -> Result<(PathBuf, SnapshotFilter)> {
+    let mut state_dir = None;
+    let mut repository = None;
+    let mut agent = None;
+    let mut kind = None;
+    let mut limit = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let value = match option.as_str() {
+            "--state-dir" | "--repository" | "--agent" | "--kind" | "--limit" => {
+                option_value(arguments, &mut index, &option)?
+            }
+            option => return Err(AppError::usage(format!("unknown option: {option}"))),
+        };
+        match option.as_str() {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(value),
+            "--agent" => agent = Some(value),
+            "--kind" => kind = Some(value),
+            "--limit" => {
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| AppError::usage("--limit must be a positive integer"))?;
+                if parsed == 0 {
+                    return Err(AppError::usage("--limit must be a positive integer"));
+                }
+                limit = Some(parsed);
+            }
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = state_dir.ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((
+        state_dir,
+        SnapshotFilter {
+            repository,
+            agent,
+            kind,
+            limit,
+        },
+    ))
 }
 
 fn parse_drain(arguments: &[String]) -> Result<(PathBuf, String, String)> {
@@ -1062,8 +1107,9 @@ fn run_command(arguments: &[String]) -> Result<()> {
             emit_json(&store::submit(&paths, &request)?)
         }
         [command, rest @ ..] if command == "snapshot" => {
-            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
-            emit_json(&store::snapshot(&paths)?)
+            let (state_dir, filter) = parse_snapshot(rest)?;
+            let paths = Paths::new(&state_dir).configured()?;
+            emit_json(&store::snapshot(&paths, &filter)?)
         }
         [command, rest @ ..] if command == "status" => {
             let (paths, run_id, _) = parse_run_selector(rest, false)?;

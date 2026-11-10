@@ -148,6 +148,7 @@ def fake_client(monkeypatch):
         "resume": [],
         "follow": [],
         "snapshot": [_snapshot()],
+        "snapshot_calls": [],
     }
 
     class Client:
@@ -161,7 +162,15 @@ def fake_client(monkeypatch):
                 }
             )
 
-        def snapshot(self):
+        def snapshot(self, *, repository=None, agent=None, kind=None, limit=None):
+            observations["snapshot_calls"].append(
+                {
+                    "repository": repository,
+                    "agent": agent,
+                    "kind": kind,
+                    "limit": limit,
+                }
+            )
             return deepcopy(observations["snapshot"][0])
 
         def status(self, run_id):
@@ -379,6 +388,34 @@ def test_cli_table_visually_distinguishes_queued_and_completed_statuses(fake_cli
     assert "\033[1;36mrunning" in colored
     assert "\033[32mpassed" in colored
     assert "\033[2m" not in colored
+
+
+def test_list_passes_filters_to_snapshot(fake_client):
+    filtered = StringIO()
+    assert (
+        cli.run(
+            _args(
+                "list",
+                "--repository",
+                "org/repo",
+                "--agent",
+                "claude-1",
+                "--kind",
+                "check",
+                "--limit",
+                "10",
+            ),
+            out=filtered,
+        )
+        == 0
+    )
+    last_call = fake_client["snapshot_calls"][-1]
+    assert last_call == {
+        "repository": "org/repo",
+        "agent": "claude-1",
+        "kind": "check",
+        "limit": 10,
+    }
 
 
 def test_human_list_shows_the_durable_maintenance_receipt(fake_client):

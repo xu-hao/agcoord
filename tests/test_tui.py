@@ -175,8 +175,24 @@ class FakeClient:
         self.calls[name] += 1
         self.threads.setdefault(name, []).append(threading.get_ident())
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(
+        self,
+        *,
+        repository: str | None = None,
+        agent: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
         self._called("snapshot")
+        self.snapshot_calls = getattr(self, "snapshot_calls", [])
+        self.snapshot_calls.append(
+            {
+                "repository": repository,
+                "agent": agent,
+                "kind": kind,
+                "limit": limit,
+            }
+        )
         return deepcopy(self.result)
 
     def log(self, run_id: str, *, offset: int = 0) -> dict[str, object]:
@@ -1029,5 +1045,84 @@ async def test_kind_filter_uses_searchable_cancelable_picker_menu():
         await pilot.pause()
         assert _table_ids(app) == ["check-active", "full-waiting", "merge-recent"]
         assert "all kinds" in _screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_server_side_filtered_snapshots_and_picker_choices():
+    snapshot = _snapshot()
+    snapshot["available_filters"] = {
+        "repositories": [
+            {"id": "repo-1", "name": "/repos/one.git"},
+            {"id": "repo-2", "name": "/repos/two.git"},
+        ],
+        "agents": ["agent-alpha", "agent-beta"],
+        "kinds": ["check", "full", "land"],
+    }
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settled(pilot)
+
+        # Open kind picker and verify choices come from available_filters
+        await pilot.press("k")
+        await pilot.pause()
+        options = app.screen.query_one("#filter-options", OptionList)
+        prompts = [
+            str(options.get_option_at_index(i).prompt)
+            for i in range(options.option_count)
+        ]
+        assert prompts == ["All kinds", "check", "full", "land"]
+
+        for key in "land":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await _settled(pilot)
+
+        assert any(
+            call.get("kind") == "land" for call in client.snapshot_calls
+        )
+
+        # Open repository picker and verify choices include repos not in visible rows
+        await pilot.press("p")
+        await pilot.pause()
+        repo_options = app.screen.query_one("#filter-options", OptionList)
+        repo_prompts = [
+            str(repo_options.get_option_at_index(i).prompt)
+            for i in range(repo_options.option_count)
+        ]
+        assert repo_prompts == ["All repositories", "/repos/one.git", "/repos/two.git"]
+
+        for key in "two":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await _settled(pilot)
+
+        assert any(
+            call.get("repository") == "repo-2" and call.get("kind") == "land"
+            for call in client.snapshot_calls
+        )
+
+        # Open agent picker and verify choices include agents from available_filters
+        await pilot.press("a")
+        await pilot.pause()
+        agent_options = app.screen.query_one("#filter-options", OptionList)
+        agent_prompts = [
+            str(agent_options.get_option_at_index(i).prompt)
+            for i in range(agent_options.option_count)
+        ]
+        assert agent_prompts == ["All agents", "agent-alpha", "agent-beta"]
+
+        for key in "beta":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await _settled(pilot)
+
+        assert any(
+            call.get("repository") == "repo-2"
+            and call.get("kind") == "land"
+            and call.get("agent") == "agent-beta"
+            for call in client.snapshot_calls
+        )
 
 
