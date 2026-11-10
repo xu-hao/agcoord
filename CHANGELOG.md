@@ -3,6 +3,16 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Support server-side filtered snapshot queries across broker, client, CLI (`agc list`), and TUI (`agc tui`).
+  Snapshots accept `--repository`, `--agent`, `--kind`, and `--limit`, enabling filtered views to display
+  matching runs across the full durable spool rather than restricting results to whatever happened to fall
+  within the default recent window (#266).
+- Include `available_filters` in broker snapshots containing all historically known repositories, agents,
+  and kinds, keeping TUI filter pickers populated with all known choices even while active filters are
+  narrowing visible table rows (#266).
+
 ## 0.7.7 — 2026-11-09
 
 - Add an interactive kind filter (`k`) to `agc tui`, allowing users to filter active,
