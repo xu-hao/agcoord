@@ -144,7 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
         return command
 
-    state(commands.add_parser("list", help="show active, queued, and recent runs"))
+    list_cmd = state(commands.add_parser("list", help="show active, queued, and recent runs"))
+    list_cmd.add_argument("--repository", help="filter runs by repository name or path")
+    list_cmd.add_argument("--agent", help="filter runs by submitting agent")
+    list_cmd.add_argument("--kind", help="filter runs by run kind")
+    list_cmd.add_argument("--limit", type=int, help="maximum number of recent runs to return")
     show = state(commands.add_parser("show", help="show one run"))
     show.add_argument("run_id")
     log = state(commands.add_parser("log", help="print one run's log"))
@@ -608,7 +612,12 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
 
     client = client_factory()
     if args.command == "list":
-        snapshot = client.snapshot()
+        snapshot = client.snapshot(
+            repository=args.repository,
+            agent=args.agent,
+            kind=args.kind,
+            limit=args.limit,
+        )
         if emit:
             emit(snapshot)
         else:

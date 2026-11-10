@@ -461,6 +461,10 @@ def build_app(
             self._kind_filter: str | None = None
             self._repository_filter: str | None = None
             self._agent_filter: str | None = None
+            self._known_repositories: dict[str, str] = {}
+            self._known_agents: set[str] = set()
+            self._known_kinds: set[str] = set()
+            self._refresh_pending = False
 
         def compose(self) -> ComposeResult:
             with Vertical():
@@ -517,13 +521,21 @@ def build_app(
 
         def action_refresh(self) -> None:
             if self._reading:
+                self._refresh_pending = True
                 return
             self._reading = True
+            repo_filter = self._repository_filter
+            agent_filter = self._agent_filter
+            kind_filter = self._kind_filter
 
             async def work() -> None:
                 try:
                     result = await _off_loop(
-                        lambda: self._client_for_worker().snapshot()
+                        lambda: self._client_for_worker().snapshot(
+                            repository=repo_filter,
+                            agent=agent_filter,
+                            kind=kind_filter,
+                        )
                     )
                 except CoordinatorError as exc:
                     self._read_failed(exc)
@@ -541,6 +553,9 @@ def build_app(
             if not self.is_running:
                 return
             self._reading = False
+            if self._refresh_pending:
+                self._refresh_pending = False
+                self.action_refresh()
             self._message = f"unavailable · {exc}"
             self.query_one("#gate-subject", Static).update("MACHINE │ AGCOORD │ unavailable")
             self.query_one("#gate-status", Static).update(self._message)
@@ -564,8 +579,36 @@ def build_app(
             if not self.is_running:
                 return
             self._reading = False
+            available = snapshot.get("available_filters")
+            if available is not None and isinstance(available, dict):
+                for repo in available.get("repositories", ()):
+                    if isinstance(repo, dict) and "id" in repo and "name" in repo:
+                        self._known_repositories[str(repo["id"])] = str(repo["name"])
+                for agent in available.get("agents", ()):
+                    if isinstance(agent, str) and not _LEGACY_PID_AGENT.fullmatch(agent):
+                        self._known_agents.add(agent)
+                for kind in available.get("kinds", ()):
+                    if isinstance(kind, str) and kind:
+                        self._known_kinds.add(kind)
+            else:
+                for row in (
+                    *snapshot.get("active", ()),
+                    *snapshot.get("queued", ()),
+                    *snapshot.get("recent", ()),
+                ):
+                    if "repository_id" in row and "repository" in row:
+                        self._known_repositories.setdefault(
+                            str(row["repository_id"]), str(row["repository"])
+                        )
+                    if row.get("agent") and not _LEGACY_PID_AGENT.fullmatch(str(row["agent"])):
+                        self._known_agents.add(str(row["agent"]))
+                    if row.get("kind"):
+                        self._known_kinds.add(str(row["kind"]))
             self._snapshot = snapshot
             self._render_snapshot(snapshot)
+            if self._refresh_pending:
+                self._refresh_pending = False
+                self.action_refresh()
 
         def _render_snapshot(self, snapshot: dict) -> None:
             selected = self._selected_id()
@@ -669,13 +712,16 @@ def build_app(
             kind = self._kind_filter or "all kinds"
             repository = "all repos"
             if self._repository_filter is not None:
-                repository = next(
-                    (
-                        str(row["repository"])
-                        for row in all_rows
-                        if row["repository_id"] == self._repository_filter
+                repository = self._known_repositories.get(
+                    self._repository_filter,
+                    next(
+                        (
+                            str(row["repository"])
+                            for row in all_rows
+                            if row["repository_id"] == self._repository_filter
+                        ),
+                        "selected repo",
                     ),
-                    "selected repo",
                 )
             agent = self._agent_filter or "all agents"
             self.query_one("#gate-subject", Static).update(
@@ -707,24 +753,8 @@ def build_app(
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
 
-        def _filter_rows(self) -> list[dict]:
-            if self._snapshot is None:
-                return []
-            return [
-                *self._snapshot["active"],
-                *self._snapshot["queued"],
-                *self._snapshot["recent"],
-            ]
-
         def action_kind(self) -> None:
-            kinds = sorted(
-                {
-                    str(row["kind"])
-                    for row in self._filter_rows()
-                    if row.get("kind")
-                },
-                key=str.casefold,
-            )
+            kinds = sorted(self._known_kinds, key=str.casefold)
             choices = [(kind, kind) for kind in kinds]
             self.push_screen(
                 FilterPicker(
@@ -738,20 +768,16 @@ def build_app(
 
         def _kind_picked(self, result: tuple[bool, str | None]) -> None:
             accepted, kind = result
-            if not accepted:
+            if not accepted or self._kind_filter == kind:
                 return
             self._kind_filter = kind
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
+            self.action_refresh()
 
         def action_repository(self) -> None:
-            repositories: dict[str, str] = {}
-            for row in self._filter_rows():
-                repositories.setdefault(
-                    str(row["repository_id"]), str(row["repository"])
-                )
             choices = sorted(
-                repositories.items(),
+                self._known_repositories.items(),
                 key=lambda choice: (choice[1].casefold(), choice[0]),
             )
             self.push_screen(
@@ -766,21 +792,15 @@ def build_app(
 
         def _repository_picked(self, result: tuple[bool, str | None]) -> None:
             accepted, repository = result
-            if not accepted:
+            if not accepted or self._repository_filter == repository:
                 return
             self._repository_filter = repository
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
+            self.action_refresh()
 
         def action_agent(self) -> None:
-            agents = sorted(
-                {
-                    str(row["agent"])
-                    for row in self._filter_rows()
-                    if not _LEGACY_PID_AGENT.fullmatch(str(row["agent"]))
-                },
-                key=str.casefold,
-            )
+            agents = sorted(self._known_agents, key=str.casefold)
             choices = [(agent, agent) for agent in agents]
             self.push_screen(
                 FilterPicker(
@@ -794,11 +814,12 @@ def build_app(
 
         def _agent_picked(self, result: tuple[bool, str | None]) -> None:
             accepted, agent = result
-            if not accepted:
+            if not accepted or self._agent_filter == agent:
                 return
             self._agent_filter = agent
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
+            self.action_refresh()
 
         def _update_detail(self) -> None:
             row = self._selected()
