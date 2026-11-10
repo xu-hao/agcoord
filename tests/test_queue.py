@@ -79,6 +79,7 @@ SNAPSHOT_KEYS = {
     "resource_bindings",
     "resource_capabilities",
     "maintenance",
+    "available_filters",
     "active",
     "queued",
     "recent",
@@ -408,6 +409,7 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
 
     assert set(row) == ROW_KEYS
     assert set(snapshot) == SNAPSHOT_KEYS
+    assert set(snapshot["available_filters"]) == {"repositories", "agents", "kinds"}
     assert snapshot["protocol"] == NATIVE_PROTOCOL
     assert snapshot["capacities"] == {"jobs": 2}
     assert snapshot["allocations"] == {"jobs": 0}
@@ -2826,3 +2828,64 @@ def test_land_gate_reuse_rejects_a_receipt_from_another_worktree_of_one_reposito
 
     assert _executions(ledger) == ["shared", "shared"]
     assert row["gate_run_id"] is None
+
+
+def test_snapshot_supports_repository_agent_kind_and_limit_filters(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    repo_a = _repository(tmp_path / "checkout-a")
+    repo_b = _repository(tmp_path / "checkout-b", content="b\n")
+
+    check_a1 = _submit(client, _python("print('a1')"), repo_a, kind="check", agent="agent-1")
+    check_a2 = _submit(client, _python("print('a2')"), repo_a, kind="check", agent="agent-1")
+    full_a = _submit(client, _python("print('afull')"), repo_a, kind="full", agent="agent-1")
+
+    check_b1 = _submit(client, _python("print('b1')"), repo_b, kind="check", agent="agent-2")
+    check_b2 = _submit(client, _python("print('b2')"), repo_b, kind="check", agent="agent-2")
+
+    for run_id in (check_a1, check_a2, full_a, check_b1, check_b2):
+        _row(client, run_id, "passed")
+
+    all_snapshot = client.snapshot()
+    assert len(all_snapshot["recent"]) == 5
+    assert "available_filters" in all_snapshot
+    available = all_snapshot["available_filters"]
+    assert "agent-1" in available["agents"]
+    assert "agent-2" in available["agents"]
+    assert "check" in available["kinds"]
+    assert "full" in available["kinds"]
+
+    full_snapshot = client.snapshot(kind="full")
+    assert len(full_snapshot["recent"]) == 1
+    assert full_snapshot["recent"][0]["run_id"] == full_a
+
+    check_snapshot = client.snapshot(kind="check")
+    assert len(check_snapshot["recent"]) == 4
+
+    repo_b_snapshot = client.snapshot(repository=str(repo_b))
+    assert len(repo_b_snapshot["recent"]) == 2
+    assert {r["run_id"] for r in repo_b_snapshot["recent"]} == {check_b1, check_b2}
+
+    agent_1_snapshot = client.snapshot(agent="agent-1")
+    assert len(agent_1_snapshot["recent"]) == 3
+
+    limit_snapshot = client.snapshot(limit=2)
+    assert len(limit_snapshot["recent"]) == 2
+
+    combo_snapshot = client.snapshot(repository=str(repo_a), kind="check", limit=1)
+    assert len(combo_snapshot["recent"]) == 1
+    assert combo_snapshot["recent"][0]["run_id"] in {check_a1, check_a2}
+
+    with pytest.raises(CoordinatorError, match="limit must be a positive integer"):
+        client.snapshot(limit=0)
+    with pytest.raises(CoordinatorError, match="limit must be a positive integer"):
+        client.snapshot(limit=-1)
+    with pytest.raises(CoordinatorError, match="repository filter must be a non-empty string"):
+        client.snapshot(repository="   ")
+    with pytest.raises(CoordinatorError, match="agent filter must be a non-empty string"):
+        client.snapshot(agent="")
+    with pytest.raises(CoordinatorError, match="kind filter must be a non-empty string"):
+        client.snapshot(kind="")
+
