@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.7.8 — 2026-11-10
 
 - Support server-side filtered snapshot queries across broker, client, CLI (`agc list`), and TUI (`agc tui`).
   Snapshots accept `--repository`, `--agent`, `--kind`, and `--limit`, enabling filtered views to display
