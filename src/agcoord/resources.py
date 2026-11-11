@@ -650,8 +650,11 @@ def resource_enforcement_summary(receipt: Mapping[str, object]) -> str:
     )
     failed = any(event.get("status") == "failed" for event in selected_events)
     unapplied = any(event.get("status") == "unapplied" for event in selected_events)
+    delegated = any(event.get("code") == "overflow-delegated" for event in selected_events)
     if failed:
         return "failed"
+    if delegated:
+        return "delegated"
     if applied and unapplied:
         return "partial"
     if unapplied:

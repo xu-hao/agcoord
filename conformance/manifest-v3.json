@@ -145,6 +145,22 @@
       }
     },
     {
+      "id": "resources.overflow-pools",
+      "domain": "resources",
+      "description": "A job that allowed overflow and has waited past a pool's threshold runs through that pool's executor under the pool's capacities, single-job limit, hard runtime limit, and daily CPU-hour budget, with enforcement delegated to the executor; a land sends only its gate, an executor without a verdict ends the run without one, and local allocations and jobs that did not allow overflow are unaffected.",
+      "tests": {
+        "rust_native": [
+          "scheduler::an_eligible_row_overflows_to_a_pool_after_its_wait_threshold",
+          "scheduler::an_overflow_budget_bounds_concurrent_reservations",
+          "scheduler::a_placed_run_is_stopped_at_the_pool_runtime_limit",
+          "scheduler::a_land_sends_only_its_gate_through_the_pool_executor",
+          "scheduler::a_claim_above_a_pool_single_job_limit_falls_through_to_the_next_pool",
+          "scheduler::a_required_claim_is_delegated_to_the_pool_instead_of_enforced_locally",
+          "scheduler::an_executor_that_cannot_obtain_a_verdict_ends_the_run_without_one"
+        ]
+      }
+    },
+    {
       "id": "receipts.verified-terminal-evidence",
       "domain": "receipts",
       "description": "Receipts retain sanitized applied, peak, and event evidence exactly once.",

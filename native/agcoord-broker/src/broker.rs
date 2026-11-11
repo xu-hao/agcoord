@@ -1,17 +1,18 @@
 use crate::error::{AppError, Result};
 use crate::host;
+use crate::overflow::Pool;
 use crate::platform::{
     OwnerLock, process_group_exists, same_worker_process, signal_process_group,
     worker_identity_conflicts,
 };
 use crate::store::{
-    Paths, RunRecord, allocations, blocked_by, commit_sha_valid, configured_stop_grace, connect,
-    initialize_native, load_live_runs, load_run, load_runs, maintain_child_cpu_leases,
-    maintenance_record, map_database_error, mark_maintenance_drained, now,
-    validate_child_cpu_leases,
+    Paths, RunRecord, blocked_by, commit_sha_valid, configured_stop_grace, connect,
+    initialize_native, load_live_runs, load_run, load_runs, local_allocations,
+    maintain_child_cpu_leases, maintenance_record, map_database_error, mark_maintenance_drained,
+    now, overflow_candidate, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
-use crate::{cgroup, project_quota, resources};
+use crate::{cgroup, overflow, project_quota, resources};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -59,6 +60,8 @@ pub struct Broker {
     /// exclusive lock that every opening reader waits behind, which a slow disk stretches past
     /// a short `database_timeout`.
     _spool_anchor: Connection,
+    /// Overflow pools in the configured order of preference.
+    overflow_pools: Vec<Pool>,
     children: HashMap<String, NativeWorker>,
     cancellation_started: HashMap<String, Instant>,
     group_drain_started: HashMap<String, Instant>,
@@ -135,9 +138,22 @@ fn land_request_options(run: &RunRecord) -> Result<Vec<String>> {
 }
 
 impl Broker {
-    fn worker_command(&self, run: &RunRecord) -> Result<Vec<String>> {
+    /// A row placed in a pool runs `EXECUTOR... -- COMMAND...`: the executor is this
+    /// machine's worker and carries the submitted command to the pool.  A land keeps its
+    /// local worker for preflight and publication, and only its gate goes through the
+    /// executor.
+    fn worker_command(&self, run: &RunRecord, pool: Option<&Pool>) -> Result<Vec<String>> {
+        let submitted = match pool {
+            Some(pool) => {
+                let mut command = pool.executor.clone();
+                command.push("--".to_owned());
+                command.extend(run.command.clone());
+                command
+            }
+            None => run.command.clone(),
+        };
         if run.kind != "land" {
-            return Ok(run.command.clone());
+            return Ok(submitted);
         }
         let python = run
             .environment
@@ -187,7 +203,7 @@ impl Broker {
         ]);
         command.extend(land_request_options(run)?);
         command.push("--".to_owned());
-        command.extend(run.command.clone());
+        command.extend(submitted);
         Ok(command)
     }
     pub fn start(options: ServeOptions) -> Result<Self> {
@@ -199,6 +215,7 @@ impl Broker {
         paths.prepare()?;
         let paths = paths.configured()?;
         let resource_configuration = resources::load_configuration(&options.state_dir)?;
+        let overflow_pools = overflow::load_pools(&options.state_dir)?;
         let capacities = if options.capacities.is_empty() {
             resource_configuration.capacities.clone()
         } else {
@@ -430,13 +447,14 @@ impl Broker {
             )
         })?;
         owner.publish(&format!(
-            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\nstarted_at={}\n",
+            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\noverflow_pools={}\nstarted_at={}\n",
             std::process::id(),
             env!("CARGO_PKG_VERSION"),
             env!("AGCOORD_BUILD_ID"),
             capacities_json,
             bindings_json,
             capabilities_json,
+            overflow::pools_json(&overflow_pools),
             started_at,
         ))?;
         let stop_grace = configured_stop_grace(&paths)?;
@@ -452,6 +470,7 @@ impl Broker {
             project_quota_backend,
             _owner: owner,
             _spool_anchor: connection,
+            overflow_pools,
             children: HashMap::new(),
             cancellation_started: HashMap::new(),
             group_drain_started: HashMap::new(),
@@ -516,8 +535,12 @@ impl Broker {
         }
     }
 
-    fn validate_active(&self, active: &[RunRecord]) -> Result<()> {
-        for (name, units) in allocations(active) {
+    fn validate_active(
+        &self,
+        active: &[RunRecord],
+        placed: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        for (name, units) in local_allocations(active, placed) {
             if units > self.capacities.get(&name).copied().unwrap_or(0) {
                 return Err(AppError::new(
                     "broker-active-state-invalid",
@@ -560,8 +583,15 @@ impl Broker {
             .filter(|run| run.status == "running")
             .cloned()
             .collect();
-        self.validate_active(&active)?;
+        let placed = overflow::live_placements(&connection)?;
+        self.validate_active(&active, &placed)?;
         for run in active {
+            if let Some(pool) = placed
+                .get(&run.run_id)
+                .and_then(|name| self.overflow_pools.iter().find(|pool| pool.name == *name))
+            {
+                Self::expire_overflow(&connection, &run, pool)?;
+            }
             self.observe(&connection, &run)?;
         }
         maintain_child_cpu_leases(&connection)?;
@@ -581,14 +611,86 @@ impl Broker {
                 .cloned()
                 .collect();
             crate::recovery::filter_queued(&connection, &mut queued)?;
-            self.validate_active(&active)?;
-            let Some(next) = self.next_admissible(&active, &queued) else {
-                return Ok(());
+            let placed = overflow::live_placements(&connection)?;
+            self.validate_active(&active, &placed)?;
+            // This machine is always preferred: a pool is considered only when nothing
+            // more can be admitted locally in this pass.
+            let (next, pool) = match self.next_admissible(&active, &queued, &placed) {
+                Some(next) => (next, None),
+                None => match self.next_overflow(&connection, &active, &queued, &placed)? {
+                    Some((next, pool)) => (next, Some(pool)),
+                    None => return Ok(()),
+                },
             };
             drop(connection);
-            self.start_worker(&next)?;
+            self.start_worker(&next, pool.as_ref())?;
             self.last_repository = Some(next.repository_id);
         }
+    }
+
+    /// Choose the earliest queued row that may leave this machine, with the first
+    /// configured pool that can take it now.
+    ///
+    /// A row qualifies only when its submitter allowed overflow, nothing but this machine's
+    /// capacity blocks it and it has waited at least the pool's threshold.  The pool must have room for the claim and, when it has
+    /// a budget, enough of today's allowance left for the claim's worst case.
+    fn next_overflow(
+        &self,
+        connection: &Connection,
+        active: &[RunRecord],
+        queued: &[RunRecord],
+        placed: &BTreeMap<String, String>,
+    ) -> Result<Option<(RunRecord, Pool)>> {
+        if self.overflow_pools.is_empty() {
+            return Ok(None);
+        }
+        for run in queued {
+            if !overflow_candidate(&run.kind, &run.environment) {
+                continue;
+            }
+            let blockers = blocked_by(run, active, queued, &self.capacities, placed);
+            if blockers.is_empty()
+                || blockers
+                    .iter()
+                    .any(|blocker| !blocker.starts_with("resource:"))
+            {
+                continue;
+            }
+            let waited = overflow::waited_seconds(connection, &run.created_at)?;
+            for pool in &self.overflow_pools {
+                if waited < pool.wait_threshold {
+                    continue;
+                }
+                let used = overflow::pool_allocations(active, placed, &pool.name);
+                if pool.fits(&run.resources, &used)
+                    && overflow::budget_allows(connection, pool, &run.resources)?
+                {
+                    return Ok(Some((run.clone(), pool.clone())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Stop a placed run that has held its pool capacity for the pool's whole runtime
+    /// limit.  The limit bounds what a reservation can cost, so it is enforced here rather
+    /// than left to the executor.
+    fn expire_overflow(connection: &Connection, run: &RunRecord, pool: &Pool) -> Result<()> {
+        if run.cancel_requested || !overflow::runtime_exceeded(connection, &run.run_id, pool)? {
+            return Ok(());
+        }
+        connection
+            .execute(
+                "UPDATE runs SET cancel_requested = 1, cancel_requested_at = ?1,
+                     failure_reason = ?2
+                 WHERE run_id = ?3
+                   AND status = 'running'
+                   AND cancel_requested = 0
+                   AND NOT (kind = 'land' AND phase = 'publishing')",
+                params![now(connection)?, overflow::RUNTIME_EXCEEDED, run.run_id],
+            )
+            .map_err(map_database_error)?;
+        Ok(())
     }
 
     /// Choose one repository lane's first admissible job in round-robin order.
@@ -596,14 +698,19 @@ impl Broker {
     /// Within a lane, a queued job that is blocked by a barrier, by its worktree, or by
     /// capacity lets later admissible lane work pass it; the blockers themselves keep
     /// barriers in submission order.
-    fn next_admissible(&self, active: &[RunRecord], queued: &[RunRecord]) -> Option<RunRecord> {
+    fn next_admissible(
+        &self,
+        active: &[RunRecord],
+        queued: &[RunRecord],
+        placed: &BTreeMap<String, String>,
+    ) -> Option<RunRecord> {
         let mut heads = Vec::new();
         let mut seen = BTreeSet::new();
         for run in queued {
             if seen.contains(&run.repository_id) {
                 continue;
             }
-            if blocked_by(run, active, queued, &self.capacities).is_empty() {
+            if blocked_by(run, active, queued, &self.capacities, placed).is_empty() {
                 seen.insert(run.repository_id.clone());
                 heads.push(run.clone());
             }
@@ -659,8 +766,16 @@ impl Broker {
             } else {
                 exit_status
             };
+            let executor_failed = overflow::live_placements(connection)?.contains_key(&run.run_id)
+                && overflow::executor_failed(&run, exit_status);
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
                 Self::requested_stop_outcome(&run)
+            } else if executor_failed {
+                (
+                    "interrupted",
+                    overflow::EXECUTOR_FAILED_EXIT,
+                    Some(overflow::EXECUTOR_FAILED),
+                )
             } else if observed_exit == 0 {
                 ("passed", 0, None)
             } else if Self::has_resource_observation(&run, "memory-oom") {
@@ -813,6 +928,7 @@ impl Broker {
                 ],
             )
             .map_err(map_database_error)?;
+        overflow::settle(connection, &current)?;
         connection
             .execute_batch("COMMIT")
             .map_err(map_database_error)
@@ -1466,7 +1582,17 @@ impl Broker {
         Ok(())
     }
 
-    fn prepare_resources(&mut self, connection: &Connection, run: &RunRecord) -> Result<bool> {
+    /// Prepare the local enforcement of a row's claims before its worker exists.
+    ///
+    /// A row placed in an overflow pool does not consume those claims on this machine, so
+    /// nothing is enforced here.  Each enforced binding is recorded as delegated to the
+    /// pool, whose executor must run the command in an environment sized to the claim.
+    fn prepare_resources(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+        placed: bool,
+    ) -> Result<bool> {
         let mut receipt = run.resource_receipt.clone();
         let mut state = run.resource_state.clone();
         if !state.is_empty() {
@@ -1487,6 +1613,18 @@ impl Broker {
                 continue;
             }
             let backend = binding.backend.as_deref().unwrap();
+            if placed {
+                Self::append_resource_event(
+                    connection,
+                    &mut receipt,
+                    backend,
+                    name,
+                    "prepare",
+                    "recorded",
+                    overflow::DELEGATED_CODE,
+                )?;
+                continue;
+            }
             let Some(issue) = resources::capability_issue(binding, capabilities.get(backend))
             else {
                 eligible
@@ -1916,7 +2054,7 @@ impl Broker {
         Self::save_resource_records(connection, &refreshed, &receipt, &state)
     }
 
-    fn start_worker(&mut self, queued: &RunRecord) -> Result<()> {
+    fn start_worker(&mut self, queued: &RunRecord, pool: Option<&Pool>) -> Result<()> {
         let connection = connect(&self.paths)?;
         connection
             .execute_batch("BEGIN IMMEDIATE")
@@ -1940,6 +2078,10 @@ impl Broker {
                 params![phase, now(&connection)?, current.run_id],
             )
             .map_err(map_database_error)?;
+        if let Some(pool) = pool {
+            // The placement and its budget reservation commit with the admission.
+            overflow::place(&connection, &current, pool)?;
+        }
         connection
             .execute_batch("COMMIT")
             .map_err(map_database_error)?;
@@ -1950,7 +2092,7 @@ impl Broker {
             self.finish_run(&connection, &current, "cancelled", 130, None)?;
             return Ok(());
         }
-        if !self.prepare_resources(&connection, &current)? {
+        if !self.prepare_resources(&connection, &current, pool.is_some())? {
             let refreshed = load_run(&connection, &current.run_id)?;
             self.finish_run(
                 &connection,
@@ -1999,6 +2141,21 @@ impl Broker {
             "AGCOORD_STATE_DIR".to_owned(),
             self.paths.state_dir.to_string_lossy().into_owned(),
         );
+        if let Some(pool) = pool {
+            environment.insert("AGCOORD_OVERFLOW_POOL".to_owned(), pool.name.clone());
+            environment.insert(
+                "AGCOORD_OVERFLOW_MAX_RUNTIME".to_owned(),
+                pool.max_runtime.to_string(),
+            );
+            environment.insert(
+                "AGCOORD_OVERFLOW_RESOURCES".to_owned(),
+                serde_json::to_string(&current.resources).unwrap(),
+            );
+            environment.insert(
+                "AGCOORD_OVERFLOW_CONTRACT".to_owned(),
+                serde_json::to_string(&current.resource_contract).unwrap(),
+            );
+        }
         for name in ["TMPDIR", "TMP", "TEMP"] {
             environment.remove(name);
         }
@@ -2014,7 +2171,7 @@ impl Broker {
             environment.insert("TMP".to_owned(), target.clone());
             environment.insert("TEMP".to_owned(), target);
         }
-        let worker_command = self.worker_command(&current)?;
+        let worker_command = self.worker_command(&current, pool)?;
         let mut pending = match PendingWorker::spawn(
             &worker_command,
             &environment,
@@ -2243,6 +2400,12 @@ impl Broker {
     fn requested_stop_outcome(run: &RunRecord) -> (&'static str, i64, Option<&'static str>) {
         if run.failure_reason.as_deref() == Some(BROKER_STOPPED) {
             ("interrupted", 125, Some(BROKER_STOPPED))
+        } else if run.failure_reason.as_deref() == Some(overflow::RUNTIME_EXCEEDED) {
+            (
+                "failed",
+                overflow::RUNTIME_EXCEEDED_EXIT,
+                Some(overflow::RUNTIME_EXCEEDED),
+            )
         } else {
             ("cancelled", 130, None)
         }
@@ -2258,7 +2421,7 @@ impl Broker {
             .filter(|run| run.status == "running")
             .cloned()
             .collect();
-        self.validate_active(&active)?;
+        self.validate_active(&active, &overflow::live_placements(&connection)?)?;
         for run in &active {
             self.observe(&connection, run)?;
         }
