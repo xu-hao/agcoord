@@ -302,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("worker_command", nargs=argparse.REMAINDER)
         return command
 
+    commands.add_parser(
+        "overflow-ssh",
+        help="overflow executor: run a placed job on another machine over SSH",
+        add_help=False,
+    )
     submission("run", "submit a compatible check")
     submission("full", "submit a clean exact-head receipt without a lane barrier")
 
@@ -734,7 +739,14 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    selected = list(sys.argv[1:] if argv is None else argv)
+    if selected[:1] == ["overflow-ssh"]:
+        # An overflow executor is started by the broker as a placed job's worker and has
+        # its own options and carried command, so it parses the rest of the line itself.
+        from .overflow_ssh import main as overflow_ssh
+
+        return overflow_ssh(selected[1:])
+    args = build_parser().parse_args(selected)
     try:
         return run(args, out=sys.stdout)
     except CoordinatorError as exc:

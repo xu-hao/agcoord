@@ -13,7 +13,7 @@ versioning; dates use ISO 8601.
   Enforcing the claim is delegated to the executor and shown as `delegated`. Rows gain a `pool`
   field and snapshots an `overflow_pools` list (#270).
 
-- Add `agc-overflow-ssh`, an overflow executor that runs a placed job in a container on
+- Add `agc overflow-ssh`, an overflow executor that runs a placed job in a container on
   another machine over SSH, limited to the job's claims. A repository opts in to overflow with
   `.agcoord/overflow.json`, which names its toolchain Dockerfile or image; `--overflow` is
   refused without it. Ignored files never leave the machine (#273).

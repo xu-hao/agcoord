@@ -2,9 +2,9 @@
 
 Configure it as a pool's executor::
 
-    "executor": ["agc-overflow-ssh", "builder@workstation"]
+    "executor": ["agc", "overflow-ssh", "builder@workstation"]
 
-The broker starts it in the job's checkout as ``agc-overflow-ssh DESTINATION -- COMMAND``.
+The broker starts it in the job's checkout as ``agc overflow-ssh DESTINATION -- COMMAND``.
 It sends the repository's toolchain image to the destination once, sends the job's source
 and builds it into a run image there, runs the command in a container limited to the job's
 claims, relays the output, and exits with the command's status.  The destination needs
@@ -173,12 +173,12 @@ class SshExecutor:
 
 
 def _say(message: str) -> None:
-    print(f"agc-overflow-ssh: {message}", file=sys.stderr, flush=True)
+    print(f"agc overflow-ssh: {message}", file=sys.stderr, flush=True)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="agc-overflow-ssh",
+        prog="agc overflow-ssh",
         description=(
             "AGCoord overflow executor: run a placed job in a limited container on "
             "another machine over SSH."
