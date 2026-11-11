@@ -18,6 +18,10 @@ versioning; dates use ISO 8601.
   `.agcoord/overflow.json`, which names its toolchain Dockerfile or image; `--overflow` is
   refused without it. Ignored files never leave the machine (#273).
 
+- Add a Terraform module, `packaging/terraform/gcp-overflow/`, that provisions the GCP project,
+  APIs, Artifact Registry repository with cleanup policies, and job service account that the
+  Google Cloud overflow executors use (#281).
+
 ## 0.7.8 — 2026-11-10
 
 - Support server-side filtered snapshot queries across broker, client, CLI (`agc list`), and TUI (`agc tui`).
