@@ -7592,3 +7592,500 @@ fn recent_terminal_runs_are_ordered_by_completion_time_descending() {
     assert_eq!(recent[0]["run_id"], "check-first-completes-second");
     assert_eq!(recent[1]["run_id"], "check-second-completes-first");
 }
+
+/// Write a test-owned executor that records what the broker handed it and then runs the
+/// carried command, standing in for an adapter that would run it on another machine.
+fn write_overflow_executor(directory: &Path) -> PathBuf {
+    let executor = directory.join("agcoord-test-executor");
+    fs::write(
+        &executor,
+        "#!/bin/sh\nprintf '%s\\n' \"$AGCOORD_OVERFLOW_POOL\" \"$AGCOORD_OVERFLOW_MAX_RUNTIME\" \"$AGCOORD_OVERFLOW_RESOURCES\" \"$@\" >\"$0.seen\"\nprintf '%s\\n' \"$AGCOORD_OVERFLOW_CONTRACT\" >\"$0.contract\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755)).unwrap();
+    executor
+}
+
+fn write_overflow_config(state: &Path, pool: Value) {
+    fs::create_dir_all(state).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({"overflow_pools": [pool]})).unwrap(),
+    )
+    .unwrap();
+}
+
+fn submit_overflow_ok(state: &Path, submission: &Submission<'_>, resources: &[(&str, u64)]) {
+    assert_submitted(
+        submission,
+        submit_in_worktree(
+            state,
+            submission,
+            resources,
+            &[("_AGCOORD_OVERFLOW", "1")],
+            None,
+        ),
+    );
+}
+
+#[test]
+fn an_eligible_row_overflows_to_a_pool_after_its_wait_threshold() {
+    let temporary = TestDirectory::new("overflow-placement");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "elsewhere",
+            "capacities": {"jobs": 2, "cpu": 4},
+            "executor": [executor.to_str().unwrap(), "--flag"],
+            "wait_threshold": 1,
+            "max_runtime": 60,
+            "budget": {"cpu_hours_per_day": 1, "rollover_utc": "06:00"},
+            "cpu_hour_price": 0.5,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 1)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
+    let over_entered = temporary.path().join("over-entered");
+    let over_release = temporary.path().join("over-release");
+    let local = temporary.path().join("local");
+
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-first",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&first_entered, &first_release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 1)],
+        None,
+    );
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-local",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&local),
+            gate_run_id: None,
+        },
+        &[("cpu", 1)],
+        None,
+    );
+
+    // A claim this machine can never hold is refused unless the submitter allowed
+    // overflow and a pool offers it.
+    let wide = Submission {
+        run_id: "check-over",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&over_entered, &over_release, None),
+        gate_run_id: None,
+    };
+    let refused = submit_with_resources(&state, &wide, &[("cpu", 2)]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("broker-resource-unavailable"));
+    let unoffered = submit_in_worktree(
+        &state,
+        &wide,
+        &[("cpu", 5)],
+        &[("_AGCOORD_OVERFLOW", "1")],
+        None,
+    );
+    assert!(!unoffered.status.success());
+
+    submit_overflow_ok(&state, &wide, &[("cpu", 2)]);
+    // The row waits locally until the pool's threshold has passed.
+    let waiting = status(&state, "check-over");
+    assert_eq!(waiting["status"], "queued");
+    assert_eq!(waiting["pool"], Value::Null);
+    assert_eq!(waiting["blocked_by"], json!(["resource:cpu"]));
+
+    wait_for(Duration::from_secs(10), || over_entered.exists());
+    let placed = status(&state, "check-over");
+    assert_eq!(placed["status"], "running");
+    assert_eq!(placed["pool"], "elsewhere");
+    let seen = fs::read_to_string(executor.with_extension("seen")).unwrap();
+    let seen: Vec<_> = seen.lines().collect();
+    assert_eq!(
+        &seen[..5],
+        ["elsewhere", "60", "{\"cpu\":2,\"jobs\":1}", "--flag", "--"]
+    );
+    assert_eq!(seen[5], "/bin/sh");
+
+    // The pool holds the placed claim; this machine's allocations and the row that did
+    // not allow overflow are unaffected.
+    let snap = snapshot(&state).unwrap();
+    assert_eq!(snap["allocations"], json!({"cpu": 1, "jobs": 1}));
+    let pool = &snap["overflow_pools"][0];
+    assert_eq!(pool["name"], "elsewhere");
+    assert_eq!(pool["allocations"], json!({"cpu": 2, "jobs": 1}));
+    assert_eq!(pool["budget"]["rollover_utc"], "06:00");
+    assert_eq!(pool["cpu_hour_price"], 0.5);
+    // Two CPUs for the 60-second limit are reserved while the run is live.
+    let reserved = pool["budget"]["used_cpu_hours"].as_f64().unwrap();
+    assert!((reserved - 120.0 / 3600.0).abs() < 1e-9, "{reserved}");
+    let local_row = status(&state, "check-local");
+    assert_eq!(local_row["status"], "queued");
+    assert_eq!(local_row["blocked_by"], json!(["resource:cpu"]));
+
+    fs::write(&over_release, "release").unwrap();
+    let finished = wait_status(&state, "check-over", "passed");
+    assert_eq!(finished["pool"], "elsewhere");
+    assert_eq!(
+        finished["resource_receipt"]["events"],
+        json!([]),
+        "admission-only claims record no enforcement"
+    );
+    let snap = snapshot(&state).unwrap();
+    let pool = &snap["overflow_pools"][0];
+    assert_eq!(pool["allocations"], json!({"cpu": 0, "jobs": 0}));
+    // The unused part of the reservation is returned when the run ends.
+    let settled = pool["budget"]["used_cpu_hours"].as_f64().unwrap();
+    assert!(settled > 0.0 && settled < reserved, "{settled}");
+
+    fs::write(&first_release, "release").unwrap();
+    let local_row = wait_status(&state, "check-local", "passed");
+    assert_eq!(local_row["pool"], Value::Null);
+    assert!(local.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn an_overflow_budget_bounds_concurrent_reservations() {
+    let temporary = TestDirectory::new("overflow-budget");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    // Each two-CPU row reserves one CPU-hour, so the budget covers one live reservation.
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "paid",
+            "capacities": {"jobs": 4, "cpu": 8},
+            "executor": [executor.to_str().unwrap()],
+            "max_runtime": 1800,
+            "budget": {"cpu_hours_per_day": 1.5},
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 1)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
+    let second = temporary.path().join("second");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-first",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&first_entered, &first_release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-second",
+            kind: "check",
+            repository: "repo-b",
+            checkout: &checkout,
+            command: touch_command(&second),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    thread::sleep(Duration::from_millis(400));
+    let waiting = status(&state, "check-second");
+    assert_eq!(waiting["status"], "queued");
+    assert_eq!(waiting["pool"], Value::Null);
+    assert!(!second.exists());
+
+    // Finishing the first run returns its unused reservation, which admits the second.
+    fs::write(&first_release, "release").unwrap();
+    wait_status(&state, "check-first", "passed");
+    let placed = wait_status(&state, "check-second", "passed");
+    assert_eq!(placed["pool"], "paid");
+    assert!(second.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_placed_run_is_stopped_at_the_pool_runtime_limit() {
+    let temporary = TestDirectory::new("overflow-runtime");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "bounded",
+            "capacities": {"jobs": 1, "cpu": 2},
+            "executor": [executor.to_str().unwrap()],
+            "max_runtime": 1,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 1)]);
+    let entered = temporary.path().join("entered");
+    let never_released = temporary.path().join("never-released");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-long",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&entered, &never_released, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let stopped = wait_status(&state, "check-long", "failed");
+    assert_eq!(stopped["pool"], "bounded");
+    assert_eq!(stopped["failure_reason"], "overflow-runtime-exceeded");
+    assert_eq!(stopped["exit_status"], 124);
+    assert_eq!(
+        snapshot(&state).unwrap()["overflow_pools"][0]["allocations"],
+        json!({"cpu": 0, "jobs": 0})
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_land_sends_only_its_gate_through_the_pool_executor() {
+    let temporary = TestDirectory::new("overflow-land");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "elsewhere",
+            "capacities": {"jobs": 1, "cpu": 4},
+            "executor": [executor.to_str().unwrap()],
+            "max_runtime": 60,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 2), ("cpu", 1)]);
+    let gated = temporary.path().join("gated");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "land-over",
+            kind: "land",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&gated),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    let landed = wait_status(&state, "land-over", "passed");
+    assert_eq!(landed["pool"], "elsewhere");
+    assert!(gated.exists());
+    // The land worker stays this machine's worker; the executor wraps only the gate
+    // command that follows the worker's own separator.
+    let argv = fs::read_to_string(checkout.join("agcoord-test-land-python.argv")).unwrap();
+    let argv: Vec<_> = argv.lines().collect();
+    let separator = argv.iter().position(|argument| *argument == "--").unwrap();
+    assert!(argv[..separator].contains(&"--run-id"));
+    assert_eq!(
+        &argv[separator + 1..],
+        [
+            executor.to_str().unwrap(),
+            "--",
+            "/usr/bin/touch",
+            gated.to_str().unwrap()
+        ]
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_claim_above_a_pool_single_job_limit_falls_through_to_the_next_pool() {
+    let temporary = TestDirectory::new("overflow-max-claim");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({"overflow_pools": [
+            {
+                "name": "small-jobs",
+                "capacities": {"jobs": 4, "cpu": 8},
+                "max_claim": {"cpu": 1},
+                "executor": [executor.to_str().unwrap()],
+                "max_runtime": 60,
+            },
+            {
+                "name": "large-jobs",
+                "capacities": {"jobs": 1, "cpu": 4},
+                "executor": [executor.to_str().unwrap()],
+                "max_runtime": 60,
+            },
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 2), ("cpu", 1)]);
+    let ran = temporary.path().join("ran");
+    let wide = Submission {
+        run_id: "check-wide",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&ran),
+        gate_run_id: None,
+    };
+
+    // No pool can run five CPUs as one job, although the first pool holds eight in total.
+    let unoffered = submit_in_worktree(
+        &state,
+        &wide,
+        &[("cpu", 5)],
+        &[("_AGCOORD_OVERFLOW", "1")],
+        None,
+    );
+    assert!(!unoffered.status.success());
+
+    submit_overflow_ok(&state, &wide, &[("cpu", 2)]);
+    let placed = wait_status(&state, "check-wide", "passed");
+    assert_eq!(placed["pool"], "large-jobs");
+    assert_eq!(
+        snapshot(&state).unwrap()["overflow_pools"][0]["max_claim"],
+        json!({"cpu": 1})
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_required_claim_is_delegated_to_the_pool_instead_of_enforced_locally() {
+    let temporary = TestDirectory::new("overflow-delegated");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("not-a-cgroup");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    // This machine cannot enforce the required CPU binding at all, so the same claim run
+    // locally is refused before user code.
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "cpu": {
+                    "backend": "cgroup-v2",
+                    "kind": "cpu",
+                    "mode": "required",
+                    "unit": "logical-cpu"
+                }
+            },
+            "cgroup_root": root,
+            "overflow_pools": [{
+                "name": "elsewhere",
+                "capacities": {"jobs": 1, "cpu": 4},
+                "executor": [executor.to_str().unwrap()],
+                "max_runtime": 60,
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 2), ("cpu", 1)]);
+    let ran = temporary.path().join("ran");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-required",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&ran),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    let finished = wait_status(&state, "check-required", "passed");
+    assert_eq!(finished["pool"], "elsewhere");
+    assert!(ran.exists());
+    let receipt = &finished["resource_receipt"];
+    assert_eq!(receipt["applied"], json!({}));
+    let events = receipt["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["resource"], "cpu");
+    assert_eq!(events[0]["status"], "recorded");
+    assert_eq!(events[0]["code"], "overflow-delegated");
+    // The executor is told what each claim means so that it can size the remote run.
+    let seen = fs::read_to_string(executor.with_extension("contract")).unwrap();
+    let contract: Value = serde_json::from_str(seen.trim()).unwrap();
+    assert_eq!(contract["cpu"]["kind"], "cpu");
+    assert_eq!(contract["cpu"]["mode"], "required");
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn an_executor_that_cannot_obtain_a_verdict_ends_the_run_without_one() {
+    let temporary = TestDirectory::new("overflow-executor-failed");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = temporary.path().join("agcoord-test-lost-executor");
+    fs::write(
+        &executor,
+        "#!/bin/sh\necho 'connection lost' >&2\nexit 125\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755)).unwrap();
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "elsewhere",
+            "capacities": {"jobs": 1, "cpu": 4},
+            "executor": [executor.to_str().unwrap()],
+            "max_runtime": 60,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 2), ("cpu", 1)]);
+    let must_not_run = temporary.path().join("must-not-run");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-lost",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&must_not_run),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    let lost = wait_status(&state, "check-lost", "interrupted");
+    assert_eq!(lost["failure_reason"], "overflow-executor-failed");
+    assert_eq!(lost["exit_status"], 125);
+    assert!(!must_not_run.exists());
+    assert!(broker.terminate().success());
+}

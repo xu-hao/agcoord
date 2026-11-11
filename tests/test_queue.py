@@ -53,6 +53,7 @@ ROW_KEYS = {
     "resource_contract",
     "resource_receipt",
     "blocked_by",
+    "pool",
     "gate_run_id",
     "publication",
     "failure_reason",
@@ -78,6 +79,7 @@ SNAPSHOT_KEYS = {
     "allocations",
     "resource_bindings",
     "resource_capabilities",
+    "overflow_pools",
     "maintenance",
     "available_filters",
     "active",
@@ -783,6 +785,70 @@ def test_impossible_or_nonpositive_resource_requests_are_never_queued(
         assert snapshot["active"] == []
         assert snapshot["queued"] == []
         assert snapshot["recent"] == []
+    finally:
+        running.stop()
+
+
+def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    executor = tmp_path / "executor"
+    executor.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$AGCOORD_OVERFLOW_POOL" >"$0.pool"\n'
+        'while [ "$1" != -- ]; do shift; done\n'
+        "shift\n"
+        'exec "$@"\n',
+        encoding="utf-8",
+    )
+    executor.chmod(0o755)
+    write_broker_config(
+        state_dir,
+        overflow_pools=[
+            {
+                "name": "elsewhere",
+                "capacities": {"jobs": 1, "cpu": 8},
+                "executor": [str(executor)],
+                "max_runtime": 60,
+            }
+        ],
+    )
+    running = RunningCoordinator(state_dir, capacities={"jobs": 2, "cpu": 2})
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    marker = tmp_path / "ran"
+    command = _python(
+        "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+        marker,
+    )
+    try:
+        # Without the submitter's consent a claim above this machine's capacity is
+        # still refused, even though a pool could hold it.
+        with pytest.raises(CoordinatorError, match="capacity"):
+            client.submit(
+                command,
+                checkout=str(repository),
+                resources={"cpu": 4},
+                caller_pid=os.getpid(),
+                environment=caller_environment(),
+            )
+        run_id = client.submit(
+            command,
+            checkout=str(repository),
+            resources={"cpu": 4},
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+            overflow=True,
+        )
+        row = _row(client, run_id, "passed")
+        assert row["pool"] == "elsewhere"
+        assert marker.read_text(encoding="utf-8") == "ran"
+        assert (tmp_path / "executor.pool").read_text(encoding="utf-8") == "elsewhere\n"
+        snapshot = client.snapshot()
+        assert snapshot["allocations"] == {"cpu": 0, "jobs": 0}
+        (pool,) = snapshot["overflow_pools"]
+        assert pool["name"] == "elsewhere"
+        assert pool["allocations"] == {"cpu": 0, "jobs": 0}
+        assert pool["budget"] is None
     finally:
         running.stop()
 
