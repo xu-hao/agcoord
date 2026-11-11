@@ -3,6 +3,15 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Add overflow pools: an `overflow_pools` list in `config.json` names extra capacity on another
+  machine or an ephemeral cloud machine, reached through a configured executor command. A job
+  submitted with the new `--overflow` option that has waited past a pool's `wait_threshold` for
+  local capacity runs through that executor instead, under the pool's own capacities, a hard
+  `max_runtime`, and an optional daily CPU-hour budget. Rows gain a `pool` field and snapshots
+  an `overflow_pools` list (#270).
+
 ## 0.7.8 — 2026-11-10
 
 - Support server-side filtered snapshot queries across broker, client, CLI (`agc list`), and TUI (`agc tui`).

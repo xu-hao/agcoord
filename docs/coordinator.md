@@ -132,7 +132,8 @@ the entire machine:
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
-`database_timeout`, `land_gate_reuse_max_age`, `stop_grace`, and `native_broker`; invalid JSON, a top-level
+`database_timeout`, `land_gate_reuse_max_age`, `stop_grace`, `native_broker`, and
+`overflow_pools`; invalid JSON, a top-level
 value that is not an object,
 an unknown key, a section that is not an object, or an empty `cgroup_root` is refused when the
 client or broker loads its configuration. When present, `cgroup_io` contains exactly one
@@ -212,7 +213,8 @@ Every job implicitly requests `jobs=1`. Jobs add resources with repeatable
 `memory`, `browser`, or a project-defined singleton; units are positive integers and the name
 must exist in the configured capacity map. Admission requires every request to fit, and
 allocation is held until the complete worker process group is gone. A request that can never
-fit is rejected rather than left queued forever. Scheduling does not infer resource use from
+fit is rejected rather than left queued forever, unless it allowed overflow and an
+[overflow pool](#overflow-pools) offers it. Scheduling does not infer resource use from
 labels or commands.
 
 Admission greedily packs the complete declared resource vectors rather than assigning fixed
@@ -282,6 +284,90 @@ finish, cancellation, and cleanup remain owned by the broker. The core currently
 backend-neutral seam, a Linux cgroup v2 lifecycle backend, and a Linux project-quota scratch
 backend. Controller values, provisioned filesystems, process-specific adapters, and executors
 remain separate implementations; a configured backend is never silently treated as successful.
+
+### Overflow pools
+
+An overflow pool extends this machine's capacity with capacity somewhere else: another machine
+the operator owns, or a machine a cloud provider creates for one run. The coordinator core does
+not know which. A pool is only a name, its own capacities, and an *executor* command; reaching
+the other machine is the executor's job, so provider-specific behavior stays in adapters.
+
+Pools are the ordered `overflow_pools` list in `config.json`, and like every other section they
+are frozen when the broker starts:
+
+```json
+{
+  "capacities": {"jobs": 8, "cpu": 16},
+  "overflow_pools": [
+    {
+      "name": "workstation",
+      "capacities": {"jobs": 2, "cpu": 32},
+      "executor": ["run-on-workstation"],
+      "wait_threshold": 120,
+      "max_runtime": 3600
+    },
+    {
+      "name": "cloud",
+      "capacities": {"jobs": 4, "cpu": 64},
+      "executor": ["run-in-cloud", "--machine-type", "e2-standard-16"],
+      "wait_threshold": 300,
+      "max_runtime": 3600,
+      "budget": {"cpu_hours_per_day": 100, "rollover_utc": "08:00"},
+      "cpu_hour_price": 0.034
+    }
+  ]
+}
+```
+
+Each pool has exactly these keys. `name` follows the resource-name rules and is unique.
+`capacities` lists every resource the pool offers as positive integers, `jobs` included; a claim
+on a name the pool does not list can never be placed there. `executor` is a non-empty command.
+`wait_threshold` is whole seconds, default `0`. `max_runtime` is required whole seconds.
+`budget` is optional: `cpu_hours_per_day` is a positive number and `rollover_utc` is the `HH:MM`
+UTC time at which a new budget day begins, default `00:00`. `cpu_hour_price` is an optional
+non-negative number that clients may use to display an estimated cost; the broker never
+enforces anything with it. An invalid pool is `broker-config-invalid`.
+
+A job may leave this machine only when its submitter passed `--overflow`. Nothing overflows by
+default, because a job must be able to run without this machine's files, tools, and ignored
+local state, and only its submitter knows that. A retained `merge` never overflows, and neither
+does a job with a claim whose binding is `required`: a run elsewhere cannot honor a required
+local limit, and that limit is never silently dropped.
+
+This machine is always preferred. In each scheduling pass the broker first admits everything
+that fits locally. Only then does it take the earliest queued job that allowed overflow, is
+blocked by nothing but this machine's capacity, and has been queued for at least a pool's
+`wait_threshold`, and place it in the first configured pool that has room for its complete claim
+and enough budget. Lane and barrier rules are unchanged: a placed job still counts as active
+work in its repository and worktree, and a job waiting for a land or for its worktree never
+overflows around it. With `--overflow`, a claim larger than this machine's capacity is accepted
+at submission when some pool offers it, and reaches that pool by the same rule.
+
+A placed job's row moves to `running` with its `pool` set. Its worker on this machine is
+`EXECUTOR... -- COMMAND...`, started in the submitted checkout with the usual admission
+environment plus `AGCOORD_OVERFLOW_POOL`, `AGCOORD_OVERFLOW_MAX_RUNTIME` in seconds, and
+`AGCOORD_OVERFLOW_RESOURCES`, the claim as a JSON object. The executor runs the command on the
+pool's machine, relays its output, and exits with its status; that exit status, the log, and
+cancellation are those of any other worker, so stopping the job signals the executor's process
+group and the executor must stop the remote run. A `land` keeps its local worker for preflight
+and publication, and only its gate command goes through the executor. The claim is held by the
+pool, not by this machine: it does not appear in `allocations`, and no local enforcement is
+applied. Each best-effort binding is recorded in the receipt as `unapplied` with code
+`overflow-pool`.
+
+A placed job that has held its pool capacity for `max_runtime` is stopped like a cancelled job
+and ends `failed` with exit status 124 and `failure_reason=overflow-runtime-exceeded`. The limit
+is what bounds a budget reservation, and it stops a forgotten remote machine from running on.
+An executor for a paid pool must also set the same limit on the remote resource itself, so that
+a lost broker cannot leave it billing.
+
+A budget counts CPU-hours of the `cpu` claim per budget day. Placement reserves the worst case,
+the claimed CPUs for the whole `max_runtime`, in the same transaction that admits the row, so
+concurrent placements cannot exceed the budget. When the run ends the charge becomes the claimed
+CPUs for the time it actually held the pool, and the rest is returned. A job whose reservation
+does not fit today's remaining budget is not placed and keeps waiting for local capacity. The
+budget counts claimed CPU time, not a provider's bill; use the provider's own billing alert as
+the backstop. `agc clear` does not reset a budget day.
 
 ### Delegated cgroup v2 lifecycle
 
@@ -697,7 +783,7 @@ The snapshot top level is strict:
 
 ```text
 protocol · broker_pid · captured_at · capacities · allocations
-resource_bindings · resource_capabilities
+resource_bindings · resource_capabilities · overflow_pools
 active · queued · recent
 ```
 
@@ -705,7 +791,10 @@ active · queued · recent
 the nonnegative units currently held. `resource_bindings` is the exact machine binding map
 frozen by the live broker. `resource_capabilities` maps each installed or referenced backend to
 its `available`, `kinds`, `units`, `operations`, and stable `reason` fields. It contains no host
-paths or backend exception text. Active and queued jobs appear in scheduling order; recent
+paths or backend exception text. `overflow_pools` lists each configured
+[overflow pool](#overflow-pools) in order with its configuration, the `allocations` its running
+jobs hold, and, inside a configured `budget`, the current budget day's `used_cpu_hours` and
+`remaining_cpu_hours`. Active and queued jobs appear in scheduling order; recent
 contains retained terminal history ordered by completion time (`finished_at` descending, tie-broken
 by sequence descending).
 
@@ -714,7 +803,7 @@ Each row contains exactly:
 ```text
 run_id · sequence · status · kind · label · agent
 repository_id · repository · worktree_id · checkout · branch · head_sha
-barrier · resources · resource_contract · resource_receipt · blocked_by
+barrier · resources · resource_contract · resource_receipt · blocked_by · pool
 gate_run_id · publication · failure_reason · phase · gate_exit_status
 caller_pid · command · created_at · started_at · finished_at
 exit_status · worker_pid · cancel_requested · log_bytes · position
@@ -734,7 +823,9 @@ event fields. A backend sample may also return stable, sanitized observations su
 controller-limit event; the broker validates the resource and code, records each observation
 once, and never exposes a raw controller file or exception. Backend handles and host paths remain
 private spool state and never enter the public row;
-`blocked_by` identifies durable predecessors currently preventing admission. Repository and
+`blocked_by` identifies durable predecessors currently preventing admission. `pool` is the
+name of the overflow pool the job was placed in, or null for a job that ran or will run on this
+machine. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
 operators. `agent` is the explicit `--agent` value, then `AGCOORD_AGENT`, or the stable value
 `unnamed` when neither is set; `caller_pid` remains the exact submitting process diagnostic and
