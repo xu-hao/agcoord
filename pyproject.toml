@@ -49,6 +49,7 @@ xdist = ["pytest-xdist>=3.8"]
 
 [project.scripts]
 agc = "agcoord.cli:main"
+agc-overflow-ssh = "agcoord.overflow_ssh:main"
 
 [project.entry-points.pytest11]
 agcoord-xdist = "agcoord.pytest_xdist"

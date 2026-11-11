@@ -1,0 +1,281 @@
+"""The image step shared by overflow executors.
+
+An overflow executor runs a placed job's command somewhere other than this machine, so
+it must carry three things there: the repository's toolchain, the job's source, and the
+limits the job claimed.  This module derives all three from the checkout and from the
+environment the broker gives an executor, without knowing how the target is reached.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+from typing import IO, Mapping, Sequence
+
+
+REPOSITORY_CONFIG = ".agcoord/overflow.json"
+WORKSPACE = "/workspace"
+#: The exit status with which an executor reports that it could not obtain a verdict.
+EXIT_NO_VERDICT = 125
+
+
+class ExecutorError(RuntimeError):
+    """A failure that prevents the executor from obtaining the command's verdict."""
+
+
+@dataclass(frozen=True)
+class RepositoryOverflow:
+    """How one repository's toolchain image is obtained: built here, or named."""
+
+    dockerfile: Path | None
+    image: str | None
+
+
+@dataclass(frozen=True)
+class ContainerLimits:
+    """The limits a container must carry to honour a job's enforced claims."""
+
+    cpus: int | None = None
+    memory: int | None = None
+    memory_reservation: int | None = None
+    swap: int | None = None
+    tmpfs: int | None = None
+    tmpfs_inodes: int | None = None
+    processes: int | None = None
+
+    def run_options(self) -> list[str]:
+        """Return the container-run options, shared by Docker and Podman."""
+        options: list[str] = []
+        if self.cpus is not None:
+            options.append(f"--cpus={self.cpus}")
+        if self.memory is not None:
+            options.append(f"--memory={self.memory}")
+            # Without an explicit swap claim the job gets no swap beyond its memory.
+            options.append(f"--memory-swap={self.memory + (self.swap or 0)}")
+        if self.memory_reservation is not None:
+            options.append(f"--memory-reservation={self.memory_reservation}")
+        if self.tmpfs is not None:
+            mount = f"/tmp:rw,size={self.tmpfs}"
+            if self.tmpfs_inodes is not None:
+                mount += f",nr_inodes={self.tmpfs_inodes}"
+            options.append(f"--tmpfs={mount}")
+        if self.processes is not None:
+            options.append(f"--pids-limit={self.processes}")
+        return options
+
+
+def repository_root(checkout: str | os.PathLike[str]) -> Path:
+    """Return the top of the working tree that contains ``checkout``."""
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise ExecutorError(f"{checkout} is not inside a Git working tree")
+    return Path(completed.stdout.strip())
+
+
+def has_repository_config(checkout: str | os.PathLike[str]) -> bool:
+    """Say whether the working tree declares itself able to run in an overflow pool."""
+    try:
+        return (repository_root(checkout) / REPOSITORY_CONFIG).is_file()
+    except ExecutorError:
+        return False
+
+
+def load_repository_config(root: Path) -> RepositoryOverflow:
+    """Read the file through which a repository opts in to overflow."""
+    path = root / REPOSITORY_CONFIG
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ExecutorError(
+            f"{REPOSITORY_CONFIG} is missing; the repository has not opted in to overflow"
+        ) from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ExecutorError(f"cannot read {REPOSITORY_CONFIG}: {exc}") from exc
+    if not isinstance(document, dict) or set(document) - {"dockerfile", "image"}:
+        raise ExecutorError(
+            f"{REPOSITORY_CONFIG} must be an object with only dockerfile or image"
+        )
+    dockerfile = document.get("dockerfile")
+    image = document.get("image")
+    if (dockerfile is None) == (image is None):
+        raise ExecutorError(f"{REPOSITORY_CONFIG} must name exactly one of dockerfile or image")
+    if dockerfile is not None:
+        if not isinstance(dockerfile, str) or not dockerfile.strip():
+            raise ExecutorError(f"{REPOSITORY_CONFIG} dockerfile must be a non-empty path")
+        selected = (root / dockerfile).resolve()
+        if root.resolve() not in selected.parents or not selected.is_file():
+            raise ExecutorError(
+                f"{REPOSITORY_CONFIG} dockerfile must be an existing file in the repository"
+            )
+        return RepositoryOverflow(dockerfile=selected, image=None)
+    if not isinstance(image, str) or not image.strip() or any(c.isspace() for c in image):
+        raise ExecutorError(f"{REPOSITORY_CONFIG} image must be one image reference")
+    return RepositoryOverflow(dockerfile=None, image=image)
+
+
+def source_files(root: Path) -> list[str]:
+    """List the working tree's tracked and untracked files, never its ignored ones.
+
+    A clean exact head lists exactly the commit; a check lists the working state.  Ignored
+    files, which is where local secrets live, never leave this machine.
+    """
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise ExecutorError("cannot list the working tree's files")
+    names = [os.fsdecode(name) for name in completed.stdout.split(b"\0") if name]
+    # A tracked file deleted in the working tree is listed but no longer exists.
+    return sorted(name for name in set(names) if os.path.lexists(root / name))
+
+
+def write_build_context(root: Path, toolchain: str, stream: IO[bytes]) -> int:
+    """Write a build context that adds the source as one layer on the toolchain image.
+
+    The image only copies files: nothing is compiled at build time, because a job
+    overflows exactly when this machine's CPUs are busy.  Returns the number of source
+    files written.
+    """
+    dockerfile = (
+        f"FROM {toolchain}\nCOPY workspace {WORKSPACE}\nWORKDIR {WORKSPACE}\n"
+    ).encode()
+    names = source_files(root)
+    with tarfile.open(fileobj=stream, mode="w|") as archive:
+        info = tarfile.TarInfo("Dockerfile")
+        info.size = len(dockerfile)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(dockerfile))
+        directory = tarfile.TarInfo("workspace")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        archive.addfile(directory)
+        for name in names:
+            archive.add(root / name, arcname=f"workspace/{name}", recursive=False)
+    return len(names)
+
+
+def container_limits(
+    resources: Mapping[str, int],
+    contract: Mapping[str, Mapping[str, object]],
+) -> ContainerLimits:
+    """Translate a job's enforced claims into container limits, or refuse.
+
+    Enforcement of a placed job is delegated to the executor.  A ``required`` claim of a
+    kind a container cannot limit is refused rather than run unenforced; a best-effort one
+    is skipped, as it would be on a host whose backend is unavailable.
+    """
+    selected: dict[str, int] = {}
+    for name, units in resources.items():
+        binding = contract.get(name, {})
+        mode = binding.get("mode", "admission-only")
+        if mode == "admission-only":
+            continue
+        field = {
+            "cpu": "cpus",
+            "memory": "memory",
+            "memory-high": "memory_reservation",
+            "swap": "swap",
+            "tmpfs": "tmpfs",
+            "processes": "processes",
+        }.get(str(binding.get("kind")))
+        if field is None and binding.get("kind") == "inodes":
+            # Inodes are enforceable only as the inode limit of a claimed tmpfs.
+            field = "tmpfs_inodes"
+        if field is None:
+            if mode == "required":
+                raise ExecutorError(
+                    f"required claim {name} of kind {binding.get('kind')} cannot be "
+                    "enforced in a container"
+                )
+            continue
+        selected[field] = units
+    limits = ContainerLimits(**selected)
+    for dependent, base, subject in (
+        ("swap", "memory", "a swap claim needs a memory claim"),
+        ("tmpfs_inodes", "tmpfs", "an inode claim needs a tmpfs claim"),
+    ):
+        if getattr(limits, dependent) is not None and getattr(limits, base) is None:
+            raise ExecutorError(f"{subject} to be enforced in a container")
+    return limits
+
+
+def placement(environment: Mapping[str, str]) -> tuple[str, int, ContainerLimits]:
+    """Read the run ID, runtime limit, and limits the broker gave a placed job's executor."""
+    try:
+        run_id = environment["AGCOORD_RUN_ID"]
+        max_runtime = int(environment["AGCOORD_OVERFLOW_MAX_RUNTIME"])
+        resources = json.loads(environment["AGCOORD_OVERFLOW_RESOURCES"])
+        contract = json.loads(environment["AGCOORD_OVERFLOW_CONTRACT"])
+    except (KeyError, ValueError) as exc:
+        raise ExecutorError(
+            "this command is an overflow executor and must be started by the broker "
+            "for a job placed in an overflow pool"
+        ) from exc
+    if max_runtime <= 0 or not isinstance(resources, dict) or not isinstance(contract, dict):
+        raise ExecutorError("the broker's overflow placement is invalid")
+    return run_id, max_runtime, container_limits(resources, contract)
+
+
+def container_tool(preferred: str | None = None) -> str:
+    """Return the local container tool: the one asked for, else Docker, else Podman."""
+    for candidate in [preferred] if preferred else ["docker", "podman"]:
+        if shutil.which(candidate):
+            return candidate
+    raise ExecutorError(
+        "overflow needs Docker or Podman on this machine to build the job's image"
+    )
+
+
+def build_toolchain(tool: str, root: Path, config: RepositoryOverflow) -> str:
+    """Return a local reference to the repository's toolchain image, building it if needed.
+
+    A Dockerfile is built with the tool's own layer cache and tagged by its image ID, so
+    an unchanged toolchain is found again without rebuilding or re-sending it.
+    """
+    if config.image is not None:
+        return config.image
+    assert config.dockerfile is not None
+    completed = subprocess.run(
+        [tool, "build", "-q", "-f", str(config.dockerfile), str(config.dockerfile.parent)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    image_id = completed.stdout.strip().removeprefix("sha256:")
+    if completed.returncode != 0 or not image_id:
+        raise ExecutorError(f"cannot build the toolchain image from {config.dockerfile}")
+    reference = f"agcoord-toolchain:{image_id[:24]}"
+    if subprocess.run([tool, "tag", image_id, reference]).returncode != 0:
+        raise ExecutorError("cannot tag the toolchain image")
+    return reference
+
+
+def command_line(arguments: Sequence[str]) -> list[str]:
+    """Return the carried command that follows the executor's own ``--`` separator.
+
+    Argument parsers differ on whether the separator itself is kept, so one leading
+    ``--`` is dropped when present.
+    """
+    command = list(arguments[1:] if arguments[:1] == ["--"] else arguments)
+    if not command:
+        raise ExecutorError("an overflow executor needs a command after --")
+    return command
