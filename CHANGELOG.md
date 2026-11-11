@@ -8,9 +8,10 @@ versioning; dates use ISO 8601.
 - Add overflow pools: an `overflow_pools` list in `config.json` names extra capacity on another
   machine or an ephemeral cloud machine, reached through a configured executor command. A job
   submitted with the new `--overflow` option that has waited past a pool's `wait_threshold` for
-  local capacity runs through that executor instead, under the pool's own capacities, a hard
-  `max_runtime`, and an optional daily CPU-hour budget. Rows gain a `pool` field and snapshots
-  an `overflow_pools` list (#270).
+  local capacity runs through that executor instead, under the pool's own capacities, an
+  optional single-job `max_claim`, a hard `max_runtime`, and an optional daily CPU-hour budget.
+  Enforcing the claim is delegated to the executor and shown as `delegated`. Rows gain a `pool`
+  field and snapshots an `overflow_pools` list (#270).
 
 ## 0.7.8 — 2026-11-10
 

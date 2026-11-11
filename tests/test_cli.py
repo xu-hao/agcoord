@@ -1281,3 +1281,25 @@ def test_json_wait_reports_a_lost_stream_as_a_coded_object_with_the_run_id(
     assert payload["code"] == "coordinator-unreachable"
     assert payload["run_id"] == "check-locked"
     assert "database is locked" in payload["message"]
+
+
+def test_a_claim_delegated_to_an_overflow_pool_is_labelled_delegated():
+    from agcoord.resources import resource_enforcement_summary
+
+    receipt = {
+        "requested": {"cpu": 2, "jobs": 1},
+        "applied": {},
+        "peak": {},
+        "events": [
+            {
+                "at": "2026-11-11T00:00:00.000Z",
+                "backend": "cgroup-v2",
+                "resource": "cpu",
+                "stage": "prepare",
+                "status": "recorded",
+                "code": "overflow-delegated",
+            }
+        ],
+    }
+
+    assert resource_enforcement_summary(receipt) == "delegated"

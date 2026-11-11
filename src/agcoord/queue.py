@@ -662,7 +662,11 @@ def _validate_resources(
     """
     selected = _positive_mapping(resources, subject="resource", include_job=True)
     if any(
-        all(units <= pool["capacities"].get(name, 0) for name, units in selected.items())
+        all(
+            units <= pool["capacities"].get(name, 0)
+            and units <= pool.get("max_claim", {}).get(name, units)
+            for name, units in selected.items()
+        )
         for pool in overflow_pools
     ):
         return selected

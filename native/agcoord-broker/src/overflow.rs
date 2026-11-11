@@ -21,7 +21,11 @@ pub const ELIGIBLE: &str = "_AGCOORD_OVERFLOW";
 pub const BUDGET_RESOURCE: &str = "cpu";
 pub const RUNTIME_EXCEEDED: &str = "overflow-runtime-exceeded";
 pub const RUNTIME_EXCEEDED_EXIT: i64 = 124;
-pub const UNAPPLIED_CODE: &str = "overflow-pool";
+pub const DELEGATED_CODE: &str = "overflow-delegated";
+/// The exit status with which an executor reports that it could not obtain a verdict,
+/// such as a lost connection or a preempted machine.
+pub const EXECUTOR_FAILED_EXIT: i64 = 125;
+pub const EXECUTOR_FAILED: &str = "overflow-executor-failed";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS overflow_placements (
@@ -53,6 +57,8 @@ pub struct Budget {
 pub struct Pool {
     pub name: String,
     pub capacities: BTreeMap<String, u64>,
+    /// The largest single claim the pool's target can run, per resource.
+    pub max_claim: BTreeMap<String, u64>,
     pub executor: Vec<String>,
     pub wait_threshold: u64,
     pub max_runtime: u64,
@@ -86,6 +92,7 @@ impl Pool {
         let allowed = [
             "name",
             "capacities",
+            "max_claim",
             "executor",
             "wait_threshold",
             "max_runtime",
@@ -124,6 +131,29 @@ impl Pool {
                 Ok((resource.clone(), units))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let max_claim = match object.get("max_claim") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(value) => value
+                .as_object()
+                .ok_or_else(|| {
+                    config_error(format!("overflow pool {name} max_claim must be an object"))
+                })?
+                .iter()
+                .map(|(resource, units)| {
+                    let units = units
+                        .as_u64()
+                        .filter(|units| *units > 0)
+                        .filter(|units| capacities.get(resource).is_some_and(|cap| units <= cap))
+                        .ok_or_else(|| {
+                            config_error(format!(
+                                "overflow pool {name} max_claim {resource} must be a positive \
+                                 amount no larger than the pool's capacity"
+                            ))
+                        })?;
+                    Ok((resource.clone(), units))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        };
         let executor = object
             .get("executor")
             .and_then(Value::as_array)
@@ -218,6 +248,7 @@ impl Pool {
         Ok(Self {
             name,
             capacities,
+            max_claim,
             executor,
             wait_threshold,
             max_runtime,
@@ -231,6 +262,7 @@ impl Pool {
         let mut value = Map::new();
         value.insert("name".to_owned(), json!(self.name));
         value.insert("capacities".to_owned(), json!(self.capacities));
+        value.insert("max_claim".to_owned(), json!(self.max_claim));
         value.insert("executor".to_owned(), json!(self.executor));
         value.insert("wait_threshold".to_owned(), json!(self.wait_threshold));
         value.insert("max_runtime".to_owned(), json!(self.max_runtime));
@@ -247,20 +279,23 @@ impl Pool {
         Value::Object(value)
     }
 
-    /// Whether the pool offers every claimed resource in the claimed amount at all.
+    /// Whether the pool offers every claimed resource in the claimed amount at all, as one
+    /// job.
     pub fn can_ever_fit(&self, resources: &BTreeMap<String, u64>) -> bool {
-        resources
-            .iter()
-            .all(|(name, units)| self.capacities.get(name).is_some_and(|cap| units <= cap))
+        resources.iter().all(|(name, units)| {
+            self.capacities.get(name).is_some_and(|cap| units <= cap)
+                && self.max_claim.get(name).is_none_or(|limit| units <= limit)
+        })
     }
 
     /// Whether the claim fits beside the pool's running rows right now.
     pub fn fits(&self, resources: &BTreeMap<String, u64>, used: &BTreeMap<String, u64>) -> bool {
-        resources.iter().all(|(name, units)| {
-            self.capacities.get(name).is_some_and(|capacity| {
-                used.get(name).copied().unwrap_or(0).saturating_add(*units) <= *capacity
+        self.can_ever_fit(resources)
+            && resources.iter().all(|(name, units)| {
+                self.capacities.get(name).is_some_and(|capacity| {
+                    used.get(name).copied().unwrap_or(0).saturating_add(*units) <= *capacity
+                })
             })
-        })
     }
 
     /// The worst-case CPU-seconds a placed row can consume before its runtime limit.
@@ -323,6 +358,16 @@ pub fn parse_pools_json(value: &str) -> Result<Vec<Pool>> {
     };
     let value: Value = serde_json::from_str(value).map_err(|_| invalid())?;
     parse_pools(Some(&value)).map_err(|_| invalid())
+}
+
+/// Whether a placed run's executor reported that it could not obtain a verdict.  A land
+/// reports its gate's status; every other kind reports the executor's own exit status.
+pub fn executor_failed(run: &RunRecord, exit_status: i64) -> bool {
+    if run.kind == "land" {
+        run.gate_exit_status == Some(EXECUTOR_FAILED_EXIT)
+    } else {
+        exit_status == EXECUTOR_FAILED_EXIT
+    }
 }
 
 /// Whether the submitter allowed this row to run on another machine.
@@ -562,6 +607,7 @@ mod tests {
         let pools = parse_pools(Some(&json!([{
             "name": "cloud",
             "capacities": {"jobs": 4, "cpu": 64},
+            "max_claim": {"cpu": 32},
             "executor": ["run-elsewhere", "--zone", "a"],
             "wait_threshold": 300,
             "max_runtime": 3600,

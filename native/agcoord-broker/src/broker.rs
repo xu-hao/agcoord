@@ -632,8 +632,7 @@ impl Broker {
     /// configured pool that can take it now.
     ///
     /// A row qualifies only when its submitter allowed overflow, nothing but this machine's
-    /// capacity blocks it, it carries no required local binding, and it has waited at
-    /// least the pool's threshold.  The pool must have room for the claim and, when it has
+    /// capacity blocks it and it has waited at least the pool's threshold.  The pool must have room for the claim and, when it has
     /// a budget, enough of today's allowance left for the claim's worst case.
     fn next_overflow(
         &self,
@@ -646,7 +645,7 @@ impl Broker {
             return Ok(None);
         }
         for run in queued {
-            if !overflow::requested(&run.environment) {
+            if !overflow_candidate(&run.kind, &run.environment) {
                 continue;
             }
             let blockers = blocked_by(run, active, queued, &self.capacities, placed);
@@ -655,12 +654,6 @@ impl Broker {
                     .iter()
                     .any(|blocker| !blocker.starts_with("resource:"))
             {
-                continue;
-            }
-            let bindings = Self::run_bindings(run)?;
-            let required =
-                |name: &str| bindings.get(name).is_some_and(|binding| binding.required());
-            if !overflow_candidate(&run.kind, &run.environment, required, &run.resources) {
                 continue;
             }
             let waited = overflow::waited_seconds(connection, &run.created_at)?;
@@ -773,8 +766,16 @@ impl Broker {
             } else {
                 exit_status
             };
+            let executor_failed = overflow::live_placements(connection)?.contains_key(&run.run_id)
+                && overflow::executor_failed(&run, exit_status);
             let (status, selected_exit, failure_reason) = if run.cancel_requested {
                 Self::requested_stop_outcome(&run)
+            } else if executor_failed {
+                (
+                    "interrupted",
+                    overflow::EXECUTOR_FAILED_EXIT,
+                    Some(overflow::EXECUTOR_FAILED),
+                )
             } else if observed_exit == 0 {
                 ("passed", 0, None)
             } else if Self::has_resource_observation(&run, "memory-oom") {
@@ -1584,8 +1585,8 @@ impl Broker {
     /// Prepare the local enforcement of a row's claims before its worker exists.
     ///
     /// A row placed in an overflow pool does not consume those claims on this machine, so
-    /// nothing is enforced here; each enforced binding is recorded as unapplied instead of
-    /// being treated as successful.
+    /// nothing is enforced here.  Each enforced binding is recorded as delegated to the
+    /// pool, whose executor must run the command in an environment sized to the claim.
     fn prepare_resources(
         &mut self,
         connection: &Connection,
@@ -1618,9 +1619,9 @@ impl Broker {
                     &mut receipt,
                     backend,
                     name,
-                    "probe",
-                    "unapplied",
-                    overflow::UNAPPLIED_CODE,
+                    "prepare",
+                    "recorded",
+                    overflow::DELEGATED_CODE,
                 )?;
                 continue;
             }
@@ -2149,6 +2150,10 @@ impl Broker {
             environment.insert(
                 "AGCOORD_OVERFLOW_RESOURCES".to_owned(),
                 serde_json::to_string(&current.resources).unwrap(),
+            );
+            environment.insert(
+                "AGCOORD_OVERFLOW_CONTRACT".to_owned(),
+                serde_json::to_string(&current.resource_contract).unwrap(),
             );
         }
         for name in ["TMPDIR", "TMP", "TEMP"] {
