@@ -98,6 +98,14 @@ Run this opt-in test as init-namespace root on an exclusive disposable host with
 exhaustion, parallel project identity, cleanup, and replacement-broker crash recovery, and
 unmounts only its test-owned filesystem.
 
+The Terraform module below `packaging/terraform/` has opt-in static checks. With `terraform`
+installed, set `AGCOORD_TEST_TERRAFORM=1` and run `tests/test_terraform_gcp_overflow.py` to check
+its formatting and validate it against the provider schema; the provider is downloaded into a
+temporary copy. These checks never contact a cloud API. A snap-installed `terraform` refuses to
+start inside an admitted job on an enforced host, so run this one file directly rather than
+through `agc run` there. Applying the module, or running a job on real cloud infrastructure, is
+an operator action or a benchmark, never part of a test suite.
+
 Use `agc full` from a clean checkout when an exact-head verdict is useful
 independently of publication. It is ordinary lane work, not a barrier or an undeclared
 machine-global lock. Do not invoke `agc`, a gate wrapper, or publication from inside
