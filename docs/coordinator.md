@@ -440,6 +440,54 @@ running. When the job ends or is stopped, the container and the job's image are 
 toolchain image stays on both machines as a cache. The executor exits with the command's
 status, or 125 when SSH or the container tool failed before the command produced a verdict.
 
+#### GCP project for overflow executors
+
+The executors that run jobs on Google Cloud need a project with billing, an image repository,
+and an identity for the job machines. The Terraform module in
+`packaging/terraform/gcp-overflow/` provides them as infrastructure as code. It manages:
+
+- the project and its billing link, with deletion prevented;
+- the Artifact Registry, Batch, Compute Engine, Cloud Logging, and IAM APIs;
+- one Docker repository in Artifact Registry, whose cleanup policies delete images under the
+  `run` package after `job_image_retention_days` (default 2) and under the `toolchain` package
+  after `toolchain_image_retention_days` (default 30). An executor deletes a job's image itself
+  when the job ends; the policies are the backstop for an executor that was killed first;
+- a service account for job machines that may only report to Batch, write logs, and read that
+  repository. It holds no forge credentials;
+- for each member of the optional `submitters` set, the grants to push images, start jobs as that
+  service account, and read job output. A project owner needs none of them.
+
+Nothing the module creates runs or bills by itself; machines exist only while an executor runs
+a job, and stored images cost by size. The module has no provider configuration, so call it from
+a small root of your own, kept outside any repository:
+
+```hcl
+provider "google" {}
+
+module "overflow" {
+  source = "/path/to/agcoord/packaging/terraform/gcp-overflow"
+
+  project_id      = var.project_id
+  billing_account = var.billing_account
+}
+
+output "overflow" {
+  value = module.overflow
+}
+```
+
+`project_id` and `billing_account` are required. `region` defaults to `us-central1`,
+`repository_id` to `agcoord-overflow`, and `org_id` or `folder_id` place the project when an
+organization requires it. The outputs are the facts an executor needs: `project_id`, `region`,
+`registry` (the image path prefix), `runner_service_account`, and the two package names.
+
+Terraform state and variable files name your project and billing account. They are operator
+state, like the broker's `config.json`: keep them in that root, never in a repository. The
+provider reads application default credentials, or a short-lived token from
+`GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token)"`. To adopt a project that already
+exists, `terraform import` it, and any repository or enabled API it already has, before the
+first apply.
+
 ### Delegated cgroup v2 lifecycle
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers

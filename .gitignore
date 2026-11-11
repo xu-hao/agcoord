@@ -7,3 +7,9 @@
 *.egg-info/
 __pycache__/
 *.py[cod]
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
