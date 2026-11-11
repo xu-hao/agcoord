@@ -22,6 +22,12 @@ versioning; dates use ISO 8601.
   APIs, Artifact Registry repository with cleanup policies, and job service account that the
   Google Cloud overflow executors use (#281).
 
+- Add `agc overflow-gcp-batch`, an overflow executor that runs a placed job on a Google Cloud
+  Batch machine that exists only for that run. It pushes the job's image to the project's own
+  Artifact Registry repository, sizes the machine to the job's claims, relays output from Cloud
+  Logging, and reports Batch's own failures, such as a preempted Spot machine, as no verdict
+  rather than a failed job (#274).
+
 ## 0.7.8 — 2026-11-10
 
 - Support server-side filtered snapshot queries across broker, client, CLI (`agc list`), and TUI (`agc tui`).
