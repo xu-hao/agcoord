@@ -42,15 +42,15 @@ fn matches_snapshot_filter(run: &RunRecord, filter: &SnapshotFilter) -> bool {
             return false;
         }
     }
-    if let Some(expected_agent) = &filter.agent {
-        if run.agent != *expected_agent {
-            return false;
-        }
+    if let Some(expected_agent) = &filter.agent
+        && run.agent != *expected_agent
+    {
+        return false;
     }
-    if let Some(expected_kind) = &filter.kind {
-        if run.kind != *expected_kind {
-            return false;
-        }
+    if let Some(expected_kind) = &filter.kind
+        && run.kind != *expected_kind
+    {
+        return false;
     }
     true
 }
