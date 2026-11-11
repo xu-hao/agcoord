@@ -27,6 +27,12 @@ from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 from .config import BrokerConfig, BrokerConfigError, load_broker_config
+from .overflow_image import (
+    REPOSITORY_CONFIG,
+    ExecutorError,
+    load_repository_config,
+    repository_root,
+)
 from .native_client import (
     NATIVE_IMPLEMENTATION,
     NATIVE_PROTOCOL,
@@ -709,14 +715,26 @@ def _owner_overflow_pools(raw: str | None) -> list[dict[str, Any]]:
 def _overflow_environment(
     environment: Mapping[str, str],
     overflow: bool,
+    checkout: Path,
 ) -> dict[str, str]:
-    """Mark a submission as allowed to run in an overflow pool."""
+    """Mark a submission as allowed to run in an overflow pool.
+
+    The repository must have opted in by naming its toolchain in its own
+    ``.agcoord/overflow.json``; without that a placed job could only fail on the other
+    machine, so the request is refused before anything is queued.
+    """
     if not isinstance(overflow, bool):
         raise CoordinatorError("overflow must be boolean")
     selected = dict(environment)
     if OVERFLOW_ENV in selected:
         raise CoordinatorError(f"gate environment uses the reserved {OVERFLOW_ENV} name")
     if overflow:
+        try:
+            load_repository_config(repository_root(checkout))
+        except ExecutorError as exc:
+            raise CoordinatorError(
+                f"--overflow needs a valid {REPOSITORY_CONFIG} in the checkout: {exc}"
+            ) from exc
         selected[OVERFLOW_ENV] = "1"
     return selected
 
@@ -1397,7 +1415,11 @@ class CoordinatorClient:
         owner: Mapping[str, Any],
         overflow: bool = False,
     ) -> str:
-        environment = _overflow_environment(prepared.environment, overflow)
+        environment = _overflow_environment(
+            prepared.environment,
+            overflow,
+            Path(prepared.identity.checkout),
+        )
         run_id = f"{kind}-{uuid4().hex[:12]}"
         arguments = self._native_submission_arguments(
             run_id=run_id,
@@ -1653,7 +1675,11 @@ class CoordinatorClient:
         owner: Mapping[str, Any],
         overflow: bool = False,
     ) -> str:
-        selected_environment = _overflow_environment(prepared.environment, overflow)
+        selected_environment = _overflow_environment(
+            prepared.environment,
+            overflow,
+            Path(prepared.identity.checkout),
+        )
         selected_avoid = _validate_avoid_commits(avoid_commits)
         if LAND_TARGET_SYNC_ENV in selected_environment:
             raise CoordinatorError(

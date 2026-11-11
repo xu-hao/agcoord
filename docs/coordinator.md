@@ -380,6 +380,66 @@ does not fit today's remaining budget is not placed and keeps waiting for local 
 budget counts claimed CPU time, not a provider's bill; use the provider's own billing alert as
 the backstop. `agc clear` does not reset a budget day.
 
+#### Repository opt-in and the job image
+
+A repository declares that its jobs can run away from this machine with one file,
+`.agcoord/overflow.json`, which names its toolchain in exactly one of two ways:
+
+```json
+{"dockerfile": ".agcoord/Dockerfile"}
+```
+
+```json
+{"image": "registry.example/team/toolchain:2026-11"}
+```
+
+`dockerfile` is a path inside the repository; the toolchain image is built from it on this
+machine with Docker or Podman, using the Dockerfile's directory as build context and the tool's
+own layer cache. `image` names a prebuilt image instead. Because the file is part of the
+checkout, a branch that changes its toolchain changes it in the same commit. `--overflow` is
+refused at submission, before anything is queued, when the checkout has no valid file.
+
+The built-in executors run a job from an image made of that toolchain plus the job's source as
+one copied layer at `/workspace`, which is also the working directory. Nothing is compiled when
+the image is built. The source is the working tree's tracked and untracked files; ignored files
+are never included, so a local `.env` or credential file does not leave this machine, and a job
+that needs one cannot overflow. A `full` or `land` runs from a clean exact head, so its image
+holds exactly that commit. Submodule contents are not included.
+
+Enforced claims become container limits: `cpu` to a CPU limit, `memory` to a memory limit with
+no additional swap unless `swap` is claimed, `memory-high` to a memory reservation, `tmpfs` to a
+sized `/tmp` (with `inodes` as its inode limit), and `processes` to a process limit. A `required`
+claim of any other kind is refused with exit status 125 before anything runs; a best-effort one
+is skipped.
+
+#### SSH executor
+
+`agc-overflow-ssh` runs a placed job in a container on another machine the operator owns:
+
+```json
+{
+  "name": "workstation",
+  "capacities": {"jobs": 2, "cpu": 32, "memory": 68719476736},
+  "executor": ["agc-overflow-ssh", "builder@workstation"],
+  "wait_threshold": 120,
+  "max_runtime": 3600
+}
+```
+
+The destination needs a non-interactive SSH login for the broker's user and Docker or Podman.
+It needs no registry and no forge credentials. `--ssh-option OPTION` adds an `ssh -o` option
+such as `Port=2222`, `--runtime` selects the local container tool, `--remote-runtime` the
+destination's (default `docker`), and `--env NAME` passes one environment variable into the
+container; by default the container receives none of the submitter's environment.
+
+For each job the executor sends the toolchain image over SSH unless the destination already
+holds it, streams the source and builds the job's image there, and runs the command in a
+container named `agcoord-RUN_ID` with the limits above. The destination itself stops the
+container after the pool's `max_runtime`, so a lost connection or broker cannot leave it
+running. When the job ends or is stopped, the container and the job's image are removed; the
+toolchain image stays on both machines as a cache. The executor exits with the command's
+status, or 125 when SSH or the container tool failed before the command produced a verdict.
+
 ### Delegated cgroup v2 lifecycle
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
