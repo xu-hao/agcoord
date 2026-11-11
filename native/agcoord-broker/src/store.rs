@@ -2648,17 +2648,9 @@ fn validate_identifier(value: &str, subject: &str) -> Result<()> {
 }
 
 /// Whether a row may ever be placed in an overflow pool: the submitter allowed it, it is
-/// not a retained merge, and none of its claims carries a required local binding, which a
-/// run on another machine could not honour.
-pub(crate) fn overflow_candidate(
-    kind: &str,
-    environment: &BTreeMap<String, String>,
-    required: impl Fn(&str) -> bool,
-    resources: &BTreeMap<String, u64>,
-) -> bool {
-    crate::overflow::requested(environment)
-        && kind != "merge"
-        && !resources.keys().any(|name| required(name))
+/// not a retained merge.  Enforcing its claims becomes the pool executor's duty.
+pub(crate) fn overflow_candidate(kind: &str, environment: &BTreeMap<String, String>) -> bool {
+    crate::overflow::requested(environment) && kind != "merge"
 }
 
 pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
@@ -2793,20 +2785,11 @@ pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Res
     }
     // A claim this machine can never hold is still accepted when the submitter allowed
     // overflow and some pool offers it; otherwise it could never run and is refused.
-    let overflow_can_hold = overflow_candidate(
-        &request.kind,
-        &request.environment,
-        |name| {
-            owner
-                .resource_bindings
-                .get(name)
-                .is_some_and(|binding| binding.required())
-        },
-        &request.resources,
-    ) && owner
-        .overflow_pools
-        .iter()
-        .any(|pool| pool.can_ever_fit(&request.resources));
+    let overflow_can_hold = overflow_candidate(&request.kind, &request.environment)
+        && owner
+            .overflow_pools
+            .iter()
+            .any(|pool| pool.can_ever_fit(&request.resources));
     for (name, units) in &request.resources {
         validate_identifier(name, "resource name")?;
         if *units == 0

@@ -309,7 +309,8 @@ are frozen when the broker starts:
     {
       "name": "cloud",
       "capacities": {"jobs": 4, "cpu": 64},
-      "executor": ["run-in-cloud", "--machine-type", "e2-standard-16"],
+      "max_claim": {"cpu": 16},
+      "executor": ["run-in-cloud"],
       "wait_threshold": 300,
       "max_runtime": 3600,
       "budget": {"cpu_hours_per_day": 100, "rollover_utc": "08:00"},
@@ -321,7 +322,10 @@ are frozen when the broker starts:
 
 Each pool has exactly these keys. `name` follows the resource-name rules and is unique.
 `capacities` lists every resource the pool offers as positive integers, `jobs` included; a claim
-on a name the pool does not list can never be placed there. `executor` is a non-empty command.
+on a name the pool does not list can never be placed there. `max_claim` is optional and
+gives, per listed resource, the largest amount one job may claim there, for a target that can
+run many jobs but only up to a certain size each; a job above it skips this pool and is offered
+to the next one. `executor` is a non-empty command.
 `wait_threshold` is whole seconds, default `0`. `max_runtime` is required whole seconds.
 `budget` is optional: `cpu_hours_per_day` is a positive number and `rollover_utc` is the `HH:MM`
 UTC time at which a new budget day begins, default `00:00`. `cpu_hour_price` is an optional
@@ -330,9 +334,7 @@ enforces anything with it. An invalid pool is `broker-config-invalid`.
 
 A job may leave this machine only when its submitter passed `--overflow`. Nothing overflows by
 default, because a job must be able to run without this machine's files, tools, and ignored
-local state, and only its submitter knows that. A retained `merge` never overflows, and neither
-does a job with a claim whose binding is `required`: a run elsewhere cannot honor a required
-local limit, and that limit is never silently dropped.
+local state, and only its submitter knows that. A retained `merge` never overflows.
 
 This machine is always preferred. In each scheduling pass the broker first admits everything
 that fits locally. Only then does it take the earliest queued job that allowed overflow, is
@@ -341,19 +343,28 @@ blocked by nothing but this machine's capacity, and has been queued for at least
 and enough budget. Lane and barrier rules are unchanged: a placed job still counts as active
 work in its repository and worktree, and a job waiting for a land or for its worktree never
 overflows around it. With `--overflow`, a claim larger than this machine's capacity is accepted
-at submission when some pool offers it, and reaches that pool by the same rule.
+at submission when some pool offers it as one job, and reaches that pool by the same rule.
 
 A placed job's row moves to `running` with its `pool` set. Its worker on this machine is
 `EXECUTOR... -- COMMAND...`, started in the submitted checkout with the usual admission
-environment plus `AGCOORD_OVERFLOW_POOL`, `AGCOORD_OVERFLOW_MAX_RUNTIME` in seconds, and
-`AGCOORD_OVERFLOW_RESOURCES`, the claim as a JSON object. The executor runs the command on the
-pool's machine, relays its output, and exits with its status; that exit status, the log, and
-cancellation are those of any other worker, so stopping the job signals the executor's process
-group and the executor must stop the remote run. A `land` keeps its local worker for preflight
+environment plus `AGCOORD_OVERFLOW_POOL`, `AGCOORD_OVERFLOW_MAX_RUNTIME` in seconds,
+`AGCOORD_OVERFLOW_RESOURCES`, the claim as a JSON object, and `AGCOORD_OVERFLOW_CONTRACT`, the
+row's `resource_contract`, which gives each claim's kind and unit. The executor runs the command
+on the pool's machine, relays its output, and exits with its status; that exit status, the log,
+and cancellation are those of any other worker, so stopping the job signals the executor's
+process group and the executor must stop the remote run. An executor that cannot obtain a
+verdict at all, for example because the connection was lost or the remote machine was
+preempted, exits with status 125. The job then ends `interrupted` with
+`failure_reason=overflow-executor-failed` rather than `failed`, and for a `land` nothing is
+published and no gate verdict is claimed. A `land` keeps its local worker for preflight
 and publication, and only its gate command goes through the executor. The claim is held by the
 pool, not by this machine: it does not appear in `allocations`, and no local enforcement is
-applied. Each best-effort binding is recorded in the receipt as `unapplied` with code
-`overflow-pool`.
+applied. Enforcing the claim becomes the executor's duty: it must run the command in an
+environment sized to the claim, such as a container or a machine with those CPU and memory
+limits, and must exit 125 instead of running a claim it cannot enforce. Each enforced binding,
+`required` or best-effort, is recorded in the receipt as a `prepare` event with status
+`recorded` and code `overflow-delegated`, and `agc list` shows such a job's enforcement as
+`delegated`.
 
 A placed job that has held its pool capacity for `max_runtime` is stopped like a cancelled job
 and ends `failed` with exit status 124 and `failure_reason=overflow-runtime-exceeded`. The limit
