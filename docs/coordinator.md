@@ -414,13 +414,13 @@ is skipped.
 
 #### SSH executor
 
-`agc-overflow-ssh` runs a placed job in a container on another machine the operator owns:
+`agc overflow-ssh` runs a placed job in a container on another machine the operator owns:
 
 ```json
 {
   "name": "workstation",
   "capacities": {"jobs": 2, "cpu": 32, "memory": 68719476736},
-  "executor": ["agc-overflow-ssh", "builder@workstation"],
+  "executor": ["agc", "overflow-ssh", "builder@workstation"],
   "wait_threshold": 120,
   "max_runtime": 3600
 }

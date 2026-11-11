@@ -271,7 +271,8 @@ def test_it_refuses_to_run_outside_a_broker_placement(destination: Destination):
     del environment["AGCOORD_OVERFLOW_CONTRACT"]
 
     completed = subprocess.run(
-        [sys.executable, "-m", "agcoord.overflow_ssh", "builder@workstation", "--", "true"],
+        # The public spelling: the executor is a subcommand of the one agc command.
+        [sys.executable, "-m", "agcoord", "overflow-ssh", "builder@workstation", "--", "true"],
         cwd=destination.repository,
         env=environment,
         capture_output=True,
