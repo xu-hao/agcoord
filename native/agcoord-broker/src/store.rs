@@ -1,4 +1,5 @@
 use crate::error::{AppError, Result};
+use crate::overflow::Pool;
 use crate::platform::{
     OwnerLock, direct_child_of, is_descendant_process, live_owner_metadata,
     prepare_private_directory, same_process, same_worker_process, sync_file,
@@ -210,6 +211,7 @@ pub struct OwnerInfo {
     pub capacities: BTreeMap<String, u64>,
     pub resource_bindings: BTreeMap<String, Binding>,
     pub resource_capabilities: Value,
+    pub overflow_pools: Vec<Pool>,
 }
 
 #[derive(Clone, Debug)]
@@ -420,6 +422,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
         "land_gate_reuse_max_age",
         "stop_grace",
         "native_broker",
+        "overflow_pools",
     ];
     if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(AppError::new(
@@ -1298,6 +1301,7 @@ pub fn initialize_native(paths: &Paths, capacities: &BTreeMap<String, u64>) -> R
         // Validate all client-authored rows before journal or activity metadata can change.
         load_runs(&connection)?;
     }
+    crate::overflow::ensure_schema(&connection)?;
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(map_database_error)?;
@@ -1428,11 +1432,18 @@ pub fn owner_info(paths: &Paths) -> Result<OwnerInfo> {
                 "live owner resource capabilities are missing",
             )
         })?)?;
+    // An owner without overflow pools, or one that predates them, publishes none.
+    let overflow_pools = fields
+        .get("overflow_pools")
+        .map(|value| crate::overflow::parse_pools_json(value))
+        .transpose()?
+        .unwrap_or_default();
     Ok(OwnerInfo {
         pid,
         capacities,
         resource_bindings,
         resource_capabilities,
+        overflow_pools,
     })
 }
 
@@ -1705,11 +1716,25 @@ pub fn allocations(active: &[RunRecord]) -> BTreeMap<String, u64> {
     selected
 }
 
+/// The summed claims of the running rows that hold this machine's own capacity.
+pub fn local_allocations(
+    active: &[RunRecord],
+    placed: &BTreeMap<String, String>,
+) -> BTreeMap<String, u64> {
+    let local: Vec<_> = active
+        .iter()
+        .filter(|run| !placed.contains_key(&run.run_id))
+        .cloned()
+        .collect();
+    allocations(&local)
+}
+
 pub fn blocked_by(
     run: &RunRecord,
     active: &[RunRecord],
     queued: &[RunRecord],
     capacities: &BTreeMap<String, u64>,
+    placed: &BTreeMap<String, String>,
 ) -> Vec<String> {
     if run.status != "queued" {
         return Vec::new();
@@ -1762,7 +1787,9 @@ pub fn blocked_by(
             run.repository_id, candidate.run_id
         ));
     }
-    let used = allocations(active);
+    // Rows placed in an overflow pool keep their lane and barrier effects above, but
+    // their claims are held by the pool rather than by this machine.
+    let used = local_allocations(active, placed);
     for (name, units) in &run.resources {
         if used.get(name).copied().unwrap_or(0) + units > capacities.get(name).copied().unwrap_or(0)
         {
@@ -1777,6 +1804,7 @@ pub fn public_run(
     run: &RunRecord,
     position: Option<usize>,
     blockers: Vec<String>,
+    placed: &BTreeMap<String, String>,
 ) -> Value {
     let log_bytes = fs::metadata(paths.logs.join(format!("{}.log", run.run_id)))
         .map(|metadata| metadata.len())
@@ -1806,6 +1834,7 @@ pub fn public_run(
         "resource_contract": run.resource_contract,
         "resource_receipt": run.resource_receipt,
         "blocked_by": blockers,
+        "pool": placed.get(&run.run_id),
         "gate_run_id": run.gate_run_id,
         "publication": publication,
         "failure_reason": run.failure_reason,
@@ -1905,8 +1934,14 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         .as_ref()
         .map(|owner| owner.resource_capabilities.clone())
         .unwrap_or_else(|| json!({}));
+    let overflow_pools = match &owner {
+        Some(owner) => owner.overflow_pools.clone(),
+        None => crate::overflow::load_pools(&paths.state_dir)?,
+    };
+    let placed = crate::overflow::all_placements(&connection)?;
+    let live_placed = crate::overflow::live_placements(&connection)?;
     let mut selected_allocations = BTreeMap::new();
-    let used = allocations(&all_active);
+    let used = local_allocations(&all_active, &live_placed);
     for name in capacities.keys() {
         selected_allocations.insert(name.clone(), used.get(name).copied().unwrap_or(0));
     }
@@ -1918,7 +1953,8 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
                 paths,
                 run,
                 Some(index + 1),
-                blocked_by(run, &all_active, &all_queued, &capacities),
+                blocked_by(run, &all_active, &all_queued, &capacities, &live_placed),
+                &placed,
             )
         })
         .collect();
@@ -1926,7 +1962,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     let recent: Vec<_> = terminal
         .iter()
         .take(limit)
-        .map(|run| public_run(paths, run, None, Vec::new()))
+        .map(|run| public_run(paths, run, None, Vec::new(), &placed))
         .collect();
     Ok(json!({
         "protocol": PROTOCOL,
@@ -1936,6 +1972,12 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         "allocations": selected_allocations,
         "resource_bindings": resource_bindings,
         "resource_capabilities": resource_capabilities,
+        "overflow_pools": crate::overflow::public_pools(
+            &connection,
+            &overflow_pools,
+            &all_active,
+            &live_placed,
+        )?,
         "maintenance": maintenance.as_ref().map(|record| maintenance_value(
             record,
             PROTOCOL,
@@ -1947,7 +1989,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
             "agents": known_agents,
             "kinds": known_kinds,
         }),
-        "active": active.iter().map(|run| public_run(paths, run, None, Vec::new())).collect::<Vec<_>>(),
+        "active": active.iter().map(|run| public_run(paths, run, None, Vec::new(), &placed)).collect::<Vec<_>>(),
         "queued": queued_public,
         "recent": recent,
     }))
@@ -1988,11 +2030,14 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
                 .and_then(|value| serde_json::from_str(&value).ok())
         })
         .unwrap_or_default();
+    let live_placed = crate::overflow::live_placements(&connection)?;
+    let placed = crate::overflow::all_placements(&connection)?;
     Ok(public_run(
         paths,
         &run,
         position,
-        blocked_by(&run, &active, &queued, &capacities),
+        blocked_by(&run, &active, &queued, &capacities, &live_placed),
+        &placed,
     ))
 }
 
@@ -2602,6 +2647,20 @@ fn validate_identifier(value: &str, subject: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a row may ever be placed in an overflow pool: the submitter allowed it, it is
+/// not a retained merge, and none of its claims carries a required local binding, which a
+/// run on another machine could not honour.
+pub(crate) fn overflow_candidate(
+    kind: &str,
+    environment: &BTreeMap<String, String>,
+    required: impl Fn(&str) -> bool,
+    resources: &BTreeMap<String, u64>,
+) -> bool {
+    crate::overflow::requested(environment)
+        && kind != "merge"
+        && !resources.keys().any(|name| required(name))
+}
+
 pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Result<()> {
     validate_identifier(&request.run_id, "run ID")?;
     validate_identifier(&request.repository_id, "repository ID")?;
@@ -2722,11 +2781,37 @@ pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Res
             "full, merge, and land submissions require a lowercase 40-character head",
         ));
     }
+    if request
+        .environment
+        .get(crate::overflow::ELIGIBLE)
+        .is_some_and(|value| value != "1")
+    {
+        return Err(AppError::new(
+            "broker-submission-invalid",
+            "overflow eligibility must be 1 when present",
+        ));
+    }
+    // A claim this machine can never hold is still accepted when the submitter allowed
+    // overflow and some pool offers it; otherwise it could never run and is refused.
+    let overflow_can_hold = overflow_candidate(
+        &request.kind,
+        &request.environment,
+        |name| {
+            owner
+                .resource_bindings
+                .get(name)
+                .is_some_and(|binding| binding.required())
+        },
+        &request.resources,
+    ) && owner
+        .overflow_pools
+        .iter()
+        .any(|pool| pool.can_ever_fit(&request.resources));
     for (name, units) in &request.resources {
         validate_identifier(name, "resource name")?;
         if *units == 0
             || *units > i64::MAX as u64
-            || *units > owner.capacities.get(name).copied().unwrap_or(0)
+            || (*units > owner.capacities.get(name).copied().unwrap_or(0) && !overflow_can_hold)
         {
             return Err(AppError::new(
                 "broker-resource-unavailable",

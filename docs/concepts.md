@@ -69,6 +69,14 @@ the machine hands out. Admission is arithmetic: a job starts when, for every nam
 the units already held plus its own fit under the capacity. A name with no capacity is refused
 at submission, and so is a claim larger than the capacity, because neither could ever run.
 
+An *overflow pool* is extra capacity somewhere else: another machine you own, or one a cloud
+provider creates for a single run. A job submitted with `--overflow` that has waited longer than
+the pool's threshold for local capacity is run there instead, through the pool's *executor*
+command. The pool has its own capacities, a hard runtime limit, and optionally a daily CPU-hour
+budget. This machine is always tried first, nothing overflows unless its submitter allowed it,
+and with that permission a claim too large for this machine is accepted when a pool offers it.
+Exact rules: [overflow pools](coordinator.md#overflow-pools).
+
 A *binding* gives a name a meaning beyond arithmetic: a kind, a unit, a backend, and a mode.
 Without a binding, a claim is *admission accounting*, a promise the job makes and nothing
 checks. With a `cgroup-v2` binding, the claim becomes a limit the kernel applies to the job's

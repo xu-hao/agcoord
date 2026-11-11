@@ -30,6 +30,7 @@ _CONFIG_KEYS = frozenset(
         "land_gate_reuse_max_age",
         "stop_grace",
         "native_broker",
+        "overflow_pools",
     }
 )
 
@@ -59,6 +60,7 @@ class BrokerConfig:
     land_gate_reuse_max_age: float | None
     stop_grace: float | None
     native_broker: NativeBrokerConfig
+    overflow_pools: tuple[Mapping[str, Any], ...] = ()
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -115,6 +117,7 @@ def parse_broker_config(
     land_gate_reuse_max_age = _land_gate_reuse_max_age(document, source=source)
     stop_grace = _stop_grace(document, source=source)
     native_broker = _native_broker_section(document, source=source)
+    overflow_pools = _overflow_pools_section(document, source=source)
     cgroup_root = document.get("cgroup_root")
     if cgroup_root is not None and (
         not isinstance(cgroup_root, str) or not cgroup_root.strip()
@@ -131,7 +134,24 @@ def parse_broker_config(
         land_gate_reuse_max_age=land_gate_reuse_max_age,
         stop_grace=stop_grace,
         native_broker=native_broker,
+        overflow_pools=overflow_pools,
     )
+
+
+def _overflow_pools_section(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> tuple[Mapping[str, Any], ...]:
+    """Return the ordered overflow pools; the broker owns their detailed validation."""
+    pools = document.get("overflow_pools")
+    if pools is None:
+        return ()
+    if not isinstance(pools, list) or not all(isinstance(pool, dict) for pool in pools):
+        raise BrokerConfigError(
+            f"broker configuration {source} overflow_pools must be a list of objects"
+        )
+    return tuple(pools)
 
 
 def _native_broker_section(

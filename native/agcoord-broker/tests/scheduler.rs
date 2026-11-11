@@ -7592,3 +7592,278 @@ fn recent_terminal_runs_are_ordered_by_completion_time_descending() {
     assert_eq!(recent[0]["run_id"], "check-first-completes-second");
     assert_eq!(recent[1]["run_id"], "check-second-completes-first");
 }
+
+/// Write a test-owned executor that records what the broker handed it and then runs the
+/// carried command, standing in for an adapter that would run it on another machine.
+fn write_overflow_executor(directory: &Path) -> PathBuf {
+    let executor = directory.join("agcoord-test-executor");
+    fs::write(
+        &executor,
+        "#!/bin/sh\nprintf '%s\\n' \"$AGCOORD_OVERFLOW_POOL\" \"$AGCOORD_OVERFLOW_MAX_RUNTIME\" \"$AGCOORD_OVERFLOW_RESOURCES\" \"$@\" >\"$0.seen\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755)).unwrap();
+    executor
+}
+
+fn write_overflow_config(state: &Path, pool: Value) {
+    fs::create_dir_all(state).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({"overflow_pools": [pool]})).unwrap(),
+    )
+    .unwrap();
+}
+
+fn submit_overflow_ok(state: &Path, submission: &Submission<'_>, resources: &[(&str, u64)]) {
+    assert_submitted(
+        submission,
+        submit_in_worktree(
+            state,
+            submission,
+            resources,
+            &[("_AGCOORD_OVERFLOW", "1")],
+            None,
+        ),
+    );
+}
+
+#[test]
+fn an_eligible_row_overflows_to_a_pool_after_its_wait_threshold() {
+    let temporary = TestDirectory::new("overflow-placement");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "elsewhere",
+            "capacities": {"jobs": 2, "cpu": 4},
+            "executor": [executor.to_str().unwrap(), "--flag"],
+            "wait_threshold": 1,
+            "max_runtime": 60,
+            "budget": {"cpu_hours_per_day": 1, "rollover_utc": "06:00"},
+            "cpu_hour_price": 0.5,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 1)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
+    let over_entered = temporary.path().join("over-entered");
+    let over_release = temporary.path().join("over-release");
+    let local = temporary.path().join("local");
+
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-first",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&first_entered, &first_release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 1)],
+        None,
+    );
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-local",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&local),
+            gate_run_id: None,
+        },
+        &[("cpu", 1)],
+        None,
+    );
+
+    // A claim this machine can never hold is refused unless the submitter allowed
+    // overflow and a pool offers it.
+    let wide = Submission {
+        run_id: "check-over",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: blocking_command(&over_entered, &over_release, None),
+        gate_run_id: None,
+    };
+    let refused = submit_with_resources(&state, &wide, &[("cpu", 2)]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("broker-resource-unavailable"));
+    let unoffered = submit_in_worktree(
+        &state,
+        &wide,
+        &[("cpu", 5)],
+        &[("_AGCOORD_OVERFLOW", "1")],
+        None,
+    );
+    assert!(!unoffered.status.success());
+
+    submit_overflow_ok(&state, &wide, &[("cpu", 2)]);
+    // The row waits locally until the pool's threshold has passed.
+    let waiting = status(&state, "check-over");
+    assert_eq!(waiting["status"], "queued");
+    assert_eq!(waiting["pool"], Value::Null);
+    assert_eq!(waiting["blocked_by"], json!(["resource:cpu"]));
+
+    wait_for(Duration::from_secs(10), || over_entered.exists());
+    let placed = status(&state, "check-over");
+    assert_eq!(placed["status"], "running");
+    assert_eq!(placed["pool"], "elsewhere");
+    let seen = fs::read_to_string(executor.with_extension("seen")).unwrap();
+    let seen: Vec<_> = seen.lines().collect();
+    assert_eq!(
+        &seen[..5],
+        ["elsewhere", "60", "{\"cpu\":2,\"jobs\":1}", "--flag", "--"]
+    );
+    assert_eq!(seen[5], "/bin/sh");
+
+    // The pool holds the placed claim; this machine's allocations and the row that did
+    // not allow overflow are unaffected.
+    let snap = snapshot(&state).unwrap();
+    assert_eq!(snap["allocations"], json!({"cpu": 1, "jobs": 1}));
+    let pool = &snap["overflow_pools"][0];
+    assert_eq!(pool["name"], "elsewhere");
+    assert_eq!(pool["allocations"], json!({"cpu": 2, "jobs": 1}));
+    assert_eq!(pool["budget"]["rollover_utc"], "06:00");
+    assert_eq!(pool["cpu_hour_price"], 0.5);
+    // Two CPUs for the 60-second limit are reserved while the run is live.
+    let reserved = pool["budget"]["used_cpu_hours"].as_f64().unwrap();
+    assert!((reserved - 120.0 / 3600.0).abs() < 1e-9, "{reserved}");
+    let local_row = status(&state, "check-local");
+    assert_eq!(local_row["status"], "queued");
+    assert_eq!(local_row["blocked_by"], json!(["resource:cpu"]));
+
+    fs::write(&over_release, "release").unwrap();
+    let finished = wait_status(&state, "check-over", "passed");
+    assert_eq!(finished["pool"], "elsewhere");
+    assert_eq!(
+        finished["resource_receipt"]["events"],
+        json!([]),
+        "admission-only claims record no enforcement"
+    );
+    let snap = snapshot(&state).unwrap();
+    let pool = &snap["overflow_pools"][0];
+    assert_eq!(pool["allocations"], json!({"cpu": 0, "jobs": 0}));
+    // The unused part of the reservation is returned when the run ends.
+    let settled = pool["budget"]["used_cpu_hours"].as_f64().unwrap();
+    assert!(settled > 0.0 && settled < reserved, "{settled}");
+
+    fs::write(&first_release, "release").unwrap();
+    let local_row = wait_status(&state, "check-local", "passed");
+    assert_eq!(local_row["pool"], Value::Null);
+    assert!(local.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn an_overflow_budget_bounds_concurrent_reservations() {
+    let temporary = TestDirectory::new("overflow-budget");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    // Each two-CPU row reserves one CPU-hour, so the budget covers one live reservation.
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "paid",
+            "capacities": {"jobs": 4, "cpu": 8},
+            "executor": [executor.to_str().unwrap()],
+            "max_runtime": 1800,
+            "budget": {"cpu_hours_per_day": 1.5},
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 1)]);
+    let first_entered = temporary.path().join("first-entered");
+    let first_release = temporary.path().join("first-release");
+    let second = temporary.path().join("second");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-first",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&first_entered, &first_release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    wait_for(Duration::from_secs(5), || first_entered.exists());
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-second",
+            kind: "check",
+            repository: "repo-b",
+            checkout: &checkout,
+            command: touch_command(&second),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    thread::sleep(Duration::from_millis(400));
+    let waiting = status(&state, "check-second");
+    assert_eq!(waiting["status"], "queued");
+    assert_eq!(waiting["pool"], Value::Null);
+    assert!(!second.exists());
+
+    // Finishing the first run returns its unused reservation, which admits the second.
+    fs::write(&first_release, "release").unwrap();
+    wait_status(&state, "check-first", "passed");
+    let placed = wait_status(&state, "check-second", "passed");
+    assert_eq!(placed["pool"], "paid");
+    assert!(second.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_placed_run_is_stopped_at_the_pool_runtime_limit() {
+    let temporary = TestDirectory::new("overflow-runtime");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "bounded",
+            "capacities": {"jobs": 1, "cpu": 2},
+            "executor": [executor.to_str().unwrap()],
+            "max_runtime": 1,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 4), ("cpu", 1)]);
+    let entered = temporary.path().join("entered");
+    let never_released = temporary.path().join("never-released");
+
+    submit_overflow_ok(
+        &state,
+        &Submission {
+            run_id: "check-long",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&entered, &never_released, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 2)],
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let stopped = wait_status(&state, "check-long", "failed");
+    assert_eq!(stopped["pool"], "bounded");
+    assert_eq!(stopped["failure_reason"], "overflow-runtime-exceeded");
+    assert_eq!(stopped["exit_status"], 124);
+    assert_eq!(
+        snapshot(&state).unwrap()["overflow_pools"][0]["allocations"],
+        json!({"cpu": 0, "jobs": 0})
+    );
+    assert!(broker.terminate().success());
+}

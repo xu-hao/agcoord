@@ -507,9 +507,18 @@ def test_run_and_full_parse_repeatable_resources_and_follow_the_durable_job(
     assert metadata["kind"] == ("full" if command_kind == "full" else "check")
     assert metadata["label"] == "behavior check"
     assert metadata["resources"] == {"cpu": 2, "browser": 1}
+    assert metadata["overflow"] is False
     expected_id = "full-new" if command_kind == "full" else "check-new"
     assert expected_id in output.getvalue()
     assert fake_client["follow"][-1][1] == expected_id
+
+
+def test_run_allows_overflow_only_when_the_submitter_asks(fake_client, tmp_path: Path):
+    args = _args("run", "--checkout", str(tmp_path), "--overflow", "--", "true")
+
+    cli.run(args, out=StringIO())
+
+    assert fake_client["submitted"][-1][1]["overflow"] is True
 
 
 @pytest.mark.parametrize(

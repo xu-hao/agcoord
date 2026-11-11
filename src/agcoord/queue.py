@@ -67,6 +67,7 @@ CHILD_CPU_RESOURCE = "cpu"
 CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
 LAND_TARGET_SYNC_ENV = "_AGCOORD_LAND_TARGET_SYNC"
+OVERFLOW_ENV = "_AGCOORD_OVERFLOW"
 LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
 LAND_REUSE_ENV = "_AGCOORD_LAND_REUSE_FULL"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
@@ -651,8 +652,20 @@ def _pre_native_spool_refusal(
 def _validate_resources(
     resources: Mapping[str, int] | None,
     capacities: Mapping[str, int],
+    overflow_pools: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, int]:
+    """Validate claims against this machine, or against a pool that could hold them.
+
+    ``overflow_pools`` is passed only for a submission that allowed overflow.  A claim
+    this machine can never hold is then accepted when one pool offers every claimed
+    resource in the claimed amount; the broker makes the same decision authoritatively.
+    """
     selected = _positive_mapping(resources, subject="resource", include_job=True)
+    if any(
+        all(units <= pool["capacities"].get(name, 0) for name, units in selected.items())
+        for pool in overflow_pools
+    ):
+        return selected
     for name, units in selected.items():
         if name not in capacities:
             raise CoordinatorError(
@@ -662,6 +675,45 @@ def _validate_resources(
             raise CoordinatorError(
                 f"resource {name!r} requests {units}, above capacity {capacities[name]}"
             )
+    return selected
+
+
+def _owner_overflow_pools(raw: str | None) -> list[dict[str, Any]]:
+    """Read the overflow pools a live owner published; an older owner publishes none."""
+    if raw is None:
+        return []
+    pools = json.loads(raw)
+    if not isinstance(pools, list):
+        raise ValueError("overflow pools must be a list")
+    selected = []
+    for pool in pools:
+        if not isinstance(pool, dict) or not isinstance(pool.get("name"), str):
+            raise ValueError("overflow pool is invalid")
+        selected.append(
+            {
+                **pool,
+                "capacities": _positive_mapping(
+                    pool.get("capacities"),
+                    subject="overflow pool capacity",
+                    include_job=False,
+                ),
+            }
+        )
+    return selected
+
+
+def _overflow_environment(
+    environment: Mapping[str, str],
+    overflow: bool,
+) -> dict[str, str]:
+    """Mark a submission as allowed to run in an overflow pool."""
+    if not isinstance(overflow, bool):
+        raise CoordinatorError("overflow must be boolean")
+    selected = dict(environment)
+    if OVERFLOW_ENV in selected:
+        raise CoordinatorError(f"gate environment uses the reserved {OVERFLOW_ENV} name")
+    if overflow:
+        selected[OVERFLOW_ENV] = "1"
     return selected
 
 
@@ -715,6 +767,7 @@ def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             subject="owner capacity",
             include_job=False,
         )
+        overflow_pools = _owner_overflow_pools(fields.get("overflow_pools"))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, CoordinatorError) as exc:
         raise _OwnerMetadataError(
             f"live gate broker wrote incomplete ownership metadata in {paths.owner_lock}"
@@ -741,6 +794,7 @@ def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
         "pid": owner_pid,
         "protocol": protocol,
         "capacities": capacities,
+        "overflow_pools": overflow_pools,
         "resource_bindings": bindings,
         "resource_capabilities": capabilities,
     }
@@ -1056,6 +1110,7 @@ class CoordinatorClient:
             "protocol": owner["protocol"],
             "broker_pid": owner["pid"],
             "capacities": owner["capacities"],
+            "overflow_pools": owner.get("overflow_pools", []),
             "resource_bindings": owner["resource_bindings"],
             "resource_capabilities": owner["resource_capabilities"],
         }
@@ -1249,6 +1304,7 @@ class CoordinatorClient:
         head_sha: str | None = None,
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
+        overflow: bool = False,
     ) -> str:
         selected_command = _validate_command(command)
         if kind not in RUN_KINDS:
@@ -1277,6 +1333,7 @@ class CoordinatorClient:
             agent=agent,
             prepared=prepared,
             owner=owner,
+            overflow=overflow,
         )
 
     def _prepare_submission(
@@ -1334,7 +1391,9 @@ class CoordinatorClient:
         agent: str | None,
         prepared: _PreparedSubmission,
         owner: Mapping[str, Any],
+        overflow: bool = False,
     ) -> str:
+        environment = _overflow_environment(prepared.environment, overflow)
         run_id = f"{kind}-{uuid4().hex[:12]}"
         arguments = self._native_submission_arguments(
             run_id=run_id,
@@ -1343,10 +1402,14 @@ class CoordinatorClient:
             identity=prepared.identity,
             branch=prepared.branch,
             head_sha=prepared.head_sha,
-            resources=_validate_resources(resources, owner["capacities"]),
+            resources=_validate_resources(
+                resources,
+                owner["capacities"],
+                owner.get("overflow_pools", ()) if overflow else (),
+            ),
             agent=_agent_identity(agent),
             caller_pid=prepared.caller_pid,
-            environment=prepared.environment,
+            environment=environment,
             command=command,
         )
         result = self._native_invoke("submit", arguments)
@@ -1529,6 +1592,7 @@ class CoordinatorClient:
         synchronize_target: bool = True,
         avoid_commits: Sequence[str] = (),
         reuse_full: bool = False,
+        overflow: bool = False,
     ) -> str:
         selected_command = _validate_command(command)
         if adapter != "github":
@@ -1566,6 +1630,7 @@ class CoordinatorClient:
             avoid_commits=selected_avoid,
             reuse_full=reuse_full,
             owner=owner,
+            overflow=overflow,
         )
 
     def _native_submit_land(
@@ -1582,8 +1647,9 @@ class CoordinatorClient:
         avoid_commits: Sequence[str],
         reuse_full: bool,
         owner: Mapping[str, Any],
+        overflow: bool = False,
     ) -> str:
-        selected_environment = dict(prepared.environment)
+        selected_environment = _overflow_environment(prepared.environment, overflow)
         selected_avoid = _validate_avoid_commits(avoid_commits)
         if LAND_TARGET_SYNC_ENV in selected_environment:
             raise CoordinatorError(
@@ -1620,7 +1686,11 @@ class CoordinatorClient:
             identity=prepared.identity,
             branch=prepared.branch,
             head_sha=prepared.exact_head(),
-            resources=_validate_resources(resources, owner["capacities"]),
+            resources=_validate_resources(
+                resources,
+                owner["capacities"],
+                owner.get("overflow_pools", ()) if overflow else (),
+            ),
             agent=_agent_identity(agent),
             caller_pid=prepared.caller_pid,
             environment=selected_environment,

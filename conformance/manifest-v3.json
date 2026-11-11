@@ -145,6 +145,18 @@
       }
     },
     {
+      "id": "resources.overflow-pools",
+      "domain": "resources",
+      "description": "A job that allowed overflow and has waited past a pool's threshold runs through that pool's executor under the pool's capacities, hard runtime limit, and daily CPU-hour budget, while local allocations and jobs that did not allow overflow are unaffected.",
+      "tests": {
+        "rust_native": [
+          "scheduler::an_eligible_row_overflows_to_a_pool_after_its_wait_threshold",
+          "scheduler::an_overflow_budget_bounds_concurrent_reservations",
+          "scheduler::a_placed_run_is_stopped_at_the_pool_runtime_limit"
+        ]
+      }
+    },
+    {
       "id": "receipts.verified-terminal-evidence",
       "domain": "receipts",
       "description": "Receipts retain sanitized applied, peak, and event evidence exactly once.",
