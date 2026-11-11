@@ -488,6 +488,56 @@ provider reads application default credentials, or a short-lived token from
 exists, `terraform import` it, and any repository or enabled API it already has, before the
 first apply.
 
+#### GCP Batch executor
+
+`agc overflow-gcp-batch` runs a placed job on a Google Cloud Batch machine that exists only for
+that run. Its options are the outputs of the Terraform module above:
+
+```json
+{
+  "name": "cloud",
+  "capacities": {"jobs": 4, "cpu": 64, "memory": 274877906944},
+  "max_claim": {"cpu": 32},
+  "executor": [
+    "agc", "overflow-gcp-batch",
+    "--project", "my-overflow-project",
+    "--region", "us-central1",
+    "--registry", "us-central1-docker.pkg.dev/my-overflow-project/agcoord-overflow",
+    "--service-account", "agcoord-overflow-runner@my-overflow-project.iam.gserviceaccount.com"
+  ],
+  "wait_threshold": 300,
+  "max_runtime": 3600,
+  "budget": {"cpu_hours_per_day": 100}
+}
+```
+
+This machine needs Docker or Podman and a `gcloud` that is signed in with permission to push to
+the repository and submit Batch jobs; the executor holds no credentials of its own and asks for
+everything through that `gcloud`. `--machine-type` fixes the Compute Engine machine type; without
+it Batch chooses one that fits the job. `--spot` uses a Spot machine, which is cheaper but can be
+preempted. `--runtime` selects the local container tool, `--env NAME` passes one environment
+variable into the container, and `--poll-interval` sets how often the job is checked.
+
+For each job the executor builds the job's image on this machine, pushes the repository's
+toolchain image as `toolchain` and the job's image as `run` in the registry, and submits one
+Batch job named `agcoord-RUN_ID` with a single task that runs the command in that image by
+digest. The registry login uses a short-lived access token in a private temporary directory, so
+the operator's own container configuration is neither read nor changed. Because the toolchain
+stays in the registry, later jobs upload only their source layer.
+
+The machine is sized to the job: its CPU and memory requirements are the job's enforced `cpu` and
+`memory` claims, or, for a job whose claims are only admission units, the claims named `cpu` and
+`memory` in bytes. Enforced claims are also applied to the container as the limits described
+above. The task carries the pool's `max_runtime` as its own maximum run duration and is never
+retried, so a lost broker cannot leave a machine running and the command never runs twice.
+
+The job's output is relayed from Cloud Logging, so it appears a few seconds late. The executor
+exits with the command's status. A job stopped by Batch at the runtime limit exits 124. Any other
+failure that is Batch's rather than the command's, such as a preempted Spot machine, a job that
+could not be submitted, or an image that could not be pushed, exits 125, so the run ends without
+a verdict. When the job ends or is stopped, the Batch job, the pushed job image, and the local
+job image are deleted; deleting the Batch job is what stops its machine.
+
 ### Delegated cgroup v2 lifecycle
 
 The built-in `cgroup-v2` backend owns process-tree lifecycle and, when the matching controllers
