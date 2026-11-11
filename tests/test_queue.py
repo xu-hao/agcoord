@@ -821,6 +821,22 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
         marker,
     )
     try:
+        # A repository opts in to overflow by naming its toolchain; without that file
+        # the request is refused before anything is queued.
+        with pytest.raises(CoordinatorError, match="overflow.json"):
+            client.submit(
+                command,
+                checkout=str(repository),
+                resources={"cpu": 4},
+                caller_pid=os.getpid(),
+                environment=caller_environment(),
+                overflow=True,
+            )
+        assert client.snapshot()["queued"] == []
+        (repository / ".agcoord").mkdir()
+        (repository / ".agcoord" / "overflow.json").write_text(
+            '{"image": "example/toolchain:1"}', encoding="utf-8"
+        )
         # Without the submitter's consent a claim above this machine's capacity is
         # still refused, even though a pool could hold it.
         with pytest.raises(CoordinatorError, match="capacity"):
