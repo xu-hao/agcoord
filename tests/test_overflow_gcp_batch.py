@@ -307,6 +307,67 @@ def test_gcloud_progress_reports_stay_out_of_the_job_log(cloud: Cloud):
     assert "console.cloud.google.com" not in completed.stderr
 
 
+def test_lines_indexed_or_flushed_after_a_later_timestamp_are_not_skipped(cloud: Cloud):
+    early = {
+        "insertId": "early-1",
+        "timestamp": "2026-11-11T00:00:02.000100000Z",
+        "receiveTimestamp": "2026-11-11T00:00:32.020564748Z",
+        "logName": f"projects/{PROJECT}/logs/batch_task_logs",
+        "textPayload": "=== host check ===",
+    }
+    later = {
+        "insertId": "later-2",
+        "timestamp": "2026-11-11T00:00:30.389899221Z",
+        "receiveTimestamp": "2026-11-11T00:00:32.020564748Z",
+        "logName": f"projects/{PROJECT}/logs/batch_task_logs",
+        "textPayload": "=== running pytest ===",
+    }
+    cloud.answer(
+        "states",
+        ["RUNNING", "RUNNING", "SUCCEEDED"],
+    )
+    cloud.answer(
+        "logs",
+        [
+            # Cloud Logging indexed the later shard of the upload batch first.
+            [later],
+            [early, later],
+            [],
+        ],
+    )
+
+    completed = cloud.run("pytest", "-q")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "=== host check ===\n" in completed.stdout
+    assert "=== running pytest ===\n" in completed.stdout
+    assert completed.stdout.count("=== running pytest ===") == 1
+    reads = [call[2] for call in cloud.gcloud() if call[:2] == ["logging", "read"]]
+    assert all('timestamp>="2026-11-11T00:00:00Z"' in query for query in reads)
+    assert any('receiveTimestamp>="2026-11-11T00:00:02Z"' in query for query in reads[1:])
+
+
+def test_output_arriving_several_polls_after_a_fast_job_finishes_is_still_relayed(
+    cloud: Cloud,
+):
+    cloud.answer("states", ["SUCCEEDED"])
+    cloud.answer(
+        "logs",
+        [
+            # First read at completion and first post-finish drain read see nothing yet.
+            [],
+            [],
+            [entry("a1", "235 passed in 0.4s")],
+            [],
+        ],
+    )
+
+    completed = cloud.run("pytest", "-q")
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "235 passed in 0.4s\n"
+
+
 def test_a_configured_build_context_builds_the_toolchain_from_that_directory(cloud: Cloud):
     (cloud.repository / "locks").mkdir()
     (cloud.repository / ".agcoord" / "overflow.json").write_text(
