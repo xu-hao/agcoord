@@ -12,8 +12,9 @@ It builds the job's image here, pushes it to the project's own Artifact Registry
 repository, and creates and executes one Cloud Run job that exists only for this run.  It
 relays the job's output from Cloud Logging and exits with the command's status.
 
-Cloud Run starts faster than a Batch machine but is smaller: one job gets at most 8 CPUs
-and 32 GiB of memory, and it can limit only CPU, memory, and in-memory scratch space.
+Cloud Run needs no machine of its own but is smaller than Batch: one job gets at most 8
+CPUs and 32 GiB of memory, and it can limit only CPU, memory, and in-memory scratch space.
+It is not faster to start, and the container can see more processors than it was given.
 Give a pool that uses this executor a matching ``max_claim``, and list in its
 ``capacities`` only the resources Cloud Run can provide.
 

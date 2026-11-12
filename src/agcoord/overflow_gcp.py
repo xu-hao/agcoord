@@ -36,19 +36,29 @@ class Gcloud:
         return ["gcloud", *arguments, f"--project={self.project}", "--quiet"]
 
     def run(self, *arguments: str, stdin: str | None = None) -> str:
-        """Run one command and return its output, or fail without a verdict."""
+        """Run one command and return its output, or fail without a verdict.
+
+        ``gcloud`` reports progress on standard error even with ``--quiet``: "Creating
+        job... Done.", advice on what to run next, and console links that name the
+        project.  The executor's standard error is the job's log, so what ``gcloud`` says
+        there is kept out of it unless the command fails, when it explains the failure.
+        """
         try:
             completed = subprocess.run(
                 self.command(*arguments),
                 input=stdin,
                 stdin=None if stdin is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
             )
         except FileNotFoundError as exc:
             raise ExecutorError("gcloud is not installed on this machine") from exc
         if completed.returncode != 0:
-            raise ExecutorError(f"gcloud {' '.join(arguments[:3])} failed")
+            detail = " ".join(completed.stderr.split())
+            raise ExecutorError(
+                f"gcloud {' '.join(arguments[:3])} failed" + (f": {detail}" if detail else "")
+            )
         return completed.stdout
 
     def json(self, *arguments: str, stdin: str | None = None) -> object:
