@@ -19,6 +19,7 @@ from agcoord.overflow_image import ContainerLimits, ExecutorError, Placement
 from gcp_fakes import (
     ADMISSION_ONLY,
     CONTRACT,
+    GCLOUD_PROGRESS,
     JOB_IMAGE,
     JOB_IMAGE_DIGEST,
     PROJECT,
@@ -359,7 +360,7 @@ def test_a_job_that_cannot_be_created_is_no_verdict_and_leaves_no_image(cloud: C
     completed = cloud.run("true")
 
     assert completed.returncode == 125
-    assert "run jobs replace failed" in completed.stderr
+    assert "run jobs replace failed: ERROR: (gcloud) fake gcloud failure" in completed.stderr
     assert cloud.called("run", "jobs", "execute") == []
     assert cloud.wait_for_gcloud("artifacts", "docker", "images", "delete")[4] == JOB_IMAGE
 
@@ -394,3 +395,15 @@ def test_the_project_is_named_on_every_cloud_call(cloud: Cloud):
     assert completed.returncode == 0, completed.stderr
     cloud.wait_for_gcloud("artifacts", "docker", "images", "delete")
     assert all(f"--project={PROJECT}" in call for call in cloud.gcloud())
+
+
+def test_gcloud_progress_reports_stay_out_of_the_job_log(cloud: Cloud):
+    completed = cloud.run("true")
+
+    assert completed.returncode == 0, completed.stderr
+    # The executor's standard error is the job's log.  What gcloud says while it works
+    # is not about the job, and its console links name the project.
+    assert cloud.gcloud()
+    for line in GCLOUD_PROGRESS.splitlines():
+        assert line not in completed.stderr
+    assert "console.cloud.google.com" not in completed.stderr

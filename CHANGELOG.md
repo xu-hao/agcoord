@@ -29,9 +29,13 @@ versioning; dates use ISO 8601.
   rather than a failed job (#274).
 
 - Add `agc overflow-gcp-run`, an overflow executor that runs a placed job as a Google Cloud Run
-  job, for jobs of up to 8 CPUs and 32 GiB that should start sooner than a Batch machine. The
+  job, for jobs of up to 8 CPUs and 32 GiB, with no machine to manage. It is not faster to
+  start than Batch, and the job may see more processors than it claimed. The
   Terraform module enables the Cloud Run API. Both Google Cloud executors now keep following a
   job through `gcloud` calls that fail for a while instead of abandoning it (#275).
+- Keep `gcloud`'s progress reports and console links, which name the project, out of the logs of
+  jobs run by the Google Cloud overflow executors; they are shown only when a `gcloud` command
+  fails, as part of its error (#288).
 
 ## 0.7.8 — 2026-11-10
 
