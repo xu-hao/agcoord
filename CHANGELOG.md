@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Allow `.agcoord/overflow.json` to set an optional repository-contained `"context"` directory
+  alongside `"dockerfile"`, so a toolchain Dockerfile can copy tracked lockfiles outside
+  `.agcoord/` without keeping duplicate copies (#298).
+
 ## 0.8.0 — 2026-11-12
 
 - A 0.8 client commands only a 0.8 broker. Overflow pools need the broker's new scheduler,

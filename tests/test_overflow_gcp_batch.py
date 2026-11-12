@@ -305,3 +305,23 @@ def test_gcloud_progress_reports_stay_out_of_the_job_log(cloud: Cloud):
     for line in GCLOUD_PROGRESS.splitlines():
         assert line not in completed.stderr
     assert "console.cloud.google.com" not in completed.stderr
+
+
+def test_a_configured_build_context_builds_the_toolchain_from_that_directory(cloud: Cloud):
+    (cloud.repository / "locks").mkdir()
+    (cloud.repository / ".agcoord" / "overflow.json").write_text(
+        json.dumps({"dockerfile": ".agcoord/Dockerfile", "context": "locks"}),
+        encoding="utf-8",
+    )
+
+    completed = cloud.run("true")
+
+    assert completed.returncode == 0, completed.stderr
+    builds = [record["argv"] for record in cloud.docker() if record["argv"][0] == "build"]
+    assert builds[0] == [
+        "build",
+        "-q",
+        "-f",
+        str(cloud.repository / ".agcoord" / "Dockerfile"),
+        str((cloud.repository / "locks").resolve()),
+    ]
