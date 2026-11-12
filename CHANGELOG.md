@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Allow `.agcoord/overflow.json` to set an optional repository-contained `"context"` directory
+  alongside `"dockerfile"`, so a toolchain Dockerfile can copy tracked lockfiles outside
+  `.agcoord/` without keeping duplicate copies (#298).
+
 - Keep Google Cloud overflow job logs from dropping lines that Cloud Logging indexes or flushes
   out of emission-timestamp order, or that become readable a few seconds after a fast job finishes
   (#297).

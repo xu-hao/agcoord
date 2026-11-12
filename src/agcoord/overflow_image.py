@@ -78,6 +78,7 @@ class RepositoryOverflow:
 
     dockerfile: Path | None
     image: str | None
+    context: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -144,26 +145,58 @@ def load_repository_config(root: Path) -> RepositoryOverflow:
         ) from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ExecutorError(f"cannot read {REPOSITORY_CONFIG}: {exc}") from exc
-    if not isinstance(document, dict) or set(document) - {"dockerfile", "image"}:
+    if not isinstance(document, dict) or set(document) - {"dockerfile", "context", "image"}:
         raise ExecutorError(
-            f"{REPOSITORY_CONFIG} must be an object with only dockerfile or image"
+            f"{REPOSITORY_CONFIG} must be an object with only dockerfile, context, or image"
         )
     dockerfile = document.get("dockerfile")
     image = document.get("image")
     if (dockerfile is None) == (image is None):
         raise ExecutorError(f"{REPOSITORY_CONFIG} must name exactly one of dockerfile or image")
     if dockerfile is not None:
-        if not isinstance(dockerfile, str) or not dockerfile.strip():
-            raise ExecutorError(f"{REPOSITORY_CONFIG} dockerfile must be a non-empty path")
+        if (
+            not isinstance(dockerfile, str)
+            or not dockerfile.strip()
+            or Path(dockerfile).is_absolute()
+        ):
+            raise ExecutorError(
+                f"{REPOSITORY_CONFIG} dockerfile must be a relative path in the repository"
+            )
+        resolved_root = root.resolve()
         selected = (root / dockerfile).resolve()
-        if root.resolve() not in selected.parents or not selected.is_file():
+        if resolved_root not in selected.parents or not selected.is_file():
             raise ExecutorError(
                 f"{REPOSITORY_CONFIG} dockerfile must be an existing file in the repository"
             )
-        return RepositoryOverflow(dockerfile=selected, image=None)
+        if "context" in document:
+            raw_context = document["context"]
+            if (
+                not isinstance(raw_context, str)
+                or not raw_context.strip()
+                or Path(raw_context).is_absolute()
+            ):
+                raise ExecutorError(
+                    f"{REPOSITORY_CONFIG} context must be a relative directory in the repository"
+                )
+            selected_context = (root / raw_context).resolve()
+            if (
+                (
+                    selected_context != resolved_root
+                    and resolved_root not in selected_context.parents
+                )
+                or not selected_context.is_dir()
+            ):
+                raise ExecutorError(
+                    f"{REPOSITORY_CONFIG} context must be an existing directory in the repository"
+                )
+        else:
+            selected_context = selected.parent
+        return RepositoryOverflow(dockerfile=selected, image=None, context=selected_context)
+    if "context" in document:
+        raise ExecutorError(f"{REPOSITORY_CONFIG} context is allowed only with dockerfile")
     if not isinstance(image, str) or not image.strip() or any(c.isspace() for c in image):
         raise ExecutorError(f"{REPOSITORY_CONFIG} image must be one image reference")
-    return RepositoryOverflow(dockerfile=None, image=image)
+    return RepositoryOverflow(dockerfile=None, image=image, context=None)
 
 
 def source_files(root: Path) -> list[str]:
@@ -351,8 +384,9 @@ def build_toolchain(tool: str, root: Path, config: RepositoryOverflow) -> str:
     if config.image is not None:
         return config.image
     assert config.dockerfile is not None
+    context = config.context if config.context is not None else config.dockerfile.parent
     completed = subprocess.run(
-        [tool, "build", "-q", "-f", str(config.dockerfile), str(config.dockerfile.parent)],
+        [tool, "build", "-q", "-f", str(config.dockerfile), str(context)],
         stdout=subprocess.PIPE,
         text=True,
     )
