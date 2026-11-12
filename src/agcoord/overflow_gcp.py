@@ -107,9 +107,16 @@ class Registry:
                 text=True,
                 env=environment,
                 stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
             if login.returncode != 0:
-                raise ExecutorError(f"cannot log in to {self.host}")
+                detail = " ".join(login.stderr.split())
+                raise ExecutorError(
+                    f"cannot log in to {self.host}" + (f": {detail}" if detail else "")
+                )
+            # A successful login is silent.  Docker warns that the token is stored
+            # unencrypted, which is advice about an operator's lasting configuration; here
+            # the token is short-lived and its directory is removed after the push.
             yield environment
 
     def tag(self, source: str, target: str) -> None:
