@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.8.0 — 2026-11-12
 
 - Add overflow pools: an `overflow_pools` list in `config.json` names extra capacity on another
   machine or an ephemeral cloud machine, reached through a configured executor command. A job
