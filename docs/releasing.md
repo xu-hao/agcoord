@@ -169,23 +169,26 @@ interface and must be smoke-tested from the built wheel.
    GitHub's zipped workflow-artifact transport normalizes file modes, so the workflow restores
    `0755` on only the fixed broker and three fixed helper names before running this verifier;
    content sidecars and the host archive's internal modes remain independently checked.
-7. A PyPI upload is a separate, explicit maintainer action. Only after the user explicitly asks
-   for it, upload the exact wheel and sdist already named in `release-manifest.json` with Twine.
-   Twine reads an owner-only `~/.pypirc` and a project-scoped token; never put credentials in the
-   repository, command line, workflow, or long-lived environment. No permission to implement,
-   land, tag, or create a GitHub release implies PyPI authorization.
+7. Publishing a release requires an explicit maintainer request, and PyPI upload and the GitHub
+   release always go together: never upload to PyPI without completing the matching GitHub
+   release, and never publish a GitHub release without uploading to production PyPI, because
+   `pip install agcoord==<version>` paired with `agc host install --download` or
+   `agc host upgrade --download` depends on both channels carrying the same release. No
+   permission to implement, test, or land repository work authorizes a release. Once the user
+   explicitly requests releasing, upload the exact wheel and sdist already named in
+   `release-manifest.json` with Twine. Twine reads an owner-only `~/.pypirc` and a project-scoped
+   token; never put credentials in the repository, command line, workflow, or long-lived
+   environment.
 8. Read production PyPI JSON for the uploaded version, require exactly that wheel and sdist,
    compare their hashes to `SHA256SUMS`, and install `agcoord==<version>` from the production
-   simple index into one more clean environment. If no PyPI upload was authorized, skip this
-   step and state that the release is not on PyPI; never substitute TestPyPI evidence.
+   simple index into one more clean environment; never substitute TestPyPI evidence.
 9. Tag the exact release commit as `v<version>`. The tag workflow independently rebuilds the
    Python, native, and host inputs, reruns conformance and the candidate verifier with the tag
    check enabled, and uploads one credential-free workflow artifact. After it passes, create the
-   GitHub release and attach every file from the verified release bundle. If PyPI was authorized,
-   the attached wheel and sdist must be the exact files production PyPI accepted.
+   GitHub release and attach every file from the verified release bundle, with the attached wheel
+   and sdist byte-identical to the exact files production PyPI accepted.
 10. Upgrade or install the host bundle on the supported Ubuntu configuration. Install the matching
-   non-editable `agcoord==<version>` client first (from production PyPI when uploaded, or from the
-   verified wheel in `dist/release` when no PyPI upload was authorized), then run
+   non-editable `agcoord==<version>` client from production PyPI first, then run
    `agc host upgrade --download` (or `agc host install --download` on a fresh host; pass the
    verified local bundle path when the host has no GitHub access) as described in the
    [native host runbook](native_host.md). For an existing spool with a functioning outgoing owner,
