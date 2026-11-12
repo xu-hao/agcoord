@@ -96,9 +96,7 @@ def test_fresh_release_candidate_jobs_fetch_locked_rust_dependencies():
             encoding="utf-8"
         )
         release_job = workflow.split("\n  release-candidate:\n", 1)[1]
-        toolchain = release_job.index(
-            "rustup toolchain install 1.94.1 --profile minimal"
-        )
+        toolchain = release_job.index("./scripts/install-rust-toolchain")
         fetch = release_job.index("cargo fetch --locked")
         verify = release_job.index("./scripts/verify-release-candidate")
 
