@@ -27,9 +27,11 @@ procedures listed in [docs/index.md](docs/index.md).
   coordinator, declare every scarce resource, and never submit coordinated work from an
   admitted job. Gate and publish through one `agc land` request; never bypass or separate
   its verdict from publication.
-- Never upload an AGCoord distribution to PyPI unless the user explicitly requests it.
-  Permission to implement, test, commit, push, merge, tag, or create a GitHub release
-  does not authorize an upload.
+- Never publish an AGCoord release—to PyPI or as a GitHub release—unless the user
+  explicitly requests releasing. Permission to implement, test, commit, push, or merge
+  does not authorize a release. When a release is explicitly requested, always publish
+  the PyPI upload and the matching GitHub release together; never leave one published
+  without the other.
 - End changed work with the four-part [session handoff](docs/session_handoff_format.md);
   answer read-only questions directly without an empty handoff shell.
 - Follow the [contributor workflow](docs/contributing.md) for commands, bootstrap,

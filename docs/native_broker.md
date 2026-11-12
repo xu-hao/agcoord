@@ -521,4 +521,5 @@ The epic proceeds through the linked issues in this order: architecture and thre
 reproducible artifact, scheduler and state, worker lifecycle, cgroup parity, project quota,
 Python compatibility, host packaging, conformance, then migration documentation and release.
 No resource backend becomes the default until its public behavior passes the shared black-box
-conformance suite. No ticket authorizes a PyPI upload without a separate explicit user request.
+conformance suite. No ticket authorizes publishing a release without an explicit user request, and
+an authorized release always publishes the PyPI distribution and the GitHub release together.
