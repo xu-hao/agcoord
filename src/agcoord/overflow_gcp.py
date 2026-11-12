@@ -9,12 +9,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
-from typing import Iterator, Sequence
+import time
+from typing import Callable, Collection, Iterator, Sequence
 
-from agcoord.overflow_image import ExecutorError
+from agcoord.overflow_image import ExecutorError, RepositoryOverflow, build_job_image
 
 
 #: The package names under which images are pushed.  The cleanup policies of the
@@ -58,10 +61,119 @@ class Gcloud:
             ) from exc
 
 
-def resource_name(prefix: str, run_id: str) -> str:
+class LogRelay:
+    """Print the Cloud Logging entries of one job as they arrive.
+
+    Cloud Logging is read by polling.  Each read starts at the time of the last entry
+    seen, so an entry can be returned twice and is printed once.  Entries are delivered
+    seconds late, which is why callers keep reading for a moment after a job ends.
+    """
+
+    def __init__(
+        self,
+        gcloud: Gcloud,
+        log_filter: str,
+        since: str,
+        is_output: Callable[[dict[str, object]], bool] = lambda entry: True,
+    ) -> None:
+        self.gcloud = gcloud
+        self.log_filter = log_filter
+        self.is_output = is_output
+        self._cursor = since or "1970-01-01T00:00:00Z"
+        self._seen: set[str] = set()
+
+    def relay(self) -> int:
+        """Print the entries that arrived since the last call and return how many.
+
+        The job's own output goes to standard output unchanged.  Anything else the
+        platform logged about the job goes to standard error, so it reaches the job's log
+        without being mistaken for the command's output.
+        """
+        entries = self.gcloud.json(
+            "logging",
+            "read",
+            f'{self.log_filter} AND timestamp>="{self._cursor}"',
+            "--order=asc",
+        )
+        printed = 0
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            identity = str(entry.get("insertId") or "")
+            if identity in self._seen:
+                continue
+            self._seen.add(identity)
+            self._cursor = str(entry.get("timestamp") or self._cursor)
+            if isinstance(entry.get("textPayload"), str):
+                text = entry["textPayload"]
+            elif entry.get("jsonPayload") is not None:
+                # A line the command printed as JSON is stored parsed; print it as JSON.
+                text = json.dumps(entry["jsonPayload"], separators=(",", ":"))
+            else:
+                continue
+            stream = sys.stdout if self.is_output(entry) else sys.stderr
+            stream.write(text if text.endswith("\n") else text + "\n")
+            printed += 1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return printed
+
+
+#: Consecutive failed checks of a job's state after which contact counts as lost.
+LOST_CONTACT_CHECKS = 12
+#: Extra reads of a job's output after it ends, because Cloud Logging delivers entries late.
+LOG_DRAIN_READS = 3
+
+
+def follow_job(
+    *,
+    state: Callable[[], str],
+    relay: Callable[[], int],
+    finished: Collection[str],
+    poll_interval: float,
+    say: Callable[[str], None],
+) -> str:
+    """Relay a running job's output until the job ends, and return its final state.
+
+    A job can run for an hour, and one failed ``gcloud`` call in that time is not a reason
+    to give up on it.  A check that fails is repeated at the next poll; only a run of
+    failures as long as ``LOST_CONTACT_CHECKS`` ends the job without a verdict.  Output
+    that cannot be read is read again later, and its loss is reported, never fatal.
+    """
+    current = ""
+    failures = 0
+    while current not in finished:
+        time.sleep(poll_interval)
+        try:
+            observed = state()
+        except ExecutorError as error:
+            failures += 1
+            if failures >= LOST_CONTACT_CHECKS:
+                raise ExecutorError(f"lost contact with the job: {error}") from error
+            continue
+        failures = 0
+        if observed != current:
+            current = observed
+            say(f"job is {current}")
+        try:
+            relay()
+        except ExecutorError:
+            pass
+    for _ in range(LOG_DRAIN_READS):
+        time.sleep(poll_interval)
+        try:
+            if relay() == 0:
+                break
+        except ExecutorError:
+            say("some of the job's output could not be read from Cloud Logging")
+            break
+    return current
+
+
+def resource_name(prefix: str, run_id: str, limit: int = 63) -> str:
     """Return a name Google Cloud accepts for a job: lowercase, digits, and hyphens."""
     name = re.sub(r"[^a-z0-9-]+", "-", f"{prefix}-{run_id}".lower())
-    return name[:63].strip("-")
+    return name[:limit].strip("-")
 
 
 class Registry:
@@ -158,3 +270,31 @@ class Registry:
 
     def local_delete_command(self, images: Sequence[str]) -> list[str]:
         return [self.tool, "rmi", "-f", *images]
+
+
+def publish_job_image(
+    registry: Registry,
+    root: Path,
+    config: RepositoryOverflow,
+    toolchain: str,
+    run_id: str,
+    cleanup: list[list[str]],
+) -> tuple[str, int]:
+    """Build a job's image, push it, and return its reference and source file count.
+
+    ``cleanup`` receives the commands that remove each copy of the job's image, as soon
+    as that copy can exist, so that a failure or a stop part-way leaves nothing behind.
+    """
+    image = registry.job_image(run_id)
+    count = build_job_image(registry.tool, root, toolchain, image)
+    cleanup.append(registry.local_delete_command([image]))
+    with registry.login() as environment:
+        if config.dockerfile is not None:
+            # Keeping the toolchain in the registry under its own name means later jobs
+            # upload only their source layer.
+            published = registry.toolchain_image(toolchain)
+            registry.tag(toolchain, published)
+            registry.push(published, environment)
+        cleanup.append(registry.remote_delete_command(image))
+        reference = registry.push(image, environment)
+    return reference, count

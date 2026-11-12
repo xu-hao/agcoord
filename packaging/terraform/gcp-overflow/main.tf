@@ -9,6 +9,7 @@ locals {
     "compute.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
+    "run.googleapis.com",
   ])
 
   # The package names executors push under.  The cleanup policies below depend on them.
@@ -25,6 +26,7 @@ locals {
   submitter_project_roles = toset([
     "roles/batch.jobsEditor",
     "roles/logging.viewer",
+    "roles/run.developer",
   ])
 }
 

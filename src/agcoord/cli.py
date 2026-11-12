@@ -45,6 +45,10 @@ OVERFLOW_EXECUTORS = {
         "agcoord.overflow_gcp_batch",
         "overflow executor: run a placed job on a Google Cloud Batch machine",
     ),
+    "overflow-gcp-run": (
+        "agcoord.overflow_gcp_run",
+        "overflow executor: run a placed job as a Google Cloud Run job",
+    ),
 }
 
 

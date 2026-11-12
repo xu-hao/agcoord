@@ -217,14 +217,39 @@ def write_build_context(root: Path, toolchain: str, stream: IO[bytes]) -> int:
     return len(names)
 
 
+@dataclass(frozen=True)
+class EnforcementTarget:
+    """Which kinds of claim one kind of destination can enforce.
+
+    ``dependencies`` lists limits the destination can apply only together with another:
+    ``(dependent, base, explanation)`` over :class:`ContainerLimits` field names.
+    """
+
+    description: str
+    kinds: frozenset[str]
+    dependencies: tuple[tuple[str, str, str], ...] = ()
+
+
+#: A Docker or Podman container, which every executor that starts one itself can limit.
+CONTAINER = EnforcementTarget(
+    description="a container",
+    kinds=frozenset({"cpu", "memory", "memory-high", "swap", "tmpfs", "inodes", "processes"}),
+    dependencies=(
+        ("swap", "memory", "a swap claim needs a memory claim"),
+        ("tmpfs_inodes", "tmpfs", "an inode claim needs a tmpfs claim"),
+    ),
+)
+
+
 def container_limits(
     resources: Mapping[str, int],
     contract: Mapping[str, Mapping[str, object]],
+    target: EnforcementTarget = CONTAINER,
 ) -> ContainerLimits:
-    """Translate a job's enforced claims into container limits, or refuse.
+    """Translate a job's enforced claims into limits the target can apply, or refuse.
 
     Enforcement of a placed job is delegated to the executor.  A ``required`` claim of a
-    kind a container cannot limit is refused rather than run unenforced; a best-effort one
+    kind the target cannot limit is refused rather than run unenforced; a best-effort one
     is skipped, as it would be on a host whose backend is unavailable.
     """
     selected: dict[str, int] = {}
@@ -233,32 +258,29 @@ def container_limits(
         mode = binding.get("mode", "admission-only")
         if mode == "admission-only":
             continue
+        kind = str(binding.get("kind"))
         field = {
             "cpu": "cpus",
             "memory": "memory",
             "memory-high": "memory_reservation",
             "swap": "swap",
             "tmpfs": "tmpfs",
-            "processes": "processes",
-        }.get(str(binding.get("kind")))
-        if field is None and binding.get("kind") == "inodes":
             # Inodes are enforceable only as the inode limit of a claimed tmpfs.
-            field = "tmpfs_inodes"
-        if field is None:
+            "inodes": "tmpfs_inodes",
+            "processes": "processes",
+        }.get(kind)
+        if field is None or kind not in target.kinds:
             if mode == "required":
                 raise ExecutorError(
-                    f"required claim {name} of kind {binding.get('kind')} cannot be "
-                    "enforced in a container"
+                    f"required claim {name} of kind {kind} cannot be enforced in "
+                    f"{target.description}"
                 )
             continue
         selected[field] = units
     limits = ContainerLimits(**selected)
-    for dependent, base, subject in (
-        ("swap", "memory", "a swap claim needs a memory claim"),
-        ("tmpfs_inodes", "tmpfs", "an inode claim needs a tmpfs claim"),
-    ):
+    for dependent, base, subject in target.dependencies:
         if getattr(limits, dependent) is not None and getattr(limits, base) is None:
-            raise ExecutorError(f"{subject} to be enforced in a container")
+            raise ExecutorError(f"{subject} to be enforced in {target.description}")
     return limits
 
 
@@ -285,7 +307,10 @@ class Placement:
         return self.limits.memory or self.resources.get("memory")
 
 
-def placement(environment: Mapping[str, str]) -> Placement:
+def placement(
+    environment: Mapping[str, str],
+    target: EnforcementTarget = CONTAINER,
+) -> Placement:
     """Read the run ID, runtime limit, and claims the broker gave a placed job's executor."""
     try:
         run_id = environment["AGCOORD_RUN_ID"]
@@ -303,7 +328,7 @@ def placement(environment: Mapping[str, str]) -> Placement:
         run_id=run_id,
         max_runtime=max_runtime,
         resources=resources,
-        limits=container_limits(resources, contract),
+        limits=container_limits(resources, contract, target),
     )
 
 

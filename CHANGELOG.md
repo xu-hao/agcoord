@@ -28,6 +28,11 @@ versioning; dates use ISO 8601.
   Logging, and reports Batch's own failures, such as a preempted Spot machine, as no verdict
   rather than a failed job (#274).
 
+- Add `agc overflow-gcp-run`, an overflow executor that runs a placed job as a Google Cloud Run
+  job, for jobs of up to 8 CPUs and 32 GiB that should start sooner than a Batch machine. The
+  Terraform module enables the Cloud Run API. Both Google Cloud executors now keep following a
+  job through `gcloud` calls that fail for a while instead of abandoning it (#275).
+
 ## 0.7.8 — 2026-11-10
 
 - Support server-side filtered snapshot queries across broker, client, CLI (`agc list`), and TUI (`agc tui`).
