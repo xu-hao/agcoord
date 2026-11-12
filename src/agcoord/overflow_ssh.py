@@ -25,12 +25,15 @@ from typing import Sequence
 from agcoord.overflow_image import (
     EXIT_NO_VERDICT,
     ExecutorError,
+    Stopped,
     build_toolchain,
     command_line,
     container_tool,
+    ignore_stop_signals,
     load_repository_config,
     placement,
     repository_root,
+    stop_on_signals,
     write_build_context,
 )
 
@@ -39,10 +42,6 @@ from agcoord.overflow_image import (
 SSH_FAILED = 255
 #: Seconds the remote container is given to stop after its runtime limit before it is killed.
 STOP_GRACE = 10
-
-
-class _Stopped(Exception):
-    """The broker asked this executor to stop."""
 
 
 class SshExecutor:
@@ -213,15 +212,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(arguments)
     name = image = None
     executor = None
-
-    def stop(_signal: int, _frame: object) -> None:
-        raise _Stopped()
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    stop_on_signals()
     try:
         command = command_line(args.command)
-        run_id, max_runtime, limits = placement(os.environ)
+        placed = placement(os.environ)
         root = repository_root(Path.cwd())
         config = load_repository_config(root)
         local_tool = container_tool(args.runtime)
@@ -235,19 +229,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
         toolchain = build_toolchain(local_tool, root, config)
         executor.ensure_toolchain(toolchain)
-        name = f"agcoord-{run_id}"
-        image = f"agcoord-run:{run_id}"
+        name = f"agcoord-{placed.run_id}"
+        image = f"agcoord-run:{placed.run_id}"
         executor.build_run_image(root, toolchain, image)
         status = executor.run(
             name=name,
             image=image,
-            options=limits.run_options(),
-            max_runtime=max_runtime,
+            options=placed.limits.run_options(),
+            max_runtime=placed.max_runtime,
             command=command,
         )
-    except _Stopped:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Stopped:
+        ignore_stop_signals()
         if executor is not None and name is not None and image is not None:
             executor.cleanup(name, image, detached=True)
         return 128 + signal.SIGTERM

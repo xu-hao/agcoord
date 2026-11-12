@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,20 @@ from .queue import (
     wait,
 )
 from .resources import resource_enforcement_summary
+
+
+#: Overflow executors: subcommand -> (module with ``main``, help text).  The broker starts
+#: one as a placed job's worker; each is an optional adapter loaded only when used.
+OVERFLOW_EXECUTORS = {
+    "overflow-ssh": (
+        "agcoord.overflow_ssh",
+        "overflow executor: run a placed job on another machine over SSH",
+    ),
+    "overflow-gcp-batch": (
+        "agcoord.overflow_gcp_batch",
+        "overflow executor: run a placed job on a Google Cloud Batch machine",
+    ),
+}
 
 
 def _resources(values: list[str]) -> dict[str, int]:
@@ -302,11 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("worker_command", nargs=argparse.REMAINDER)
         return command
 
-    commands.add_parser(
-        "overflow-ssh",
-        help="overflow executor: run a placed job on another machine over SSH",
-        add_help=False,
-    )
+    for name, (_module, help_text) in OVERFLOW_EXECUTORS.items():
+        commands.add_parser(name, help=help_text, add_help=False)
     submission("run", "submit a compatible check")
     submission("full", "submit a clean exact-head receipt without a lane barrier")
 
@@ -740,12 +752,11 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
 
 def main(argv: Iterable[str] | None = None) -> int:
     selected = list(sys.argv[1:] if argv is None else argv)
-    if selected[:1] == ["overflow-ssh"]:
+    if selected[:1] and selected[0] in OVERFLOW_EXECUTORS:
         # An overflow executor is started by the broker as a placed job's worker and has
         # its own options and carried command, so it parses the rest of the line itself.
-        from .overflow_ssh import main as overflow_ssh
-
-        return overflow_ssh(selected[1:])
+        module = importlib.import_module(OVERFLOW_EXECUTORS[selected[0]][0])
+        return module.main(selected[1:])
     args = build_parser().parse_args(selected)
     try:
         return run(args, out=sys.stdout)
