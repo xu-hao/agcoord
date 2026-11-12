@@ -538,6 +538,10 @@ could not be submitted, or an image that could not be pushed, exits 125, so the 
 a verdict. When the job ends or is stopped, the Batch job, the pushed job image, and the local
 job image are deleted; deleting the Batch job is what stops its machine.
 
+The executors' standard error is the job's log, so the progress reports `gcloud` prints there,
+such as "Creating job... Done." and console links that name the project, are kept out of it.
+What `gcloud` said is shown only when one of its commands fails, as part of the error.
+
 Both Google Cloud executors keep following a job through `gcloud` calls that fail for a while:
 a failed check of the job's state is repeated at the next poll, and only twelve failures in a
 row end the run without a verdict.
@@ -545,8 +549,10 @@ row end the run without a verdict.
 #### GCP Cloud Run executor
 
 `agc overflow-gcp-run` runs a placed job as a Cloud Run job that exists only for that run. It
-takes the same project, region, registry, and service account as the Batch executor, and starts
-sooner than a Batch machine, but Cloud Run is smaller and limits less:
+takes the same project, region, registry, and service account as the Batch executor. It is
+not faster to start: measured once in `us-central1`, a job's first output arrived 89 seconds
+after the executor started, against 81 seconds on Batch. What it offers is no machine to manage,
+at the cost of being smaller and limiting less:
 
 ```json
 {
@@ -578,6 +584,12 @@ scratch space at `/tmp` and is added to the memory the job is given. A job that 
 gets the most its CPU count allows, 4 GiB for each CPU; claim memory to pay for less. The job
 carries the pool's `max_runtime` as its own timeout and is created to never retry, and the
 executor reads the created job back and refuses to execute one that Cloud Run would retry.
+
+Cloud Run applies the CPU limit from outside the container, and the container cannot read it:
+`nproc` and the processor count Python or a test runner sees can be larger than the CPUs the job
+claimed (a 2-CPU job saw 6), and the cgroup limit files are not readable. A command that sizes
+its parallelism from the visible processor count oversubscribes its claim and runs slower, so
+give it the count to use, for example `pytest -n 2` rather than `pytest -n auto`.
 
 Output is relayed from Cloud Logging: the command's standard output and standard error as the
 job's output, and what Cloud Run itself reports about the job on standard error. A line the
