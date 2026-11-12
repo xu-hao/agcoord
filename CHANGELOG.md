@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## 0.8.0 — 2026-11-12
 
+- A 0.8 client commands only a 0.8 broker. Overflow pools need the broker's new scheduler,
+  configuration section, and placement table, so the client's supported-broker line moves from
+  0.7 to 0.8; upgrade the client and the native host package together. The on-disk protocol is
+  unchanged and stays 5, and the broker adds its placement table itself, so no spool migration
+  is required (#291).
 - Add overflow pools: an `overflow_pools` list in `config.json` names extra capacity on another
   machine or an ephemeral cloud machine, reached through a configured executor command. A job
   submitted with the new `--overflow` option that has waited past a pool's `wait_threshold` for
