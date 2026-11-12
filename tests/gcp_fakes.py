@@ -68,7 +68,35 @@ verb = argv[:3]
 if argv[:2] == ["auth", "print-access-token"]:
     print("fake-access-token")
 elif argv[:2] == ["logging", "read"]:
-    print(json.dumps(next_of("logs", [[]])))
+    import re
+    from datetime import datetime, timezone
+    query = argv[2] if len(argv) > 2 else ""
+
+    def stamp_key(raw):
+        match = re.fullmatch(
+            r"(\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}:\\d{{2}})(?:\\.(\\d+))?(Z|[+-]\\d{{2}}:\\d{{2}})",
+            raw,
+        )
+        if not match:
+            return (0, 0)
+        whole, fraction, zone = match.groups()
+        offset = "+00:00" if zone == "Z" else zone
+        dt = datetime.fromisoformat(whole + offset).astimezone(timezone.utc)
+        nanos = int((fraction or "").ljust(9, "0")[:9])
+        return (int(dt.timestamp()), nanos)
+
+    min_ts = re.search(r'\\btimestamp>="([^"]+)"', query)
+    min_rx = re.search(r'\\breceiveTimestamp>="([^"]+)"', query)
+    selected = []
+    for item in next_of("logs", [[]]):
+        if min_ts and "timestamp" in item and stamp_key(item["timestamp"]) < stamp_key(min_ts.group(1)):
+            continue
+        if min_rx and "receiveTimestamp" in item and stamp_key(item["receiveTimestamp"]) < stamp_key(min_rx.group(1)):
+            continue
+        selected.append(item)
+    if "--order=asc" in argv:
+        selected.sort(key=lambda item: stamp_key(item.get("timestamp", "")))
+    print(json.dumps(selected))
 
 # --- Batch
 elif verb == ["batch", "jobs", "submit"]:
