@@ -170,9 +170,11 @@ publish anything that reaches it, then rebuild the request as a fresh branch fro
 target and land it with `--no-target-sync`. The coordinator guide describes the
 [avoided-commit refusal](coordinator.md#avoided-commits-after-a-target-rewrite).
 
-Landing repository work does not authorize a package upload. Upload an AGCoord
-distribution to PyPI only when the user explicitly requests it; permission to implement,
-test, commit, push, open or merge a pull request, tag, or create a GitHub release is not
-upload permission. Follow the [release guide](releasing.md) for the exact procedure.
+Landing repository work does not authorize cutting or publishing a release. Publish an
+AGCoord release only when the user explicitly requests it; permission to implement, test,
+commit, push, or open or merge a pull request is not release permission. When a release is
+explicitly requested, publish the PyPI upload and the matching GitHub release together so
+neither channel is left without the other. Follow the [release guide](releasing.md) for
+the exact procedure.
 
 Remove the merged ticket worktree and branch only after publication succeeds.
