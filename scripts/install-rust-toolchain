@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Install the Rust toolchain rust-toolchain.toml pins, with every component and target it names,
+# from a clean state.
+#
+# A runner image can carry a partly installed copy of the pinned toolchain. rustup then tries to
+# repair it and fails on files its records do not cover ("detected conflict: 'bin/cargo-clippy'").
+# So any existing copy is removed first, and everything rust-toolchain.toml names is installed in
+# this one step, leaving nothing for the first cargo command to install implicitly. A failed
+# install, such as an interrupted download, is retried from a clean state.
+#
+#   install-rust-toolchain
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+pin="$repository/rust-toolchain.toml"
+attempts=${AGCOORD_RUST_INSTALL_ATTEMPTS:-3}
+retry_delay=${AGCOORD_RUST_INSTALL_RETRY_DELAY:-10}
+
+value() {
+    sed -n "s/^$1 *= *\"\\([^\"]*\\)\"\$/\\1/p" "$pin"
+}
+
+list() {
+    sed -n "s/^$1 *= *\\[\\(.*\\)\\]\$/\\1/p" "$pin" | tr -d ' "'
+}
+
+channel=$(value channel)
+profile=$(value profile)
+components=$(list components)
+targets=$(list targets)
+if [[ -z "$channel" ]]; then
+    printf 'cannot read the toolchain channel from %s\n' "$pin" >&2
+    exit 2
+fi
+
+arguments=(toolchain install "$channel" --profile "${profile:-minimal}")
+[[ -n "$components" ]] && arguments+=(--component "$components")
+[[ -n "$targets" ]] && arguments+=(--target "$targets")
+
+# rustup consults rust-toolchain.toml in the working directory, which could make it install the
+# toolchain implicitly before this script has cleaned up; run it from elsewhere.
+cd /
+home=$(rustup show home)
+
+remove_existing() {
+    rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+    # A partly installed toolchain may not uninstall; remove what is left of it directly.
+    rm -rf "$home/toolchains/$channel"-* "$home/update-hashes/$channel"-*
+}
+
+attempt=1
+while true; do
+    remove_existing
+    if rustup "${arguments[@]}"; then
+        exit 0
+    fi
+    if (( attempt >= attempts )); then
+        printf 'could not install Rust %s after %d attempts\n' "$channel" "$attempt" >&2
+        exit 1
+    fi
+    printf 'installing Rust %s failed; retrying from a clean state (%d of %d)\n' \
+        "$channel" "$attempt" "$attempts" >&2
+    attempt=$((attempt + 1))
+    sleep "$retry_delay"
+done
