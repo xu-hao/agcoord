@@ -79,6 +79,16 @@ if argv[0] == "login":
     )
 with open(state / "docker.log", "a", encoding="utf-8") as log:
     log.write(json.dumps(record) + "\\n")
+if argv[0] == "login":
+    # Docker answers every login into a plain configuration file with this warning.
+    sys.stderr.write(
+        "\\nWARNING! Your credentials are stored unencrypted in '"
+        + record["config"] + "/config.json'.\\n"
+        "Configure a credential helper to remove this warning.\\n\\n"
+    )
+    if (state / "login-fails").exists():
+        sys.stderr.write("Error response from daemon: login denied for this account\\n")
+        raise SystemExit(1)
 if argv[0] == "build" and argv[-1] == "-":
     (state / "context.tar").write_bytes(sys.stdin.buffer.read())
     print("sha256:" + "cd" * 32)
@@ -316,6 +326,28 @@ def test_the_registry_login_never_touches_the_operator_container_configuration(c
     # Building uses the operator's own configuration, as any local build would.
     builds = [record for record in records if record["argv"][0] == "build"]
     assert {record["config"] for record in builds} == {"/operator/docker-config"}
+
+
+def test_a_successful_registry_login_adds_nothing_to_the_job_log(cloud: Cloud):
+    completed = cloud.run("true")
+
+    assert completed.returncode == 0, completed.stderr
+    # The token lives in a private directory that is removed after the push, so the
+    # container tool's advice about storing credentials does not apply to the operator.
+    assert "stored unencrypted" not in completed.stderr
+    assert "credential helper" not in completed.stderr
+
+
+def test_a_refused_registry_login_shows_what_the_container_tool_said(cloud: Cloud):
+    cloud.state.joinpath("login-fails").touch()
+
+    completed = cloud.run("true")
+
+    assert completed.returncode == 125
+    assert "cannot log in to us-central1-docker.pkg.dev" in completed.stderr
+    assert "login denied for this account" in completed.stderr
+    assert not any(record["argv"][0] == "push" for record in cloud.docker())
+    assert not any(call[:3] == ["batch", "jobs", "submit"] for call in cloud.gcloud())
 
 
 def test_a_failing_command_exit_status_is_the_executor_exit_status(cloud: Cloud):
