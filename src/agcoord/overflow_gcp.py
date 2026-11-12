@@ -7,6 +7,7 @@ the executors hold no credentials of their own and add no Python dependencies.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,26 @@ from agcoord.overflow_image import ExecutorError, RepositoryOverflow, build_job_
 #: ``packaging/terraform/gcp-overflow`` module match these names.
 TOOLCHAIN_PACKAGE = "toolchain"
 JOB_PACKAGE = "run"
+_RFC3339 = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _parse_rfc3339(raw: str) -> datetime | None:
+    """Parse an RFC 3339 timestamp to UTC whole seconds, including on Python 3.10."""
+    match = _RFC3339.fullmatch(raw.strip())
+    if match is None:
+        return None
+    whole, zone = match.groups()
+    offset = "+00:00" if zone == "Z" else zone
+    try:
+        return datetime.fromisoformat(f"{whole}{offset}").astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _format_rfc3339(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class Gcloud:
@@ -71,12 +92,18 @@ class Gcloud:
             ) from exc
 
 
+#: Lookback applied to ``receiveTimestamp`` so shards indexed moments apart are not missed.
+RECEIVE_LOOKBACK_SECONDS = 30
+
+
 class LogRelay:
     """Print the Cloud Logging entries of one job as they arrive.
 
-    Cloud Logging is read by polling.  Each read starts at the time of the last entry
-    seen, so an entry can be returned twice and is printed once.  Entries are delivered
-    seconds late, which is why callers keep reading for a moment after a job ends.
+    Cloud Logging is read by polling.  ``timestamp>=`` stays anchored at the job's start
+    so buffered lines or entries indexed out of emission-timestamp order are never skipped,
+    while ``receiveTimestamp>=`` moves forward with a lookback window and ``insertId``
+    deduplication prints each entry once.  Entries are delivered seconds late, which is why
+    callers keep reading for a moment after a job ends.
     """
 
     def __init__(
@@ -89,7 +116,8 @@ class LogRelay:
         self.gcloud = gcloud
         self.log_filter = log_filter
         self.is_output = is_output
-        self._cursor = since or "1970-01-01T00:00:00Z"
+        self._since = since or "1970-01-01T00:00:00Z"
+        self._latest_received: datetime | None = None
         self._seen: set[str] = set()
 
     def relay(self) -> int:
@@ -99,21 +127,30 @@ class LogRelay:
         platform logged about the job goes to standard error, so it reaches the job's log
         without being mistaken for the command's output.
         """
+        query = f'{self.log_filter} AND timestamp>="{self._since}"'
+        if self._latest_received is not None:
+            lookback = self._latest_received - timedelta(seconds=RECEIVE_LOOKBACK_SECONDS)
+            query += f' AND receiveTimestamp>="{_format_rfc3339(lookback)}"'
         entries = self.gcloud.json(
             "logging",
             "read",
-            f'{self.log_filter} AND timestamp>="{self._cursor}"',
+            query,
             "--order=asc",
         )
         printed = 0
         for entry in entries if isinstance(entries, list) else []:
             if not isinstance(entry, dict):
                 continue
+            received = _parse_rfc3339(str(entry.get("receiveTimestamp") or ""))
+            if received is not None and (
+                self._latest_received is None or received > self._latest_received
+            ):
+                self._latest_received = received
             identity = str(entry.get("insertId") or "")
-            if identity in self._seen:
-                continue
-            self._seen.add(identity)
-            self._cursor = str(entry.get("timestamp") or self._cursor)
+            if identity:
+                if identity in self._seen:
+                    continue
+                self._seen.add(identity)
             if isinstance(entry.get("textPayload"), str):
                 text = entry["textPayload"]
             elif entry.get("jsonPayload") is not None:
@@ -131,8 +168,10 @@ class LogRelay:
 
 #: Consecutive failed checks of a job's state after which contact counts as lost.
 LOST_CONTACT_CHECKS = 12
-#: Extra reads of a job's output after it ends, because Cloud Logging delivers entries late.
+#: Minimum post-finish reads so entries indexed seconds after exit are not missed.
 LOG_DRAIN_READS = 3
+#: Upper bound on post-finish reads when output continues arriving across polls.
+MAX_LOG_DRAIN_READS = 6
 
 
 def follow_job(
@@ -169,13 +208,14 @@ def follow_job(
             relay()
         except ExecutorError:
             pass
-    for _ in range(LOG_DRAIN_READS):
+    for drain_index in range(MAX_LOG_DRAIN_READS):
         time.sleep(poll_interval)
         try:
-            if relay() == 0:
-                break
+            printed = relay()
         except ExecutorError:
             say("some of the job's output could not be read from Cloud Logging")
+            break
+        if drain_index + 1 >= LOG_DRAIN_READS and printed == 0:
             break
     return current
 

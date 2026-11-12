@@ -407,3 +407,28 @@ def test_gcloud_progress_reports_stay_out_of_the_job_log(cloud: Cloud):
     for line in GCLOUD_PROGRESS.splitlines():
         assert line not in completed.stderr
     assert "console.cloud.google.com" not in completed.stderr
+
+
+def test_buffered_stdout_flushed_after_later_stderr_is_not_dropped(cloud: Cloud):
+    unbuffered_stderr = {
+        "insertId": "err-1",
+        "timestamp": "2026-11-11T00:00:25Z",
+        "receiveTimestamp": "2026-11-11T00:00:26Z",
+        "logName": f"projects/{PROJECT}/logs/{STDERR}",
+        "textPayload": "progress on stderr",
+    }
+    buffered_stdout = {
+        "insertId": "out-1",
+        "timestamp": "2026-11-11T00:00:03Z",
+        "receiveTimestamp": "2026-11-11T00:00:45Z",
+        "logName": f"projects/{PROJECT}/logs/{STDOUT}",
+        "textPayload": "buffered stdout from start of run",
+    }
+    cloud.answer("states", ["RUNNING", "RUNNING", "SUCCEEDED"])
+    cloud.answer("logs", [[unbuffered_stderr], [buffered_stdout], []])
+
+    completed = cloud.run("python", "-m", "pytest", "-q")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "progress on stderr\n" in completed.stdout
+    assert "buffered stdout from start of run\n" in completed.stdout
