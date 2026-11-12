@@ -13,7 +13,9 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
+import signal
 import subprocess
 import tarfile
 from typing import IO, Mapping, Sequence
@@ -25,8 +27,49 @@ WORKSPACE = "/workspace"
 EXIT_NO_VERDICT = 125
 
 
+#: The exit status of a job stopped at its runtime limit, as ``timeout`` reports it.
+EXIT_RUNTIME_EXCEEDED = 124
+
+
 class ExecutorError(RuntimeError):
     """A failure that prevents the executor from obtaining the command's verdict."""
+
+
+class Stopped(Exception):
+    """The broker asked this executor to stop."""
+
+
+def stop_on_signals() -> None:
+    """Turn the broker's stop signal into :class:`Stopped` in the main thread."""
+
+    def stop(_signal: int, _frame: object) -> None:
+        raise Stopped()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+
+def ignore_stop_signals() -> None:
+    """Let cleanup proceed once a stop has been accepted."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def run_detached(commands: Sequence[Sequence[str]]) -> None:
+    """Run cleanup commands in order from a process that outlives this executor.
+
+    A stopping broker kills the executor's whole process group shortly after signalling
+    it, which can be sooner than one round trip to another machine.  Cleanup that must
+    still happen is therefore handed to a process in its own session.
+    """
+    script = "; ".join(f"{shlex.join(command)} >/dev/null 2>&1" for command in commands)
+    subprocess.Popen(
+        ["sh", "-c", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -219,8 +262,31 @@ def container_limits(
     return limits
 
 
-def placement(environment: Mapping[str, str]) -> tuple[str, int, ContainerLimits]:
-    """Read the run ID, runtime limit, and limits the broker gave a placed job's executor."""
+@dataclass(frozen=True)
+class Placement:
+    """What the broker told an executor about the placed job it must run."""
+
+    run_id: str
+    max_runtime: int
+    resources: Mapping[str, int]
+    limits: ContainerLimits
+
+    def machine_cpus(self) -> int | None:
+        """CPUs a machine created for this job needs.
+
+        An enforced CPU claim decides it.  Otherwise the claim named ``cpu`` does, by the
+        same convention the pool's budget uses, so that a job whose claims are only
+        admission units still gets a machine of the size it asked for.
+        """
+        return self.limits.cpus or self.resources.get("cpu")
+
+    def machine_memory(self) -> int | None:
+        """Bytes of memory a machine created for this job needs, by the same rule."""
+        return self.limits.memory or self.resources.get("memory")
+
+
+def placement(environment: Mapping[str, str]) -> Placement:
+    """Read the run ID, runtime limit, and claims the broker gave a placed job's executor."""
     try:
         run_id = environment["AGCOORD_RUN_ID"]
         max_runtime = int(environment["AGCOORD_OVERFLOW_MAX_RUNTIME"])
@@ -233,7 +299,12 @@ def placement(environment: Mapping[str, str]) -> tuple[str, int, ContainerLimits
         ) from exc
     if max_runtime <= 0 or not isinstance(resources, dict) or not isinstance(contract, dict):
         raise ExecutorError("the broker's overflow placement is invalid")
-    return run_id, max_runtime, container_limits(resources, contract)
+    return Placement(
+        run_id=run_id,
+        max_runtime=max_runtime,
+        resources=resources,
+        limits=container_limits(resources, contract),
+    )
 
 
 def container_tool(preferred: str | None = None) -> str:
@@ -267,6 +338,24 @@ def build_toolchain(tool: str, root: Path, config: RepositoryOverflow) -> str:
     if subprocess.run([tool, "tag", image_id, reference]).returncode != 0:
         raise ExecutorError("cannot tag the toolchain image")
     return reference
+
+
+def build_job_image(tool: str, root: Path, toolchain: str, image: str) -> int:
+    """Build the job's image on this machine and return the number of source files in it."""
+    build = subprocess.Popen(
+        [tool, "build", "-q", "-t", image, "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+    )
+    assert build.stdin is not None
+    try:
+        count = write_build_context(root, toolchain, build.stdin)
+        build.stdin.close()
+    except BrokenPipeError:
+        count = 0
+    if build.wait() != 0:
+        raise ExecutorError("cannot build the job's image")
+    return count
 
 
 def command_line(arguments: Sequence[str]) -> list[str]:
