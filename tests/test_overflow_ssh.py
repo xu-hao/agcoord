@@ -306,3 +306,22 @@ def test_stopping_the_executor_removes_the_remote_container(destination: Destina
         if process.poll() is None:
             process.kill()
         process.communicate()
+
+
+def test_a_configured_build_context_is_passed_to_the_toolchain_build(destination: Destination):
+    (destination.repository / ".agcoord" / "overflow.json").write_text(
+        json.dumps({"dockerfile": ".agcoord/Dockerfile", "context": "."}),
+        encoding="utf-8",
+    )
+
+    completed = destination.run("true")
+
+    assert completed.returncode == 0, completed.stderr
+    local = destination.calls(remote=False)
+    assert local[0] == [
+        "build",
+        "-q",
+        "-f",
+        str(destination.repository / ".agcoord" / "Dockerfile"),
+        str(destination.repository.resolve()),
+    ]

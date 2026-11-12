@@ -869,6 +869,80 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
         running.stop()
 
 
+def test_overflow_submission_validates_dockerfile_build_context(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    executor = tmp_path / "executor"
+    executor.write_text(
+        "#!/bin/sh\n"
+        'while [ "$1" != -- ]; do shift; done\n'
+        "shift\n"
+        'exec "$@"\n',
+        encoding="utf-8",
+    )
+    executor.chmod(0o755)
+    write_broker_config(
+        state_dir,
+        overflow_pools=[
+            {
+                "name": "elsewhere",
+                "capacities": {"jobs": 1, "cpu": 4},
+                "executor": [str(executor)],
+                "max_runtime": 60,
+            }
+        ],
+    )
+    running = RunningCoordinator(state_dir, capacities={"jobs": 1, "cpu": 2})
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repository / ".agcoord").mkdir()
+    (repository / ".agcoord" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (repository / "file.txt").write_text("not a dir\n", encoding="utf-8")
+    (repository / "escape").symlink_to(outside)
+    command = _python("None")
+    try:
+        for invalid in (
+            {"image": "example/toolchain:1", "context": "."},
+            {"dockerfile": ".agcoord/Dockerfile", "context": ".."},
+            {"dockerfile": ".agcoord/Dockerfile", "context": "escape"},
+            {"dockerfile": ".agcoord/Dockerfile", "context": "file.txt"},
+            {"dockerfile": ".agcoord/Dockerfile", "context": str(repository)},
+            {"dockerfile": ".agcoord/Dockerfile", "context": ""},
+        ):
+            (repository / ".agcoord" / "overflow.json").write_text(
+                json.dumps(invalid),
+                encoding="utf-8",
+            )
+            with pytest.raises(CoordinatorError, match="overflow.json"):
+                client.submit(
+                    command,
+                    checkout=str(repository),
+                    resources={"cpu": 4},
+                    caller_pid=os.getpid(),
+                    environment=caller_environment(),
+                    overflow=True,
+                )
+        assert client.snapshot()["queued"] == []
+
+        (repository / ".agcoord" / "overflow.json").write_text(
+            json.dumps({"dockerfile": ".agcoord/Dockerfile", "context": "."}),
+            encoding="utf-8",
+        )
+        run_id = client.submit(
+            command,
+            checkout=str(repository),
+            resources={"cpu": 4},
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+            overflow=True,
+        )
+        row = _row(client, run_id, "passed")
+        assert row["pool"] == "elsewhere"
+    finally:
+        running.stop()
+
+
 def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: Path):
     running = RunningCoordinator(
         tmp_path / "state",

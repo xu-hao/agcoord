@@ -390,12 +390,20 @@ A repository declares that its jobs can run away from this machine with one file
 ```
 
 ```json
+{"dockerfile": ".agcoord/Dockerfile", "context": "."}
+```
+
+```json
 {"image": "registry.example/team/toolchain:2026-11"}
 ```
 
-`dockerfile` is a path inside the repository; the toolchain image is built from it on this
-machine with Docker or Podman, using the Dockerfile's directory as build context and the tool's
-own layer cache. `image` names a prebuilt image instead. Because the file is part of the
+`dockerfile` is a relative path inside the repository; the toolchain image is built from it on
+this machine with Docker or Podman, using the optional relative `context` directory inside the
+repository (or the Dockerfile's directory when `context` is omitted) as build context and the
+tool's own layer cache. The container tool reads `context` directly (honoring `.dockerignore` or
+`.containerignore`), so a toolchain Dockerfile with a wider context should `COPY` only specific
+tracked files such as a dependency lockfile rather than `.`. `image` names a prebuilt image
+instead and cannot be combined with `context`. Because the file is part of the
 checkout, a branch that changes its toolchain changes it in the same commit. `--overflow` is
 refused at submission, before anything is queued, when the checkout has no valid file.
 
