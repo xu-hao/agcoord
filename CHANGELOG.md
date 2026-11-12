@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Keep Google Cloud overflow job logs from dropping lines that Cloud Logging indexes or flushes
+  out of emission-timestamp order, or that become readable a few seconds after a fast job finishes
+  (#297).
+
 ## 0.8.0 — 2026-11-12
 
 - A 0.8 client commands only a 0.8 broker. Overflow pools need the broker's new scheduler,
