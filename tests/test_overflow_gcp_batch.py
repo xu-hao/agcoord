@@ -18,6 +18,7 @@ import tarfile
 import pytest
 
 from gcp_fakes import (
+    GCLOUD_PROGRESS,
     JOB_IMAGE,
     JOB_IMAGE_DIGEST,
     MEMORY,
@@ -190,7 +191,7 @@ def test_a_job_that_cannot_be_submitted_is_no_verdict_and_leaves_no_image(cloud:
     completed = cloud.run("true")
 
     assert completed.returncode == 125
-    assert "batch jobs submit failed" in completed.stderr
+    assert "batch jobs submit failed: ERROR: (gcloud) fake gcloud failure" in completed.stderr
     assert cloud.wait_for_gcloud("artifacts", "docker", "images", "delete")
 
 
@@ -292,3 +293,15 @@ def test_it_refuses_a_registry_that_is_not_an_artifact_registry_path(cloud: Clou
     assert completed.returncode == 125
     assert "--registry" in completed.stderr
     assert cloud.gcloud() == []
+
+
+def test_gcloud_progress_reports_stay_out_of_the_job_log(cloud: Cloud):
+    completed = cloud.run("true")
+
+    assert completed.returncode == 0, completed.stderr
+    # The executor's standard error is the job's log.  What gcloud says while it works
+    # is not about the job, and its console links name the project.
+    assert cloud.gcloud()
+    for line in GCLOUD_PROGRESS.splitlines():
+        assert line not in completed.stderr
+    assert "console.cloud.google.com" not in completed.stderr

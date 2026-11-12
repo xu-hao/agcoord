@@ -42,8 +42,11 @@ def next_of(name, default):
     return answers[0]
 
 
+PROGRESS = {progress!r}
+
+
 def fail():
-    sys.stderr.write("fake gcloud failure\\n")
+    sys.stderr.write("ERROR: (gcloud) fake gcloud failure\\n")
     raise SystemExit(1)
 
 
@@ -56,6 +59,10 @@ if flaky.exists():
         plan["times"] -= 1
         flaky.write_text(json.dumps(plan))
         fail()
+
+
+# Like the real gcloud, report progress on standard error even with --quiet.
+sys.stderr.write(PROGRESS)
 
 verb = argv[:3]
 if argv[:2] == ["auth", "print-access-token"]:
@@ -161,6 +168,12 @@ JOB_IMAGE = f"{REGISTRY}/run:{RUN_ID}"
 JOB_IMAGE_DIGEST = f"{REGISTRY}/run@sha256:" + "12" * 32
 TOOLCHAIN_IMAGE = f"{REGISTRY}/toolchain:" + ("ab" * 32)[:24]
 MEMORY = 3 * 1024**3
+#: What the real gcloud prints on standard error while it works, even with --quiet.
+GCLOUD_PROGRESS = (
+    "Creating Cloud Run job [agcoord-run]... Done.\n"
+    "To execute this job, use: gcloud run jobs execute agcoord-run\n"
+    "View details: https://console.cloud.google.com/run/jobs?project=123456789012\n"
+)
 ADMISSION_ONLY = {
     "backend": None,
     "kind": "generic",
@@ -196,7 +209,9 @@ class Cloud:
         self.bin.mkdir()
         for name, body in (("gcloud", FAKE_GCLOUD), ("docker", FAKE_DOCKER)):
             path = self.bin / name
-            path.write_text(body.format(python=sys.executable), encoding="utf-8")
+            path.write_text(
+                body.format(python=sys.executable, progress=GCLOUD_PROGRESS), encoding="utf-8"
+            )
             path.chmod(0o755)
         self.repository = tmp_path / "repository"
         self.repository.mkdir()
