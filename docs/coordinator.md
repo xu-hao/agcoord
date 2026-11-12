@@ -447,7 +447,7 @@ and an identity for the job machines. The Terraform module in
 `packaging/terraform/gcp-overflow/` provides them as infrastructure as code. It manages:
 
 - the project and its billing link, with deletion prevented;
-- the Artifact Registry, Batch, Compute Engine, Cloud Logging, and IAM APIs;
+- the Artifact Registry, Batch, Cloud Run, Compute Engine, Cloud Logging, and IAM APIs;
 - one Docker repository in Artifact Registry, whose cleanup policies delete images under the
   `run` package after `job_image_retention_days` (default 2) and under the `toolchain` package
   after `toolchain_image_retention_days` (default 30). An executor deletes a job's image itself
@@ -537,6 +537,55 @@ failure that is Batch's rather than the command's, such as a preempted Spot mach
 could not be submitted, or an image that could not be pushed, exits 125, so the run ends without
 a verdict. When the job ends or is stopped, the Batch job, the pushed job image, and the local
 job image are deleted; deleting the Batch job is what stops its machine.
+
+Both Google Cloud executors keep following a job through `gcloud` calls that fail for a while:
+a failed check of the job's state is repeated at the next poll, and only twelve failures in a
+row end the run without a verdict.
+
+#### GCP Cloud Run executor
+
+`agc overflow-gcp-run` runs a placed job as a Cloud Run job that exists only for that run. It
+takes the same project, region, registry, and service account as the Batch executor, and starts
+sooner than a Batch machine, but Cloud Run is smaller and limits less:
+
+```json
+{
+  "name": "cloud-run",
+  "capacities": {"jobs": 8, "cpu": 32, "memory": 137438953472, "tmpfs": 34359738368},
+  "max_claim": {"cpu": 8, "memory": 34359738368},
+  "executor": [
+    "agc", "overflow-gcp-run",
+    "--project", "my-overflow-project",
+    "--region", "us-central1",
+    "--registry", "us-central1-docker.pkg.dev/my-overflow-project/agcoord-overflow",
+    "--service-account", "agcoord-overflow-runner@my-overflow-project.iam.gserviceaccount.com"
+  ],
+  "wait_threshold": 120,
+  "max_runtime": 3600
+}
+```
+
+One Cloud Run job gets at most 8 CPUs and 32 GiB of memory, so give the pool a `max_claim` that
+says so; a larger job then goes to the next pool instead of failing here. Cloud Run can enforce
+only `cpu`, `memory`, and `tmpfs` claims. A limit on `swap` always holds, because Cloud Run has
+none. A `required` claim of any other kind, such as an inode or process limit, is refused with
+exit status 125 before anything is built, so list in the pool's `capacities` only the resources
+Cloud Run provides: a job that claims anything else is then never placed here.
+
+The executor chooses the smallest Cloud Run size that holds the claim, from 1, 2, 4, 6, or 8
+CPUs. Scratch space is held in memory on Cloud Run, so a `tmpfs` claim becomes sized in-memory
+scratch space at `/tmp` and is added to the memory the job is given. A job that claims no memory
+gets the most its CPU count allows, 4 GiB for each CPU; claim memory to pay for less. The job
+carries the pool's `max_runtime` as its own timeout and is created to never retry, and the
+executor reads the created job back and refuses to execute one that Cloud Run would retry.
+
+Output is relayed from Cloud Logging: the command's standard output and standard error as the
+job's output, and what Cloud Run itself reports about the job on standard error. A line the
+command printed as JSON is relayed as JSON. The executor exits with the command's status. When
+Cloud Run ends the job without an exit status from the command, for example at a memory limit,
+the executor exits 125 and the run ends without a verdict. When the job ends, the Cloud Run job
+and both copies of the job's image are deleted; when it is stopped, its execution is cancelled
+first.
 
 ### Delegated cgroup v2 lifecycle
 

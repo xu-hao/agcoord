@@ -27,17 +27,22 @@ import os
 from pathlib import Path
 import signal
 import sys
-import time
 from typing import Sequence
 
-from agcoord.overflow_gcp import Gcloud, Registry, resource_name
+from agcoord.overflow_gcp import (
+    Gcloud,
+    LogRelay,
+    Registry,
+    follow_job,
+    publish_job_image,
+    resource_name,
+)
 from agcoord.overflow_image import (
     EXIT_NO_VERDICT,
     EXIT_RUNTIME_EXCEEDED,
     ExecutorError,
     Placement,
     Stopped,
-    build_job_image,
     build_toolchain,
     command_line,
     container_tool,
@@ -56,8 +61,6 @@ BATCH_RESERVED = 50000
 #: The reserved code for a task that ran past ``maxRunDuration``.
 BATCH_RUNTIME_EXCEEDED = 50005
 FINISHED = {"SUCCEEDED", "FAILED", "CANCELLED", "DELETION_IN_PROGRESS"}
-#: Extra log reads after the job ends, because Cloud Logging delivers entries late.
-LOG_DRAIN_READS = 3
 
 
 @dataclass(frozen=True)
@@ -143,9 +146,7 @@ class BatchJob:
         self.name = name
         self.path = f"projects/{gcloud.project}/locations/{region}/jobs/{name}"
         self.uid = ""
-        self.created = ""
-        self._seen: set[str] = set()
-        self._cursor = ""
+        self.output: LogRelay | None = None
 
     def submit(self, config: dict[str, object]) -> None:
         job = self.gcloud.json(
@@ -160,7 +161,11 @@ class BatchJob:
         if not isinstance(job, dict) or not job.get("uid"):
             raise ExecutorError("Batch accepted the job without returning its identity")
         self.uid = str(job["uid"])
-        self._cursor = self.created = str(job.get("createTime") or "1970-01-01T00:00:00Z")
+        self.output = LogRelay(
+            self.gcloud,
+            f'labels.job_uid="{self.uid}" AND log_id("batch_task_logs")',
+            str(job.get("createTime") or ""),
+        )
 
     def state(self) -> str:
         job = self.gcloud.json("batch", "jobs", "describe", self.path)
@@ -170,26 +175,7 @@ class BatchJob:
 
     def relay_output(self) -> int:
         """Print the output lines that have arrived since the last call; return how many."""
-        entries = self.gcloud.json(
-            "logging",
-            "read",
-            f'labels.job_uid="{self.uid}" AND log_id("batch_task_logs") '
-            f'AND timestamp>="{self._cursor}"',
-            "--order=asc",
-        )
-        printed = 0
-        for entry in entries if isinstance(entries, list) else []:
-            identity = str(entry.get("insertId") or "")
-            if identity in self._seen:
-                continue
-            self._seen.add(identity)
-            self._cursor = str(entry.get("timestamp") or self._cursor)
-            text = entry.get("textPayload")
-            if isinstance(text, str):
-                sys.stdout.write(text if text.endswith("\n") else text + "\n")
-                printed += 1
-        sys.stdout.flush()
-        return printed
+        return self.output.relay() if self.output is not None else 0
 
     def exit_status(self) -> int:
         """Return the command's exit status, or report that Batch produced no verdict."""
@@ -298,37 +284,23 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
 
         toolchain = build_toolchain(tool, root, config)
-        image = registry.job_image(placed.run_id)
-        count = build_job_image(tool, root, toolchain, image)
-        cleanup.append(registry.local_delete_command([image]))
-        _say(f"built the job image from {count} source files")
-        with registry.login() as environment:
-            if config.dockerfile is not None:
-                # Keeping the toolchain in the registry under its own name means later
-                # jobs upload only their source layer.
-                published = registry.toolchain_image(toolchain)
-                registry.tag(toolchain, published)
-                registry.push(published, environment)
-            cleanup.append(registry.remote_delete_command(image))
-            reference = registry.push(image, environment)
+        reference, count = publish_job_image(
+            registry, root, config, toolchain, placed.run_id, cleanup
+        )
+        _say(f"pushed the job image, built from {count} source files")
 
         job = BatchJob(gcloud, args.region, resource_name("agcoord", placed.run_id))
         cleanup.append(job.delete_command())
         job.submit(job_config(image=reference, command=command, placed=placed, options=options))
         _say(f"submitted Batch job {job.name}; waiting for a machine")
 
-        state = ""
-        while state not in FINISHED:
-            time.sleep(options.poll_interval)
-            observed = job.state()
-            if observed != state:
-                state = observed
-                _say(f"job is {state}")
-            job.relay_output()
-        for _ in range(LOG_DRAIN_READS):
-            time.sleep(options.poll_interval)
-            if job.relay_output() == 0:
-                break
+        state = follow_job(
+            state=job.state,
+            relay=job.relay_output,
+            finished=FINISHED,
+            poll_interval=options.poll_interval,
+            say=_say,
+        )
         if state == "SUCCEEDED":
             status = 0
         elif state == "FAILED":
