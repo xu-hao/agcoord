@@ -507,7 +507,7 @@ def test_run_and_full_parse_repeatable_resources_and_follow_the_durable_job(
     assert metadata["kind"] == ("full" if command_kind == "full" else "check")
     assert metadata["label"] == "behavior check"
     assert metadata["resources"] == {"cpu": 2, "browser": 1}
-    assert metadata["overflow"] is False
+    assert metadata["overflow"] is None
     expected_id = "full-new" if command_kind == "full" else "check-new"
     assert expected_id in output.getvalue()
     assert fake_client["follow"][-1][1] == expected_id
@@ -519,6 +519,26 @@ def test_run_allows_overflow_only_when_the_submitter_asks(fake_client, tmp_path:
     cli.run(args, out=StringIO())
 
     assert fake_client["submitted"][-1][1]["overflow"] is True
+
+
+@pytest.mark.parametrize("kind", ["run", "full", "land"])
+@pytest.mark.parametrize("option, expected", [(None, None), ("--overflow", True), ("--no-overflow", False)])
+def test_submission_overflow_options_reach_client(fake_client, tmp_path, kind, option, expected):
+    arguments = [kind] + (["123"] if kind == "land" else [])
+    arguments += ["--checkout", str(tmp_path)]
+    if option:
+        arguments.append(option)
+    arguments += ["--", "true"]
+    cli.run(_args(*arguments), out=StringIO())
+    entry = fake_client["landed"][-1][3] if kind == "land" else fake_client["submitted"][-1][1]
+    assert entry["overflow"] is expected
+
+
+@pytest.mark.parametrize("kind", ["run", "full", "land"])
+def test_overflow_options_are_mutually_exclusive(kind):
+    arguments = [kind] + (["123"] if kind == "land" else [])
+    with pytest.raises(SystemExit):
+        _args(*arguments, "--overflow", "--no-overflow", "--", "true")
 
 
 @pytest.mark.parametrize(

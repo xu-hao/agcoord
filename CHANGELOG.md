@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Enable overflow eligibility by default for `run`, `full`, and `land` when the checkout has a
+  valid `.agcoord/overflow.json`; add `--no-overflow` to keep a job local, and refuse invalid
+  declarations before submission (#311 — enable overflow by default when the repository declares it, with an opt-out).
+
 ## 0.8.2 — 2026-11-13
 
 - Allow `agc resume <drain-id>` to cancel an in-progress `draining` state without stopping
