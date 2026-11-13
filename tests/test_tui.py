@@ -5,13 +5,19 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
 
 from agcoord.queue import CoordinatorError, NATIVE_PROTOCOL
+from conftest import RunningCoordinator, caller_environment, wait_for
 
 
 textual = pytest.importorskip("textual", reason="the TUI dependency is not installed")
@@ -279,6 +285,80 @@ def _screen_text(app) -> str:
 
 def _widget_text(widget: Static) -> str:
     return str(widget.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["list", "show", "tui"])
+async def test_front_row_reservation_is_visible_in_public_views(tmp_path: Path, surface: str):
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "-c", "user.name=AGCoord test",
+            "-c", "user.email=agcoord@example.invalid", "commit", "-q",
+            "--allow-empty", "-m", "initial",
+        ],
+        check=True,
+    )
+    state = tmp_path / "state"
+    gib = 1024**3
+    running = RunningCoordinator(state, capacities={"jobs": 24, "cpu": 24, "tmpfs": 16 * gib})
+    client = running.start()
+    release = tmp_path / "release"
+
+    def submit(label: str, cpu: int, tmpfs: int, *, kind: str = "check") -> str:
+        entered = tmp_path / label
+        return client.submit(
+            [
+                sys.executable, "-c",
+                "import pathlib,sys,time\npathlib.Path(sys.argv[1]).touch()\n"
+                "while not pathlib.Path(sys.argv[2]).exists():\n    time.sleep(0.02)\n",
+                str(entered), str(release),
+            ],
+            checkout=str(checkout),
+            kind=kind,
+            label=label,
+            resources={"cpu": cpu, "tmpfs": tmpfs},
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+        )
+
+    try:
+        submit("active", 10, 6 * gib)
+        wait_for((tmp_path / "active").exists, "the active check never started")
+        front_id = submit("front", 16, 12 * gib, kind="full")
+        later_id = submit("later", 2, 2 * gib)
+        reasons = [f"reservation:{front_id}:cpu", f"reservation:{front_id}:tmpfs"]
+        if surface in {"list", "show"}:
+            arguments = ["list", "--json"] if surface == "list" else ["show", later_id]
+            result = subprocess.run(
+                [sys.executable, "-m", "agcoord", *arguments, "--state-dir", str(state)],
+                capture_output=True, text=True, env=caller_environment(), check=True,
+            )
+            record = json.loads(result.stdout)
+            if surface == "list":
+                record = next(
+                    row for group in ("active", "queued", "recent")
+                    for row in record[group] if row["run_id"] == later_id
+                )
+            assert record["blocked_by"] == reasons
+            assert record["status"] == "queued"
+        else:
+            app = build_app(lambda: client, refresh_interval=60)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await _settled(pilot)
+                await pilot.press("down", "down")
+                await pilot.pause()
+                selected = _widget_text(app.query_one("#gate-detail", Static))
+                for reason in reasons:
+                    assert reason in selected
+                await pilot.press("enter")
+                await pilot.pause()
+                for reason in reasons:
+                    assert reason in _screen_text(app)
+    finally:
+        release.touch()
+        running.stop()
 
 
 @pytest.mark.asyncio

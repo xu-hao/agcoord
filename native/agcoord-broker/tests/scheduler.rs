@@ -748,6 +748,17 @@ fn blocking_command(entered: &Path, release: &Path, started: Option<&Path>) -> V
     command
 }
 
+/// Release this test's workers before its broker guard runs, including after an assertion.
+struct ReleaseFiles(Vec<PathBuf>);
+
+impl Drop for ReleaseFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::write(path, "release");
+        }
+    }
+}
+
 fn touch_command(path: &Path) -> Vec<String> {
     vec![
         "/usr/bin/touch".to_owned(),
@@ -949,6 +960,7 @@ fn full_is_not_a_lane_barrier_and_lane_work_packs_by_capacity() {
     let large = temporary.path().join("large");
     let small = temporary.path().join("small");
     let other = temporary.path().join("other");
+    let _releases = ReleaseFiles(vec![first_release.clone(), full_release.clone()]);
 
     submit_ok_in_worktree(
         &state,
@@ -1023,10 +1035,15 @@ fn full_is_not_a_lane_barrier_and_lane_work_packs_by_capacity() {
         None,
     );
 
-    // The large request waits for capacity while smaller lane and cross-repository work
-    // packs into the free CPU behind it.
-    wait_status(&state, "check-small", "passed");
-    wait_status(&state, "check-other", "passed");
+    // The resource-blocked front row reserves its claim across repository lanes.
+    for run_id in ["check-small", "check-other"] {
+        let waiting = status(&state, run_id);
+        assert_eq!(waiting["status"], "queued");
+        assert_eq!(
+            waiting["blocked_by"],
+            json!(["reservation:check-large:cpu"])
+        );
+    }
     assert!(!large.exists());
     let blocked = status(&state, "check-large");
     assert_eq!(blocked["status"], "queued");
@@ -1041,11 +1058,351 @@ fn full_is_not_a_lane_barrier_and_lane_work_packs_by_capacity() {
     fs::write(&full_release, "release").unwrap();
     wait_status(&state, "full-receipt", "passed");
     wait_status(&state, "check-large", "passed");
+    wait_status(&state, "check-small", "passed");
+    wait_status(&state, "check-other", "passed");
     assert!(large.exists());
     assert_eq!(
         snapshot(&state).unwrap()["allocations"],
         json!({"cpu": 0, "jobs": 0})
     );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn front_row_reserves_local_resources_across_repositories_and_row_kinds() {
+    for kind in ["land", "check", "full", "merge"] {
+        let temporary = TestDirectory::new(&format!("front-row-{kind}"));
+        let state = temporary.path().join("state");
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let gib = 1024 * MIB;
+        let mut broker = RunningBroker::start(
+            &state,
+            &[
+                ("jobs", 24),
+                ("cpu", 24),
+                ("tmpfs", 16 * gib),
+                ("browser", 1),
+            ],
+        );
+        let _releases = ReleaseFiles(vec![
+            temporary.path().join("check-active-a-release"),
+            temporary.path().join("check-active-b-release"),
+            temporary.path().join("front-release"),
+        ]);
+        if kind == "merge" {
+            submit_ok(
+                &state,
+                &Submission {
+                    run_id: "full-gate",
+                    kind: "full",
+                    repository: "repo-a",
+                    checkout: &checkout,
+                    command: touch_command(&temporary.path().join("gate-done")),
+                    gate_run_id: None,
+                },
+            );
+            wait_status(&state, "full-gate", "passed");
+        }
+        for run_id in ["check-active-a", "check-active-b"] {
+            submit_ok_in_worktree(
+                &state,
+                &Submission {
+                    run_id,
+                    kind: "check",
+                    repository: "repo-a",
+                    checkout: &checkout,
+                    command: blocking_command(
+                        &temporary.path().join(format!("{run_id}-entered")),
+                        &temporary.path().join(format!("{run_id}-release")),
+                        None,
+                    ),
+                    gate_run_id: None,
+                },
+                &[("cpu", 5), ("tmpfs", 3 * gib)],
+                None,
+            );
+            wait_status(&state, run_id, "running");
+        }
+        let front_entered = temporary.path().join("front-entered");
+        let front_release = temporary.path().join("front-release");
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id: "front-wide",
+                kind,
+                repository: "repo-a",
+                checkout: &checkout,
+                command: blocking_command(&front_entered, &front_release, None),
+                gate_run_id: (kind == "merge").then_some("full-gate"),
+            },
+            &[("cpu", 16), ("tmpfs", 12 * gib)],
+            Some("worktree-front"),
+        );
+        assert_eq!(
+            status(&state, "front-wide")["blocked_by"],
+            json!(["resource:cpu", "resource:tmpfs"])
+        );
+        for (run_id, repository) in [
+            ("check-later-a1", "repo-a"),
+            ("check-later-b1", "repo-b"),
+            ("check-later-a2", "repo-a"),
+            ("check-later-b2", "repo-b"),
+        ] {
+            let entered = temporary.path().join(run_id);
+            submit_ok_in_worktree(
+                &state,
+                &Submission {
+                    run_id,
+                    kind: "check",
+                    repository,
+                    checkout: &checkout,
+                    command: touch_command(&entered),
+                    gate_run_id: None,
+                },
+                &[("cpu", 2), ("tmpfs", 2 * gib)],
+                None,
+            );
+            let waiting = status(&state, run_id);
+            assert_eq!(waiting["status"], "queued", "front kind {kind}: {waiting}");
+            assert_eq!(
+                waiting["blocked_by"],
+                json!(["reservation:front-wide:cpu", "reservation:front-wide:tmpfs"])
+            );
+            assert!(!entered.exists());
+        }
+        // A row using only spare jobs and a resource absent from the front claim backfills.
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id: "check-spare",
+                kind: "check",
+                repository: "repo-b",
+                checkout: &checkout,
+                command: touch_command(&temporary.path().join("spare")),
+                gate_run_id: None,
+            },
+            &[("browser", 1)],
+            None,
+        );
+        assert_eq!(
+            wait_status(&state, "check-spare", "passed")["pool"],
+            Value::Null
+        );
+        assert_eq!(status(&state, "front-wide")["status"], "queued");
+
+        // Releasing just one original row makes the front fit. Lane rotation cannot let
+        // another repository consume its capacity first.
+        fs::write(temporary.path().join("check-active-a-release"), "release").unwrap();
+        wait_status(&state, "check-active-a", "passed");
+        wait_for(Duration::from_secs(5), || front_entered.exists());
+        let front = status(&state, "front-wide");
+        assert_eq!(front["status"], "running");
+        assert_eq!(status(&state, "check-active-b")["status"], "running");
+        fs::write(temporary.path().join("check-active-b-release"), "release").unwrap();
+        wait_status(&state, "check-active-b", "passed");
+        for run_id in [
+            "check-later-a1",
+            "check-later-b1",
+            "check-later-a2",
+            "check-later-b2",
+        ] {
+            let later = wait_status(&state, run_id, "passed");
+            assert!(later["started_at"].as_str().unwrap() >= front["started_at"].as_str().unwrap());
+            assert_eq!(later["pool"], Value::Null);
+        }
+        fs::write(front_release, "release").unwrap();
+        wait_status(&state, "front-wide", "passed");
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn front_row_ignores_repository_blocked_rows() {
+    let temporary = TestDirectory::new("repository-no-reservation");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 24), ("cpu", 24)]);
+    let release = temporary.path().join("land-release");
+    let _releases = ReleaseFiles(vec![release.clone()]);
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "land-active",
+            kind: "land",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&temporary.path().join("land-entered"), &release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 16)],
+        None,
+    );
+    wait_status(&state, "land-active", "running");
+    for (run_id, kind, worktree) in [
+        ("land-second", "land", "worktree-second"),
+        ("land-third", "land", "worktree-third"),
+        ("check-same-worktree", "check", "worktree-repo-a"),
+    ] {
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id,
+                kind,
+                repository: "repo-a",
+                checkout: &checkout,
+                command: touch_command(&temporary.path().join(run_id)),
+                gate_run_id: None,
+            },
+            &[("cpu", 16)],
+            Some(worktree),
+        );
+    }
+    assert_eq!(
+        status(&state, "land-second")["blocked_by"],
+        json!(["repository:repo-a:active:land-active", "resource:cpu"])
+    );
+    assert_eq!(
+        status(&state, "land-third")["blocked_by"],
+        json!([
+            "repository:repo-a:active:land-active",
+            "repository:repo-a:fifo:land-second",
+            "resource:cpu"
+        ])
+    );
+    assert_eq!(
+        status(&state, "check-same-worktree")["blocked_by"],
+        json!(["repository:repo-a:barrier:land-active", "resource:cpu"])
+    );
+    for (run_id, repository) in [
+        ("check-a", "repo-a"),
+        ("check-b", "repo-b"),
+        ("check-c", "repo-a"),
+    ] {
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id,
+                kind: "check",
+                repository,
+                checkout: &checkout,
+                command: touch_command(&temporary.path().join(run_id)),
+                gate_run_id: None,
+            },
+            &[("cpu", 2)],
+            Some("worktree-checks"),
+        );
+        assert_eq!(wait_status(&state, run_id, "passed")["pool"], Value::Null);
+        assert_eq!(status(&state, "land-active")["status"], "running");
+    }
+    fs::write(release, "release").unwrap();
+    for run_id in [
+        "land-active",
+        "land-second",
+        "land-third",
+        "check-same-worktree",
+    ] {
+        wait_status(&state, run_id, "passed");
+    }
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn front_row_reserves_all_claims_while_allowing_exact_spare_capacity() {
+    let temporary = TestDirectory::new("front-row-spare");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 3), ("cpu", 8), ("memory", 8)]);
+    let active_release = temporary.path().join("active-release");
+    let spare_release = temporary.path().join("spare-release");
+    let _releases = ReleaseFiles(vec![active_release.clone(), spare_release.clone()]);
+    for (run_id, resources, release) in [
+        (
+            "check-active",
+            vec![("cpu", 5), ("memory", 1)],
+            &active_release,
+        ),
+        (
+            "full-front",
+            vec![("cpu", 6), ("memory", 4)],
+            &active_release,
+        ),
+        ("check-spare", vec![("memory", 3)], &spare_release),
+    ] {
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id,
+                kind: if run_id == "full-front" {
+                    "full"
+                } else {
+                    "check"
+                },
+                repository: "repo-a",
+                checkout: &checkout,
+                command: blocking_command(&temporary.path().join(run_id), release, None),
+                gate_run_id: None,
+            },
+            &resources,
+            None,
+        );
+        if run_id != "full-front" {
+            wait_for(Duration::from_secs(5), || {
+                temporary.path().join(run_id).exists()
+            });
+        }
+    }
+    assert_eq!(
+        status(&state, "full-front")["blocked_by"],
+        json!(["resource:cpu"])
+    );
+    for (run_id, resources, expected) in [
+        ("check-jobs", vec![], json!(["reservation:full-front:jobs"])),
+        (
+            "check-memory",
+            vec![("memory", 1)],
+            json!([
+                "reservation:full-front:jobs",
+                "reservation:full-front:memory"
+            ]),
+        ),
+        (
+            "check-newer-wide",
+            vec![("cpu", 7)],
+            json!(["resource:cpu", "reservation:full-front:jobs"]),
+        ),
+    ] {
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id,
+                kind: "check",
+                repository: "repo-b",
+                checkout: &checkout,
+                command: touch_command(&temporary.path().join(run_id)),
+                gate_run_id: None,
+            },
+            &resources,
+            None,
+        );
+        let waiting = status(&state, run_id);
+        assert_eq!(waiting["status"], "queued");
+        assert_eq!(waiting["blocked_by"], expected);
+    }
+    fs::write(active_release, "release").unwrap();
+    wait_status(&state, "full-front", "passed");
+    fs::write(spare_release, "release").unwrap();
+    for run_id in [
+        "check-active",
+        "check-spare",
+        "check-jobs",
+        "check-memory",
+        "check-newer-wide",
+    ] {
+        wait_status(&state, run_id, "passed");
+    }
     assert!(broker.terminate().success());
 }
 
@@ -7626,6 +7983,269 @@ fn submit_overflow_ok(state: &Path, submission: &Submission<'_>, resources: &[(&
             None,
         ),
     );
+}
+
+#[test]
+fn front_row_ignores_oversized_overflow_claims() {
+    let temporary = TestDirectory::new("front-row-oversized");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "elsewhere",
+            "capacities": {"jobs": 4, "cpu": 8},
+            "executor": [executor],
+            "wait_threshold": 60,
+            "max_runtime": 60,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
+    let active_release = temporary.path().join("active-release");
+    let front_release = temporary.path().join("front-release");
+    let _releases = ReleaseFiles(vec![active_release.clone(), front_release.clone()]);
+    let oversized = Submission {
+        run_id: "check-oversized",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&temporary.path().join("oversized")),
+        gate_run_id: None,
+    };
+    let refused = submit_with_resources(&state, &oversized, &[("cpu", 5)]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-resource-unavailable"
+    );
+    submit_overflow_ok(&state, &oversized, &[("cpu", 5)]);
+    // The overflow-only row is older than every local row, even on an idle machine.
+    for (run_id, cpu, release) in [
+        ("check-active", 2, &active_release),
+        ("check-front", 4, &front_release),
+    ] {
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id,
+                kind: "check",
+                repository: "repo-b",
+                checkout: &checkout,
+                command: blocking_command(&temporary.path().join(run_id), release, None),
+                gate_run_id: None,
+            },
+            &[("cpu", cpu)],
+            None,
+        );
+        if run_id == "check-active" {
+            wait_for(Duration::from_secs(5), || {
+                temporary.path().join(run_id).exists()
+            });
+        }
+    }
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-later",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&temporary.path().join("later")),
+            gate_run_id: None,
+        },
+        &[("cpu", 1)],
+        None,
+    );
+    let later = status(&state, "check-later");
+    assert_eq!(later["status"], "queued");
+    assert_eq!(later["blocked_by"], json!(["reservation:check-front:cpu"]));
+    assert_eq!(
+        status(&state, "check-oversized")["blocked_by"],
+        json!(["resource:cpu"])
+    );
+    json_output(&[
+        "cancel",
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "check-oversized",
+    ]);
+    wait_status(&state, "check-oversized", "cancelled");
+    fs::write(active_release, "release").unwrap();
+    wait_for(Duration::from_secs(5), || {
+        temporary.path().join("check-front").exists()
+    });
+    assert!(!temporary.path().join("later").exists());
+    fs::write(front_release, "release").unwrap();
+    for run_id in ["check-active", "check-front", "check-later"] {
+        wait_status(&state, run_id, "passed");
+    }
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn front_row_reservation_allows_overflow_after_wait_threshold() {
+    let temporary = TestDirectory::new("front-row-overflow");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let executor = write_overflow_executor(temporary.path());
+    write_overflow_config(
+        &state,
+        json!({
+            "name": "elsewhere",
+            "capacities": {"jobs": 3, "cpu": 5, "tmpfs": 2},
+            "executor": [executor],
+            "wait_threshold": 2,
+            "max_runtime": 60,
+        }),
+    );
+    let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4), ("tmpfs", 8)]);
+    let active_release = temporary.path().join("active-release");
+    let front_release = temporary.path().join("front-release");
+    let overflow_release = temporary.path().join("overflow-release");
+    let _releases = ReleaseFiles(vec![
+        active_release.clone(),
+        front_release.clone(),
+        overflow_release.clone(),
+    ]);
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "check-active",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&temporary.path().join("active"), &active_release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 2), ("tmpfs", 4)],
+        None,
+    );
+    wait_status(&state, "check-active", "running");
+    submit_ok_in_worktree(
+        &state,
+        &Submission {
+            run_id: "land-front",
+            kind: "land",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: blocking_command(&temporary.path().join("front"), &front_release, None),
+            gate_run_id: None,
+        },
+        &[("cpu", 4), ("tmpfs", 6)],
+        Some("worktree-front"),
+    );
+    for (run_id, cpu, expected) in [
+        (
+            "check-reserved",
+            1,
+            json!(["reservation:land-front:cpu", "reservation:land-front:tmpfs"]),
+        ),
+        (
+            "check-mixed",
+            3,
+            json!(["resource:cpu", "reservation:land-front:tmpfs"]),
+        ),
+    ] {
+        submit_overflow_ok(
+            &state,
+            &Submission {
+                run_id,
+                kind: "check",
+                repository: "repo-b",
+                checkout: &checkout,
+                command: blocking_command(&temporary.path().join(run_id), &overflow_release, None),
+                gate_run_id: None,
+            },
+            &[("cpu", cpu), ("tmpfs", 1)],
+        );
+        let waiting = status(&state, run_id);
+        assert_eq!(waiting["status"], "queued");
+        assert_eq!(waiting["pool"], Value::Null);
+        assert_eq!(waiting["blocked_by"], expected);
+    }
+    let lane_blocked = Submission {
+        run_id: "check-lane-blocked",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: touch_command(&temporary.path().join("lane-blocked")),
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &lane_blocked,
+        submit_in_worktree(
+            &state,
+            &lane_blocked,
+            &[("cpu", 1)],
+            &[("_AGCOORD_OVERFLOW", "1")],
+            Some("worktree-front"),
+        ),
+    );
+    for run_id in ["check-reserved", "check-mixed"] {
+        wait_for(Duration::from_secs(10), || {
+            temporary.path().join(run_id).exists()
+        });
+        let placed = status(&state, run_id);
+        assert_eq!(placed["status"], "running");
+        assert_eq!(placed["pool"], "elsewhere");
+        let waited: f64 = Connection::open(state.join("queue.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT (julianday(?1) - julianday(?2)) * 86400.0",
+                params![
+                    placed["started_at"].as_str().unwrap(),
+                    placed["created_at"].as_str().unwrap()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(waited >= 2.0, "overflow started after {waited}s");
+    }
+    let snap = snapshot(&state).unwrap();
+    assert_eq!(
+        snap["allocations"],
+        json!({"cpu": 2, "jobs": 1, "tmpfs": 4})
+    );
+    assert_eq!(
+        snap["overflow_pools"][0]["allocations"],
+        json!({"cpu": 4, "jobs": 2, "tmpfs": 2})
+    );
+    // Leave room for the lane-blocked claim and let its own threshold elapse too.
+    thread::sleep(Duration::from_secs(2));
+    let waiting = status(&state, "check-lane-blocked");
+    assert_eq!(waiting["status"], "queued");
+    assert_eq!(waiting["pool"], Value::Null);
+    assert_eq!(
+        waiting["blocked_by"],
+        json!([
+            "repository:repo-a:barrier:land-front",
+            "reservation:land-front:cpu"
+        ])
+    );
+    // Pool claims do not delay the local front, and barrier blockers still forbid overflow.
+    fs::write(active_release, "release").unwrap();
+    wait_for(Duration::from_secs(5), || {
+        temporary.path().join("front").exists()
+    });
+    assert_eq!(status(&state, "land-front")["pool"], Value::Null);
+    assert_eq!(status(&state, "check-reserved")["status"], "running");
+    assert_eq!(status(&state, "check-lane-blocked")["status"], "queued");
+    fs::write(front_release, "release").unwrap();
+    fs::write(overflow_release, "release").unwrap();
+    for run_id in [
+        "check-active",
+        "land-front",
+        "check-reserved",
+        "check-mixed",
+        "check-lane-blocked",
+    ] {
+        wait_status(&state, run_id, "passed");
+    }
+    assert!(broker.terminate().success());
 }
 
 #[test]

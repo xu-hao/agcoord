@@ -3,6 +3,15 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Reserve local capacity for the oldest queued row blocked only by resources, across all
+  repositories and row kinds, while allowing later work to use spare unreserved capacity.
+  Report `reservation:<front_run_id>:<resource>` blockers in queue views and allow eligible
+  reserved-around work to overflow after its pool's wait threshold. Repository-blocked and
+  oversized overflow-only rows reserve nothing locally. #238 — prevent later narrow rows
+  from starving a wide resource-blocked front row.
+
 ## 0.8.2 — 2026-11-13
 
 - Allow `agc resume <drain-id>` to cancel an in-progress `draining` state without stopping

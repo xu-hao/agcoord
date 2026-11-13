@@ -999,36 +999,36 @@ def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: P
             resources={"cpu": 1},
         )
 
-        # The large request waits for capacity while the smaller lane request behind it
-        # packs into the free CPU.
-        wait_for(entered_small.exists, "later lane work did not pack around a blocked request")
         other_id = _submit(
             client,
             _blocking_command(entered_other, release_other, "other repository"),
             second,
             resources={"cpu": 1},
         )
-        # Unrelated repository work waits only for capacity.
+        # The front request reserves capacity across repository lanes.
         assert client.status(large_id)["status"] == "queued"
         assert client.status(large_id)["blocked_by"] == ["resource:cpu"]
-        assert client.status(other_id)["status"] == "queued"
-        assert client.status(other_id)["blocked_by"] == ["resource:cpu"]
+        for run_id in (small_id, other_id):
+            assert client.status(run_id)["status"] == "queued"
+            assert client.status(run_id)["blocked_by"] == [f"reservation:{large_id}:cpu"]
+        assert not entered_small.exists()
+        assert not entered_other.exists()
         assert not entered_large.exists()
-        assert client.snapshot()["allocations"] == {"jobs": 3, "cpu": 3}
+        assert client.snapshot()["allocations"] == {"jobs": 2, "cpu": 2}
 
         release_first.touch()
         _row(client, first_id, "passed")
-        wait_for(entered_other.exists, "cross-repository work did not use the freed CPU")
-        assert client.status(large_id)["status"] == "queued"
-        assert not entered_large.exists()
+        wait_for(entered_large.exists, "the front request did not use the freed capacity")
+        assert not entered_other.exists()
 
         release_full.touch()
-        release_small.touch()
         _row(client, full_id, "passed")
-        _row(client, small_id, "passed")
-        wait_for(entered_large.exists, "the large request never fit")
         release_large.touch()
+        wait_for(entered_small.exists, "later lane work never started")
+        wait_for(entered_other.exists, "cross-repository work never started")
+        release_small.touch()
         release_other.touch()
+        _row(client, small_id, "passed")
         assert _row(client, large_id, "passed")["repository_id"] == client.status(full_id)[
             "repository_id"
         ]

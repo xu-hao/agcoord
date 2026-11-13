@@ -662,8 +662,9 @@ impl Broker {
     /// configured pool that can take it now.
     ///
     /// A row qualifies only when its submitter allowed overflow, nothing but this machine's
-    /// capacity blocks it and it has waited at least the pool's threshold.  The pool must have room for the claim and, when it has
-    /// a budget, enough of today's allowance left for the claim's worst case.
+    /// capacity or front-row reservation blocks it and it has waited at least the pool's
+    /// threshold. The pool must have room for the claim and, when it has a budget, enough
+    /// of today's allowance left for the claim's worst case.
     fn next_overflow(
         &self,
         connection: &Connection,
@@ -680,9 +681,9 @@ impl Broker {
             }
             let blockers = blocked_by(run, active, queued, &self.capacities, placed);
             if blockers.is_empty()
-                || blockers
-                    .iter()
-                    .any(|blocker| !blocker.starts_with("resource:"))
+                || blockers.iter().any(|blocker| {
+                    !blocker.starts_with("resource:") && !blocker.starts_with("reservation:")
+                })
             {
                 continue;
             }

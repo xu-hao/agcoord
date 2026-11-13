@@ -145,6 +145,20 @@
       }
     },
     {
+      "id": "resources.front-row-reservation",
+      "domain": "resources",
+      "description": "The oldest locally feasible queued row blocked only by resources reserves its complete local claim across repositories and row kinds; later rows backfill only spare capacity, repository-blocked and oversized overflow-only rows reserve nothing, and reservation-blocked overflow waits for the pool threshold without consuming local capacity or bypassing repository exclusions.",
+      "tests": {
+        "rust_native": [
+          "scheduler::front_row_reserves_local_resources_across_repositories_and_row_kinds",
+          "scheduler::front_row_ignores_repository_blocked_rows",
+          "scheduler::front_row_reserves_all_claims_while_allowing_exact_spare_capacity",
+          "scheduler::front_row_ignores_oversized_overflow_claims",
+          "scheduler::front_row_reservation_allows_overflow_after_wait_threshold"
+        ]
+      }
+    },
+    {
       "id": "resources.overflow-pools",
       "domain": "resources",
       "description": "A job that allowed overflow and has waited past a pool's threshold runs through that pool's executor under the pool's capacities, single-job limit, hard runtime limit, and daily CPU-hour budget, with enforcement delegated to the executor; a land sends only its gate, an executor without a verdict ends the run without one, and local allocations and jobs that did not allow overflow are unaffected.",

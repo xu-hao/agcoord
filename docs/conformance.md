@@ -19,6 +19,9 @@ unrelated process kill, or unverified enforcement claim.
 Resource coverage proves the zero-scratch default at the worker boundary — the broker removes
 caller temporary-directory variables and creates no managed run scratch path unless a provider is
 declared — and that a worker under a declared scratch policy still verifies its admission.
+It also proves machine-wide front-row reservations across row kinds, backfilling into spare
+unreserved capacity, exclusion of repository-blocked and oversized overflow-only rows from
+reservation, and overflow placement of reservation-blocked work after the pool threshold.
 
 Contention coverage includes durable maintenance draining: competing submissions linearize
 entirely before or after the guard, accepted work and authoritative publication complete, a
