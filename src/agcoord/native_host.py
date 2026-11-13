@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -13,8 +14,9 @@ import re
 import stat
 import subprocess
 import tarfile
+import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from . import __version__
@@ -58,6 +60,23 @@ SERVICE = "agcoord-broker.service"
 OWNERSHIP_TIMEOUT = 30.0
 OWNERSHIP_POLL_INTERVAL = 0.1
 PACKAGE_NAME = "agcoord-native-host-x86_64-linux.tar.gz"
+PROOF_REPOSITORY = "agcoord-native-host-proof"
+PROOF_BRANCH = "main"
+
+
+@contextmanager
+def _temporary_proof_repository() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="agcoord-host-proof-") as raw:
+        root = Path(raw).resolve()
+        git_dir = root / ".git"
+        (git_dir / "objects").mkdir(parents=True)
+        (git_dir / "refs" / "heads").mkdir(parents=True)
+        (git_dir / "HEAD").write_text(f"ref: refs/heads/{PROOF_BRANCH}\n", encoding="utf-8")
+        (git_dir / "config").write_text(
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n",
+            encoding="utf-8",
+        )
+        yield root
 CHECKER_NAME = "check-native-host-package"
 INSTALLER_NAME = "install-native-host"
 PROBE_NAME = "test-native-host-enforcement"
@@ -1054,18 +1073,33 @@ def _verify_running_host(
         operation=operation,
         state_dir=state_dir,
     )
-    proof_run_id = proof_client.submit(
-        [str(probe)],
-        checkout=str(checkout),
-        kind="check",
-        label=f"native host enforcement {expected_identity['version']}",
-        resources={"cpu": 1},
-    )
-    proof = _validate_proof(
-        wait(proof_client, proof_run_id),
-        proof_run_id,
-        operation=operation,
-    )
+    with ExitStack() as stack:
+        try:
+            proof_run_id = proof_client.submit(
+                [str(probe)],
+                checkout=str(checkout),
+                kind="check",
+                label=f"native host enforcement {expected_identity['version']}",
+                resources={"cpu": 1},
+            )
+        except CoordinatorError as exc:
+            if "is not inside a Git repository" not in str(exc):
+                raise
+            temporary_checkout = stack.enter_context(_temporary_proof_repository())
+            proof_run_id = proof_client.submit(
+                [str(probe)],
+                checkout=str(temporary_checkout),
+                repository=PROOF_REPOSITORY,
+                branch=PROOF_BRANCH,
+                kind="check",
+                label=f"native host enforcement {expected_identity['version']}",
+                resources={"cpu": 1},
+            )
+        proof = _validate_proof(
+            wait(proof_client, proof_run_id),
+            proof_run_id,
+            operation=operation,
+        )
     return identity, proof_run_id, proof
 
 
@@ -1393,40 +1427,62 @@ def recover_native_host(
         client = CoordinatorClient(state_dir=paths.state_dir, checkout=checkout_path, autostart=False)
         phase = "owner-verification"
         _await_spool_ownership(client, operation="recovery", state_dir=paths.state_dir)
-        # Reuse the ordinary client preparation policy; the native recovery boundary alone
-        # authorizes the one fixed proof command while regular submit remains guarded.
-        prepared = client._prepare_submission(checkout=str(checkout_path), repository=None, branch=None,
-            head_sha=None, caller_pid=None, environment=None, exact_head=False)
-        proof_id = "check-" + uuid4().hex[:12]
-        arguments = client._native_submission_arguments(run_id=proof_id, kind="check",
-            label="native host recovery enforcement", identity=prepared.identity,
-            branch=prepared.branch, head_sha=prepared.head_sha, resources={"jobs":1,"cpu":1},
-            agent="host-recovery", caller_pid=prepared.caller_pid, environment=prepared.environment,
-            command=[str(probe)])
-        phase = "proof-submission"
-        settlement_deadline = time.monotonic() + OWNERSHIP_TIMEOUT
-        while True:
+        with ExitStack() as stack:
+            # Reuse the ordinary client preparation policy; the native recovery boundary alone
+            # authorizes the one fixed proof command while regular submit remains guarded.
             try:
-                submitted = _recovery_invoke("host-recover-proof", paths.state_dir,
-                    ["--recovery-id", recovery_id, *arguments])
-                break
-            except CoordinatorError as settlement_error:
-                if settlement_error.code != "host-recovery-settling" or time.monotonic() >= settlement_deadline:
+                prepared = client._prepare_submission(
+                    checkout=str(checkout_path),
+                    repository=None,
+                    branch=None,
+                    head_sha=None,
+                    caller_pid=None,
+                    environment=None,
+                    exact_head=False,
+                )
+            except CoordinatorError as exc:
+                if "is not inside a Git repository" not in str(exc):
                     raise
-                time.sleep(OWNERSHIP_POLL_INTERVAL)
-        if not isinstance(submitted, dict) or set(submitted) != {"run_id"} or not isinstance(submitted["run_id"], str):
-            raise CoordinatorError("invalid recovery proof submission receipt", code="host-recovery-invalid")
-        proof_id = submitted["run_id"]
-        phase = "enforcement-proof"
-        deadline = time.monotonic() + RECOVERY_PROOF_TIMEOUT
-        while True:
-            proof = client.status(proof_id)
-            if proof["status"] not in {"queued", "running"}:
-                break
-            if time.monotonic() >= deadline:
-                raise CoordinatorError("enforcement proof exceeded its deadline", code="host-recovery-proof-timeout")
-            time.sleep(0.1)
-        proof = _validate_proof(proof, proof_id, operation="recovery")
+                temporary_checkout = stack.enter_context(_temporary_proof_repository())
+                prepared = client._prepare_submission(
+                    checkout=str(temporary_checkout),
+                    repository=PROOF_REPOSITORY,
+                    branch=PROOF_BRANCH,
+                    head_sha=None,
+                    caller_pid=None,
+                    environment=None,
+                    exact_head=False,
+                )
+            proof_id = "check-" + uuid4().hex[:12]
+            arguments = client._native_submission_arguments(run_id=proof_id, kind="check",
+                label="native host recovery enforcement", identity=prepared.identity,
+                branch=prepared.branch, head_sha=prepared.head_sha, resources={"jobs":1,"cpu":1},
+                agent="host-recovery", caller_pid=prepared.caller_pid, environment=prepared.environment,
+                command=[str(probe)])
+            phase = "proof-submission"
+            settlement_deadline = time.monotonic() + OWNERSHIP_TIMEOUT
+            while True:
+                try:
+                    submitted = _recovery_invoke("host-recover-proof", paths.state_dir,
+                        ["--recovery-id", recovery_id, *arguments])
+                    break
+                except CoordinatorError as settlement_error:
+                    if settlement_error.code != "host-recovery-settling" or time.monotonic() >= settlement_deadline:
+                        raise
+                    time.sleep(OWNERSHIP_POLL_INTERVAL)
+            if not isinstance(submitted, dict) or set(submitted) != {"run_id"} or not isinstance(submitted["run_id"], str):
+                raise CoordinatorError("invalid recovery proof submission receipt", code="host-recovery-invalid")
+            proof_id = submitted["run_id"]
+            phase = "enforcement-proof"
+            deadline = time.monotonic() + RECOVERY_PROOF_TIMEOUT
+            while True:
+                proof = client.status(proof_id)
+                if proof["status"] not in {"queued", "running"}:
+                    break
+                if time.monotonic() >= deadline:
+                    raise CoordinatorError("enforcement proof exceeded its deadline", code="host-recovery-proof-timeout")
+                time.sleep(0.1)
+            proof = _validate_proof(proof, proof_id, operation="recovery")
         phase = "completion"
         for attempt in range(3):
             try:

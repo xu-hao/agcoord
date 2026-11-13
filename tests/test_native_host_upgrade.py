@@ -850,3 +850,74 @@ def test_install_refuses_an_existing_queue_before_privileged_host_changes(
             [str(package.parent / "check-native-host-package"), str(package)],
         )
     ]
+
+
+def test_install_and_upgrade_outside_git_repository_prepare_real_proof_submission(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord.queue import CoordinatorClient as RealCoordinatorClient
+
+    real_run = subprocess.run
+    native_host, _timeline, _clients = _install_fakes(monkeypatch)
+    fake_run = native_host.subprocess.run
+
+    def run_allowing_git(arguments, **options):
+        command = [str(value) for value in arguments]
+        if command[:1] == ["git"]:
+            return real_run(arguments, **options)
+        return fake_run(arguments, **options)
+
+    monkeypatch.setattr(native_host.subprocess, "run", run_allowing_git)
+    fake_client_cls = native_host.CoordinatorClient
+    proof_submissions: list[tuple[Path, str, str]] = []
+
+    class ValidatingClient(fake_client_cls):
+        def submit(self, command, **metadata):
+            prepared = RealCoordinatorClient._prepare_submission(
+                self,
+                checkout=metadata["checkout"],
+                repository=metadata.get("repository"),
+                branch=metadata.get("branch"),
+                head_sha=metadata.get("head_sha"),
+                caller_pid=metadata.get("caller_pid"),
+                environment=metadata.get("environment"),
+                exact_head=False,
+            )
+            proof_submissions.append(
+                (Path(prepared.identity.checkout), prepared.identity.repository, prepared.branch)
+            )
+            assert Path(prepared.identity.checkout).is_dir()
+            return super().submit(command, **metadata)
+
+    monkeypatch.setattr(native_host, "CoordinatorClient", ValidatingClient)
+    original_wait = native_host.wait
+
+    def wait_checking_checkout_alive(client, run_id):
+        assert proof_submissions[-1][0].is_dir()
+        return original_wait(client, run_id)
+
+    monkeypatch.setattr(native_host, "wait", wait_checking_checkout_alive)
+    package = _release_bundle(tmp_path)
+    non_git_home = tmp_path / "home"
+    non_git_home.mkdir()
+    monkeypatch.chdir(non_git_home)
+
+    install_state = tmp_path / "install-state"
+    _managed_state(install_state, existing_spool=False)
+    monkeypatch.setattr(native_host, "MANAGED_STATE_DIR", install_state.resolve())
+    installed = native_host.install_native_host(package, state_dir=install_state)
+    assert installed["state"] == "complete"
+
+    upgrade_state = tmp_path / "upgrade-state"
+    _managed_state(upgrade_state, existing_spool=True)
+    monkeypatch.setattr(native_host, "MANAGED_STATE_DIR", upgrade_state.resolve())
+    upgraded = native_host.upgrade_native_host(package, state_dir=upgrade_state)
+    assert upgraded["state"] == "complete"
+
+    assert len(proof_submissions) == 2
+    for temporary_checkout, repository_name, branch_name in proof_submissions:
+        assert temporary_checkout != non_git_home
+        assert repository_name == "agcoord-native-host-proof"
+        assert branch_name == "main"
+        assert not temporary_checkout.exists()
