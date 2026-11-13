@@ -93,11 +93,14 @@ spool cannot autostart an ordinary owner.
 
 The receipt contains exactly `state`, `drain_id`, `reason`, `started_at`, `protocol`, `live`,
 and `broker_pid`. The marker and its SQLite guards survive client exit, broker crash, host
-activation, migration, and rollback. `resume` requires the exact `drain-…` identifier, zero
-queued or running rows, and exclusive owner-lock acquisition. It removes the marker and guards
-in one transaction and returns the spool to `open`; a wrong or stale identifier cannot reopen
-submissions. Migration and rollback preserve the current marker across the protocol boundary
-and never resurrect a marker already removed by a successful resume.
+activation, migration, and rollback. `resume` requires the exact `drain-…` identifier. While
+`state` is `draining`, `resume` atomically removes the marker and guards inside an immediate
+SQLite write transaction without stopping live rows or displacing the serving owner, cancelling
+an unwanted drain before maintenance begins. Once `state` is `drained`, `resume` requires zero
+queued or running rows and exclusive owner-lock acquisition so it cannot race an active
+maintenance holder. A wrong or stale identifier cannot reopen submissions. Migration and
+rollback preserve the current marker across the protocol boundary and never resurrect a marker
+already removed by a successful resume.
 
 A normal drain stranded behind a dead or unstartable managed owner may be repaired through
 [guarded managed host recovery](native_host.md#guarded-recovery-when-the-outgoing-broker-cannot-drain).
