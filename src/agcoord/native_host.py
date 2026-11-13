@@ -1328,7 +1328,7 @@ def _recovery_original_drain(value: object) -> dict[str, Any] | None:
         or "\0" in value["reason"] or not isinstance(value["started_at"], str)):
         raise CoordinatorError("invalid retained recovery drain", code="host-recovery-invalid")
     try:
-        started = datetime.fromisoformat(value["started_at"].replace("Z", "+00:00"))
+        started = datetime.fromisoformat(value["started_at"])
         if started.tzinfo is None or started.utcoffset() != timezone.utc.utcoffset(started):
             raise ValueError("maintenance time must be UTC")
     except ValueError as exc:

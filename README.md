@@ -29,7 +29,7 @@ the case in depth.
 
 ## What you need
 
-- Linux on x86_64, and Python 3.10 or newer for the `agcoord` client.
+- Linux on x86_64, and Python 3.11 or newer for the `agcoord` client.
 - For the two-minute try-out below: nothing else. The released broker runs as your own user
   with admission-only accounting.
 - For enforced limits: an Ubuntu 24.04-class host (unified cgroup v2 mounted read-write with

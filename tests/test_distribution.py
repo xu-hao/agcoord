@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 
 
 PUBLIC_COMMANDS = {
@@ -71,6 +72,23 @@ def test_distribution_requires_supported_textual_8_release_line():
         (specifier.operator, specifier.version)
         for specifier in textual[0].specifier
     } == {(">=", "8.2"), ("<", "9")}
+
+
+def test_distribution_requires_python_3_11_or_newer():
+    metadata = importlib.metadata.distribution("agcoord").metadata
+    requires_python = SpecifierSet(metadata["Requires-Python"])
+    classifiers = set(metadata.get_all("Classifier") or [])
+    supported = {
+        classifier.removeprefix("Programming Language :: Python :: ")
+        for classifier in classifiers
+        if re.fullmatch(r"Programming Language :: Python :: 3\.\d+", classifier)
+    }
+
+    assert "3.10" not in requires_python
+    assert "3.10.99" not in requires_python
+    assert all(version in requires_python for version in ("3.11", "3.12", "3.13"))
+    assert "3.10" not in supported
+    assert {"3.11", "3.12", "3.13"} <= supported
 
 
 def test_module_entrypoint_exposes_the_complete_public_command_set():
