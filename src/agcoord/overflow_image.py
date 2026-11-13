@@ -143,7 +143,7 @@ def load_repository_config(root: Path) -> RepositoryOverflow:
         raise ExecutorError(
             f"{REPOSITORY_CONFIG} is missing; the repository has not opted in to overflow"
         ) from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ExecutorError(f"cannot read {REPOSITORY_CONFIG}: {exc}") from exc
     if not isinstance(document, dict) or set(document) - {"dockerfile", "context", "image"}:
         raise ExecutorError(

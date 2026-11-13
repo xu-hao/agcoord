@@ -714,29 +714,28 @@ def _owner_overflow_pools(raw: str | None) -> list[dict[str, Any]]:
 
 def _overflow_environment(
     environment: Mapping[str, str],
-    overflow: bool,
+    overflow: bool | None,
     checkout: Path,
-) -> dict[str, str]:
-    """Mark a submission as allowed to run in an overflow pool.
-
-    The repository must have opted in by naming its toolchain in its own
-    ``.agcoord/overflow.json``; without that a placed job could only fail on the other
-    machine, so the request is refused before anything is queued.
-    """
-    if not isinstance(overflow, bool):
-        raise CoordinatorError("overflow must be boolean")
+) -> tuple[dict[str, str], bool]:
+    """Select overflow eligibility and validate the repository opt-in when needed."""
+    if overflow is not None and not isinstance(overflow, bool):
+        raise CoordinatorError("overflow must be boolean or None")
     selected = dict(environment)
     if OVERFLOW_ENV in selected:
         raise CoordinatorError(f"gate environment uses the reserved {OVERFLOW_ENV} name")
-    if overflow:
-        try:
-            load_repository_config(repository_root(checkout))
-        except ExecutorError as exc:
-            raise CoordinatorError(
-                f"--overflow needs a valid {REPOSITORY_CONFIG} in the checkout: {exc}"
-            ) from exc
-        selected[OVERFLOW_ENV] = "1"
-    return selected
+    if overflow is False:
+        return selected, False
+    try:
+        root = repository_root(checkout)
+        if overflow is None and not os.path.lexists(root / REPOSITORY_CONFIG):
+            return selected, False
+        load_repository_config(root)
+    except ExecutorError as exc:
+        raise CoordinatorError(
+            f"overflow needs a valid {REPOSITORY_CONFIG} in the checkout: {exc}"
+        ) from exc
+    selected[OVERFLOW_ENV] = "1"
+    return selected, True
 
 
 def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
@@ -1326,7 +1325,7 @@ class CoordinatorClient:
         head_sha: str | None = None,
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
-        overflow: bool = False,
+        overflow: bool | None = None,
     ) -> str:
         selected_command = _validate_command(command)
         if kind not in RUN_KINDS:
@@ -1413,9 +1412,9 @@ class CoordinatorClient:
         agent: str | None,
         prepared: _PreparedSubmission,
         owner: Mapping[str, Any],
-        overflow: bool = False,
+        overflow: bool | None = None,
     ) -> str:
-        environment = _overflow_environment(
+        environment, effective_overflow = _overflow_environment(
             prepared.environment,
             overflow,
             Path(prepared.identity.checkout),
@@ -1431,7 +1430,7 @@ class CoordinatorClient:
             resources=_validate_resources(
                 resources,
                 owner["capacities"],
-                owner.get("overflow_pools", ()) if overflow else (),
+                owner.get("overflow_pools", ()) if effective_overflow else (),
             ),
             agent=_agent_identity(agent),
             caller_pid=prepared.caller_pid,
@@ -1618,7 +1617,7 @@ class CoordinatorClient:
         synchronize_target: bool = True,
         avoid_commits: Sequence[str] = (),
         reuse_full: bool = False,
-        overflow: bool = False,
+        overflow: bool | None = None,
     ) -> str:
         selected_command = _validate_command(command)
         if adapter != "github":
@@ -1673,9 +1672,9 @@ class CoordinatorClient:
         avoid_commits: Sequence[str],
         reuse_full: bool,
         owner: Mapping[str, Any],
-        overflow: bool = False,
+        overflow: bool | None = None,
     ) -> str:
-        selected_environment = _overflow_environment(
+        selected_environment, effective_overflow = _overflow_environment(
             prepared.environment,
             overflow,
             Path(prepared.identity.checkout),
@@ -1719,7 +1718,7 @@ class CoordinatorClient:
             resources=_validate_resources(
                 resources,
                 owner["capacities"],
-                owner.get("overflow_pools", ()) if overflow else (),
+                owner.get("overflow_pools", ()) if effective_overflow else (),
             ),
             agent=_agent_identity(agent),
             caller_pid=prepared.caller_pid,
