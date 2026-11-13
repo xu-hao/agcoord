@@ -520,3 +520,62 @@ def test_lost_completion_response_replays_durable_drain_state_after_settlement(r
         ["--recovery-id", RECOVERY_ID], ["--recovery-id", RECOVERY_ID]]
     assert _names(recovery).count("host-recover-proof") == 1
     assert not recovery.guarded and not recovery.parked
+
+
+def test_recovery_outside_git_repository_prepares_real_proof_submission(
+    recovery,
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord.queue import CoordinatorClient as RealCoordinatorClient
+
+    fake_run = native_host.subprocess.run
+
+    def run_allowing_git(arguments, **options):
+        command = [str(value) for value in arguments]
+        if command[:1] == ["git"]:
+            with subprocess.Popen(
+                command,
+                stdout=options.get("stdout"),
+                stderr=options.get("stderr"),
+                text=options.get("text", False),
+            ) as proc:
+                stdout, stderr = proc.communicate()
+                return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+        return fake_run(arguments, **options)
+
+    monkeypatch.setattr(native_host.subprocess, "run", run_allowing_git)
+    fake_client_cls = native_host.CoordinatorClient
+    proof_submissions: list[tuple[Path, str, str]] = []
+    non_git_home = tmp_path / "home"
+    non_git_home.mkdir()
+    monkeypatch.chdir(non_git_home)
+
+    class ValidatingRecoveryClient(fake_client_cls):
+        def __init__(self, *, state_dir, checkout, autostart):
+            assert state_dir == recovery.state
+            assert Path(checkout) == non_git_home
+            assert autostart is False
+
+        def _prepare_submission(self, **metadata):
+            assert recovery.guarded
+            prepared = RealCoordinatorClient._prepare_submission(self, **metadata)
+            proof_submissions.append(
+                (Path(prepared.identity.checkout), prepared.identity.repository, prepared.branch)
+            )
+            assert Path(prepared.identity.checkout).is_dir()
+            return prepared
+
+        def status(self, run_id):
+            assert proof_submissions[-1][0].is_dir()
+            return super().status(run_id)
+
+    monkeypatch.setattr(native_host, "CoordinatorClient", ValidatingRecoveryClient)
+    result = native_host.recover_native_host(recovery.package, state_dir=recovery.state)
+    assert result["state"] == "complete"
+    assert len(proof_submissions) == 1
+    temporary_checkout, repository_name, branch_name = proof_submissions[0]
+    assert temporary_checkout != non_git_home
+    assert repository_name == "agcoord-native-host-proof"
+    assert branch_name == "main"
+    assert not temporary_checkout.exists()
