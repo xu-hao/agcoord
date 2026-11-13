@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Show overflow placement and pool budgets in `agc tui`: add a `POOL` table column (`local`,
+  `—`, or the overflow pool name), include the pool in persistent selection detail and the `Enter`
+  modal, note active overflow count in the subject bar, and summarize configured `overflow_pools`
+  allocations and remaining daily CPU-hour budgets (with estimated cost when `cpu_hour_price` is
+  set) in the status bar (#301).
+
 - Allow `.agcoord/overflow.json` to set an optional repository-contained `"context"` directory
   alongside `"dockerfile"`, so a toolchain Dockerfile can copy tracked lockfiles outside
   `.agcoord/` without keeping duplicate copies (#298).
