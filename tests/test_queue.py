@@ -837,8 +837,16 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
         (repository / ".agcoord" / "overflow.json").write_text(
             '{"image": "example/toolchain:1"}', encoding="utf-8"
         )
-        # Without the submitter's consent a claim above this machine's capacity is
-        # still refused, even though a pool could hold it.
+        local_id = client.submit(
+            command,
+            checkout=str(repository),
+            resources={"cpu": 1},
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+            overflow=False,
+        )
+        assert _row(client, local_id, "passed")["pool"] is None
+        # An explicit opt-out validates claims against local capacity only.
         with pytest.raises(CoordinatorError, match="capacity"):
             client.submit(
                 command,
@@ -846,6 +854,7 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
                 resources={"cpu": 4},
                 caller_pid=os.getpid(),
                 environment=caller_environment(),
+                overflow=False,
             )
         run_id = client.submit(
             command,
@@ -853,7 +862,6 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
             resources={"cpu": 4},
             caller_pid=os.getpid(),
             environment=caller_environment(),
-            overflow=True,
         )
         row = _row(client, run_id, "passed")
         assert row["pool"] == "elsewhere"
@@ -865,6 +873,108 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
         assert pool["name"] == "elsewhere"
         assert pool["allocations"] == {"cpu": 0, "jobs": 0}
         assert pool["budget"] is None
+    finally:
+        running.stop()
+
+
+@pytest.mark.parametrize("kind", ["check", "full", "land"])
+def test_overflow_default_and_opt_out_validate_checkout(kind: str, tmp_path: Path):
+    running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 1, "cpu": 2})
+    client = running.start()
+    repository, _, branch, head = _publication_repository(tmp_path / "repository")
+    bin_dir = _install_land_gh(tmp_path)
+    environment = _land_environment(
+        bin_dir, branch=branch, head_sha=head, tag="overflow", event_log=tmp_path / "events"
+    )
+    config = repository / ".agcoord" / "overflow.json"
+
+    def submit(**kwargs):
+        common = dict(checkout=str(repository), resources={"cpu": 1}, environment=environment)
+        if kind == "land":
+            return client.submit_land("github", 101, _python("None"), **common, **kwargs)
+        return client.submit(_python("None"), kind=kind, **common, **kwargs)
+
+    try:
+        with pytest.raises(CoordinatorError, match="overflow.json"):
+            submit(overflow=True)
+        run_id = submit()
+        assert _row(client, run_id, "passed")["pool"] is None
+
+        config.parent.mkdir()
+        for content in (b"{invalid", b'{"dockerfile": ".agcoord/missing"}', b"\xff"):
+            config.write_bytes(content)
+            _git(repository, "add", ".agcoord")
+            _git(repository, "commit", "-m", "invalid overflow configuration")
+            environment["AGCOORD_TEST_HEAD"] = _head(repository)
+            _git(repository, "push", "origin", branch)
+            with pytest.raises(CoordinatorError, match="overflow.json"):
+                submit()
+            run_id = submit(overflow=False)
+            assert _row(client, run_id, "passed")["pool"] is None
+
+        config.unlink()
+        config.symlink_to("missing.json")
+        _git(repository, "add", ".agcoord")
+        _git(repository, "commit", "-m", "broken overflow configuration")
+        environment["AGCOORD_TEST_HEAD"] = _head(repository)
+        _git(repository, "push", "origin", branch)
+        with pytest.raises(CoordinatorError, match="overflow.json"):
+            submit()
+        run_id = submit(overflow=False)
+        assert _row(client, run_id, "passed")["pool"] is None
+        for invalid in (0, 1, "yes"):
+            with pytest.raises(CoordinatorError, match="overflow must be boolean or None"):
+                submit(overflow=invalid)
+        with pytest.raises(CoordinatorError, match="reserved _AGCOORD_OVERFLOW"):
+            if kind == "land":
+                client.submit_land("github", 101, _python("None"), checkout=str(repository),
+                                   environment={"_AGCOORD_OVERFLOW": "1"}, overflow=False)
+            else:
+                client.submit(_python("None"), checkout=str(repository), kind=kind,
+                              environment={"_AGCOORD_OVERFLOW": "1"}, overflow=False)
+    finally:
+        running.stop()
+
+
+@pytest.mark.parametrize("kind", ["full", "land"])
+def test_exact_head_submission_defaults_to_pool_capacity(kind: str, tmp_path: Path):
+    state_dir = tmp_path / "state"
+    executor = tmp_path / "executor"
+    executor.write_text(
+        '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n',
+        encoding="utf-8",
+    )
+    executor.chmod(0o755)
+    write_broker_config(state_dir, overflow_pools=[{
+        "name": "elsewhere", "capacities": {"jobs": 1, "cpu": 4},
+        "executor": [str(executor)], "max_runtime": 60,
+    }])
+    running = RunningCoordinator(state_dir, capacities={"jobs": 1, "cpu": 2})
+    client = running.start()
+    repository, _, branch, _ = _publication_repository(tmp_path / "repository")
+    config = repository / ".agcoord" / "overflow.json"
+    config.parent.mkdir()
+    config.write_text('{"image": "example/toolchain:1"}', encoding="utf-8")
+    _git(repository, "add", ".agcoord")
+    _git(repository, "commit", "-m", "declare overflow")
+    _git(repository, "push", "origin", branch)
+    bin_dir = _install_land_gh(tmp_path)
+    environment = _land_environment(
+        bin_dir, branch=branch, head_sha=_head(repository), tag="overflow",
+        event_log=tmp_path / "events",
+    )
+    common = dict(checkout=str(repository), resources={"cpu": 4}, environment=environment)
+    try:
+        with pytest.raises(CoordinatorError, match="capacity"):
+            if kind == "land":
+                client.submit_land("github", 101, _python("None"), **common, overflow=False)
+            else:
+                client.submit(_python("None"), kind=kind, **common, overflow=False)
+        if kind == "land":
+            run_id = client.submit_land("github", 101, _python("None"), **common)
+        else:
+            run_id = client.submit(_python("None"), kind=kind, **common)
+        assert _row(client, run_id, "passed")["pool"] == "elsewhere"
     finally:
         running.stop()
 

@@ -301,6 +301,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing configuration when writing",
     )
 
+    def overflow_options(command: argparse.ArgumentParser) -> None:
+        group = command.add_mutually_exclusive_group()
+        group.add_argument(
+            "--overflow", dest="overflow", action="store_true", default=None,
+            help="require repository overflow eligibility for this job",
+        )
+        group.add_argument(
+            "--no-overflow", dest="overflow", action="store_false",
+            help="keep this job on the local machine",
+        )
+
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
         command = state(commands.add_parser(name, help=help_text))
         command.add_argument("--label", default=name, help="short queue label")
@@ -317,7 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="NAME=UNITS",
             help="repeatable machine resource claim",
         )
-        command.add_argument("--overflow", action="store_true", help="allow this job to run in a configured overflow pool, on another machine, when it has waited too long for local capacity")
+        overflow_options(command)
         command.add_argument("worker_command", nargs=argparse.REMAINDER)
         return command
 
@@ -340,7 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="agent identity (default: AGCOORD_AGENT or unnamed)",
     )
     land.add_argument("--resource", action="append", default=[], metavar="NAME=UNITS")
-    land.add_argument("--overflow", action="store_true", help="allow this job to run in a configured overflow pool, on another machine, when it has waited too long for local capacity")
+    overflow_options(land)
     land.add_argument(
         "--no-target-sync",
         dest="synchronize_target",

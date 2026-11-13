@@ -15,6 +15,10 @@ versioning; dates use ISO 8601.
 - Render native UTC timestamps in the TUI on Python 3.10. #314 — accept the broker's UTC
   timestamp suffix so live queue and reservation details render on every supported Python.
 
+- Enable overflow eligibility by default for `run`, `full`, and `land` when the checkout has a
+  valid `.agcoord/overflow.json`; add `--no-overflow` to keep a job local, and refuse invalid
+  declarations before submission (#311 — enable overflow by default when the repository declares it, with an opt-out).
+
 ## 0.8.2 — 2026-11-13
 
 - Allow `agc resume <drain-id>` to cancel an in-progress `draining` state without stopping

@@ -354,9 +354,11 @@ UTC time at which a new budget day begins, default `00:00`. `cpu_hour_price` is 
 non-negative number that clients may use to display an estimated cost; the broker never
 enforces anything with it. An invalid pool is `broker-config-invalid`.
 
-A job may leave this machine only when its submitter passed `--overflow`. Nothing overflows by
-default, because a job must be able to run without this machine's files, tools, and ignored
-local state, and only its submitter knows that. A retained `merge` never overflows.
+A job submitted with `agc run`, `agc full`, or `agc land` is eligible for overflow by default
+when its checkout contains `.agcoord/overflow.json`. Pass `--no-overflow` to keep a job on this
+machine, for example when it needs local files, tools, or ignored state. Pass `--overflow` to
+require a valid repository declaration. These options are mutually exclusive. A retained `merge`
+never overflows.
 
 This machine is always preferred. In each scheduling pass the broker first admits everything
 that fits locally. Only then does it take the earliest queued job that allowed overflow, is
@@ -364,8 +366,10 @@ blocked only by `resource:*` shortages and/or `reservation:*` reasons, and has b
 at least a pool's `wait_threshold`, and place it in the first configured pool that has room
 for its complete claim and enough budget. Lane and barrier rules are unchanged: a placed job
 still counts as active work in its repository and worktree, and a job waiting for a land or for
-its worktree never overflows around it. With `--overflow`, a claim larger than this machine's capacity is accepted
+its worktree never overflows around it. For an eligible job, a claim larger than this machine's
+capacity is accepted
 at submission when some pool offers it as one job, and reaches that pool by the same rule.
+With `--no-overflow`, claims must fit local capacities.
 A later row held back by the front row's reservation may overflow after that threshold:
 placement consumes the pool's capacity rather than local capacity, so it does not delay the
 local front row. Pool allocations are excluded from local shortages and reservations, while
@@ -430,8 +434,11 @@ tool's own layer cache. The container tool reads `context` directly (honoring `.
 `.containerignore`), so a toolchain Dockerfile with a wider context should `COPY` only specific
 tracked files such as a dependency lockfile rather than `.`. `image` names a prebuilt image
 instead and cannot be combined with `context`. Because the file is part of the
-checkout, a branch that changes its toolchain changes it in the same commit. `--overflow` is
-refused at submission, before anything is queued, when the checkout has no valid file.
+checkout, a branch that changes its toolchain changes it in the same commit. An absent file keeps
+default submissions local. A present but invalid file, including a broken symlink or missing
+Dockerfile, refuses default submissions before anything is queued. `--overflow` also refuses an
+absent file; `--no-overflow` skips the file entirely. The Python client exposes the same choices
+as `overflow=None` (default), `True`, and `False` on `submit` and `submit_land`.
 
 The built-in executors run a job from an image made of that toolchain plus the job's source as
 one copied layer at `/workspace`, which is also the working directory. Nothing is compiled when
