@@ -220,6 +220,7 @@
       "tests": {
         "rust_native": [
           "client_compatibility::durable_drain_rejects_native_submissions_then_resumes_by_exact_id",
+          "client_compatibility::resume_cancels_an_active_draining_state_while_preserving_running_work",
           "client_compatibility::draining_native_spool_recovers_after_broker_crash"
         ]
       }

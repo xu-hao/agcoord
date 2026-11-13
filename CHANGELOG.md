@@ -5,6 +5,10 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Allow `agc resume <drain-id>` to cancel an in-progress `draining` state without stopping
+  accepted jobs or displacing the serving broker, while continuing to require exclusive lock
+  ownership and zero live rows once `drained` (#306).
+
 - Allow `agc host install`, `agc host upgrade`, and `agc host recover` to run outside a Git
   repository by executing the post-activation enforcement proof in a disposable temporary
   repository (`agcoord-native-host-proof`) when the current directory is not a checkout (#305).

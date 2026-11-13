@@ -981,6 +981,122 @@ fn durable_drain_rejects_native_submissions_then_resumes_by_exact_id() {
 }
 
 #[test]
+fn resume_cancels_an_active_draining_state_while_preserving_running_work() {
+    let temporary = TestDirectory::new("resume-draining");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    let ready = temporary.path().join("ready");
+    let release = temporary.path().join("release");
+    let selected_broker = installed_broker(&temporary);
+    initialize_checkout(&checkout);
+    write_config(&state, &selected_broker, json!({"jobs": 2}));
+
+    let state_for_run = state.clone();
+    let checkout_for_run = checkout.clone();
+    let ready_for_run = ready.clone();
+    let release_for_run = release.clone();
+    let active = thread::spawn(move || {
+        python_cli(&[
+            "--json".to_owned(),
+            "--state-dir".to_owned(),
+            state_for_run.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "--label".to_owned(),
+            "running job across cancelled drain".to_owned(),
+            "--checkout".to_owned(),
+            checkout_for_run.to_string_lossy().into_owned(),
+            "--".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "touch \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.02; done".to_owned(),
+            "agcoord-resume-draining".to_owned(),
+            ready_for_run.to_string_lossy().into_owned(),
+            release_for_run.to_string_lossy().into_owned(),
+        ])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready.exists(), "running worker never became ready");
+
+    let draining = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "drain".to_owned(),
+        "--reason".to_owned(),
+        "abortable host upgrade".to_owned(),
+        "--no-wait".to_owned(),
+    ]);
+    assert_success(&draining, "drain start");
+    let draining = parse_json_output(&draining);
+    assert_eq!(draining["state"], "draining");
+    assert_eq!(draining["live"], 1);
+    let drain_id = draining["drain_id"].as_str().unwrap().to_owned();
+
+    let wrong_resume = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        "drain-ffffffffffff".to_owned(),
+    ]);
+    assert!(!wrong_resume.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&wrong_resume.stderr).unwrap()["code"],
+        "broker-drain-id-mismatch"
+    );
+
+    let resumed = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        drain_id.clone(),
+    ]);
+    assert_success(&resumed, "cancel active drain via resume");
+    assert_eq!(
+        parse_json_output(&resumed),
+        json!({"state": "open", "drain_id": drain_id, "resumed": true})
+    );
+
+    let concurrent = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--label".to_owned(),
+        "admitted while survivor still runs".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert_success(&concurrent, "submission after cancelling drain");
+    assert_eq!(parse_json_output(&concurrent)["status"], "passed");
+
+    fs::write(&release, "release\n").unwrap();
+    let active = active.join().unwrap();
+    assert_success(&active, "survivor run");
+    assert_eq!(parse_json_output(&active)["status"], "passed");
+
+    let after = python_cli(&[
+        "--json".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--checkout".to_owned(),
+        checkout.to_string_lossy().into_owned(),
+        "--".to_owned(),
+        "/bin/true".to_owned(),
+    ]);
+    assert_success(&after, "submission after survivor completes");
+    assert_eq!(parse_json_output(&after)["status"], "passed");
+    let (_guard, _owner) = owner_guard(&state).expect("broker unexpectedly exited into drained");
+}
+
+#[test]
 fn draining_native_spool_recovers_after_broker_crash() {
     let temporary = TestDirectory::new("drain-recovery");
     let state = temporary.path().join("state");

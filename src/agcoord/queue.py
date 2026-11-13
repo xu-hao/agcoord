@@ -1878,12 +1878,18 @@ class CoordinatorClient:
         result = _validated_maintenance_receipt(result)
         if not wait:
             return result
+        expected_id = result["drain_id"]
         while result.get("state") != "drained":
             result = self._recover_native_drain(result)
             if result["state"] == "drained":
                 break
             time.sleep(poll_interval)
             result = self.drain_status()
+            if result["drain_id"] != expected_id:
+                raise CoordinatorError(
+                    f"maintenance drain {expected_id} was cancelled while waiting",
+                    code="broker-not-draining",
+                )
         return result
 
     def drain_status(self) -> dict[str, Any]:
@@ -1902,7 +1908,7 @@ class CoordinatorClient:
         return _validated_maintenance_receipt(result)
 
     def resume(self, drain_id: str) -> dict[str, Any]:
-        """Remove one exact drained guard while holding exclusive spool ownership."""
+        """Remove one exact draining or drained guard."""
         if not isinstance(drain_id, str) or not _DRAIN_ID.fullmatch(drain_id):
             raise CoordinatorError("maintenance drain ID is invalid")
         protocol = _spool_protocol(self.paths, timeout=self._database_timeout())
