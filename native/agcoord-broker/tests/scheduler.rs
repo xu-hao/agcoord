@@ -1177,7 +1177,7 @@ fn front_row_reserves_local_resources_across_repositories_and_row_kinds() {
             &Submission {
                 run_id: "check-spare",
                 kind: "check",
-                repository: "repo-b",
+                repository: "repo-a",
                 checkout: &checkout,
                 command: touch_command(&temporary.path().join("spare")),
                 gate_run_id: None,
@@ -1191,8 +1191,8 @@ fn front_row_reserves_local_resources_across_repositories_and_row_kinds() {
         );
         assert_eq!(status(&state, "front-wide")["status"], "queued");
 
-        // Releasing just one original row makes the front fit. Lane rotation cannot let
-        // another repository consume its capacity first.
+        // The last admitted lane is repo-a, so rotation would choose repo-b next.
+        // Releasing one original row must still let the reserved front start first.
         fs::write(temporary.path().join("check-active-a-release"), "release").unwrap();
         wait_status(&state, "check-active-a", "passed");
         wait_for(Duration::from_secs(5), || front_entered.exists());

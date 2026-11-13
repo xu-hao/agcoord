@@ -249,6 +249,10 @@ and the TUI's selection and detail views. Work using spare unreserved units or r
 from the front claim can continue. This is estimate-free EASY backfilling: admission does not
 assume that a later job will finish before the front row can start. The reservation is
 recomputed from live work and ends when the front row starts or leaves the queue.
+When finishing workers release enough capacity for the reserved row to run, it is admitted
+before ordinary lane rotation resumes, so another repository cannot take those newly freed
+units in the same scheduling pass. Its current repository and resource blockers must still
+be empty before it starts.
 
 Capacity and enforcement are separate contracts. An unbound name is always a generic
 `admission-unit`, even when it is spelled `cpu`, `memory`, or `disk`: AGCoord schedules it but

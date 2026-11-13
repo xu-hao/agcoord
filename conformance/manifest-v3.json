@@ -147,7 +147,7 @@
     {
       "id": "resources.front-row-reservation",
       "domain": "resources",
-      "description": "The oldest locally feasible queued row blocked only by resources reserves its complete local claim across repositories and row kinds; later rows backfill only spare capacity, repository-blocked and oversized overflow-only rows reserve nothing, and reservation-blocked overflow waits for the pool threshold without consuming local capacity or bypassing repository exclusions.",
+      "description": "The oldest locally feasible queued row blocked only by resources reserves its complete local claim across repositories and row kinds and starts before lane rotation when workers free enough capacity; later rows backfill only spare capacity, repository-blocked and oversized overflow-only rows reserve nothing, and reservation-blocked overflow waits for the pool threshold without consuming local capacity or bypassing repository exclusions.",
       "tests": {
         "rust_native": [
           "scheduler::front_row_reserves_local_resources_across_repositories_and_row_kinds",

@@ -8,7 +8,8 @@ versioning; dates use ISO 8601.
 - Reserve local capacity for the oldest queued row blocked only by resources, across all
   repositories and row kinds, while allowing later work to use spare unreserved capacity.
   Report `reservation:<front_run_id>:<resource>` blockers in queue views and allow eligible
-  reserved-around work to overflow after its pool's wait threshold. Repository-blocked and
+  reserved-around work to overflow after its pool's wait threshold. Admit the reserved row
+  first when completed workers free enough capacity. Repository-blocked and
   oversized overflow-only rows reserve nothing locally. #238 — prevent later narrow rows
   from starving a wide resource-blocked front row.
 

@@ -6,7 +6,7 @@ use crate::platform::{
     worker_identity_conflicts,
 };
 use crate::store::{
-    Paths, RunRecord, blocked_by, commit_sha_valid, configured_stop_grace, connect,
+    Paths, RunRecord, blocked_by, commit_sha_valid, configured_stop_grace, connect, front_row,
     initialize_native, load_live_runs, load_run, load_runs, local_allocations,
     maintain_child_cpu_leases, maintenance_record, map_database_error, mark_maintenance_drained,
     now, overflow_candidate, validate_child_cpu_leases,
@@ -615,6 +615,22 @@ impl Broker {
             .collect();
         let placed = overflow::live_placements(&connection)?;
         self.validate_active(&active, &placed)?;
+        let mut queued: Vec<_> = runs
+            .iter()
+            .filter(|run| run.status == "queued")
+            .cloned()
+            .collect();
+        crate::recovery::filter_queued(&connection, &mut queued)?;
+        // Remember the reservation before observation releases completed workers' claims.
+        // Once it fits, the front's raw shortages disappear; lane rotation must not let
+        // another repository take those newly freed units before the front starts.
+        let reserved_front = front_row(
+            &active,
+            &queued,
+            &self.capacities,
+            &local_allocations(&active, &placed),
+        )
+        .map(|run| run.run_id.clone());
         for run in active {
             if let Some(pool) = placed
                 .get(&run.run_id)
@@ -645,13 +661,14 @@ impl Broker {
             self.validate_active(&active, &placed)?;
             // This machine is always preferred: a pool is considered only when nothing
             // more can be admitted locally in this pass.
-            let (next, pool) = match self.next_admissible(&active, &queued, &placed) {
-                Some(next) => (next, None),
-                None => match self.next_overflow(&connection, &active, &queued, &placed)? {
-                    Some((next, pool)) => (next, Some(pool)),
-                    None => return Ok(()),
-                },
-            };
+            let (next, pool) =
+                match self.next_admissible(&active, &queued, &placed, reserved_front.as_deref()) {
+                    Some(next) => (next, None),
+                    None => match self.next_overflow(&connection, &active, &queued, &placed)? {
+                        Some((next, pool)) => (next, Some(pool)),
+                        None => return Ok(()),
+                    },
+                };
             drop(connection);
             self.start_worker(&next, pool.as_ref())?;
             self.last_repository = Some(next.repository_id);
@@ -728,13 +745,21 @@ impl Broker {
     ///
     /// Within a lane, a queued job that is blocked by a barrier, by its worktree, or by
     /// capacity lets later admissible lane work pass it; the blockers themselves keep
-    /// barriers in submission order.
+    /// barriers in submission order. A reserved front that became runnable when workers
+    /// finished is admitted before rotation can consume the capacity it waited for.
     fn next_admissible(
         &self,
         active: &[RunRecord],
         queued: &[RunRecord],
         placed: &BTreeMap<String, String>,
+        reserved_front: Option<&str>,
     ) -> Option<RunRecord> {
+        if let Some(run) = queued.iter().find(|run| {
+            reserved_front == Some(run.run_id.as_str())
+                && blocked_by(run, active, queued, &self.capacities, placed).is_empty()
+        }) {
+            return Some(run.clone());
+        }
         let mut heads = Vec::new();
         let mut seen = BTreeSet::new();
         for run in queued {

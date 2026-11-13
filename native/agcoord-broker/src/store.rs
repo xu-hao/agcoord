@@ -1744,7 +1744,19 @@ pub fn blocked_by(
     }
     // Pool placements keep their repository exclusions but consume no local capacity.
     let used = local_allocations(active, placed);
-    let front = queued
+    let front =
+        front_row(active, queued, capacities, &used).filter(|front| run.sequence > front.sequence);
+    row_blockers(run, active, queued, capacities, &used, front)
+}
+
+/// The oldest locally feasible queued row blocked only by raw resource shortages.
+pub fn front_row<'a>(
+    active: &[RunRecord],
+    queued: &'a [RunRecord],
+    capacities: &BTreeMap<String, u64>,
+    used: &BTreeMap<String, u64>,
+) -> Option<&'a RunRecord> {
+    queued
         .iter()
         .filter(|candidate| {
             // A claim accepted only for overflow must never reserve this machine.
@@ -1756,12 +1768,10 @@ pub fn blocked_by(
         .filter(|candidate| {
             // Select from raw blockers, before any reservation is applied. A row waiting
             // on its repository, barrier, or worktree reserves nothing.
-            let raw = row_blockers(candidate, active, queued, capacities, &used, None);
+            let raw = row_blockers(candidate, active, queued, capacities, used, None);
             !raw.is_empty() && raw.iter().all(|reason| reason.starts_with("resource:"))
         })
         .min_by_key(|candidate| candidate.sequence)
-        .filter(|front| run.sequence > front.sequence);
-    row_blockers(run, active, queued, capacities, &used, front)
 }
 
 /// Without a front row, these are the raw repository and local-resource blockers.
