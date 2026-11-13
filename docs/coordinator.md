@@ -1475,11 +1475,13 @@ shortcut that deletes coordinator state.
 ## Terminal UI
 
 `agc tui` is a credential-free live view over the same client API. It shows active,
-queued, and recent terminal jobs across repositories; kind, lane/repository identity,
+queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
 remain inspectable without truncating the durable values. Persistent selection detail includes
-the enforcement summary; the modal detail includes the exact resource contract and sanitized
-receipt events.
+the pool and enforcement summary; the modal detail includes the pool, exact resource contract, and
+sanitized receipt events; and the status bar summarizes configured overflow pools' active
+allocations and remaining daily CPU-hour budgets (with estimated cost when `cpu_hour_price` is
+configured).
 
 The expected key map is:
 
@@ -1512,13 +1514,15 @@ visible in the unfiltered snapshot with their separate caller PID diagnostic int
 Refresh reconciles keyed rows in place, preserving the selected run and both viewport offsets
 when that row still exists without first painting a reset-to-top frame.
 At 80 columns the compact table is exactly
-`STATE · KIND · REPO · RUN · BRANCH · LABEL · AGE · DUR` and does not require horizontal
+`STATE · KIND · REPO · RUN · POOL · BRANCH · LABEL · AGE · DUR` and does not require horizontal
 navigation, including when a long queue also needs its vertical scrollbar. Adjacent columns
 retain a visible gutter; `LABEL` yields the small amount of width needed by that scrollbar
 instead of creating a horizontal one. A value wider than its compact cell ends in a visible
 ellipsis instead of running into the next column or disappearing at a hard edge. Above 80
-columns, `BRANCH` consumes additional width up to its useful cap before `LABEL` expands into the
-remaining space; both contract back to compact ellipsis forms when the terminal narrows.
+columns, `POOL` and `BRANCH` consume additional width up to their useful caps before `LABEL`
+expands into the remaining space; all three contract back to compact ellipsis forms when the
+terminal narrows. `POOL` shows the overflow pool name for placed work, `local` once a job has
+started on this machine, and `—` before placement.
 `BRANCH` shows the exact captured Git branch rather than relying on the caller-supplied label.
 `REPO`
 shows the compact repository name derived from the credential-free normalized remote
