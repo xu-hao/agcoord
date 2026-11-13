@@ -1501,8 +1501,8 @@ shortcut that deletes coordinator state.
 
 ## Terminal UI
 
-`agc tui` is a credential-free live view over the same client API. It shows active,
-queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
+`agc tui` is a credential-free live view over the same client API on every supported Python
+version. It shows active, queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
 remain inspectable without truncating the durable values. Persistent selection detail includes
 the pool and enforcement summary; the modal detail includes the pool, exact resource contract, and

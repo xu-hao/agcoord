@@ -12,6 +12,9 @@ versioning; dates use ISO 8601.
   oversized overflow-only rows reserve nothing locally. #238 — prevent later narrow rows
   from starving a wide resource-blocked front row.
 
+- Render native UTC timestamps in the TUI on Python 3.10. #314 — accept the broker's UTC
+  timestamp suffix so live queue and reservation details render on every supported Python.
+
 ## 0.8.2 — 2026-11-13
 
 - Allow `agc resume <drain-id>` to cancel an in-progress `draining` state without stopping
