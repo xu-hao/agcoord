@@ -3045,3 +3045,80 @@ def test_snapshot_supports_repository_agent_kind_and_limit_filters(
     with pytest.raises(CoordinatorError, match="kind filter must be a non-empty string"):
         client.snapshot(kind="")
 
+
+def test_resume_cancels_active_draining_state_without_stopping_running_work_and_wakes_waiter(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    running = RunningCoordinator(state_dir, capacities={"jobs": 2})
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    waiter_outcome: dict[str, object] = {}
+
+    try:
+        active_id = _submit(
+            client,
+            _blocking_command(entered, release, "active blocker"),
+            repository,
+        )
+        wait_for(entered.exists, "the active blocker did not start")
+        initial_broker_pid = client.ping()["broker_pid"]
+        assert isinstance(initial_broker_pid, int)
+
+        waiter = CoordinatorClient(state_dir=state_dir, autostart=False)
+
+        def run_waiting_drain() -> None:
+            try:
+                waiter_outcome["result"] = waiter.drain(
+                    reason="mistaken drain",
+                    wait=True,
+                    poll_interval=0.02,
+                )
+            except CoordinatorError as exc:
+                waiter_outcome["error"] = exc
+
+        def is_draining() -> bool:
+            try:
+                return client.drain_status().get("state") == "draining"
+            except CoordinatorError as exc:
+                if exc.code == "broker-not-draining":
+                    return False
+                raise
+
+        thread = threading.Thread(target=run_waiting_drain)
+        thread.start()
+        wait_for(is_draining, "coordinator did not enter draining")
+        drain_id = client.drain_status()["drain_id"]
+        assert isinstance(drain_id, str)
+
+        with pytest.raises(CoordinatorError) as refused:
+            _submit(client, _python("print('blocked')"), repository)
+        assert refused.value.code == "broker-draining"
+
+        resumed = client.resume(drain_id)
+        assert resumed == {"state": "open", "drain_id": drain_id, "resumed": True}
+
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        waiter_error = waiter_outcome.get("error")
+        assert isinstance(waiter_error, CoordinatorError)
+        assert waiter_error.code == "broker-not-draining"
+
+        follow_up_id = _submit(
+            client,
+            _python("print('reopened while running')"),
+            _repository(tmp_path / "repository-2", content="two\n"),
+        )
+        assert _row(client, follow_up_id, "passed")["exit_status"] == 0
+        assert client.status(active_id)["status"] == "running"
+
+        release.touch()
+        assert _row(client, active_id, "passed")["exit_status"] == 0
+        assert client.ping()["broker_pid"] == initial_broker_pid
+    finally:
+        release.touch()
+        running.stop()
+
+
