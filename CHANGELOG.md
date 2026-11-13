@@ -3,7 +3,7 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
-## Unreleased
+## 0.8.1 — 2026-11-13
 
 - Show overflow placement and pool budgets in `agc tui`: add a `POOL` table column (`local`,
   `—`, or the overflow pool name), include the pool in persistent selection detail and the `Enter`
