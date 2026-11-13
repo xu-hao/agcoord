@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Allow `agc resume <drain-id>` to cancel an in-progress `draining` state without stopping
+  accepted jobs or displacing the serving broker, while continuing to require exclusive lock
+  ownership and zero live rows once `drained` (#306).
+
 ## 0.8.1 — 2026-11-13
 
 - Show overflow placement and pool budgets in `agc tui`: add a `POOL` table column (`local`,

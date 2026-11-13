@@ -304,6 +304,9 @@ impl Broker {
         }
         let connection = initialize_native(&paths, &capacities)?;
         crate::recovery::record(&connection)?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(map_database_error)?;
         let runs = load_runs(&connection)?;
         if let Some(maintenance) = maintenance_record(&connection)? {
             let live = runs
@@ -318,6 +321,9 @@ impl Broker {
             }
             if live == 0 && maintenance.state != "recovering" {
                 mark_maintenance_drained(&connection)?;
+                connection
+                    .execute_batch("COMMIT")
+                    .map_err(map_database_error)?;
                 return Err(AppError::new(
                     "broker-drained",
                     format!(
@@ -327,6 +333,9 @@ impl Broker {
                 ));
             }
         }
+        connection
+            .execute_batch("COMMIT")
+            .map_err(map_database_error)?;
         validate_child_cpu_leases(&connection)?;
         maintain_child_cpu_leases(&connection)?;
         if cgroup_backend.is_none()
@@ -504,23 +513,17 @@ impl Broker {
             if self.stop_signalled() {
                 return self.graceful_shutdown();
             }
-            let connection = connect(&self.paths)?;
-            let has_live: bool = connection
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM runs WHERE status IN ('queued', 'running')
-                    )",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(map_database_error)?;
-            if !has_live
-                && maintenance_record(&connection)?.is_some_and(|m| m.state != "recovering")
-            {
-                mark_maintenance_drained(&connection)?;
+            let (has_live, drained) = match self.check_idle_drain() {
+                Ok(status) => status,
+                Err(error) if error.code == "broker-database-busy" => {
+                    thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if drained {
                 return Ok(());
             }
-            drop(connection);
             if has_live {
                 self.idle_since = None;
             } else {
@@ -533,6 +536,33 @@ impl Broker {
             }
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    fn check_idle_drain(&self) -> Result<(bool, bool)> {
+        let connection = connect(&self.paths)?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(map_database_error)?;
+        let has_live: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runs WHERE status IN ('queued', 'running')
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_database_error)?;
+        if !has_live && maintenance_record(&connection)?.is_some_and(|m| m.state != "recovering") {
+            mark_maintenance_drained(&connection)?;
+            connection
+                .execute_batch("COMMIT")
+                .map_err(map_database_error)?;
+            return Ok((false, true));
+        }
+        connection
+            .execute_batch("COMMIT")
+            .map_err(map_database_error)?;
+        Ok((has_live, false))
     }
 
     fn validate_active(

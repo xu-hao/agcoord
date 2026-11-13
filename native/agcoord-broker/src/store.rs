@@ -1115,16 +1115,11 @@ pub fn resume(state_dir: &Path, drain_id: &str) -> Result<Value> {
             "maintenance drain ID is invalid",
         ));
     }
-    let owner = OwnerLock::acquire(state_dir).map_err(|error| {
-        if error.code == "broker-already-owned" {
-            AppError::new(
-                "broker-resume-owner-live",
-                "cannot resume while a broker or maintenance operation owns the queue",
-            )
-        } else {
-            error
-        }
-    })?;
+    let owner = match OwnerLock::acquire(state_dir) {
+        Ok(owner) => Some(owner),
+        Err(error) if error.code == "broker-already-owned" => None,
+        Err(error) => return Err(error),
+    };
     let paths = Paths::new(state_dir).configured()?;
     let connection = connect(&paths)?;
     connection
@@ -1144,18 +1139,26 @@ pub fn resume(state_dir: &Path, drain_id: &str) -> Result<Value> {
             "maintenance drain ID does not match",
         ));
     }
-    let live: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(map_database_error)?;
-    if live != 0 {
-        return Err(AppError::new(
-            "broker-drain-live-work",
-            format!("cannot resume while {live} queued or running row(s) remain"),
-        ));
+    if record.state != "draining" {
+        if owner.is_none() {
+            return Err(AppError::new(
+                "broker-resume-owner-live",
+                "cannot resume while a broker or maintenance operation owns the queue",
+            ));
+        }
+        let live: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE status IN ('queued', 'running')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_database_error)?;
+        if live != 0 {
+            return Err(AppError::new(
+                "broker-drain-live-work",
+                format!("cannot resume while {live} queued or running row(s) remain"),
+            ));
+        }
     }
     remove_maintenance_guards(&connection)?;
     connection
