@@ -1237,9 +1237,10 @@ asyncio.run(inspect())
     assert_eq!(
         observed["headers"],
         json!([
-            "STATE", "KIND", "REPO", "RUN", "BRANCH", "LABEL", "AGE", "DUR"
+            "STATE", "KIND", "REPO", "RUN", "POOL", "BRANCH", "LABEL", "AGE", "DUR"
         ])
     );
+    assert_eq!(observed["cells"][4], "local");
     assert_eq!(observed["horizontal_scroll"], 0);
     assert!(!observed["status"].as_str().unwrap().contains("unavailable"));
     let (_guard, _owner) = owner_guard(&state).expect("native owner disappeared");
