@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Allow `agc host install`, `agc host upgrade`, and `agc host recover` to run outside a Git
+  repository by executing the post-activation enforcement proof in a disposable temporary
+  repository (`agcoord-native-host-proof`) when the current directory is not a checkout (#305).
+
 ## 0.8.1 — 2026-11-13
 
 - Show overflow placement and pool budgets in `agc tui`: add a `POOL` table column (`local`,

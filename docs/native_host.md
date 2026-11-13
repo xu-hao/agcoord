@@ -140,7 +140,10 @@ before activation. It verifies every sidecar, restores the helpers' executable m
 package checker, creates or validates the owner-only state and configuration, stages and
 activates the package, reloads and enables the user service, checks its exact installed identity,
 waits for the started broker to own the spool, and submits the shipped one-CPU enforcement
-proof. An existing safe configuration without a
+proof. `agc host install`, `agc host upgrade`, and `agc host recover` may be run from any working
+directory; when invoked outside a Git repository, the enforcement proof runs in a disposable
+temporary repository (`agcoord-native-host-proof`) that is removed once the proof finishes. An
+existing safe configuration without a
 queue is preserved. Use `agc host upgrade`, not install, when a queue already exists.
 If activation succeeds but service verification or the enforcement proof fails, the command
 disables and stops the unproved fresh service before reporting recovery instructions.
