@@ -5,6 +5,17 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Reserve local capacity for the oldest queued row blocked only by resources, across all
+  repositories and row kinds, while allowing later work to use spare unreserved capacity.
+  Report `reservation:<front_run_id>:<resource>` blockers in queue views and allow eligible
+  reserved-around work to overflow after its pool's wait threshold. Admit the reserved row
+  first when completed workers free enough capacity. Repository-blocked and
+  oversized overflow-only rows reserve nothing locally. #238 — prevent later narrow rows
+  from starving a wide resource-blocked front row.
+
+- Render native UTC timestamps in the TUI on Python 3.10. #314 — accept the broker's UTC
+  timestamp suffix so live queue and reservation details render on every supported Python.
+
 - Enable overflow eligibility by default for `run`, `full`, and `land` when the checkout has a
   valid `.agcoord/overflow.json`; add `--no-overflow` to keep a job local, and refuse invalid
   declarations before submission (#311 — enable overflow by default when the repository declares it, with an opt-out).

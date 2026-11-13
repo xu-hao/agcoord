@@ -228,8 +228,31 @@ later admissible lane work pass it; only lands keep submission order among thems
 earlier same-worktree work. Thus an eight-CPU host can overlap requests for six
 and two CPUs, or four requests for two CPUs, without a preselected “two jobs at four CPUs each”
 partition. `jobs` remains an independent concurrency ceiling and does not replace CPU, memory,
-temporary-storage, or disk claims. Greedy backfill can delay a large request while smaller
-requests continue to fit; it does not reserve future capacity for that request.
+temporary-storage, or disk claims.
+
+Backfilling reserves local capacity for one **front row** across all repositories and row
+kinds (`check`, `full`, `land`, and retained `merge`). The front row is the oldest queued row
+by submission sequence whose raw blockers are nonempty and contain only `resource:<name>`
+shortages, and whose complete claim could fit on this machine when idle. Raw blockers include
+the repository barrier, FIFO, and worktree exclusions plus shortages against running local
+allocations; they exclude reservations. A row with any `repository:*` blocker reserves nothing.
+An oversized claim accepted only because an overflow pool offers it also reserves nothing
+locally, so it cannot hold this machine's capacity forever.
+
+While a front row exists, every later row may backfill locally only when, for each resource it
+claims, its units plus running local allocations plus the front row's units fit the configured
+capacity. The reservation covers the front row's complete claim, including resources that are
+not currently short. A later row that already lacks capacity reports `resource:<name>`; one
+that fits now but would consume reserved capacity reports
+`reservation:<front_run_id>:<resource>`. These blockers appear in `agc list --json`, `agc show`,
+and the TUI's selection and detail views. Work using spare unreserved units or resources absent
+from the front claim can continue. This is estimate-free EASY backfilling: admission does not
+assume that a later job will finish before the front row can start. The reservation is
+recomputed from live work and ends when the front row starts or leaves the queue.
+When finishing workers release enough capacity for the reserved row to run, it is admitted
+before ordinary lane rotation resumes, so another repository cannot take those newly freed
+units in the same scheduling pass. Its current repository and resource blockers must still
+be empty before it starts.
 
 Capacity and enforcement are separate contracts. An unbound name is always a generic
 `admission-unit`, even when it is spelled `cpu`, `memory`, or `disk`: AGCoord schedules it but
@@ -343,13 +366,18 @@ never overflows.
 
 This machine is always preferred. In each scheduling pass the broker first admits everything
 that fits locally. Only then does it take the earliest queued job that allowed overflow, is
-blocked by nothing but this machine's capacity, and has been queued for at least a pool's
-`wait_threshold`, and place it in the first configured pool that has room for its complete claim
-and enough budget. Lane and barrier rules are unchanged: a placed job still counts as active
-work in its repository and worktree, and a job waiting for a land or for its worktree never
-overflows around it. For an eligible job, a claim larger than this machine's capacity is accepted
+blocked only by `resource:*` shortages and/or `reservation:*` reasons, and has been queued for
+at least a pool's `wait_threshold`, and place it in the first configured pool that has room
+for its complete claim and enough budget. Lane and barrier rules are unchanged: a placed job
+still counts as active work in its repository and worktree, and a job waiting for a land or for
+its worktree never overflows around it. For an eligible job, a claim larger than this machine's
+capacity is accepted
 at submission when some pool offers it as one job, and reaches that pool by the same rule.
 With `--no-overflow`, claims must fit local capacities.
+A later row held back by the front row's reservation may overflow after that threshold:
+placement consumes the pool's capacity rather than local capacity, so it does not delay the
+local front row. Pool allocations are excluded from local shortages and reservations, while
+their repository and worktree exclusions still apply.
 
 A placed job's row moves to `running` with its `pool` set. Its worker on this machine is
 `EXECUTOR... -- COMMAND...`, started in the submitted checkout with the usual admission
@@ -1025,8 +1053,8 @@ credential, network, or general security sandboxes.
 
 Fairness applies across lanes and capacity: a compatible check can overlap work in another
 repository or in another worktree of its own, but it cannot leapfrog an earlier land in its own
-worktree, and lane rotation keeps one repository from monopolizing admission. Greedy backfill
-remains: a smaller request can pass a larger one that does not yet fit.
+worktree, and lane rotation keeps one repository from monopolizing admission. Backfilling
+uses only capacity left unreserved by a resource-blocked front row.
 
 ## Durable job shape
 
@@ -1074,7 +1102,8 @@ event fields. A backend sample may also return stable, sanitized observations su
 controller-limit event; the broker validates the resource and code, records each observation
 once, and never exposes a raw controller file or exception. Backend handles and host paths remain
 private spool state and never enter the public row;
-`blocked_by` identifies durable predecessors currently preventing admission. `pool` is the
+`blocked_by` identifies repository predecessors, resource shortages, and front-row reservations
+currently preventing admission. `pool` is the
 name of the overflow pool the job was placed in, or null for a job that ran or will run on this
 machine. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
@@ -1483,8 +1512,8 @@ shortcut that deletes coordinator state.
 
 ## Terminal UI
 
-`agc tui` is a credential-free live view over the same client API. It shows active,
-queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
+`agc tui` is a credential-free live view over the same client API on every supported Python
+version. It shows active, queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
 remain inspectable without truncating the durable values. Persistent selection detail includes
 the pool and enforcement summary; the modal detail includes the pool, exact resource contract, and

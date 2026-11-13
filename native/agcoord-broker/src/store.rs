@@ -1742,6 +1742,50 @@ pub fn blocked_by(
     if run.status != "queued" {
         return Vec::new();
     }
+    // Pool placements keep their repository exclusions but consume no local capacity.
+    let used = local_allocations(active, placed);
+    let front =
+        front_row(active, queued, capacities, &used).filter(|front| run.sequence > front.sequence);
+    row_blockers(run, active, queued, capacities, &used, front)
+}
+
+/// The oldest locally feasible queued row blocked only by raw resource shortages.
+pub fn front_row<'a>(
+    active: &[RunRecord],
+    queued: &'a [RunRecord],
+    capacities: &BTreeMap<String, u64>,
+    used: &BTreeMap<String, u64>,
+) -> Option<&'a RunRecord> {
+    queued
+        .iter()
+        .filter(|candidate| {
+            // A claim accepted only for overflow must never reserve this machine.
+            candidate
+                .resources
+                .iter()
+                .all(|(name, units)| capacities.get(name).is_some_and(|cap| *units <= *cap))
+        })
+        .filter(|candidate| {
+            // Select from raw blockers, before any reservation is applied. A row waiting
+            // on its repository, barrier, or worktree reserves nothing.
+            let raw = row_blockers(candidate, active, queued, capacities, used, None);
+            !raw.is_empty() && raw.iter().all(|reason| reason.starts_with("resource:"))
+        })
+        .min_by_key(|candidate| candidate.sequence)
+}
+
+/// Without a front row, these are the raw repository and local-resource blockers.
+fn row_blockers(
+    run: &RunRecord,
+    active: &[RunRecord],
+    queued: &[RunRecord],
+    capacities: &BTreeMap<String, u64>,
+    used: &BTreeMap<String, u64>,
+    front: Option<&RunRecord>,
+) -> Vec<String> {
+    if run.status != "queued" {
+        return Vec::new();
+    }
     let same_active: Vec<_> = active
         .iter()
         .filter(|candidate| candidate.repository_id == run.repository_id)
@@ -1790,13 +1834,23 @@ pub fn blocked_by(
             run.repository_id, candidate.run_id
         ));
     }
-    // Rows placed in an overflow pool keep their lane and barrier effects above, but
-    // their claims are held by the pool rather than by this machine.
-    let used = local_allocations(active, placed);
     for (name, units) in &run.resources {
         if used.get(name).copied().unwrap_or(0) + units > capacities.get(name).copied().unwrap_or(0)
         {
             reasons.push(format!("resource:{name}"));
+        } else if let Some(front) = front {
+            let front_units = front.resources.get(name).copied().unwrap_or(0);
+            if front_units > 0
+                && used
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(front_units)
+                    .saturating_add(*units)
+                    > capacities.get(name).copied().unwrap_or(0)
+            {
+                reasons.push(format!("reservation:{}:{name}", front.run_id));
+            }
         }
     }
     reasons
