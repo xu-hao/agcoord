@@ -37,6 +37,7 @@ def _row(
     gate_exit_status: int | None = None,
     position: int | None = None,
     resource_receipt: dict[str, object] | None = None,
+    pool: str | None = None,
 ) -> dict[str, object]:
     created = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
     started = created + timedelta(seconds=5) if status != "queued" else None
@@ -82,6 +83,7 @@ def _row(
         },
         "resource_receipt": selected_receipt,
         "blocked_by": [],
+        "pool": pool,
         "gate_run_id": gate_run_id,
         "publication": publication,
         "failure_reason": failure_reason,
@@ -109,6 +111,7 @@ def _snapshot() -> dict[str, object]:
         "allocations": {"jobs": 1, "cpu": 1, "browser": 1},
         "resource_bindings": {},
         "resource_capabilities": {},
+        "overflow_pools": [],
         "maintenance": None,
         "active": [_row("check-active", 1, "running")],
         "queued": [
@@ -291,6 +294,7 @@ async def test_queue_order_and_detail_keep_repository_resource_and_publication_i
             "KIND",
             "REPO",
             "RUN",
+            "POOL",
             "BRANCH",
             "LABEL",
             "AGE",
@@ -461,7 +465,7 @@ async def test_rendered_table_separates_columns_and_marks_truncated_detail_value
         rendered_row = table.render_line(table.header_height).text
         has_column_gutter = bool(
             re.search(
-                r"\bcheck +repo-\S*… +check-\S*… +feature/1 +LONGLABEL-\S*…",
+                r"\bcheck +repo-\S*… +check-\S*… +local +feature/1 +LONGLABEL-\S*…",
                 rendered_row,
             )
         )
@@ -529,6 +533,7 @@ async def test_branch_and_label_use_wide_space_and_return_to_compact_ellipsis():
             "KIND",
             "REPO",
             "RUN",
+            "POOL",
             "BRANCH",
             "LABEL",
             "AGE",
@@ -1124,5 +1129,86 @@ async def test_server_side_filtered_snapshots_and_picker_choices():
             and call.get("agent") == "agent-beta"
             for call in client.snapshot_calls
         )
+
+
+@pytest.mark.asyncio
+async def test_overflow_pool_column_detail_and_budget_status_are_visible_across_widths():
+    snapshot = _snapshot()
+    overflow_active = _row(
+        "check-overflow",
+        10,
+        "running",
+        label="overflow suite",
+        pool="gcp-batch",
+    )
+    local_active = _row("check-local", 11, "running", label="local suite")
+    waiting = _row("check-queued", 12, "queued", label="waiting suite", position=1)
+    queued_cancelled = _row("check-never-ran", 13, "cancelled", label="cancelled early")
+    queued_cancelled["started_at"] = None
+    overflow_done = _row(
+        "full-overflow-done",
+        14,
+        "passed",
+        kind="full",
+        label="completed cloud gate",
+        pool="workstation",
+    )
+    snapshot["active"] = [overflow_active, local_active]
+    snapshot["queued"] = [waiting]
+    snapshot["recent"] = [overflow_done, queued_cancelled]
+    snapshot["overflow_pools"] = [
+        {
+            "name": "gcp-batch",
+            "capacities": {"jobs": 4, "cpu": 32, "memory": 137438953472},
+            "allocations": {"jobs": 1, "cpu": 2, "memory": 4294967296},
+            "budget": {
+                "cpu_hours_per_day": 120.0,
+                "used_cpu_hours": 2.0,
+                "remaining_cpu_hours": 118.0,
+                "rollover_utc": "00:00",
+            },
+            "cpu_hour_price": 0.04,
+        }
+    ]
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _settled(pilot)
+        table = _table(app)
+        assert table.max_scroll_x == 0
+        assert [str(table.get_row(run_id)[4]) for run_id in (
+            "check-overflow",
+            "check-local",
+            "check-queued",
+            "full-overflow-done",
+            "check-never-ran",
+        )] == ["gcp-batch", "local", "—", "workstation", "—"]
+
+        compact_overflow_line = table.render_line(table.header_height).text
+        assert "gcp-…" in compact_overflow_line
+
+        subject = _widget_text(app.query_one("#gate-subject", Static))
+        assert "2 active (1 overflow)" in subject
+
+        status_bar = _widget_text(app.query_one("#gate-status", Static))
+        assert "overflow gcp-batch (jobs 1/4, cpu 2/32, budget 118.0/120 cpu-h left (~$0.08/$4.80))" in status_bar
+
+        detail_pane = _widget_text(app.query_one("#gate-detail", Static))
+        assert "pool: gcp-batch" in detail_pane
+        assert "enforcement: admission-only" in detail_pane
+
+        await pilot.press("enter")
+        await pilot.pause()
+        modal_text = _screen_text(app)
+        assert "Pool: gcp-batch" in modal_text
+        await pilot.press("escape")
+        await _settled(pilot)
+
+        await pilot.resize_terminal(100, 24)
+        await _settled(pilot)
+        assert table.max_scroll_x == 0
+        wide_overflow_line = table.render_line(table.header_height).text
+        assert "gcp-batch" in wide_overflow_line
 
 

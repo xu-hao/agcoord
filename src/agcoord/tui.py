@@ -34,32 +34,37 @@ _MISSING = (
 )
 
 _COMPACT_TABLE_WIDTH = 80
-_COMPACT_BRANCH_WIDTH = 10
-_COMPACT_LABEL_WIDTH = 11
+_COMPACT_POOL_WIDTH = 5
+_COMPACT_BRANCH_WIDTH = 9
+_COMPACT_LABEL_WIDTH = 12
+_WIDE_POOL_WIDTH = 9
 _WIDE_BRANCH_WIDTH = 27
 _LEGACY_PID_AGENT = re.compile(r"pid:[1-9][0-9]*\Z")
 
 
-def _flexible_widths(viewport_width: int) -> tuple[int, int]:
-    """Grow BRANCH to a useful cap, then give LABEL the remaining width."""
+def _flexible_widths(viewport_width: int) -> tuple[int, int, int]:
+    """Grow POOL and BRANCH to useful caps, then give LABEL the remaining width."""
     extra = max(0, viewport_width - _COMPACT_TABLE_WIDTH)
-    branch_extra = min(extra, _WIDE_BRANCH_WIDTH - _COMPACT_BRANCH_WIDTH)
+    pool_extra = min(extra, _WIDE_POOL_WIDTH - _COMPACT_POOL_WIDTH)
+    remaining = extra - pool_extra
+    branch_extra = min(remaining, _WIDE_BRANCH_WIDTH - _COMPACT_BRANCH_WIDTH)
     return (
+        _COMPACT_POOL_WIDTH + pool_extra,
         _COMPACT_BRANCH_WIDTH + branch_extra,
-        _COMPACT_LABEL_WIDTH + extra - branch_extra,
+        _COMPACT_LABEL_WIDTH + remaining - branch_extra,
     )
 
 
 def _fitted_label_width(table: DataTable, row_count: int) -> int:
     """Fit LABEL around a required vertical scrollbar at supported widths."""
-    _, preferred = _flexible_widths(table.size.width)
+    _, _, preferred = _flexible_widths(table.size.width)
     header_height = table.header_height if table.show_header else 0
     needs_vertical_scrollbar = row_count + header_height > table.size.height
     if table.size.width < _COMPACT_TABLE_WIDTH or not needs_vertical_scrollbar:
         return preferred
 
     columns = table.ordered_columns
-    label_index = 5
+    label_index = 6
     fixed_render_width = sum(
         column.width
         for index, column in enumerate(columns)
@@ -164,6 +169,52 @@ def _repository_label(repository: object) -> str:
     return identity.rsplit("/", 1)[-1] or str(repository)
 
 
+def _pool_label(row: dict) -> str:
+    """Name the overflow pool a job was placed in, local once started, or — while unplaced."""
+    pool = row.get("pool")
+    if isinstance(pool, str) and pool:
+        return pool
+    if row.get("started_at") is not None or row.get("status") == "running":
+        return "local"
+    return "—"
+
+
+def _overflow_pools_summary(snapshot: dict) -> str:
+    """Summarize configured overflow pools, live allocations, and daily CPU-hour budgets."""
+    pools = snapshot.get("overflow_pools")
+    if not isinstance(pools, list) or not pools:
+        return ""
+    parts: list[str] = []
+    for pool in pools:
+        if not isinstance(pool, dict) or not pool.get("name"):
+            continue
+        capacities = pool.get("capacities") or {}
+        allocations = pool.get("allocations") or {}
+        preferred = [key for key in ("jobs", "cpu") if key in capacities]
+        shown_keys = preferred or list(capacities.keys())
+        items = [
+            f"{key} {allocations.get(key, 0)}/{capacities[key]}"
+            for key in shown_keys
+        ]
+        budget = pool.get("budget")
+        if (
+            isinstance(budget, dict)
+            and "remaining_cpu_hours" in budget
+            and "cpu_hours_per_day" in budget
+        ):
+            remaining = float(budget["remaining_cpu_hours"])
+            limit = float(budget["cpu_hours_per_day"])
+            used = float(budget.get("used_cpu_hours", max(0.0, limit - remaining)))
+            budget_text = f"budget {remaining:.1f}/{limit:g} cpu-h left"
+            price = pool.get("cpu_hour_price")
+            if isinstance(price, (int, float)) and not isinstance(price, bool):
+                budget_text += f" (~${used * price:.2f}/${limit * price:.2f})"
+            items.append(budget_text)
+        detail = f" ({', '.join(items)})" if items else ""
+        parts.append(f"overflow {pool['name']}{detail}")
+    return " · ".join(parts)
+
+
 def _detail(row: dict | None) -> str:
     if row is None:
         return "no coordinated runs"
@@ -187,6 +238,7 @@ def _detail(row: dict | None) -> str:
     resources = ", ".join(f"{name}={units}" for name, units in row["resources"].items())
     enforcement = resource_enforcement_summary(row["resource_receipt"])
     blockers = ", ".join(row["blocked_by"]) or "—"
+    pool = _pool_label(row)
     publication = row["publication"]
     target = (
         f" · publish {publication['adapter']} {publication['request']}"
@@ -195,7 +247,7 @@ def _detail(row: dict | None) -> str:
     )
     return (
         f"{row['run_id']} · {row['kind']} · {row['repository']}{target}\n"
-        f"phase: {row['phase']} · gate exit: "
+        f"phase: {row['phase']} · pool: {pool} · gate exit: "
         f"{row['gate_exit_status'] if row['gate_exit_status'] is not None else '—'}\n"
         f"agent: {row['agent']} · resources: {resources} · enforcement: "
         f"{enforcement} · blocked: {blockers}\n"
@@ -214,6 +266,7 @@ def _modal_detail(row: dict) -> str:
         f"Status: {row['status']}\n"
         f"Kind: {row['kind']}\n"
         f"Phase: {row['phase']}\n"
+        f"Pool: {_pool_label(row)}\n"
         f"Gate exit: {row['gate_exit_status'] if row['gate_exit_status'] is not None else '—'}\n"
         f"Repository: {row['repository']} ({row['repository_id']})\n"
         f"Worktree: {row['worktree_id']}\n"
@@ -424,6 +477,7 @@ def build_app(
         CSS = frame.CSS + """
         #gates { height: 1fr; }
         #gate-detail { height: 9; min-height: 9; max-height: 9; }
+        #gate-status { height: auto; max-height: 2; }
         #filter-picker { width: 76%; max-width: 96; height: 80%; max-height: 32;
                          padding: 0 1; background: #ffffff; color: #111111;
                          border: double #111111; }
@@ -494,16 +548,17 @@ def build_app(
             table = self.query_one("#gates", RunTable)
             table.resize_callback = self._render_resized_table
             table.cell_padding = 1
-            branch_width, label_width = _flexible_widths(table.size.width)
+            pool_width, branch_width, label_width = _flexible_widths(table.size.width)
             for label, width in (
-                ("STATE", 9),
+                ("STATE", 7),
                 ("KIND", 5),
-                ("REPO", 9),
-                ("RUN", 9),
+                ("REPO", 8),
+                ("RUN", 8),
+                ("POOL", pool_width),
                 ("BRANCH", branch_width),
                 ("LABEL", label_width),
-                ("AGE", 5),
-                ("DUR", 5),
+                ("AGE", 4),
+                ("DUR", 4),
             ):
                 table.add_column(label, width=width)
             self.action_refresh()
@@ -632,9 +687,10 @@ def build_app(
             if self._agent_filter is not None:
                 ordered = [row for row in ordered if row["agent"] == self._agent_filter]
             self._rows = {row["run_id"]: row for row in ordered}
-            branch_width, _ = _flexible_widths(table.size.width)
-            table.ordered_columns[4].width = branch_width
-            table.ordered_columns[5].width = _fitted_label_width(table, len(ordered))
+            pool_width, branch_width, _ = _flexible_widths(table.size.width)
+            table.ordered_columns[4].width = pool_width
+            table.ordered_columns[5].width = branch_width
+            table.ordered_columns[6].width = _fitted_label_width(table, len(ordered))
             # Fixed-width mutation is immediate, while DataTable normally updates its
             # virtual width on a later dimension pass. Clearing previously forced that
             # pass as a side effect; keep the scroll range accurate explicitly now.
@@ -648,6 +704,7 @@ def build_app(
                     _compact_cell(row["kind"]),
                     _compact_cell(_repository_label(row["repository"])),
                     _compact_cell(row["run_id"]),
+                    _compact_cell(_pool_label(row)),
                     _compact_cell(row["branch"]),
                     _compact_cell(row["label"]),
                     _compact_cell(_age(row, now)),
@@ -707,6 +764,16 @@ def build_app(
                 immediate=True,
             )
             active = len(snapshot["active"])
+            overflow_active = sum(
+                1
+                for row in snapshot["active"]
+                if isinstance(row.get("pool"), str) and row.get("pool")
+            )
+            active_summary = (
+                f"{active} active ({overflow_active} overflow)"
+                if overflow_active
+                else f"{active} active"
+            )
             queued = len(snapshot["queued"])
             history = "shown · h hide" if self._show_history else "hidden · h show"
             kind = self._kind_filter or "all kinds"
@@ -725,13 +792,15 @@ def build_app(
                 )
             agent = self._agent_filter or "all agents"
             self.query_one("#gate-subject", Static).update(
-                f"MACHINE │ AGCOORD │ {active} active · {queued} queued · "
+                f"MACHINE │ AGCOORD │ {active_summary} · {queued} queued · "
                 f"{kind} · {repository} · {agent} · history {history}"
             )
             allocation = ", ".join(
                 f"{name} {snapshot['allocations'].get(name, 0)}/{capacity}"
                 for name, capacity in snapshot["capacities"].items()
             )
+            overflow_summary = _overflow_pools_summary(snapshot)
+            overflow_status = f"{overflow_summary} · " if overflow_summary else ""
             maintenance = snapshot.get("maintenance")
             maintenance_status = ""
             if maintenance is not None:
@@ -742,6 +811,7 @@ def build_app(
             broker = snapshot["broker_pid"]
             self._message = (
                 f"{maintenance_status}broker {broker if broker is not None else 'none'} · "
+                f"{overflow_status}"
                 f"{allocation} · "
                 f"read {snapshot['captured_at']}"
             )
