@@ -25,10 +25,11 @@ the body runs as bash -ec by default, or sh -ec / python3 -c when its first line
 that interpreter in a shebang. An inline `bash -ec '...'` command also works. Do not create
 host-local wrapper scripts. Keep fast documentation and lint checks that read .git separate,
 submitted with --no-overflow and small resources; do not bundle them with heavy test commands,
-so a heavy suite can overflow cleanly. Declare scratch resources when needed. Use --no-overflow
-for checks needing host files or venvs, .git, local services or daemons, or unbundled extras.
-Also use it on agc full and agc land when gate scripts check local admission or host
-user-namespace sandboxes.
+so a heavy suite can overflow cleanly. Declare scratch resources when needed, and pass
+--require-capability userns when a command needs unprivileged user namespaces or bubblewrap
+(and --runtime NAME when targeting specific runtimes). Use --no-overflow
+for checks needing host files or venvs, .git, local services or daemons, or unbundled extras,
+and on agc full and agc land when gate scripts verify local admission.
 Land a pull request only through one gate-and-publish request; never merge directly:
   agc land <pr> --resource cpu=4 -- <full test command>
 Never run agc from inside an admitted job. A stale-main or head-changed refusal means:
@@ -52,10 +53,12 @@ bash -ec by default; a first-line shebang can select sh -ec, bash -ec, or python
 An inline `bash -ec '...'` command also works. Do not create host-local wrapper scripts.
 Keep fast documentation and lint checks that read .git separate, submitted with
 --no-overflow and small resources; do not bundle them with heavy test commands, so a
-heavy suite can overflow cleanly. Declare scratch resources when needed. Use
+heavy suite can overflow cleanly. Declare scratch resources when needed, and pass
+--require-capability userns when a command needs unprivileged user namespaces or
+bubblewrap (and --runtime NAME when targeting specific runtimes). Use
 --no-overflow for checks needing host files or venvs, .git, local services or daemons,
-or unbundled extras. Also use it on agc full and agc land when gate scripts check local
-admission or host user-namespace sandboxes.
+or unbundled extras, and on agc full and agc land when gate scripts verify local
+admission.
 Use `agc full` for a clean exact-head verdict when you need one without publishing.
 `full` and `land` execute in reusable coordinator-owned worktrees; checks use your
 checkout. Concurrent edits in your checkout cannot affect the gated files. The row's
@@ -115,10 +118,15 @@ when needed; AGCoord does not provide `TMPDIR` without a scratch policy.
 
 Fast documentation and lint checks that inspect `.git` are local checks: submit them separately
 with `--no-overflow` and small resource claims. Keep them out of a heavy test command so that
-suite remains eligible to overflow cleanly. Pass `--no-overflow` for checks needing host files
-or venvs, `.git`, local services or daemons, or extras not bundled in the toolchain image. Pass
-it on `agc full` and `agc land` when gate scripts check local admission or host user-namespace
-sandboxes.
+suite remains eligible to overflow cleanly. Pass `--require-capability userns` when a check or
+gate needs unprivileged user namespaces or `bwrap`: the coordinator runs it on `local` when the
+host startup probe found user-namespace support, or overflows it to a pool that provides
+`userns` (such as a `"privileged": true` pool) when `local` cannot. Repeat `--require-capability
+NAME` or `--runtime NAME` (`local` or configured pool names) on `agc run`, `agc full`, and
+`agc land` when a job depends on specific runtime capabilities or targets. Pass `--no-overflow`
+for checks needing host files or venvs, `.git`, local services or daemons, or extras not bundled
+in the toolchain image, and on `agc full` and `agc land` when gate scripts verify local
+admission.
 
 Applied overflow scratch is mounted at `/tmp`, with `TMPDIR`, `TMP`, and `TEMP` set to
 that path automatically. SSH and Batch honor `"exec": true` on its binding. Cloud Run
@@ -162,6 +170,7 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | `gate-tree-setup-failed` / `gate-tree-capacity` | The coordinator could not prepare its gate tree or retain it within the cache budget. | Read the run log; resolve the filesystem failure or allow active gates to finish, then resubmit. |
 | `error: resource 'gpu' has no configured machine capacity` | The broker's `config.json` has no such capacity. | Claim only configured names; ask the operator to add one. |
 | `error: resource 'cpu' requests 99, above capacity 4` | The claim can never be admitted. | Lower the claim; `agc --json list` shows `capacities`. |
+| `error: unknown runtime '…'` / `error: capability '…' is not available on any allowed runtime` / `error: no single allowed runtime satisfies both the requested resources and capabilities (…) ` | No single permitted runtime offers the requested runtime name, capability, and resource claims together. | Inspect `capacities` and `overflow_pools` in `agc --json list`, adjust `--runtime` / `--require-capability` / `--resource` or drop `--no-overflow`, and resubmit. |
 | `error: a coordinated job cannot submit another coordinated job; …` | Nested submission. | Run the tool directly inside the job. |
 | `error: … is not the broker this agc <version> client was released with …` | A user-owned broker no longer matches the client's pin, usually after a client upgrade. | Run `agc host install --user` again; set `native_broker.allow_development` only for a build from source. |
 | A refusal with code `broker-draining` | Maintenance is closing the queue. | Wait; `agc list`, `show`, and `log` still work. |

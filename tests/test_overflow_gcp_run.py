@@ -465,3 +465,30 @@ def test_buffered_stdout_flushed_after_later_stderr_is_not_dropped(cloud: Cloud)
     assert completed.returncode == 0, completed.stderr
     assert "progress on stderr\n" in completed.stdout
     assert "buffered stdout from start of run\n" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("options", "overrides"),
+    [
+        ((), {"AGCOORD_OVERFLOW_PRIVILEGED": "1"}),
+        (("--privileged",), {}),
+        (("--privileged",), {"AGCOORD_OVERFLOW_PRIVILEGED": "0"}),
+    ],
+)
+def test_privileged_placement_or_flag_fails_closed_before_building_or_pushing(
+    cloud: Cloud,
+    options: tuple[str, ...],
+    overrides: dict[str, str],
+):
+    completed = cloud.run("true", options=options, **overrides)
+
+    assert completed.returncode == 125
+    assert "privileged" in completed.stderr
+    assert cloud.docker() == []
+    assert cloud.gcloud() == []
+
+
+def test_unprivileged_overflow_env_zero_runs_normally_on_cloud_run(cloud: Cloud):
+    completed = cloud.run("true", AGCOORD_OVERFLOW_PRIVILEGED="0")
+
+    assert completed.returncode == 0, completed.stderr

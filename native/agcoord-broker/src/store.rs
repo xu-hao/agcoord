@@ -225,6 +225,7 @@ pub struct OwnerInfo {
     pub capacities: BTreeMap<String, u64>,
     pub resource_bindings: BTreeMap<String, Binding>,
     pub resource_capabilities: Value,
+    pub local_runtime: crate::overflow::Runtime,
     pub overflow_pools: Vec<Pool>,
 }
 
@@ -484,6 +485,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
     })?;
     let allowed = [
         "capacities",
+        "capabilities",
         "bindings",
         "cgroup_root",
         "cgroup_io",
@@ -635,6 +637,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             "stop_grace must be a finite number of seconds from 0 to 2147483.647",
         ));
     }
+    crate::overflow::parse_capabilities_field(object.get("capabilities"), "broker configuration")?;
     let Some(value) = object.get("database_timeout") else {
         return Ok(DATABASE_TIMEOUT);
     };
@@ -1505,6 +1508,10 @@ pub fn owner_info(paths: &Paths) -> Result<OwnerInfo> {
                 "live owner resource capabilities are missing",
             )
         })?)?;
+    let local_runtime = match fields.get("local_runtime") {
+        Some(value) => crate::overflow::parse_local_runtime_json(value, &capacities)?,
+        None => crate::overflow::Runtime::local(capacities.clone(), BTreeSet::new()),
+    };
     // An owner without overflow pools, or one that predates them, publishes none.
     let overflow_pools = fields
         .get("overflow_pools")
@@ -1516,6 +1523,7 @@ pub fn owner_info(paths: &Paths) -> Result<OwnerInfo> {
         capacities,
         resource_bindings,
         resource_capabilities,
+        local_runtime,
         overflow_pools,
     })
 }
@@ -1861,7 +1869,7 @@ pub fn blocked_by(
     run: &RunRecord,
     active: &[RunRecord],
     queued: &[RunRecord],
-    capacities: &BTreeMap<String, u64>,
+    local_runtime: &crate::overflow::Runtime,
     placed: &BTreeMap<String, String>,
     batch_followers: &BTreeMap<String, String>,
 ) -> Vec<String> {
@@ -1870,31 +1878,36 @@ pub fn blocked_by(
     }
     // Pool placements keep their repository exclusions but consume no local capacity.
     let used = local_allocations(active, placed, batch_followers);
-    let front =
-        front_row(active, queued, capacities, &used).filter(|front| run.sequence > front.sequence);
-    row_blockers(run, active, queued, capacities, &used, front)
+    let front = front_row(active, queued, local_runtime, &used)
+        .filter(|front| run.sequence > front.sequence);
+    row_blockers(run, active, queued, local_runtime, &used, front)
 }
 
 /// The oldest locally feasible queued row blocked only by raw resource shortages.
 pub fn front_row<'a>(
     active: &[RunRecord],
     queued: &'a [RunRecord],
-    capacities: &BTreeMap<String, u64>,
+    local_runtime: &crate::overflow::Runtime,
     used: &BTreeMap<String, u64>,
 ) -> Option<&'a RunRecord> {
     queued
         .iter()
         .filter(|candidate| {
             // A claim accepted only for overflow must never reserve this machine.
-            candidate
-                .resources
-                .iter()
-                .all(|(name, units)| capacities.get(name).is_some_and(|cap| *units <= *cap))
+            let Ok((allowed_runtimes, required_capabilities)) =
+                crate::overflow::parse_placement_constraints(&candidate.environment)
+            else {
+                return false;
+            };
+            allowed_runtimes
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(crate::overflow::LOCAL_RUNTIME))
+                && local_runtime.satisfies(&candidate.resources, &required_capabilities)
         })
         .filter(|candidate| {
             // Select from raw blockers, before any reservation is applied. A row waiting
             // on its repository, barrier, or worktree reserves nothing.
-            let raw = row_blockers(candidate, active, queued, capacities, used, None);
+            let raw = row_blockers(candidate, active, queued, local_runtime, used, None);
             !raw.is_empty() && raw.iter().all(|reason| reason.starts_with("resource:"))
         })
         .min_by_key(|candidate| candidate.sequence)
@@ -1905,7 +1918,7 @@ fn row_blockers(
     run: &RunRecord,
     active: &[RunRecord],
     queued: &[RunRecord],
-    capacities: &BTreeMap<String, u64>,
+    local_runtime: &crate::overflow::Runtime,
     used: &BTreeMap<String, u64>,
     front: Option<&RunRecord>,
 ) -> Vec<String> {
@@ -1973,6 +1986,22 @@ fn row_blockers(
             run.repository_id, candidate.run_id
         ));
     }
+    if let Ok((allowed_runtimes, required_capabilities)) =
+        crate::overflow::parse_placement_constraints(&run.environment)
+    {
+        if allowed_runtimes
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(crate::overflow::LOCAL_RUNTIME))
+        {
+            reasons.push("runtime:local".to_owned());
+        }
+        for capability in &required_capabilities {
+            if !local_runtime.capabilities.contains(capability) {
+                reasons.push(format!("capability:{capability}"));
+            }
+        }
+    }
+    let capacities = &local_runtime.capacities;
     for (name, units) in &run.resources {
         if used.get(name).copied().unwrap_or(0) + units > capacities.get(name).copied().unwrap_or(0)
         {
@@ -2139,6 +2168,13 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         .as_ref()
         .map(|owner| owner.resource_capabilities.clone())
         .unwrap_or_else(|| json!({}));
+    let local_runtime = match &owner {
+        Some(owner) => owner.local_runtime.clone(),
+        None => crate::overflow::Runtime::local(
+            capacities.clone(),
+            crate::overflow::load_local_capabilities(&paths.state_dir)?,
+        ),
+    };
     let overflow_pools = match &owner {
         Some(owner) => owner.overflow_pools.clone(),
         None => crate::overflow::load_pools(&paths.state_dir)?,
@@ -2162,7 +2198,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
                     run,
                     &all_active,
                     &all_queued,
-                    &capacities,
+                    &local_runtime,
                     &live_placed,
                     &batch_followers,
                 ),
@@ -2233,16 +2269,22 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
         .iter()
         .position(|candidate| candidate.run_id == run.run_id)
         .map(|index| index + 1);
-    let capacities = live_owner_metadata(&paths.state_dir)?
-        .map(|_| owner_info(paths).map(|owner| owner.capacities))
-        .transpose()?
-        .or_else(|| {
-            metadata(&connection, "capacities_json")
+    let live_owner = live_owner_metadata(&paths.state_dir)?
+        .map(|_| owner_info(paths))
+        .transpose()?;
+    let local_runtime = match live_owner {
+        Some(owner) => owner.local_runtime,
+        None => {
+            let capacities = metadata(&connection, "capacities_json")
                 .ok()
                 .flatten()
                 .and_then(|value| serde_json::from_str(&value).ok())
-        })
-        .unwrap_or_default();
+                .unwrap_or_default();
+            let capabilities =
+                crate::overflow::load_local_capabilities(&paths.state_dir).unwrap_or_default();
+            crate::overflow::Runtime::local(capacities, capabilities)
+        }
+    };
     let live_placed = crate::overflow::live_placements(&connection)?;
     let placed = crate::overflow::all_placements(&connection)?;
     let batch_followers = active_batch_followers(&connection)?;
@@ -2254,7 +2296,7 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
             &run,
             &active,
             &queued,
-            &capacities,
+            &local_runtime,
             &live_placed,
             &batch_followers,
         ),
@@ -3004,24 +3046,91 @@ pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Res
             "overflow eligibility must be 1 when present",
         ));
     }
-    // A claim this machine can never hold is still accepted when the submitter allowed
-    // overflow and some pool offers it; otherwise it could never run and is refused.
-    let overflow_can_hold = overflow_candidate(&request.kind, &request.environment)
-        && owner
-            .overflow_pools
-            .iter()
-            .any(|pool| pool.can_ever_fit(&request.resources));
+    let (allowed_runtimes, required_capabilities) =
+        crate::overflow::parse_placement_constraints(&request.environment)?;
+    if let Some(allowed) = &allowed_runtimes {
+        for runtime_name in allowed {
+            let known = runtime_name == crate::overflow::LOCAL_RUNTIME
+                || owner
+                    .overflow_pools
+                    .iter()
+                    .any(|pool| &pool.name == runtime_name);
+            if !known {
+                return Err(AppError::new(
+                    "broker-submission-invalid",
+                    format!("unknown runtime {runtime_name}"),
+                ));
+            }
+        }
+        if !allowed.contains(crate::overflow::LOCAL_RUNTIME)
+            && !overflow_candidate(&request.kind, &request.environment)
+        {
+            return Err(AppError::new(
+                "broker-submission-invalid",
+                "selecting only overflow runtimes requires overflow eligibility",
+            ));
+        }
+    }
     for (name, units) in &request.resources {
         validate_identifier(name, "resource name")?;
-        if *units == 0
-            || *units > i64::MAX as u64
-            || (*units > owner.capacities.get(name).copied().unwrap_or(0) && !overflow_can_hold)
-        {
+        if *units == 0 || *units > i64::MAX as u64 {
             return Err(AppError::new(
                 "broker-resource-unavailable",
                 format!("resource {name} exceeds the live broker capacity"),
             ));
         }
+    }
+    let mut permitted_runtimes = Vec::new();
+    if allowed_runtimes
+        .as_ref()
+        .is_none_or(|allowed| allowed.contains(crate::overflow::LOCAL_RUNTIME))
+    {
+        permitted_runtimes.push(owner.local_runtime.clone());
+    }
+    if overflow_candidate(&request.kind, &request.environment) {
+        for pool in &owner.overflow_pools {
+            if allowed_runtimes
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(&pool.name))
+            {
+                permitted_runtimes.push(pool.runtime());
+            }
+        }
+    }
+    if !permitted_runtimes
+        .iter()
+        .any(|runtime| runtime.satisfies(&request.resources, &required_capabilities))
+    {
+        for (name, units) in &request.resources {
+            let resource_fits_any = permitted_runtimes.iter().any(|runtime| {
+                runtime.capacities.get(name).is_some_and(|cap| units <= cap)
+                    && runtime
+                        .max_claim
+                        .get(name)
+                        .is_none_or(|limit| units <= limit)
+            });
+            if !resource_fits_any {
+                return Err(AppError::new(
+                    "broker-resource-unavailable",
+                    format!("resource {name} exceeds the live broker capacity"),
+                ));
+            }
+        }
+        for capability in &required_capabilities {
+            let cap_fits_any = permitted_runtimes
+                .iter()
+                .any(|runtime| runtime.capabilities.contains(capability));
+            if !cap_fits_any {
+                return Err(AppError::new(
+                    "broker-resource-unavailable",
+                    format!("capability {capability} is unavailable on every allowed runtime"),
+                ));
+            }
+        }
+        return Err(AppError::new(
+            "broker-resource-unavailable",
+            "no single allowed runtime satisfies the requested resources and capabilities together",
+        ));
     }
     Ok(())
 }
@@ -3652,11 +3761,15 @@ struct BatchSelectionContext<'a> {
     leader_command: Vec<String>,
     same_active: Vec<&'a RunRecord>,
     repo_queued: Vec<&'a RunRecord>,
-    on_overflow_pool: bool,
+    target_runtime: &'a crate::overflow::Runtime,
 }
 
 impl<'a> BatchSelectionContext<'a> {
-    fn from_live(leader: &'a RunRecord, live: &'a [RunRecord], on_overflow_pool: bool) -> Self {
+    fn from_live(
+        leader: &'a RunRecord,
+        live: &'a [RunRecord],
+        target_runtime: &'a crate::overflow::Runtime,
+    ) -> Self {
         Self {
             leader,
             leader_command: normalize_gate_command(&leader.command),
@@ -3668,7 +3781,7 @@ impl<'a> BatchSelectionContext<'a> {
                 .iter()
                 .filter(|run| run.status == "queued" && run.repository_id == leader.repository_id)
                 .collect(),
-            on_overflow_pool,
+            target_runtime,
         }
     }
 
@@ -3678,6 +3791,12 @@ impl<'a> BatchSelectionContext<'a> {
         seen_branches: &BTreeSet<String>,
         seen_requests: &[Option<Value>],
     ) -> bool {
+        let on_overflow_pool = self.target_runtime.name != crate::overflow::LOCAL_RUNTIME;
+        let Ok((allowed_runtimes, required_capabilities)) =
+            crate::overflow::parse_placement_constraints(&candidate.environment)
+        else {
+            return false;
+        };
         if candidate.run_id == self.leader.run_id
             || candidate.kind != "land"
             || candidate.status != "queued"
@@ -3688,8 +3807,13 @@ impl<'a> BatchSelectionContext<'a> {
             || seen_requests.contains(&candidate.publication_request)
             || normalize_gate_command(&candidate.command) != self.leader_command
             || !resource_envelope_compatible(candidate, self.leader)
-            || (self.on_overflow_pool
-                && !overflow_candidate(&candidate.kind, &candidate.environment))
+            || (on_overflow_pool && !overflow_candidate(&candidate.kind, &candidate.environment))
+            || allowed_runtimes
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&self.target_runtime.name))
+            || !self
+                .target_runtime
+                .satisfies(&candidate.resources, &required_capabilities)
         {
             return false;
         }
@@ -3738,13 +3862,13 @@ fn member_descriptor(run: &RunRecord, is_leader: bool) -> Result<Value> {
 pub fn select_land_batch_candidates(
     connection: &Connection,
     leader: &RunRecord,
-    on_overflow_pool: bool,
+    target_runtime: &crate::overflow::Runtime,
 ) -> Result<Vec<Value>> {
     if leader.kind != "land" {
         return Ok(Vec::new());
     }
     let live = load_live_runs(connection)?;
-    let context = BatchSelectionContext::from_live(leader, &live, on_overflow_pool);
+    let context = BatchSelectionContext::from_live(leader, &live, target_runtime);
     let mut seen_branches = BTreeSet::new();
     seen_branches.insert(leader.branch.clone());
     let mut seen_requests = vec![leader.publication_request.clone()];
@@ -3849,7 +3973,7 @@ fn apply_land_phase_update(
 }
 
 pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> {
-    let _owner = owner_info(paths)?;
+    let owner = owner_info(paths)?;
     let connection = open_protocol5(paths)?;
     ensure_land_batch_schema(&connection)?;
     connection
@@ -3865,9 +3989,25 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
         true,
     )?;
     let live = load_live_runs(&connection)?;
-    let on_overflow_pool =
-        crate::overflow::live_placements(&connection)?.contains_key(&leader.run_id);
-    let context = BatchSelectionContext::from_live(&leader, &live, on_overflow_pool);
+    let placements = crate::overflow::live_placements(&connection)?;
+    let target_runtime = match placements.get(&leader.run_id) {
+        Some(pool_name) => owner
+            .overflow_pools
+            .iter()
+            .find(|pool| &pool.name == pool_name)
+            .map(Pool::runtime)
+            .ok_or_else(|| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!(
+                        "running land leader {} is placed on unknown pool {pool_name}",
+                        leader.run_id
+                    ),
+                )
+            })?,
+        None => owner.local_runtime.clone(),
+    };
+    let context = BatchSelectionContext::from_live(&leader, &live, &target_runtime);
     let started_at = now(&connection)?;
     let leader_env_json: String = connection
         .query_row(

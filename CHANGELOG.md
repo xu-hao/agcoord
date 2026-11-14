@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Model `local` and `overflow_pools` under one unified runtime capability model and support
+  single-source privileged overflow containers. Probe host user-namespace/`bwrap` support at
+  broker startup to derive `userns` on `local` alongside optional top-level `"capabilities"`,
+  add optional `"privileged"` (implying `userns` and always eligible for ordinary overflow
+  work) and `"capabilities"` per overflow pool, propagate `AGCOORD_OVERFLOW_PRIVILEGED=1` to
+  executors (`--privileged` in `overflow-gcp-batch` and `overflow-ssh`; fail-closed exit `125`
+  in `overflow-gcp-run`), and add repeatable `--require-capability` and `--runtime` selectors to
+  `agc run`, `agc full`, and `agc land` (#329).
 - Batch queued `land` requests on the same target branch and binary-bisect on gate failure (#326).
 - Run `full` and `land` in coordinator-owned reusable Git worktrees, preserving warm
   ignored caches and unchanged tracked mtimes while isolating verdicts from concurrent

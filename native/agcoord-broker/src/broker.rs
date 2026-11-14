@@ -44,11 +44,13 @@ pub struct ServeOptions {
     pub worker_fault: Option<WorkerFault>,
     pub cgroup_fixture: Option<PathBuf>,
     pub project_quota_fixture: Option<PathBuf>,
+    pub local_userns: Option<bool>,
 }
 
 pub struct Broker {
     paths: Paths,
     capacities: BTreeMap<String, u64>,
+    local_runtime: overflow::Runtime,
     idle_timeout: Option<Duration>,
     managed_host: bool,
     crash_after: Option<String>,
@@ -164,7 +166,8 @@ impl Broker {
             })?,
         ]);
         command.extend(land_request_options(run)?);
-        let candidates = select_land_batch_candidates(connection, run, pool.is_some())?;
+        let target_runtime = pool.map_or_else(|| self.local_runtime.clone(), Pool::runtime);
+        let candidates = select_land_batch_candidates(connection, run, &target_runtime)?;
         if !candidates.is_empty() {
             command.push("--batch-candidates-json".to_owned());
             command.push(serde_json::to_string(&candidates).map_err(|error| {
@@ -187,6 +190,7 @@ impl Broker {
         paths.prepare()?;
         let paths = paths.configured()?;
         let resource_configuration = resources::load_configuration(&options.state_dir)?;
+        let mut local_capabilities = overflow::load_local_capabilities(&options.state_dir)?;
         let overflow_pools = overflow::load_pools(&options.state_dir)?;
         let capacities = if options.capacities.is_empty() {
             resource_configuration.capacities.clone()
@@ -202,6 +206,13 @@ impl Broker {
                 "capacities require a positive jobs entry",
             ));
         }
+        if options
+            .local_userns
+            .unwrap_or_else(overflow::probe_local_userns)
+        {
+            local_capabilities.insert(overflow::USERNS_CAPABILITY.to_owned());
+        }
+        let local_runtime = overflow::Runtime::local(capacities.clone(), local_capabilities);
         let mut capability_map = Map::new();
         let referenced_backends: BTreeSet<String> = resource_configuration
             .bindings
@@ -428,13 +439,14 @@ impl Broker {
             )
         })?;
         owner.publish(&format!(
-            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\noverflow_pools={}\nstarted_at={}\n",
+            "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\nlocal_runtime={}\noverflow_pools={}\nstarted_at={}\n",
             std::process::id(),
             env!("CARGO_PKG_VERSION"),
             env!("AGCOORD_BUILD_ID"),
             capacities_json,
             bindings_json,
             capabilities_json,
+            overflow::local_runtime_json(&local_runtime),
             overflow::pools_json(&overflow_pools),
             started_at,
         ))?;
@@ -442,6 +454,7 @@ impl Broker {
         Ok(Self {
             paths,
             capacities,
+            local_runtime,
             idle_timeout: options.idle_timeout,
             managed_host,
             crash_after: options.crash_after,
@@ -618,7 +631,7 @@ impl Broker {
         let reserved_front = front_row(
             &active,
             &queued,
-            &self.capacities,
+            &self.local_runtime,
             &local_allocations(&active, &placed, &batch_followers),
         )
         .map(|run| run.run_id.clone());
@@ -697,23 +710,40 @@ impl Broker {
             if !overflow_candidate(&run.kind, &run.environment) {
                 continue;
             }
+            let Ok((allowed_runtimes, required_capabilities)) =
+                overflow::parse_placement_constraints(&run.environment)
+            else {
+                continue;
+            };
             let blockers = blocked_by(
                 run,
                 active,
                 queued,
-                &self.capacities,
+                &self.local_runtime,
                 placed,
                 batch_followers,
             );
             if blockers.is_empty()
                 || blockers.iter().any(|blocker| {
-                    !blocker.starts_with("resource:") && !blocker.starts_with("reservation:")
+                    !blocker.starts_with("resource:")
+                        && !blocker.starts_with("reservation:")
+                        && !blocker.starts_with("runtime:")
+                        && !blocker.starts_with("capability:")
                 })
             {
                 continue;
             }
             let waited = overflow::waited_seconds(connection, &run.created_at)?;
             for pool in &self.overflow_pools {
+                if allowed_runtimes
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&pool.name))
+                {
+                    continue;
+                }
+                if !required_capabilities.is_subset(&pool.capabilities) {
+                    continue;
+                }
                 if waited < pool.wait_threshold {
                     continue;
                 }
@@ -769,7 +799,7 @@ impl Broker {
                     run,
                     active,
                     queued,
-                    &self.capacities,
+                    &self.local_runtime,
                     placed,
                     batch_followers,
                 )
@@ -787,7 +817,7 @@ impl Broker {
                 run,
                 active,
                 queued,
-                &self.capacities,
+                &self.local_runtime,
                 placed,
                 batch_followers,
             )
@@ -2317,7 +2347,9 @@ impl Broker {
                 )
             })?;
         let mut environment = current.environment.clone();
-        environment.retain(|name, _value| !name.starts_with("_AGCOORD_"));
+        environment.retain(|name, _value| {
+            !name.starts_with("_AGCOORD_") && !name.starts_with("AGCOORD_OVERFLOW_")
+        });
         environment
             .entry("PATH".to_owned())
             .or_insert_with(|| "/usr/bin:/bin".to_owned());
@@ -2340,6 +2372,10 @@ impl Broker {
             environment.insert(
                 "AGCOORD_OVERFLOW_CONTRACT".to_owned(),
                 serde_json::to_string(&current.resource_contract).unwrap(),
+            );
+            environment.insert(
+                overflow::OVERFLOW_PRIVILEGED_ENV.to_owned(),
+                if pool.privileged { "1" } else { "0" }.to_owned(),
             );
         }
         for name in ["TMPDIR", "TMP", "TEMP"] {

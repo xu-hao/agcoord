@@ -198,6 +198,17 @@
       }
     },
     {
+      "id": "resources.unified-runtime-capabilities",
+      "domain": "resources",
+      "description": "Local and overflow pools share one runtime capability model: local derives userns from its startup probe plus configured host capabilities, privileged pools imply userns and propagate AGCOORD_OVERFLOW_PRIVILEGED=1 to executors while remaining eligible for ordinary overflow jobs, and --require-capability and --runtime filter placement and fail closed when no single allowed runtime satisfies all requested resources and capabilities together.",
+      "tests": {
+        "rust_native": [
+          "scheduler::unified_runtimes_filter_capabilities_and_propagate_privileged_placement",
+          "scheduler::local_userns_probe_availability_controls_local_userns_admission"
+        ]
+      }
+    },
+    {
       "id": "receipts.verified-terminal-evidence",
       "domain": "receipts",
       "description": "Receipts retain sanitized applied, peak, and event evidence exactly once.",

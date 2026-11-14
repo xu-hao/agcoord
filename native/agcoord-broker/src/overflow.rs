@@ -17,6 +17,16 @@ use std::path::Path;
 
 /// The reserved submission entry that marks a row as allowed to leave this machine.
 pub const ELIGIBLE: &str = "_AGCOORD_OVERFLOW";
+/// The reserved submission entry carrying required runtime capabilities as a JSON array.
+pub const CAPABILITIES_ENV: &str = "_AGCOORD_CAPABILITIES";
+/// The reserved submission entry carrying allowed runtime names as a JSON array.
+pub const RUNTIMES_ENV: &str = "_AGCOORD_RUNTIMES";
+/// Executor placement variable set to `"1"` on privileged pools and `"0"` on unprivileged pools.
+pub const OVERFLOW_PRIVILEGED_ENV: &str = "AGCOORD_OVERFLOW_PRIVILEGED";
+/// Reserved runtime name for the native host execution target.
+pub const LOCAL_RUNTIME: &str = "local";
+/// Standard capability indicating user-namespace / unprivileged sandbox creation support.
+pub const USERNS_CAPABILITY: &str = "userns";
 /// The resource whose claim a budget counts.
 pub const BUDGET_RESOURCE: &str = "cpu";
 pub const RUNTIME_EXCEEDED: &str = "overflow-runtime-exceeded";
@@ -53,6 +63,42 @@ pub struct Budget {
     pub rollover_minutes: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Runtime {
+    pub name: String,
+    pub capacities: BTreeMap<String, u64>,
+    pub max_claim: BTreeMap<String, u64>,
+    pub privileged: bool,
+    pub capabilities: BTreeSet<String>,
+}
+
+impl Runtime {
+    pub fn local(capacities: BTreeMap<String, u64>, capabilities: BTreeSet<String>) -> Self {
+        Self {
+            name: LOCAL_RUNTIME.to_owned(),
+            capacities,
+            max_claim: BTreeMap::new(),
+            privileged: false,
+            capabilities,
+        }
+    }
+
+    pub fn can_ever_fit(&self, resources: &BTreeMap<String, u64>) -> bool {
+        resources.iter().all(|(name, units)| {
+            self.capacities.get(name).is_some_and(|cap| units <= cap)
+                && self.max_claim.get(name).is_none_or(|limit| units <= limit)
+        })
+    }
+
+    pub fn satisfies(
+        &self,
+        resources: &BTreeMap<String, u64>,
+        required_capabilities: &BTreeSet<String>,
+    ) -> bool {
+        self.can_ever_fit(resources) && required_capabilities.is_subset(&self.capabilities)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pool {
     pub name: String,
@@ -64,10 +110,314 @@ pub struct Pool {
     pub max_runtime: u64,
     pub budget: Option<Budget>,
     pub cpu_hour_price: Option<f64>,
+    pub privileged: bool,
+    pub capabilities: BTreeSet<String>,
 }
 
 fn config_error(message: impl Into<String>) -> AppError {
     AppError::new("broker-config-invalid", message)
+}
+
+pub fn parse_capabilities_field(value: Option<&Value>, subject: &str) -> Result<BTreeSet<String>> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| config_error(format!("{subject} capabilities must be an array")))?;
+    let mut selected = BTreeSet::new();
+    for entry in entries {
+        let capability = entry
+            .as_str()
+            .filter(|capability| name_valid(capability))
+            .ok_or_else(|| {
+                config_error(format!("{subject} contains an invalid capability name"))
+            })?;
+        if !selected.insert(capability.to_owned()) {
+            return Err(config_error(format!(
+                "{subject} capability {capability} is configured twice"
+            )));
+        }
+    }
+    Ok(selected)
+}
+
+pub fn load_local_capabilities(state_dir: &Path) -> Result<BTreeSet<String>> {
+    let text = match fs::read_to_string(state_dir.join("config.json")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => {
+            return Err(config_error(format!(
+                "cannot read broker configuration: {error}"
+            )));
+        }
+    };
+    let document: Value = serde_json::from_str(&text)
+        .map_err(|_| config_error("broker configuration is not valid JSON"))?;
+    parse_capabilities_field(document.get("capabilities"), "broker configuration")
+}
+
+pub fn local_runtime_json(runtime: &Runtime) -> String {
+    json!({
+        "privileged": runtime.privileged,
+        "capabilities": runtime.capabilities,
+    })
+    .to_string()
+}
+
+pub fn parse_local_runtime_json(
+    value: &str,
+    capacities: &BTreeMap<String, u64>,
+) -> Result<Runtime> {
+    let invalid = || {
+        AppError::new(
+            "broker-owner-metadata-invalid",
+            "live owner local runtime metadata is invalid",
+        )
+    };
+    let parsed: Value = serde_json::from_str(value).map_err(|_| invalid())?;
+    let object = parsed.as_object().ok_or_else(invalid)?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "privileged" | "capabilities"))
+    {
+        return Err(invalid());
+    }
+    let privileged = object
+        .get("privileged")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    if privileged {
+        return Err(invalid());
+    }
+    let capabilities = parse_capabilities_field(object.get("capabilities"), "local runtime")
+        .map_err(|_| invalid())?;
+    Ok(Runtime::local(capacities.clone(), capabilities))
+}
+
+pub fn parse_placement_constraints(
+    environment: &BTreeMap<String, String>,
+) -> Result<(Option<BTreeSet<String>>, BTreeSet<String>)> {
+    let submission_error =
+        |message: &str| AppError::new("broker-submission-invalid", message.to_owned());
+    let parse_name_list = |raw: &str,
+                           subject: &str,
+                           allow_empty: bool|
+     -> Result<BTreeSet<String>> {
+        let value: Value = serde_json::from_str(raw)
+            .map_err(|_| submission_error(&format!("{subject} must be valid JSON")))?;
+        let entries = value
+            .as_array()
+            .ok_or_else(|| submission_error(&format!("{subject} must be a JSON array")))?;
+        if !allow_empty && entries.is_empty() {
+            return Err(submission_error(&format!("{subject} cannot be empty")));
+        }
+        let mut selected = BTreeSet::new();
+        for entry in entries {
+            let name = entry
+                .as_str()
+                .filter(|name| name_valid(name))
+                .ok_or_else(|| submission_error(&format!("{subject} contains an invalid name")))?;
+            selected.insert(name.to_owned());
+        }
+        Ok(selected)
+    };
+    let allowed_runtimes = environment
+        .get(RUNTIMES_ENV)
+        .map(|raw| parse_name_list(raw, "runtime selector", false))
+        .transpose()?;
+    let required_capabilities = environment
+        .get(CAPABILITIES_ENV)
+        .map(|raw| parse_name_list(raw, "capability selector", true))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((allowed_runtimes, required_capabilities))
+}
+
+/// Probe whether admitted local jobs on this host can create an unprivileged user namespace
+/// (either via `/usr/bin/bwrap` under the admitted AppArmor stack or direct `CLONE_NEWUSER`).
+pub fn probe_local_userns() -> bool {
+    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(run_local_userns_probe)
+}
+
+fn run_local_userns_probe() -> bool {
+    const APPARMOR_CURRENT: &str = "/proc/self/attr/current";
+    const APPARMOR_BROKER: &str = "agcoord-broker (enforce)";
+    const APPARMOR_ADMITTED: &str = "agcoord-admitted (enforce)";
+    const APPARMOR_CHANGE_ADMITTED: &[u8] = b"changeprofile agcoord-admitted";
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // SAFETY: `fork` runs during single-threaded broker startup; the child performs only
+    // bounded kernel probes and terminates via `_exit`.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        let code = (|| -> i32 {
+            // SAFETY: `/dev/null` is a static C string and `dup2`/`close`/`close_range`
+            // operate only on this forked child's file descriptor table.
+            unsafe {
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+                if devnull >= 0 {
+                    for target in [0, 1, 2] {
+                        let _ = libc::dup2(devnull, target);
+                    }
+                    if devnull > 2 {
+                        let _ = libc::close(devnull);
+                    }
+                }
+                let _ = libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0);
+            }
+
+            let was_broker_profile = fs::read_to_string(APPARMOR_CURRENT)
+                .is_ok_and(|current| current.trim() == APPARMOR_BROKER);
+            if was_broker_profile {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let changed = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                    .open(APPARMOR_CURRENT)
+                    .and_then(|mut file| file.write_all(APPARMOR_CHANGE_ADMITTED));
+                if changed.is_err() {
+                    return 1;
+                }
+                let verified = fs::read_to_string(APPARMOR_CURRENT)
+                    .is_ok_and(|current| current.trim() == APPARMOR_ADMITTED);
+                if !verified {
+                    return 1;
+                }
+            }
+
+            let header = CapabilityHeader {
+                version: LINUX_CAPABILITY_VERSION_3,
+                pid: 0,
+            };
+            let data = [CapabilityData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }; 2];
+            // SAFETY: `prctl` and `capset` receive valid scalar arguments and stack-allocated
+            // version-3 capability structures matching admitted worker privilege drop.
+            let dropped = unsafe {
+                libc::prctl(
+                    PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_CLEAR_ALL,
+                    0_u64,
+                    0_u64,
+                    0_u64,
+                ) == 0
+                    && libc::syscall(
+                        libc::SYS_capset,
+                        &header as *const CapabilityHeader,
+                        data.as_ptr(),
+                    ) == 0
+                    && libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+            };
+            if !dropped {
+                return 1;
+            }
+
+            // SAFETY: `access` inspects static NUL-terminated paths.
+            let bwrap_available =
+                unsafe { libc::access(c"/usr/bin/bwrap".as_ptr(), libc::X_OK) == 0 };
+            if bwrap_available {
+                // SAFETY: `access` inspects static NUL-terminated candidate paths.
+                let true_bin =
+                    if unsafe { libc::access(c"/usr/bin/true".as_ptr(), libc::X_OK) } == 0 {
+                        c"/usr/bin/true"
+                    } else {
+                        c"/bin/true"
+                    };
+                let args = [
+                    c"/usr/bin/bwrap".as_ptr(),
+                    c"--unshare-user".as_ptr(),
+                    c"--ro-bind".as_ptr(),
+                    c"/".as_ptr(),
+                    c"/".as_ptr(),
+                    true_bin.as_ptr(),
+                    std::ptr::null(),
+                ];
+                // SAFETY: `args` is a NUL-terminated array of valid C string pointers.
+                unsafe {
+                    libc::execv(c"/usr/bin/bwrap".as_ptr(), args.as_ptr());
+                }
+                return 1;
+            }
+
+            if was_broker_profile {
+                return 1;
+            }
+
+            // SAFETY: `geteuid`, `getegid`, and `unshare(CLONE_NEWUSER)` take no pointers.
+            let (uid, gid, unshared) = unsafe {
+                (
+                    libc::geteuid(),
+                    libc::getegid(),
+                    libc::unshare(libc::CLONE_NEWUSER),
+                )
+            };
+            if unshared != 0 {
+                return 1;
+            }
+            let _ = fs::write("/proc/self/setgroups", b"deny");
+            if fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).is_err()
+                || fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).is_err()
+            {
+                return 1;
+            }
+            0
+        })();
+        // SAFETY: `_exit` terminates the forked probe child immediately.
+        unsafe { libc::_exit(code) };
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: `status` is a valid out-pointer for `waitpid` on our child `pid`.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            return libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        }
+        if waited < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: `pid` is our still-unreaped child process.
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+                let _ = libc::waitpid(pid, &mut status, 0);
+            }
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 fn rollover_text(minutes: u32) -> String {
@@ -98,6 +448,8 @@ impl Pool {
             "max_runtime",
             "budget",
             "cpu_hour_price",
+            "privileged",
+            "capabilities",
         ];
         if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
             return Err(config_error(format!(
@@ -110,6 +462,11 @@ impl Pool {
             .filter(|name| name_valid(name))
             .ok_or_else(|| config_error("overflow pool name is missing or invalid"))?
             .to_owned();
+        if name == LOCAL_RUNTIME {
+            return Err(config_error(
+                "overflow pool name local is reserved for the native host runtime",
+            ));
+        }
         let capacities = object
             .get("capacities")
             .and_then(Value::as_object)
@@ -245,6 +602,19 @@ impl Pool {
                     })?,
             ),
         };
+        let privileged = match object.get("privileged") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                config_error(format!(
+                    "overflow pool {name} privileged must be true or false"
+                ))
+            })?,
+        };
+        let mut capabilities =
+            parse_capabilities_field(object.get("capabilities"), &format!("overflow pool {name}"))?;
+        if privileged {
+            capabilities.insert(USERNS_CAPABILITY.to_owned());
+        }
         Ok(Self {
             name,
             capacities,
@@ -254,7 +624,19 @@ impl Pool {
             max_runtime,
             budget,
             cpu_hour_price,
+            privileged,
+            capabilities,
         })
+    }
+
+    pub fn runtime(&self) -> Runtime {
+        Runtime {
+            name: self.name.clone(),
+            capacities: self.capacities.clone(),
+            max_claim: self.max_claim.clone(),
+            privileged: self.privileged,
+            capabilities: self.capabilities.clone(),
+        }
     }
 
     /// The configuration form, which is also what the owner publishes for clients.
@@ -276,6 +658,8 @@ impl Pool {
             }),
         );
         value.insert("cpu_hour_price".to_owned(), json!(self.cpu_hour_price));
+        value.insert("privileged".to_owned(), json!(self.privileged));
+        value.insert("capabilities".to_owned(), json!(self.capabilities));
         Value::Object(value)
     }
 
@@ -621,5 +1005,66 @@ mod tests {
             pools[0].reservation(&BTreeMap::from([("cpu".to_owned(), 16)])),
             57_600
         );
+        assert!(!pools[0].privileged);
+        assert!(pools[0].capabilities.is_empty());
+    }
+
+    #[test]
+    fn privileged_pools_imply_userns_and_local_name_is_reserved() {
+        let pools = parse_pools(Some(&json!([
+            {
+                "name": "batch-priv",
+                "capacities": {"jobs": 2, "cpu": 16},
+                "executor": ["agc", "overflow-gcp-batch"],
+                "max_runtime": 1800,
+                "privileged": true,
+                "capabilities": ["ssd", "userns"],
+            }
+        ])))
+        .unwrap();
+        assert!(pools[0].privileged);
+        assert_eq!(
+            pools[0].capabilities,
+            BTreeSet::from(["ssd".to_owned(), "userns".to_owned()])
+        );
+        assert_eq!(parse_pools_json(&pools_json(&pools)).unwrap(), pools);
+
+        let reserved = parse_pools(Some(&json!([{
+            "name": "local",
+            "capacities": {"jobs": 1, "cpu": 2},
+            "executor": ["true"],
+            "max_runtime": 60,
+        }])))
+        .unwrap_err();
+        assert_eq!(reserved.code, "broker-config-invalid");
+
+        for bad in [
+            json!({
+                "name": "bad-priv",
+                "capacities": {"jobs": 1},
+                "executor": ["true"],
+                "max_runtime": 60,
+                "privileged": 1,
+            }),
+            json!({
+                "name": "bad-caps",
+                "capacities": {"jobs": 1},
+                "executor": ["true"],
+                "max_runtime": 60,
+                "capabilities": ["dup", "dup"],
+            }),
+            json!({
+                "name": "bad-cap-name",
+                "capacities": {"jobs": 1},
+                "executor": ["true"],
+                "max_runtime": 60,
+                "capabilities": ["not valid"],
+            }),
+        ] {
+            assert_eq!(
+                parse_pools(Some(&json!([bad]))).unwrap_err().code,
+                "broker-config-invalid"
+            );
+        }
     }
 }

@@ -75,6 +75,10 @@ CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
 LAND_TARGET_SYNC_ENV = "_AGCOORD_LAND_TARGET_SYNC"
 OVERFLOW_ENV = "_AGCOORD_OVERFLOW"
+CAPABILITIES_ENV = "_AGCOORD_CAPABILITIES"
+RUNTIMES_ENV = "_AGCOORD_RUNTIMES"
+LOCAL_RUNTIME = "local"
+USERNS_CAPABILITY = "userns"
 LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
 LAND_REUSE_ENV = "_AGCOORD_LAND_REUSE_FULL"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
@@ -556,6 +560,32 @@ def parse_resource_claims(values: Iterable[str]) -> dict[str, int]:
     return _positive_mapping(raw, subject="resource", include_job=False)
 
 
+def parse_name_selectors(
+    values: Iterable[str] | None,
+    *,
+    subject: str,
+    allow_empty: bool = True,
+) -> tuple[str, ...]:
+    """Validate repeatable capability or runtime identifiers, preserving order."""
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        raise CoordinatorError(f"{subject} selectors must be a sequence of strings")
+    selected: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str) or _RESOURCE_NAME.fullmatch(item) is None:
+            raise CoordinatorError(
+                f"{subject} {item!r} must match {_RESOURCE_NAME.pattern}"
+            )
+        if item not in seen:
+            seen.add(item)
+            selected.append(item)
+    if not allow_empty and not selected:
+        raise CoordinatorError(f"{subject} selector cannot be empty")
+    return tuple(selected)
+
+
 def configured_capacities(section: Mapping[str, Any] | None) -> dict[str, int]:
     """Return validated machine capacities from one configuration file section."""
     if section is None:
@@ -656,37 +686,135 @@ def _pre_native_spool_refusal(
     )
 
 
+def _local_fits_resources(
+    selected: Mapping[str, int],
+    capacities: Mapping[str, int],
+) -> bool:
+    return all(units <= capacities.get(name, 0) for name, units in selected.items())
+
+
+def _pool_fits_resources(
+    selected: Mapping[str, int],
+    pool: Mapping[str, Any],
+) -> bool:
+    return all(
+        units <= pool["capacities"].get(name, 0)
+        and units <= pool.get("max_claim", {}).get(name, units)
+        for name, units in selected.items()
+    )
+
+
 def _validate_resources(
     resources: Mapping[str, int] | None,
     capacities: Mapping[str, int],
     overflow_pools: Sequence[Mapping[str, Any]] = (),
+    *,
+    local_capabilities: Sequence[str] = (),
+    require_capabilities: Sequence[str] = (),
+    runtimes: Sequence[str] = (),
 ) -> dict[str, int]:
-    """Validate claims against this machine, or against a pool that could hold them.
+    """Validate claims, required capabilities, and runtime selectors jointly.
 
-    ``overflow_pools`` is passed only for a submission that allowed overflow.  A claim
-    this machine can never hold is then accepted when one pool offers every claimed
-    resource in the claimed amount; the broker makes the same decision authoritatively.
+    ``overflow_pools`` is passed only for a submission that allowed overflow.  At least
+    one permitted runtime (``local`` or an eligible pool) must satisfy every requested
+    resource claim and every required capability together; the broker enforces the same
+    invariant authoritatively.
     """
     selected = _positive_mapping(resources, subject="resource", include_job=True)
-    if any(
-        all(
-            units <= pool["capacities"].get(name, 0)
-            and units <= pool.get("max_claim", {}).get(name, units)
-            for name, units in selected.items()
-        )
+    local_allowed = not runtimes or LOCAL_RUNTIME in runtimes
+    allowed_pools = [
+        pool
         for pool in overflow_pools
+        if not runtimes or pool["name"] in runtimes
+    ]
+    local_cap_set = set(local_capabilities)
+    required_caps = tuple(require_capabilities)
+
+    if (
+        local_allowed
+        and _local_fits_resources(selected, capacities)
+        and all(cap in local_cap_set for cap in required_caps)
     ):
         return selected
+    if any(
+        _pool_fits_resources(selected, pool)
+        and all(cap in set(pool.get("capabilities", ())) for cap in required_caps)
+        for pool in allowed_pools
+    ):
+        return selected
+
+    for cap in required_caps:
+        available = (local_allowed and cap in local_cap_set) or any(
+            cap in set(pool.get("capabilities", ())) for pool in allowed_pools
+        )
+        if not available:
+            raise CoordinatorError(
+                f"capability {cap!r} is not available on any allowed runtime"
+            )
+
+    any_fits_resources = (
+        local_allowed and _local_fits_resources(selected, capacities)
+    ) or any(_pool_fits_resources(selected, pool) for pool in allowed_pools)
+    if required_caps and any_fits_resources:
+        raise CoordinatorError(
+            "no single allowed runtime satisfies both the requested resources and "
+            f"capabilities ({', '.join(required_caps)})"
+        )
+
+    if local_allowed:
+        for name, units in selected.items():
+            if name not in capacities:
+                raise CoordinatorError(
+                    f"resource {name!r} has no configured machine capacity"
+                )
+            if units > capacities[name]:
+                raise CoordinatorError(
+                    f"resource {name!r} requests {units}, above capacity {capacities[name]}"
+                )
     for name, units in selected.items():
-        if name not in capacities:
+        if not any(
+            units <= pool["capacities"].get(name, 0)
+            and units <= pool.get("max_claim", {}).get(name, units)
+            for pool in allowed_pools
+        ):
             raise CoordinatorError(
-                f"resource {name!r} has no configured machine capacity"
+                f"resource {name!r} requests {units}, above capacity of every selected runtime"
             )
-        if units > capacities[name]:
-            raise CoordinatorError(
-                f"resource {name!r} requests {units}, above capacity {capacities[name]}"
-            )
-    return selected
+    raise CoordinatorError(
+        "no single allowed runtime satisfies the requested resources"
+    )
+
+
+def _owner_capability_names(
+    value: Any,
+    *,
+    implied_userns: bool = False,
+) -> list[str]:
+    if value is None:
+        names: set[str] = set()
+    elif isinstance(value, list) and all(
+        isinstance(item, str) and _RESOURCE_NAME.fullmatch(item) is not None
+        for item in value
+    ):
+        names = set(value)
+    else:
+        raise ValueError("runtime capabilities must be valid names")
+    if implied_userns:
+        names.add(USERNS_CAPABILITY)
+    return sorted(names)
+
+
+def _owner_local_runtime(raw: str | None) -> dict[str, Any]:
+    """Read the host runtime capabilities a live owner published."""
+    if raw is None:
+        return {"privileged": False, "capabilities": []}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict) or parsed.get("privileged", False) is not False:
+        raise ValueError("local runtime metadata is invalid")
+    return {
+        "privileged": False,
+        "capabilities": _owner_capability_names(parsed.get("capabilities")),
+    }
 
 
 def _owner_overflow_pools(raw: str | None) -> list[dict[str, Any]]:
@@ -698,8 +826,15 @@ def _owner_overflow_pools(raw: str | None) -> list[dict[str, Any]]:
         raise ValueError("overflow pools must be a list")
     selected = []
     for pool in pools:
-        if not isinstance(pool, dict) or not isinstance(pool.get("name"), str):
+        if (
+            not isinstance(pool, dict)
+            or not isinstance(pool.get("name"), str)
+            or pool["name"] == LOCAL_RUNTIME
+        ):
             raise ValueError("overflow pool is invalid")
+        privileged = pool.get("privileged", False)
+        if not isinstance(privileged, bool):
+            raise ValueError("overflow pool privileged flag must be boolean")
         selected.append(
             {
                 **pool,
@@ -708,9 +843,58 @@ def _owner_overflow_pools(raw: str | None) -> list[dict[str, Any]]:
                     subject="overflow pool capacity",
                     include_job=False,
                 ),
+                "privileged": privileged,
+                "capabilities": _owner_capability_names(
+                    pool.get("capabilities"),
+                    implied_userns=privileged,
+                ),
             }
         )
     return selected
+
+
+def _placement_environment(
+    environment: Mapping[str, str],
+    *,
+    overflow: bool | None,
+    checkout: Path,
+    owner: Mapping[str, Any],
+    require_capabilities: Sequence[str],
+    runtimes: Sequence[str],
+) -> tuple[dict[str, str], bool]:
+    """Validate runtime selectors and encode overflow + placement constraints."""
+    for reserved in (CAPABILITIES_ENV, RUNTIMES_ENV):
+        if reserved in environment:
+            raise CoordinatorError(f"gate environment uses the reserved {reserved} name")
+    known_runtimes = {
+        LOCAL_RUNTIME,
+        *(pool["name"] for pool in owner.get("overflow_pools", ())),
+    }
+    for name in runtimes:
+        if name not in known_runtimes:
+            raise CoordinatorError(f"unknown runtime {name!r}")
+    overflow_only = bool(runtimes) and LOCAL_RUNTIME not in runtimes
+    if overflow is False and overflow_only:
+        raise CoordinatorError(
+            "selecting only overflow runtimes conflicts with --no-overflow"
+        )
+    requested_overflow = True if (overflow is None and overflow_only) else overflow
+    selected, effective_overflow = _overflow_environment(
+        environment,
+        requested_overflow,
+        checkout,
+    )
+    if require_capabilities:
+        selected[CAPABILITIES_ENV] = json.dumps(
+            list(require_capabilities),
+            separators=(",", ":"),
+        )
+    if runtimes:
+        selected[RUNTIMES_ENV] = json.dumps(
+            list(runtimes),
+            separators=(",", ":"),
+        )
+    return selected, effective_overflow
 
 
 def _overflow_environment(
@@ -789,6 +973,7 @@ def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
             subject="owner capacity",
             include_job=False,
         )
+        local_runtime = _owner_local_runtime(fields.get("local_runtime"))
         overflow_pools = _owner_overflow_pools(fields.get("overflow_pools"))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, CoordinatorError) as exc:
         raise _OwnerMetadataError(
@@ -816,6 +1001,7 @@ def _read_broker_owner(paths: CoordinatorPaths) -> dict[str, Any] | None:
         "pid": owner_pid,
         "protocol": protocol,
         "capacities": capacities,
+        "local_runtime": local_runtime,
         "overflow_pools": overflow_pools,
         "resource_bindings": bindings,
         "resource_capabilities": capabilities,
@@ -1132,6 +1318,10 @@ class CoordinatorClient:
             "protocol": owner["protocol"],
             "broker_pid": owner["pid"],
             "capacities": owner["capacities"],
+            "local_runtime": owner.get(
+                "local_runtime",
+                {"privileged": False, "capabilities": []},
+            ),
             "overflow_pools": owner.get("overflow_pools", []),
             "resource_bindings": owner["resource_bindings"],
             "resource_capabilities": owner["resource_capabilities"],
@@ -1327,6 +1517,8 @@ class CoordinatorClient:
         caller_pid: int | None = None,
         environment: Mapping[str, str] | None = None,
         overflow: bool | None = None,
+        require_capabilities: Sequence[str] | None = None,
+        runtimes: Sequence[str] | None = None,
     ) -> str:
         selected_command = _validate_command(command)
         if kind not in RUN_KINDS:
@@ -1337,6 +1529,19 @@ class CoordinatorClient:
             raise CoordinatorError(f"{kind} can only be submitted through submit_{kind}")
         if not isinstance(label, str) or not label.strip():
             raise CoordinatorError("label must be a non-empty string")
+        selected_capabilities = parse_name_selectors(
+            require_capabilities,
+            subject="capability",
+        )
+        selected_runtimes = parse_name_selectors(
+            runtimes,
+            subject="runtime",
+            allow_empty=False,
+        )
+        if overflow is False and selected_runtimes and LOCAL_RUNTIME not in selected_runtimes:
+            raise CoordinatorError(
+                "selecting only overflow runtimes conflicts with --no-overflow"
+            )
         prepared = self._prepare_submission(
             checkout=checkout,
             repository=repository,
@@ -1356,6 +1561,8 @@ class CoordinatorClient:
             prepared=prepared,
             owner=owner,
             overflow=overflow,
+            require_capabilities=selected_capabilities,
+            runtimes=selected_runtimes,
         )
 
     def _prepare_submission(
@@ -1414,11 +1621,16 @@ class CoordinatorClient:
         prepared: _PreparedSubmission,
         owner: Mapping[str, Any],
         overflow: bool | None = None,
+        require_capabilities: Sequence[str] = (),
+        runtimes: Sequence[str] = (),
     ) -> str:
-        environment, effective_overflow = _overflow_environment(
+        environment, effective_overflow = _placement_environment(
             prepared.environment,
-            overflow,
-            Path(prepared.identity.checkout),
+            overflow=overflow,
+            checkout=Path(prepared.identity.checkout),
+            owner=owner,
+            require_capabilities=require_capabilities,
+            runtimes=runtimes,
         )
         run_id = f"{kind}-{uuid4().hex[:12]}"
         arguments = self._native_submission_arguments(
@@ -1432,6 +1644,9 @@ class CoordinatorClient:
                 resources,
                 owner["capacities"],
                 owner.get("overflow_pools", ()) if effective_overflow else (),
+                local_capabilities=owner.get("local_runtime", {}).get("capabilities", ()),
+                require_capabilities=require_capabilities,
+                runtimes=runtimes,
             ),
             agent=_agent_identity(agent),
             caller_pid=prepared.caller_pid,
@@ -1619,6 +1834,8 @@ class CoordinatorClient:
         avoid_commits: Sequence[str] = (),
         reuse_full: bool = False,
         overflow: bool | None = None,
+        require_capabilities: Sequence[str] | None = None,
+        runtimes: Sequence[str] | None = None,
     ) -> str:
         selected_command = _validate_command(command)
         if adapter != "github":
@@ -1634,6 +1851,19 @@ class CoordinatorClient:
         if not isinstance(reuse_full, bool):
             raise CoordinatorError("reuse_full must be boolean")
         selected_avoid = _validate_avoid_commits(avoid_commits)
+        selected_capabilities = parse_name_selectors(
+            require_capabilities,
+            subject="capability",
+        )
+        selected_runtimes = parse_name_selectors(
+            runtimes,
+            subject="runtime",
+            allow_empty=False,
+        )
+        if overflow is False and selected_runtimes and LOCAL_RUNTIME not in selected_runtimes:
+            raise CoordinatorError(
+                "selecting only overflow runtimes conflicts with --no-overflow"
+            )
         prepared = self._prepare_submission(
             checkout=checkout,
             repository=repository,
@@ -1657,6 +1887,8 @@ class CoordinatorClient:
             reuse_full=reuse_full,
             owner=owner,
             overflow=overflow,
+            require_capabilities=selected_capabilities,
+            runtimes=selected_runtimes,
         )
 
     def _native_submit_land(
@@ -1674,11 +1906,16 @@ class CoordinatorClient:
         reuse_full: bool,
         owner: Mapping[str, Any],
         overflow: bool | None = None,
+        require_capabilities: Sequence[str] = (),
+        runtimes: Sequence[str] = (),
     ) -> str:
-        selected_environment, effective_overflow = _overflow_environment(
+        selected_environment, effective_overflow = _placement_environment(
             prepared.environment,
-            overflow,
-            Path(prepared.identity.checkout),
+            overflow=overflow,
+            checkout=Path(prepared.identity.checkout),
+            owner=owner,
+            require_capabilities=require_capabilities,
+            runtimes=runtimes,
         )
         selected_avoid = _validate_avoid_commits(avoid_commits)
         if LAND_TARGET_SYNC_ENV in selected_environment:
@@ -1720,6 +1957,9 @@ class CoordinatorClient:
                 resources,
                 owner["capacities"],
                 owner.get("overflow_pools", ()) if effective_overflow else (),
+                local_capabilities=owner.get("local_runtime", {}).get("capabilities", ()),
+                require_capabilities=require_capabilities,
+                runtimes=runtimes,
             ),
             agent=_agent_identity(agent),
             caller_pid=prepared.caller_pid,

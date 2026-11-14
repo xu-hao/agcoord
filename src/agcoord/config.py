@@ -14,15 +14,18 @@ from pathlib import Path
 import json
 import math
 import os
+import re
 from typing import Any, Mapping
 
 
 CONFIG_FILENAME = "config.json"
 MAX_DATABASE_TIMEOUT = 2_147_483.647
 DEFAULT_NATIVE_BROKER_PATH = "/usr/libexec/agcoord/agcoord-broker"
+_CAPABILITY_NAME = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _CONFIG_KEYS = frozenset(
     {
         "capacities",
+        "capabilities",
         "bindings",
         "cgroup_root",
         "cgroup_io",
@@ -61,6 +64,7 @@ class BrokerConfig:
     stop_grace: float | None
     native_broker: NativeBrokerConfig
     overflow_pools: tuple[Mapping[str, Any], ...] = ()
+    capabilities: tuple[str, ...] = ()
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -111,6 +115,11 @@ def parse_broker_config(
             f"broker configuration {source} has unknown keys: {', '.join(unknown)}"
         )
     capacities = _section(document, "capacities", source=source)
+    capabilities = _capabilities_list(
+        document.get("capabilities"),
+        source=source,
+        subject="capabilities",
+    )
     bindings = _section(document, "bindings", source=source)
     cgroup_io = _cgroup_io_section(document, source=source)
     database_timeout = _database_timeout(document, source=source)
@@ -135,7 +144,34 @@ def parse_broker_config(
         stop_grace=stop_grace,
         native_broker=native_broker,
         overflow_pools=overflow_pools,
+        capabilities=capabilities,
     )
+
+
+def _capabilities_list(
+    value: Any,
+    *,
+    source: str | os.PathLike[str],
+    subject: str,
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise BrokerConfigError(
+            f"broker configuration {source} {subject} must be a list of unique capability names"
+        )
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or _CAPABILITY_NAME.fullmatch(item) is None:
+            raise BrokerConfigError(
+                f"broker configuration {source} {subject} entry {item!r} is not a valid capability name"
+            )
+        if item in seen:
+            raise BrokerConfigError(
+                f"broker configuration {source} {subject} declares {item!r} more than once"
+            )
+        seen.add(item)
+    return tuple(sorted(seen))
 
 
 def _overflow_pools_section(
@@ -150,6 +186,20 @@ def _overflow_pools_section(
     if not isinstance(pools, list) or not all(isinstance(pool, dict) for pool in pools):
         raise BrokerConfigError(
             f"broker configuration {source} overflow_pools must be a list of objects"
+        )
+    for pool in pools:
+        if pool.get("name") == "local":
+            raise BrokerConfigError(
+                f"broker configuration {source} overflow pool name 'local' is reserved for the host runtime"
+            )
+        if not isinstance(pool.get("privileged", False), bool):
+            raise BrokerConfigError(
+                f"broker configuration {source} overflow pool 'privileged' must be boolean"
+            )
+        _capabilities_list(
+            pool.get("capabilities"),
+            source=source,
+            subject="overflow pool capabilities",
         )
     return tuple(pools)
 
