@@ -25,7 +25,7 @@ AGCoord supports two deployment models:
 
 ## 1. Install the Python client
 
-Install `agcoord` in a Python 3.10+ virtual environment, or globally with `pipx`:
+Install `agcoord` in a Python 3.11+ virtual environment, or globally with `pipx`:
 
 ```bash
 # In an activated virtual environment:

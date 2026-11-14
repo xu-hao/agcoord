@@ -3,6 +3,11 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Require Python 3.11 or newer for the `agcoord` client; Python 3.10 is no longer supported.
+  #317 — drop Python 3.10 from the supported interpreters, package metadata, and CI matrix.
+
 ## 0.8.3 — 2026-11-13
 
 - Reserve local capacity for the oldest queued row blocked only by resources, across all

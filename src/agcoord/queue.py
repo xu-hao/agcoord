@@ -892,7 +892,7 @@ def _maintenance_record(
         raise CoordinatorError("coordinator maintenance reason is invalid")
     started_at = values["maintenance_started_at"]
     try:
-        parsed_start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        parsed_start = datetime.fromisoformat(started_at)
     except ValueError as exc:
         raise CoordinatorError("coordinator maintenance start time is invalid") from exc
     if (
@@ -945,7 +945,7 @@ def _validated_maintenance_receipt(value: Any) -> dict[str, Any]:
             or not _MAINTENANCE_TIME.fullmatch(started_at)
         ):
             raise ValueError
-        parsed_start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        parsed_start = datetime.fromisoformat(started_at)
         if parsed_start.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError
     except ValueError as exc:

@@ -31,14 +31,13 @@ _RFC3339 = re.compile(
 
 
 def _parse_rfc3339(raw: str) -> datetime | None:
-    """Parse an RFC 3339 timestamp to UTC whole seconds, including on Python 3.10."""
+    """Parse an RFC 3339 timestamp to UTC whole seconds."""
     match = _RFC3339.fullmatch(raw.strip())
     if match is None:
         return None
     whole, zone = match.groups()
-    offset = "+00:00" if zone == "Z" else zone
     try:
-        return datetime.fromisoformat(f"{whole}{offset}").astimezone(timezone.utc)
+        return datetime.fromisoformat(f"{whole}{zone}").astimezone(timezone.utc)
     except ValueError:
         return None
 

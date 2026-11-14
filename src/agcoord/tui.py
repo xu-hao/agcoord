@@ -106,7 +106,7 @@ async def _off_loop(operation: Callable[[], object]) -> object:
 
 
 def _moment(value: str | None) -> datetime | None:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+    return datetime.fromisoformat(value) if value else None
 
 
 def _elapsed(start: datetime | None, end: datetime | None) -> str:
