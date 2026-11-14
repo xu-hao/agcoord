@@ -5,6 +5,9 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Show used CPU-hours against the budget limit alongside estimated cost, and filter list and
+  TUI runs by overflow pool or `local`. #322 — make overflow budget units consistent and add a pool filter.
+
 - Require Python 3.11 or newer for the `agcoord` client; Python 3.10 is no longer supported.
   #317 — drop Python 3.10 from the supported interpreters, package metadata, and CI matrix.
 

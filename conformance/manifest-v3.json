@@ -37,10 +37,11 @@
     {
       "id": "commands.strict-public-records",
       "domain": "commands",
-      "description": "Public submit, snapshot, list, status, and log records retain their strict JSON contract.",
+      "description": "Public submit, snapshot, list, status, and log records retain their strict JSON contract; snapshot pool filters select local and placed runs across active, queued, and recent rows.",
       "tests": {
         "rust_native": [
-          "client_compatibility::python_public_commands_keep_the_protocol_five_json_contract"
+          "client_compatibility::python_public_commands_keep_the_protocol_five_json_contract",
+          "scheduler::an_eligible_row_overflows_to_a_pool_after_its_wait_threshold"
         ]
       }
     },

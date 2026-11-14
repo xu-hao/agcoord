@@ -169,12 +169,13 @@ fn parse_snapshot(arguments: &[String]) -> Result<(PathBuf, SnapshotFilter)> {
     let mut repository = None;
     let mut agent = None;
     let mut kind = None;
+    let mut pool = None;
     let mut limit = None;
     let mut index = 0;
     while index < arguments.len() {
         let option = arguments[index].clone();
         let value = match option.as_str() {
-            "--state-dir" | "--repository" | "--agent" | "--kind" | "--limit" => {
+            "--state-dir" | "--repository" | "--agent" | "--kind" | "--pool" | "--limit" => {
                 option_value(arguments, &mut index, &option)?
             }
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
@@ -184,6 +185,7 @@ fn parse_snapshot(arguments: &[String]) -> Result<(PathBuf, SnapshotFilter)> {
             "--repository" => repository = Some(value),
             "--agent" => agent = Some(value),
             "--kind" => kind = Some(value),
+            "--pool" => pool = Some(value),
             "--limit" => {
                 let parsed = value
                     .parse::<usize>()
@@ -204,6 +206,7 @@ fn parse_snapshot(arguments: &[String]) -> Result<(PathBuf, SnapshotFilter)> {
             repository,
             agent,
             kind,
+            pool,
             limit,
         },
     ))
