@@ -3,41 +3,24 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## 0.9.0 — 2026-11-14
+
+- Advance the supported native broker minor line to `0.9.x`. The `0.9.0` client and
+  `/usr/libexec/agcoord/agcoord-broker` must upgrade together with
+  `agc host upgrade --download`.
+- Run `full` and `land` in coordinator-owned reusable Git worktrees, batch queued landing
+  requests and bisect failing batches, and add runtime capability selectors for local and
+  overflow execution. #230 — isolate exact-head gating and publication; #326 — batch queued
+  landing and bisect failures; #329 — model runtime capabilities and privileged overflow.
+- Require Python 3.11 or newer, document portable commands for default overflow, preserve
+  executable scratch bindings across overflow placement, and show CPU-hour usage and pool
+  filters. #317 — drop Python 3.10; #319 — document overflow command portability; #321 — carry
+  scratch executability through overflow placement; #322 — clarify overflow budgets and filters.
+- Add portable inline scripts to `agc run` and `agc full`, and package the three-host native
+  Agent Skill plugin with validation and release artifact checks. #325 — add inline scripts;
+  #332 — package the Codex, Claude Code, and Antigravity plugin.
+
 ## Unreleased
-
-- Package the native agcoord Agent Skill for Codex, Claude Code, and Antigravity, with portable overflow, resource sizing, landing recovery guidance, plugin validation, and release artifact checks. #332 — package the three-host native agcoord agent skill plugin.
-- Model `local` and `overflow_pools` under one unified runtime capability model and support
-  single-source privileged overflow containers. Probe host user-namespace/`bwrap` support at
-  broker startup to derive `userns` on `local` alongside optional top-level `"capabilities"`,
-  add optional `"privileged"` (implying `userns` and always eligible for ordinary overflow
-  work) and `"capabilities"` per overflow pool, propagate `AGCOORD_OVERFLOW_PRIVILEGED=1` to
-  executors (`--privileged` in `overflow-gcp-batch` and `overflow-ssh`; fail-closed exit `125`
-  in `overflow-gcp-run`), and add repeatable `--require-capability` and `--runtime` selectors to
-  `agc run`, `agc full`, and `agc land` (#329).
-- Batch queued `land` requests on the same target branch and binary-bisect on gate failure (#326).
-- Run `full` and `land` in coordinator-owned reusable Git worktrees, preserving warm
-  ignored caches and unchanged tracked mtimes while isolating verdicts from concurrent
-  submitter edits. Prepare trees asynchronously, serialize gates on one branch, retain
-  logical receipt identity for `--reuse-full`, bound idle cache retention, and synchronize
-  landing targets without advancing the submitter's checkout. #230 — isolate exact-head
-  gating and publication in coordinator-owned worktrees.
-
-- Add `--script FILE` and `--script -` to `agc run` and `agc full`, passing validated UTF-8
-  script bodies through portable `bash`, `sh`, or Python interpreter commands. Refresh agent
-  guidance to use inline scripts for multi-step checks and keep fast local documentation and
-  lint checks separate from heavy suites. #325 — add a portable inline runner and tighten
-  overflow-aware check guidance.
-
-- Show used CPU-hours against the budget limit alongside estimated cost, and filter list and
-  TUI runs by overflow pool or `local`. #322 — make overflow budget units consistent and add a pool filter.
-
-- Preserve executable tmpfs bindings in SSH and Batch overflow containers, and set
-  `TMPDIR`, `TMP`, and `TEMP` to `/tmp` when overflow scratch is applied. Cloud Run refuses
-  required executable scratch because its volume API cannot guarantee executability.
-  #321 — carry scratch executability and its environment through overflow placement.
-
-- Require Python 3.11 or newer for the `agcoord` client; Python 3.10 is no longer supported.
-  #317 — drop Python 3.10 from the supported interpreters, package metadata, and CI matrix.
 
 ## 0.8.3 — 2026-11-13
 
