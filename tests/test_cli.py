@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -519,6 +519,175 @@ def test_run_allows_overflow_only_when_the_submitter_asks(fake_client, tmp_path:
     cli.run(args, out=StringIO())
 
     assert fake_client["submitted"][-1][1]["overflow"] is True
+
+
+@pytest.mark.parametrize("kind", ["run", "full"])
+def test_inline_script_file_becomes_portable_shell_command(fake_client, tmp_path, kind):
+    script = tmp_path / "check.sh"
+    script.write_text("printf 'first\\n'\nprintf 'second\\n'\n", encoding="utf-8")
+    cli.run(
+        _args(kind, "--checkout", str(tmp_path), "--script", str(script)),
+        out=StringIO(),
+    )
+    command, metadata = fake_client["submitted"][-1]
+    assert command == ["bash", "-ec", "printf 'first\\n'\nprintf 'second\\n'\n"]
+    assert metadata["kind"] == ("full" if kind == "full" else "check")
+
+
+def test_inline_script_reads_utf8_from_stdin(fake_client, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.sys, "stdin", StringIO("echo from stdin\n"))
+    cli.run(
+        _args("run", "--checkout", str(tmp_path), "--script", "-"),
+        out=StringIO(),
+    )
+    assert fake_client["submitted"][-1][0] == ["bash", "-ec", "echo from stdin\n"]
+
+
+def test_inline_script_refuses_non_utf8_stdin(fake_client, monkeypatch, tmp_path):
+    class BinaryStdin:
+        buffer = BytesIO(b"\xff")
+
+    monkeypatch.setattr(cli.sys, "stdin", BinaryStdin())
+    with pytest.raises(CoordinatorError, match="UTF-8"):
+        cli.run(
+            _args("run", "--checkout", str(tmp_path), "--script", "-"),
+            out=StringIO(),
+        )
+    assert fake_client["submitted"] == []
+
+
+@pytest.mark.parametrize(
+    "shebang, expected, stdout",
+    [
+        ("#!/bin/sh\necho ok\n", ["sh", "-ec", "#!/bin/sh\necho ok\n"], "ok\n"),
+        (
+            "#!/usr/bin/env bash\necho ok\n",
+            ["bash", "-ec", "#!/usr/bin/env bash\necho ok\n"],
+            "ok\n",
+        ),
+        (
+            "#!/usr/bin/python\nprint('ok')\n",
+            ["python3", "-c", "#!/usr/bin/python\nprint('ok')\n"],
+            "ok\n",
+        ),
+        (
+            "#!/usr/bin/python3\nprint('ok')\n",
+            ["python3", "-c", "#!/usr/bin/python3\nprint('ok')\n"],
+            "ok\n",
+        ),
+    ],
+)
+def test_inline_script_dispatches_supported_shebangs(
+    fake_client, tmp_path, shebang, expected, stdout
+):
+    script = tmp_path / "script"
+    script.write_text(shebang, encoding="utf-8")
+    cli.run(
+        _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+        out=StringIO(),
+    )
+    command = fake_client["submitted"][-1][0]
+    assert command == expected
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert result.stdout == stdout
+
+
+def test_inline_script_refuses_unsupported_shebang(fake_client, tmp_path):
+    script = tmp_path / "script"
+    script.write_text("#!/usr/bin/perl\nprint 'wrong';\n", encoding="utf-8")
+    with pytest.raises(CoordinatorError, match="unsupported script shebang"):
+        cli.run(
+            _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+            out=StringIO(),
+        )
+    assert fake_client["submitted"] == []
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [("", "empty"), (" \n\t", "empty"), ("echo a\0b", "NUL")],
+)
+def test_inline_script_refuses_empty_or_nul_content(fake_client, tmp_path, body, message):
+    script = tmp_path / "script"
+    script.write_text(body, encoding="utf-8")
+    with pytest.raises(CoordinatorError, match=message):
+        cli.run(
+            _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+            out=StringIO(),
+        )
+    assert fake_client["submitted"] == []
+
+
+@pytest.mark.parametrize(
+    "script_arg, contents, message",
+    [("missing", None, "read"), ("invalid", b"\xff", "UTF-8")],
+)
+def test_inline_script_reports_file_read_errors(
+    fake_client, tmp_path, script_arg, contents, message
+):
+    script = tmp_path / script_arg
+    if contents is not None:
+        script.write_bytes(contents)
+    with pytest.raises(CoordinatorError, match=message):
+        cli.run(
+            _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+            out=StringIO(),
+        )
+    assert fake_client["submitted"] == []
+
+
+def test_inline_script_and_worker_command_are_mutually_exclusive(fake_client, tmp_path):
+    script = tmp_path / "script"
+    script.write_text("true\n", encoding="utf-8")
+    with pytest.raises(CoordinatorError, match="cannot be combined"):
+        cli.run(
+            _args(
+                "run", "--checkout", str(tmp_path), "--script", str(script), "--", "true"
+            ),
+            out=StringIO(),
+        )
+    assert fake_client["submitted"] == []
+
+
+@pytest.mark.parametrize(
+    "option, expected",
+    [(None, None), ("--overflow", True), ("--no-overflow", False)],
+)
+def test_inline_script_preserves_overflow_selection(fake_client, tmp_path, option, expected):
+    script = tmp_path / "script"
+    script.write_text("true\n", encoding="utf-8")
+    args = ["run", "--checkout", str(tmp_path), "--script", str(script)]
+    if option:
+        args.append(option)
+    cli.run(_args(*args), out=StringIO())
+    assert fake_client["submitted"][-1][1]["overflow"] is expected
+
+
+def test_default_overflow_opt_in_sets_reserved_worker_environment(tmp_path):
+    from agcoord.queue import _overflow_environment
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "AGCoord test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "agcoord@example.invalid"],
+        check=True,
+    )
+    config = checkout / ".agcoord" / "overflow.json"
+    config.parent.mkdir()
+    config.write_text('{"image":"busybox:latest"}\n', encoding="utf-8")
+    environment, enabled = _overflow_environment(caller_environment(), None, checkout)
+
+    assert enabled is True
+    assert environment["_AGCOORD_OVERFLOW"] == "1"
 
 
 @pytest.mark.parametrize("kind", ["run", "full", "land"])

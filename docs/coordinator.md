@@ -1319,7 +1319,29 @@ take the complete budget, give each an appropriate `--maxprocesses` cap. Across 
 adapter only sizes worker processes; cgroup CPU and PID limits remain the aggregate enforcement
 boundary.
 
-## Atomic landing
+### Inline scripts for `run` and `full`
+
+`agc run` and `agc full` accept either the existing trailing worker command or `--script FILE`;
+the two forms are mutually exclusive, and one is required. `--script -` reads UTF-8 text from
+standard input. A file is read as UTF-8 by the submitting client, then its text is sent as the
+worker command, so the worker does not need the submitter's script path. Missing, unreadable,
+non-UTF-8, whitespace-only, and NUL-containing scripts are refused before submission.
+
+The complete script body, including its first line, is passed unchanged to one portable
+interpreter command. With no shebang the command is `bash -ec BODY`. A first line beginning
+with `#!` dispatches `sh` to `sh -ec BODY`, `bash` to `bash -ec BODY`, and `python` or
+`python3` to `python3 -c BODY`. A simple absolute interpreter path and `/usr/bin/env NAME`
+form are accepted for those names. Any other shebang or shebang arguments are refused so a
+script cannot silently run under the wrong language. The leading shebang remains part of the
+body; each supported interpreter treats it as a comment.
+
+Inline scripts use the same `--overflow` and `--no-overflow` behavior as trailing commands.
+The default still opts into overflow when the checkout contains a valid
+`.agcoord/overflow.json`; `--no-overflow` keeps the run local, and `--overflow` explicitly
+requires a valid declaration. The script body itself is submitted as command data and does not
+change overflow eligibility.
+
+### Atomic landing
 
 The normal landing operation is one durable request containing the forge adapter/request,
 exact checkout/branch/head, gate command, private caller environment, and resource claim:
