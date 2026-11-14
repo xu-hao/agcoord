@@ -165,13 +165,21 @@ impl Fixture {
     }
 
     fn queue_behind_worker(&mut self) -> OwnedProcess {
+        let script = self.root.join("retained-worker.sh");
+        let marker = self.root.join("worker-started");
+        fs::write(&script, "#!/bin/sh\n: > \"$1\"\nexec /bin/sleep 300\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         let broker = self.start();
-        parsed(self.submit("retained-running", &["/bin/sleep", "300"]));
+        parsed(self.submit(
+            "retained-running",
+            &[script.to_str().unwrap(), marker.to_str().unwrap()],
+        ));
         wait_for(|| {
             let row = self.status("retained-running");
             if let Some(pid) = row["worker_pid"].as_u64()
                 && let Some((state, token)) = process_identity(pid as u32)
                 && state != "Z"
+                && marker.exists()
             {
                 self.worker = Some((pid as u32, token));
                 true

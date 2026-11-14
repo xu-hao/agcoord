@@ -3497,8 +3497,7 @@ def test_full_reuses_gate_tree_and_preserves_warm_artifacts(coordinator, tmp_pat
     _git(repository, "commit", "-m", "ignore build cache")
     first = _submit(client, _python(
         "from pathlib import Path; p=Path('cache'); p.mkdir(exist_ok=True); "
-        "(p/'artifact').write_text('warm'); "
-        "Path('tracked.txt').touch()"
+        "(p/'artifact').write_text('warm')"
     ), repository, kind="full")
     first_row = _row(client, first, "passed", "failed")
     assert first_row["status"] == "passed"

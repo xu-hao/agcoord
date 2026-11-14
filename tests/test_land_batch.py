@@ -149,7 +149,7 @@ LOG_FILE = Path({str(log_file)!r})
 
 def git_remote(*args, input_bytes=None):
     return subprocess.run(
-        [{GIT!r}, "--git-dir", str(REMOTE), *args],
+        [{GIT!r}, "-c", "user.name=AGCoord Forge", "-c", "user.email=forge@example.invalid", "--git-dir", str(REMOTE), *args],
         input=input_bytes,
         capture_output=True,
         check=False,

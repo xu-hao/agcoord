@@ -160,6 +160,9 @@ A setup failure returns exit 125 with `gate-tree-checkout-missing`,
 contains the detail. Restore the source checkout/head or resolve the reported filesystem
 failure, then resubmit. No gate command or publication runs on a setup refusal.
 
+Checks and recovery proof workers do not materialize a gate tree. The broker completes their
+setup and releases them during admission instead of deferring setup to a later scheduler tick.
+
 The executed row's `checkout` becomes the prepared gate tree before command release.
 `worktree_id` remains the submitter's logical identity, so `--reuse-full` still matches
 receipts from that worktree, exact head and command. Workers verify their executed
@@ -1578,6 +1581,10 @@ compare-and-swap on both refs; the barrier still serializes landings in the repo
 avoided-commit check still re-reads the target. **A moved target cannot reuse a green result**,
 and not by policy: synchronizing an advanced target creates a merge commit, which changes the
 exact head, so no earlier receipt can match it.
+
+Target synchronization uses the invoking Git identity when supplied in the environment or Git
+configuration. Missing author and committer name or email fields fall back to `AGCoord` and
+`agcoord@localhost` for that merge only; configured or environment values remain in effect.
 
 What reuse does not preserve is freshness against a gate that is not a function of the tree. The
 same commit is not the same gate inputs when the gate reads the clock, the network, the installed
