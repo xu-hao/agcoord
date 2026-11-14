@@ -256,10 +256,23 @@ impl GateTree {
         }
         // A previous command could have attached HEAD. Detach without touching the
         // index or files before reset can accidentally advance a shared local ref.
-        let previous_head = git(&self.checkout, &["rev-parse", "HEAD"])?;
+        // Admission follows complete process-group drainage of the previous owner,
+        // so only this launcher's Git can be using these tree-specific lock files.
+        // A SIGKILL during an earlier reset/add may have left them behind.
+        for name in ["index.lock", "HEAD.lock"] {
+            let lock = git(
+                &self.checkout,
+                &["rev-parse", "--path-format=absolute", "--git-path", name],
+            )?;
+            match fs::remove_file(lock) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(failure(error.to_string())),
+            }
+        }
         git(
             &self.checkout,
-            &["update-ref", "--no-deref", "HEAD", &previous_head],
+            &["update-ref", "--no-deref", "HEAD", &self.head],
         )?;
         git(&self.checkout, &["reset", "--hard", &self.head])?;
         // Reset leaves ignored caches warm. Remove other untracked gate outputs so a
@@ -279,16 +292,22 @@ impl GateTree {
     fn remove(directory: &Path, common: &Path) -> Result<()> {
         let tree = directory.join("checkout");
         if common.is_dir() {
-            git(
-                common,
-                &[
-                    "worktree",
-                    "remove",
-                    "--force",
-                    "--force",
-                    tree.to_str().unwrap(),
-                ],
-            )?;
+            let registered = git(common, &["worktree", "list", "--porcelain"])?;
+            if registered
+                .lines()
+                .any(|line| line.strip_prefix("worktree ") == tree.to_str())
+            {
+                git(
+                    common,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        "--force",
+                        tree.to_str().unwrap(),
+                    ],
+                )?;
+            }
         }
         fs::remove_dir_all(directory).map_err(|error| failure(error.to_string()))
     }

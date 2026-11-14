@@ -3455,3 +3455,25 @@ def test_gate_tree_reuses_one_logical_branch_across_independent_clones(coordinat
     assert row["worktree_id"] != first_row["worktree_id"]
     assert _head(first) == old_head
     assert (first / "tracked.txt").read_text() == "candidate\n"
+
+
+def test_gate_tree_recovers_stale_tree_locks_and_unregistered_setup(coordinator, tmp_path):
+    broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    first = _submit(client, _python(
+        "from pathlib import Path; import subprocess\n"
+        "for name in ('index.lock', 'HEAD.lock'):\n"
+        "    p = subprocess.check_output(['git', 'rev-parse', '--path-format=absolute', '--git-path', name], text=True).strip()\n"
+        "    Path(p).touch()\n"
+    ), repository, kind="full")
+    first_row = _row(client, first, "passed")
+    # An owner could also die after writing ownership but before Git registered a tree.
+    orphan = broker.paths.state_dir / "gate-trees" / ("0" * 64)
+    orphan.mkdir()
+    common = _git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    (orphan / "owner.json").write_text(json.dumps({"common": common, "branch": "gone"}))
+    second = _submit(client, _python("assert open('tracked.txt').read() == 'base\\n'"), repository, kind="full")
+    row = _row(client, second, "passed", "failed")
+    assert row["status"] == "passed", client.log(second)
+    assert row["checkout"] == first_row["checkout"]
+    assert not orphan.exists()
