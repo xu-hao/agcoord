@@ -5277,13 +5277,17 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
 
-    for (mode, expected_status, expected_event_status, user_code_runs) in [
-        ("required", "failed", "failed", false),
-        ("best-effort", "passed", "unapplied", true),
+    for (kind, mode, expected_status, expected_event_status, user_code_runs) in [
+        ("check", "required", "failed", "failed", false),
+        ("check", "best-effort", "passed", "unapplied", true),
+        ("full", "required", "failed", "failed", false),
+        ("full", "best-effort", "passed", "unapplied", true),
     ] {
-        let state = temporary.path().join(format!("state-{mode}"));
-        let root = temporary.path().join(format!("delegated-{mode}"));
-        let report = temporary.path().join(format!("environment-{mode}.json"));
+        let state = temporary.path().join(format!("state-{kind}-{mode}"));
+        let root = temporary.path().join(format!("delegated-{kind}-{mode}"));
+        let report = temporary
+            .path()
+            .join(format!("environment-{kind}-{mode}.json"));
         fs::create_dir(&state).unwrap();
         fs::create_dir(&root).unwrap();
         fs::write(
@@ -5318,13 +5322,13 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
         );
         let submission = Submission {
             run_id: mode,
-            kind: "check",
+            kind,
             repository: "repo-a",
             checkout: &checkout,
             command: vec![
                 "/usr/bin/python3".to_owned(),
                 "-c".to_owned(),
-                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}), encoding='ascii')".to_owned(),
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({**{name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}, 'checkout': os.getcwd()}), encoding='ascii')".to_owned(),
                 report.to_string_lossy().into_owned(),
             ],
             gate_run_id: None,
@@ -5348,8 +5352,11 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
         if user_code_runs {
             assert_eq!(
                 serde_json::from_str::<Value>(&fs::read_to_string(&report).unwrap()).unwrap(),
-                json!({"TMPDIR": null, "TMP": null, "TEMP": null})
+                json!({"TMPDIR": null, "TMP": null, "TEMP": null, "checkout": finished["checkout"]})
             );
+        }
+        if kind == "full" && user_code_runs {
+            assert_ne!(finished["checkout"], checkout.to_string_lossy().as_ref());
         }
         assert_eq!(
             finished["failure_reason"],

@@ -2470,9 +2470,10 @@ impl Broker {
                 return Ok(());
             }
         };
-        if setup_failure.is_none()
-            && let Some(tree) = &worker_setup.gate_tree
-        {
+        // A resource refusal may degrade an optional scratch binding and still
+        // release user code. Gate preparation succeeded on every Ok setup result,
+        // so commit the executed checkout even for that best-effort fallback.
+        if let Some(tree) = &worker_setup.gate_tree {
             connection
                 .execute(
                     "UPDATE runs SET checkout = ?1 WHERE run_id = ?2 AND status = 'running'",
