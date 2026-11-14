@@ -15,7 +15,16 @@ The short form covers a repository whose agents run checks and land pull request
 
 ```text
 Run every check through the local coordinator and declare what it uses:
-  agc run --label "<what>" --resource cpu=2 -- <command>
+  PATH="<venv>/bin:$PATH" agc run --label "<what>" --resource cpu=2 -- pytest -q ...
+When .agcoord/overflow.json exists, agc run opts into overflow unless --no-overflow
+is passed. Built-in remote workers run in a container over a working-tree snapshot,
+without host venvs, pre-created host /tmp or /var/tmp files, .git, or host daemons.
+Use bare executable names, checkout-relative paths, and runtime scratch under $TMPDIR;
+never pass host-local interpreter or script paths (/var/tmp/..., host /tmp/ files,
+/home/..., or <venv>/bin/...) or .git commands without --no-overflow. Declare scratch
+resources when needed. Use --no-overflow for checks needing host files or venvs, .git,
+local services or daemons, or unbundled extras. Also use it on agc full and agc land
+when gate scripts check local admission or host user-namespace sandboxes.
 Land a pull request only through one gate-and-publish request; never merge directly:
   agc land <pr> --resource cpu=4 -- <full test command>
 Never run agc from inside an admitted job. A stale-main or head-changed refusal means:
@@ -29,6 +38,18 @@ The long form suits a repository with tickets, several agents, and an enforced h
 
 Run every check through the local coordinator and declare the resources it uses:
   agc run --label "<ticket> <what>" --resource cpu=<n> -- <command>
+When .agcoord/overflow.json exists, agc run opts into overflow unless --no-overflow
+is passed. Built-in remote workers run in a container over a working-tree snapshot,
+without host venvs, pre-created host /tmp or /var/tmp files, .git, or host daemons.
+Keep commands portable: prepend a local venv to PATH and use bare executable names,
+checkout-relative paths, and runtime scratch under $TMPDIR, for example:
+  PATH="<venv>/bin:$PATH" agc run --label "<what>" --resource cpu=2 -- pytest -q ...
+Declare scratch resources when needed. Never pass host-local interpreter or script
+paths (/var/tmp/..., host /tmp/ files, /home/..., or <venv>/bin/...) or .git
+commands in agc run without --no-overflow. Use --no-overflow for checks needing host
+files or venvs, .git, local services or daemons, or unbundled extras. Also use it on
+agc full and agc land when gate scripts check local admission or host user-namespace
+sandboxes.
 Use `agc full` for a clean exact-head verdict when you need one without publishing.
 Land only through one gate-and-publish request, from a clean checkout of the pushed
 head, after the pull request is open and ready:
@@ -58,6 +79,24 @@ A job that declares neither a tmpfs nor a project-quota policy receives no tempo
 from AGCoord, and inherited `TMPDIR`, `TMP`, and `TEMP` values are removed, so a job that
 needs temporary space declares the scratch names its broker binds. The
 [resource contract](coordinator.md#repository-lanes-and-resources) lists the kinds.
+
+### Default overflow, portable check commands, and `--no-overflow`
+
+A checkout containing `.agcoord/overflow.json` opts `agc run`, `agc full`, and `agc land`
+into overflow by default. Local capacity is preferred, but built-in executors can run the
+command in a remote container over a working-tree snapshot. That snapshot includes tracked
+and untracked files, but excludes `.git`, ignored files, and host `/tmp` and `/var/tmp`
+files. Host virtualenvs and daemons are unavailable there. See [overflow pools](coordinator.md#overflow-pools)
+for configuration, placement, and the job image.
+
+Keep `agc run` commands portable: prepend a local venv to `PATH` before invoking `agc`,
+then use bare executable names, checkout-relative paths, and runtime scratch under `$TMPDIR`.
+Declare scratch resources when needed; AGCoord does not provide `TMPDIR` without a scratch
+policy. Do not pass host-local interpreter or script paths such as `/var/tmp/...`, host
+`/tmp/...` files, `/home/...`, or `<venv>/bin/...`, or run `.git` commands, without
+`--no-overflow`. Pass `--no-overflow` for checks needing host files or venvs, `.git`, local
+services or daemons, or extras not bundled in the toolchain image. Pass it on `agc full` and
+`agc land` when gate scripts check local admission or host user-namespace sandboxes.
 
 **Never submit from inside an admitted job.** A job that submits another job and waits for
 it would deadlock behind itself, so the client refuses before any broker is involved:
@@ -100,6 +139,9 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | A refusal with code `broker-draining` | Maintenance is closing the queue. | Wait; `agc list`, `show`, and `log` still work. |
 | `Gate queue: <id> waiting at position N for branch …` | Queued, not refused. | Wait; `blocked_by` in `agc --json show <id>` names the jobs ahead. |
 | `Gate queue: lost contact with the coordinator while following <id>: …`, exit status 75 | This client's stream ended; the job continues on the broker. | Read the verdict with `agc show <id>`; keep watching with `agc log <id> --follow`. Do not report 75 as a failed gate. |
+| `error: overflow needs a valid .agcoord/overflow.json in the checkout: …` | The declaration is invalid, or `--overflow` requires a missing declaration; no row was queued. | Fix the indicated configuration or use `--no-overflow` to run locally. |
+| `failure_reason: overflow-executor-failed` | The executor could not obtain a verdict; the row is interrupted and a land publishes nothing. | Read the log, resolve the executor or connection problem, and resubmit. |
+| `failure_reason: overflow-runtime-exceeded` | The pool's maximum runtime expired; the row failed with exit status 124. | Read the log and adjust the job or ask the operator to adjust the pool limit before resubmitting. |
 | `failure_reason: gate-failed` | The gate command exited non-zero; `gate_exit_status` has the status. | Fix the code, push, and submit a new land request. |
 | `failure_reason: stale-main` | The target moved after preflight or during the gate, or `--no-target-sync` met an advanced target. | Update the branch from the target, push, and submit a new land request. |
 | `failure_reason: head-changed` | The source branch moved while the landing ran. | Do not push to a branch that is landing; submit a new request for the new head. |
