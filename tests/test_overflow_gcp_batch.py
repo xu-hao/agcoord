@@ -410,3 +410,42 @@ def test_a_configured_build_context_builds_the_toolchain_from_that_directory(clo
         str(cloud.repository / ".agcoord" / "Dockerfile"),
         str((cloud.repository / "locks").resolve()),
     ]
+
+
+@pytest.mark.parametrize(
+    ("options", "overrides", "expect_privileged"),
+    [
+        ((), {}, False),
+        ((), {"AGCOORD_OVERFLOW_PRIVILEGED": "0"}, False),
+        ((), {"AGCOORD_OVERFLOW_PRIVILEGED": "1"}, True),
+        (("--privileged",), {}, True),
+        (("--privileged",), {"AGCOORD_OVERFLOW_PRIVILEGED": "0"}, True),
+    ],
+)
+def test_privileged_placement_or_flag_adds_privileged_to_batch_container_options(
+    cloud: Cloud,
+    options: tuple[str, ...],
+    overrides: dict[str, str],
+    expect_privileged: bool,
+):
+    completed = cloud.run("true", options=options, **overrides)
+
+    assert completed.returncode == 0, completed.stderr
+    container = cloud.job()["taskGroups"][0]["taskSpec"]["runnables"][0]["container"]
+    tokens = container["options"].split()
+    if expect_privileged:
+        assert "--privileged" in tokens
+        assert tokens.count("--privileged") == 1
+    else:
+        assert "--privileged" not in tokens
+
+
+def test_an_invalid_privileged_environment_value_is_refused_without_building_or_submitting(
+    cloud: Cloud,
+):
+    completed = cloud.run("true", AGCOORD_OVERFLOW_PRIVILEGED="yes")
+
+    assert completed.returncode == 125
+    assert "placement is invalid" in completed.stderr
+    assert cloud.docker() == []
+    assert cloud.gcloud() == []

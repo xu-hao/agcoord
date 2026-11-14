@@ -369,8 +369,16 @@ remain separate implementations; a configured backend is never silently treated 
 
 An overflow pool extends this machine's capacity with capacity somewhere else: another machine
 the operator owns, or a machine a cloud provider creates for one run. The coordinator core does
-not know which. A pool is only a name, its own capacities, and an *executor* command; reaching
-the other machine is the executor's job, so provider-specific behavior stays in adapters.
+not know which. A pool is only a name, its own capacities and runtime capabilities, an optional
+privileged-container flag, and an *executor* command; reaching the other machine is the
+executor's job, so provider-specific behavior stays in adapters.
+
+`local` and `overflow_pools` share one unified runtime capability model. The host runtime is
+always named `local` (`"privileged": false`, native host execution with no local container
+runtime). When the broker starts, it probes whether an admitted local process can create an
+unprivileged user namespace (exercising `bwrap` when installed, under the admitted AppArmor
+profile when confined) and adds `"userns"` to `local` automatically when that probe succeeds,
+merged with any optional top-level `"capabilities"` list in `config.json`.
 
 Pools are the ordered `overflow_pools` list in `config.json`, and like every other section they
 are frozen when the broker starts:
@@ -378,13 +386,16 @@ are frozen when the broker starts:
 ```json
 {
   "capacities": {"jobs": 8, "cpu": 16},
+  "capabilities": ["kvm"],
   "overflow_pools": [
     {
       "name": "workstation",
       "capacities": {"jobs": 2, "cpu": 32},
       "executor": ["run-on-workstation"],
       "wait_threshold": 120,
-      "max_runtime": 3600
+      "max_runtime": 3600,
+      "privileged": true,
+      "capabilities": ["kvm"]
     },
     {
       "name": "cloud",
@@ -400,34 +411,52 @@ are frozen when the broker starts:
 }
 ```
 
-Each pool has exactly these keys. `name` follows the resource-name rules and is unique.
-`capacities` lists every resource the pool offers as positive integers, `jobs` included; a claim
-on a name the pool does not list can never be placed there. `max_claim` is optional and
-gives, per listed resource, the largest amount one job may claim there, for a target that can
-run many jobs but only up to a certain size each; a job above it skips this pool and is offered
-to the next one. `executor` is a non-empty command.
+Each pool has only these keys. `name` follows the resource-name rules, is unique, and may not
+be `local` (reserved for the host runtime). `capacities` lists every resource the pool offers
+as positive integers, `jobs` included; a claim on a name the pool does not list can never be
+placed there. `max_claim` is optional and gives, per listed resource, the largest amount one
+job may claim there, for a target that can run many jobs but only up to a certain size each; a
+job above it skips this pool and is offered to the next one. `executor` is a non-empty command.
 `wait_threshold` is whole seconds, default `0`. `max_runtime` is required whole seconds.
-`budget` is optional: `cpu_hours_per_day` is a positive number and `rollover_utc` is the `HH:MM`
-UTC time at which a new budget day begins, default `00:00`. `cpu_hour_price` is an optional
-non-negative number that clients may use to display an estimated cost; the broker never
-enforces anything with it. An invalid pool is `broker-config-invalid`.
+`privileged` is an optional boolean, default `false`; setting `"privileged": true` marks the
+pool's containers as privileged and automatically implies the `"userns"` capability without
+requiring manual duplication. Privileged pools remain eligible for ordinary overflow jobs—no
+per-job permission flag is required to land on one. `capabilities` is an optional list of unique
+capability names following the resource-name rules (as is top-level `"capabilities"` for
+`local`). `budget` is optional: `cpu_hours_per_day` is a positive number and `rollover_utc` is
+the `HH:MM` UTC time at which a new budget day begins, default `00:00`. `cpu_hour_price` is an
+optional non-negative number that clients may use to display an estimated cost; the broker never
+enforces anything with it. Both `local` runtime metadata and pool metadata are published in the
+broker's ownership handshake. An invalid capability list or pool is `broker-config-invalid`.
 
 A job submitted with `agc run`, `agc full`, or `agc land` is eligible for overflow by default
 when its checkout contains `.agcoord/overflow.json`. Pass `--no-overflow` to keep a job on this
 machine, for example when it needs local files, tools, or ignored state. Pass `--overflow` to
-require a valid repository declaration. These options are mutually exclusive. A retained `merge`
+require a valid repository declaration. These options are mutually exclusive. Repeat
+`--require-capability NAME` to require runtime capabilities (such as `userns`) and repeat
+`--runtime NAME` (`local` or configured pool names) to restrict which runtimes may run the job;
+`CoordinatorClient.submit` and `submit_land` expose `require_capabilities` and `runtimes`. No
+per-job privilege selector exists: jobs request capabilities or runtimes, and pool configuration
+remains the single source of truth for container privilege. Submission fails closed before
+queuing when an identifier or runtime is unknown, when selecting only overflow runtimes
+conflicts with `--no-overflow` or lacks a valid `.agcoord/overflow.json`, or when no single
+allowed runtime offers every requested resource and capability together. A retained `merge`
 never overflows.
 
-This machine is always preferred. In each scheduling pass the broker first admits everything
-that fits locally. Only then does it take the earliest queued job that allowed overflow, is
-blocked only by `resource:*` shortages and/or `reservation:*` reasons, and has been queued for
-at least a pool's `wait_threshold`, and place it in the first configured pool that has room
-for its complete claim and enough budget. Lane and barrier rules are unchanged: a placed job
+This machine is always preferred when `local` is an allowed runtime and holds every required
+capability. In each scheduling pass the broker first admits everything that fits locally. Rows
+excluded from `local` by `--runtime` or `--require-capability` report `runtime:local` and/or
+`capability:<name>` in `blocked_by` and never reserve front-row local capacity. Next, the broker
+takes the earliest queued job that allowed overflow, is blocked only by `resource:*`,
+`reservation:*`, `runtime:local`, and/or `capability:*` reasons, and has been queued for at
+least a matching pool's `wait_threshold`, and places it in the first configured pool that is
+allowed by `--runtime`, holds every required capability, and has room for its complete claim and
+enough budget. Lane and barrier rules are unchanged: a placed job
 still counts as active work in its repository and worktree, and a job waiting for a land or for
 its worktree never overflows around it. For an eligible job, a claim larger than this machine's
-capacity is accepted
-at submission when some pool offers it as one job, and reaches that pool by the same rule.
-With `--no-overflow`, claims must fit local capacities.
+capacity or requiring a capability `local` lacks is accepted at submission when one allowed pool
+satisfies both the complete resource claim and every required capability together, and reaches
+that pool by the same rule. With `--no-overflow`, claims and capabilities must fit `local`.
 A later row held back by the front row's reservation may overflow after that threshold:
 placement consumes the pool's capacity rather than local capacity, so it does not delay the
 local front row. Pool allocations are excluded from local shortages and reservations, while
@@ -436,9 +465,12 @@ their repository and worktree exclusions still apply.
 A placed job's row moves to `running` with its `pool` set. Its worker on this machine is
 `EXECUTOR... -- COMMAND...`, started in the executed checkout (the gate tree for
 `full`/`land`) with the usual admission
-environment plus `AGCOORD_OVERFLOW_POOL`, `AGCOORD_OVERFLOW_MAX_RUNTIME` in seconds,
-`AGCOORD_OVERFLOW_RESOURCES`, the claim as a JSON object, and `AGCOORD_OVERFLOW_CONTRACT`, the
-row's `resource_contract`, which gives each claim's kind and unit. The executor runs the command
+environment (after stripping any caller-supplied `AGCOORD_OVERFLOW_*` variables) plus
+`AGCOORD_OVERFLOW_POOL`, `AGCOORD_OVERFLOW_MAX_RUNTIME` in seconds,
+`AGCOORD_OVERFLOW_RESOURCES` (the claim as a JSON object), `AGCOORD_OVERFLOW_CONTRACT` (the
+row's `resource_contract`, which gives each claim's kind and unit), and
+`AGCOORD_OVERFLOW_PRIVILEGED` (`1` when placed onto a `"privileged": true` pool, `0` on an
+unprivileged pool; unset on `local` runs). The executor runs the command
 on the pool's machine, relays its output, and exits with its status; that exit status, the log,
 and cancellation are those of any other worker, so stopping the job signals the executor's
 process group and the executor must stop the remote run. An executor that cannot obtain a
@@ -535,7 +567,9 @@ scratch claims do not mount scratch or inject these variables.
 The destination needs a non-interactive SSH login for the broker's user and Docker or Podman.
 It needs no registry and no forge credentials. `--ssh-option OPTION` adds an `ssh -o` option
 such as `Port=2222`, `--runtime` selects the local container tool, `--remote-runtime` the
-destination's (default `docker`), and `--env NAME` passes one environment variable into the
+destination's (default `docker`), `--privileged` passes `--privileged` to the remote container
+`run` command (also enabled automatically when the broker sets `AGCOORD_OVERFLOW_PRIVILEGED=1`
+for a `"privileged": true` pool), and `--env NAME` passes one environment variable into the
 container; by default the container receives none of the submitter's environment.
 
 For each job the executor sends the toolchain image over SSH unless the destination already
@@ -621,7 +655,9 @@ This machine needs Docker or Podman and a `gcloud` that is signed in with permis
 the repository and submit Batch jobs; the executor holds no credentials of its own and asks for
 everything through that `gcloud`. `--machine-type` fixes the Compute Engine machine type; without
 it Batch chooses one that fits the job. `--spot` uses a Spot machine, which is cheaper but can be
-preempted. `--runtime` selects the local container tool, `--env NAME` passes one environment
+preempted. `--runtime` selects the local container tool, `--privileged` adds `--privileged` to
+the Batch container's `options` (also enabled automatically when `AGCOORD_OVERFLOW_PRIVILEGED=1`
+is set for a `"privileged": true` pool), `--env NAME` passes one environment
 variable into the container, and `--poll-interval` sets how often the job is checked.
 
 For each job the executor builds the job's image on this machine, pushes the repository's
@@ -682,7 +718,10 @@ at the cost of being smaller and limiting less:
 ```
 
 One Cloud Run job gets at most 8 CPUs and 32 GiB of memory, so give the pool a `max_claim` that
-says so; a larger job then goes to the next pool instead of failing here. Cloud Run can enforce
+says so; a larger job then goes to the next pool instead of failing here. Cloud Run does not
+support privileged containers: if a privileged placement (`AGCOORD_OVERFLOW_PRIVILEGED=1`) or
+`--privileged` reaches `agc overflow-gcp-run`, it fails closed with exit status 125 before
+building or pushing any image. Cloud Run can enforce
 only `cpu`, `memory`, and `tmpfs` claims. A limit on `swap` always holds, because Cloud Run has
 none. A `required` claim of any other kind, such as an inode or process limit, is refused with
 exit status 125 before anything is built, so list in the pool's `capacities` only the resources
@@ -1139,7 +1178,8 @@ the nonnegative units currently held. `resource_bindings` is the exact machine b
 frozen by the live broker. `resource_capabilities` maps each installed or referenced backend to
 its `available`, `kinds`, `units`, `operations`, and stable `reason` fields. It contains no host
 paths or backend exception text. `overflow_pools` lists each configured
-[overflow pool](#overflow-pools) in order with its configuration, the `allocations` its running
+[overflow pool](#overflow-pools) in order with its configuration (including `privileged` and
+sorted `capabilities`), the `allocations` its running
 jobs hold, and, inside a configured `budget`, the current budget day's `used_cpu_hours` and
 `remaining_cpu_hours`. Active and queued jobs appear in scheduling order; recent
 contains retained terminal history ordered by completion time (`finished_at` descending, tie-broken
@@ -1170,7 +1210,8 @@ event fields. A backend sample may also return stable, sanitized observations su
 controller-limit event; the broker validates the resource and code, records each observation
 once, and never exposes a raw controller file or exception. Backend handles and host paths remain
 private spool state and never enter the public row;
-`blocked_by` identifies repository predecessors, resource shortages, and front-row reservations
+`blocked_by` identifies repository predecessors, resource shortages, front-row reservations,
+and local runtime or capability exclusions (`runtime:local`, `capability:<name>`)
 currently preventing admission. `pool` is the
 name of the overflow pool the job was placed in, or null for a job that ran or will run on this
 machine. Repository and

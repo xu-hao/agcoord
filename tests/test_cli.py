@@ -714,6 +714,58 @@ def test_overflow_options_are_mutually_exclusive(kind):
         _args(*arguments, "--overflow", "--no-overflow", "--", "true")
 
 
+@pytest.mark.parametrize("kind", ["run", "full", "land"])
+def test_runtime_and_capability_selectors_reach_client(fake_client, tmp_path, kind):
+    arguments = [kind] + (["123"] if kind == "land" else [])
+    arguments += [
+        "--checkout",
+        str(tmp_path),
+        "--require-capability",
+        "userns",
+        "--require-capability",
+        "kvm",
+        "--runtime",
+        "local",
+        "--runtime",
+        "batch-priv",
+        "--",
+        "true",
+    ]
+    cli.run(_args(*arguments), out=StringIO())
+    entry = fake_client["landed"][-1][3] if kind == "land" else fake_client["submitted"][-1][1]
+    assert entry["require_capabilities"] == ["userns", "kvm"]
+    assert entry["runtimes"] == ["local", "batch-priv"]
+
+
+@pytest.mark.parametrize("kind", ["run", "full", "land"])
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--require-capability", ""),
+        ("--require-capability", "bad name"),
+        ("--require-capability", "-leading"),
+        ("--runtime", ""),
+        ("--runtime", "pool/1"),
+    ],
+)
+def test_invalid_runtime_or_capability_arguments_fail_closed_before_client_construction(
+    fake_client,
+    tmp_path,
+    kind: str,
+    flag: str,
+    value: str,
+):
+    fake_client["submitted"].clear()
+    fake_client["landed"].clear()
+    arguments = [kind] + (["123"] if kind == "land" else [])
+    arguments += ["--checkout", str(tmp_path), f"{flag}={value}", "--", "true"]
+    with pytest.raises(CoordinatorError):
+        cli.run(_args(*arguments), out=StringIO())
+    assert fake_client["submitted"] == []
+    assert fake_client["landed"] == []
+
+
+
 @pytest.mark.parametrize(
     "resource",
     ["cpu", "=1", "cpu=0", "cpu=-1", "cpu=one"],

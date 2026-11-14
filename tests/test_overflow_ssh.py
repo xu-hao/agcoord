@@ -352,3 +352,33 @@ def test_a_configured_build_context_is_passed_to_the_toolchain_build(destination
         str(destination.repository / ".agcoord" / "Dockerfile"),
         str(destination.repository.resolve()),
     ]
+
+
+@pytest.mark.parametrize(
+    ("options", "overrides", "expect_privileged"),
+    [
+        ((), {}, False),
+        ((), {"AGCOORD_OVERFLOW_PRIVILEGED": "0"}, False),
+        ((), {"AGCOORD_OVERFLOW_PRIVILEGED": "1"}, True),
+        (("--privileged",), {}, True),
+        (("--privileged",), {"AGCOORD_OVERFLOW_PRIVILEGED": "0"}, True),
+    ],
+)
+def test_privileged_placement_or_flag_adds_privileged_to_remote_container_run(
+    tmp_path: Path,
+    options: tuple[str, ...],
+    overrides: dict[str, str],
+    expect_privileged: bool,
+):
+    destination = Destination(tmp_path)
+    completed = destination.run("true", options=options, **overrides)
+
+    assert completed.returncode == 0, completed.stderr
+    (run_call,) = [call for call in destination.calls(remote=True) if call[0] == "run"]
+    image_index = run_call.index("agcoord-run:check-0123456789ab")
+    run_flags = run_call[1:image_index]
+    if expect_privileged:
+        assert "--privileged" in run_flags
+        assert run_flags.count("--privileged") == 1
+    else:
+        assert "--privileged" not in run_flags

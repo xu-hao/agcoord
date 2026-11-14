@@ -23,6 +23,7 @@ from agcoord.queue import (
     CoordinatorClient,
     CoordinatorError,
     NATIVE_PROTOCOL,
+    broker_config,
     state_dir_for,
 )
 from agcoord.resources import ResourceMeasurement, ResourceObservation
@@ -1051,6 +1052,185 @@ def test_overflow_submission_validates_dockerfile_build_context(tmp_path: Path):
         assert row["pool"] == "elsewhere"
     finally:
         running.stop()
+
+
+def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: Path):
+    for invalid_config in (
+        {"capabilities": "userns"},
+        {"capabilities": ["bad name"]},
+        {"capabilities": ["kvm", "kvm"]},
+        {
+            "overflow_pools": [
+                {
+                    "name": "local",
+                    "capacities": {"jobs": 1, "cpu": 2},
+                    "executor": ["true"],
+                    "max_runtime": 60,
+                }
+            ]
+        },
+        {
+            "overflow_pools": [
+                {
+                    "name": "cloud",
+                    "capacities": {"jobs": 1, "cpu": 2},
+                    "executor": ["true"],
+                    "max_runtime": 60,
+                    "privileged": "yes",
+                }
+            ]
+        },
+        {
+            "overflow_pools": [
+                {
+                    "name": "cloud",
+                    "capacities": {"jobs": 1, "cpu": 2},
+                    "executor": ["true"],
+                    "max_runtime": 60,
+                    "capabilities": ["dup", "dup"],
+                }
+            ]
+        },
+    ):
+        invalid_state = tmp_path / "invalid-config"
+        write_broker_config(invalid_state, **invalid_config)
+        with pytest.raises(CoordinatorError):
+            broker_config(invalid_state)
+
+    state_dir = tmp_path / "state"
+    executor = tmp_path / "executor"
+    records = tmp_path / "executor-records"
+    records.mkdir()
+    executor.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s:%s\\n" "$AGCOORD_OVERFLOW_POOL" "$AGCOORD_OVERFLOW_PRIVILEGED" >"{records}/$AGCOORD_RUN_ID"\n'
+        'while [ "$1" != -- ]; do shift; done\n'
+        "shift\n"
+        'exec "$@"\n',
+        encoding="utf-8",
+    )
+    executor.chmod(0o755)
+    write_broker_config(
+        state_dir,
+        capabilities=["kvm"],
+        overflow_pools=[
+            {
+                "name": "cloud-run",
+                "capacities": {"jobs": 2, "cpu": 4},
+                "executor": [str(executor)],
+                "max_runtime": 60,
+            },
+            {
+                "name": "batch-priv",
+                "capacities": {"jobs": 2, "cpu": 8},
+                "executor": [str(executor)],
+                "max_runtime": 60,
+                "privileged": True,
+                "capabilities": ["ssd"],
+            },
+        ],
+    )
+    running = RunningCoordinator(
+        state_dir,
+        capacities={"jobs": 2, "cpu": 2},
+        options=("--local-userns", "unavailable"),
+    )
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    try:
+        snapshot = client.snapshot()
+        cloud_run_pool, batch_priv_pool = snapshot["overflow_pools"]
+        assert cloud_run_pool["privileged"] is False
+        assert cloud_run_pool["capabilities"] == []
+        assert batch_priv_pool["privileged"] is True
+        assert batch_priv_pool["capabilities"] == ["ssd", "userns"]
+
+        # Selecting an overflow pool without .agcoord/overflow.json fails closed before queuing.
+        with pytest.raises(CoordinatorError, match="overflow.json"):
+            client.submit(
+                _python("None"),
+                checkout=str(repository),
+                resources={"cpu": 1},
+                environment=caller_environment(),
+                runtimes=["batch-priv"],
+            )
+
+        (repository / ".agcoord").mkdir()
+        (repository / ".agcoord" / "overflow.json").write_text(
+            '{"image": "example/toolchain:1"}',
+            encoding="utf-8",
+        )
+
+        # Unknown runtime, --no-overflow conflict, and split resource+capability failures refuse.
+        for bad_kwargs, pattern in (
+            ({"runtimes": ["unknown-pool"]}, "runtime"),
+            ({"overflow": False, "runtimes": ["batch-priv"]}, "overflow|runtime"),
+            ({"overflow": False, "require_capabilities": ["userns"]}, "userns|capability"),
+            ({"resources": {"cpu": 4}, "require_capabilities": ["kvm"]}, "kvm|capability|capacity"),
+        ):
+            with pytest.raises(CoordinatorError, match=pattern):
+                client.submit(
+                    _python("None"),
+                    checkout=str(repository),
+                    environment=caller_environment(),
+                    **bad_kwargs,
+                )
+
+        # --no-overflow with --runtime local and a local capability runs locally.
+        local_env = caller_environment()
+        local_env["AGCOORD_OVERFLOW_PRIVILEGED"] = "1"
+        env_probe = tmp_path / "local-priv-env"
+        local_id = client.submit(
+            _python(
+                "import os, pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(os.environ.get('AGCOORD_OVERFLOW_PRIVILEGED', 'unset'))",
+                env_probe,
+            ),
+            checkout=str(repository),
+            resources={"cpu": 1},
+            environment=local_env,
+            overflow=False,
+            runtimes=["local"],
+            require_capabilities=["kvm"],
+        )
+        assert _row(client, local_id, "passed")["pool"] is None
+        assert env_probe.read_text(encoding="utf-8") == "unset"
+
+        # --require-capability userns skips local (userns unavailable) and unprivileged cloud-run,
+        # landing on batch-priv with AGCOORD_OVERFLOW_PRIVILEGED=1.
+        userns_id = client.submit(
+            _python("None"),
+            checkout=str(repository),
+            resources={"cpu": 1},
+            environment=caller_environment(),
+            require_capabilities=["userns"],
+        )
+        assert _row(client, userns_id, "passed")["pool"] == "batch-priv"
+        assert (records / userns_id).read_text(encoding="utf-8") == "batch-priv:1\n"
+
+        # --runtime cloud-run skips idle local and sets AGCOORD_OVERFLOW_PRIVILEGED=0.
+        unpriv_id = client.submit(
+            _python("None"),
+            checkout=str(repository),
+            resources={"cpu": 1},
+            environment=caller_environment(),
+            runtimes=["cloud-run"],
+        )
+        assert _row(client, unpriv_id, "passed")["pool"] == "cloud-run"
+        assert (records / unpriv_id).read_text(encoding="utf-8") == "cloud-run:0\n"
+
+        # Ordinary jobs with no capability or privilege flag are still allowed onto privileged pools.
+        wide_id = client.submit(
+            _python("None"),
+            checkout=str(repository),
+            resources={"cpu": 6},
+            environment=caller_environment(),
+        )
+        assert _row(client, wide_id, "passed")["pool"] == "batch-priv"
+        assert (records / wide_id).read_text(encoding="utf-8") == "batch-priv:1\n"
+    finally:
+        running.stop()
+
 
 
 def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: Path):

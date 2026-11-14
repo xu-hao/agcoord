@@ -343,6 +343,9 @@ def container_limits(
     return limits
 
 
+OVERFLOW_PRIVILEGED_ENV = "AGCOORD_OVERFLOW_PRIVILEGED"
+
+
 @dataclass(frozen=True)
 class Placement:
     """What the broker told an executor about the placed job it must run."""
@@ -351,6 +354,7 @@ class Placement:
     max_runtime: int
     resources: Mapping[str, int]
     limits: ContainerLimits
+    privileged: bool = False
 
     def machine_cpus(self) -> int | None:
         """CPUs a machine created for this job needs.
@@ -381,13 +385,20 @@ def placement(
             "this command is an overflow executor and must be started by the broker "
             "for a job placed in an overflow pool"
         ) from exc
-    if max_runtime <= 0 or not isinstance(resources, dict) or not isinstance(contract, dict):
+    raw_privileged = environment.get(OVERFLOW_PRIVILEGED_ENV, "0")
+    if (
+        max_runtime <= 0
+        or not isinstance(resources, dict)
+        or not isinstance(contract, dict)
+        or raw_privileged not in {"", "0", "1"}
+    ):
         raise ExecutorError("the broker's overflow placement is invalid")
     return Placement(
         run_id=run_id,
         max_runtime=max_runtime,
         resources=resources,
         limits=container_limits(resources, contract, target),
+        privileged=raw_privileged == "1",
     )
 
 

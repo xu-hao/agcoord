@@ -9324,3 +9324,268 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
     wait_status(&state, "land-4", "passed");
     assert!(broker.terminate().success());
 }
+
+#[test]
+fn unified_runtimes_filter_capabilities_and_propagate_privileged_placement() {
+    let temporary = TestDirectory::new("unified-runtime-capabilities");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    let records = temporary.path().join("records");
+    fs::create_dir(&records).unwrap();
+    let executor = temporary.path().join("priv-executor");
+    fs::write(
+        &executor,
+        format!(
+            "#!/bin/sh\nprintf '%s:%s\\n' \"$AGCOORD_OVERFLOW_POOL\" \"${{AGCOORD_OVERFLOW_PRIVILEGED:-unset}}\" >\"{}/$AGCOORD_RUN_ID\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            records.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executor, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "capabilities": ["kvm"],
+            "overflow_pools": [
+                {
+                    "name": "cloud-run",
+                    "capacities": {"jobs": 2, "cpu": 4},
+                    "executor": [executor.to_str().unwrap()],
+                    "wait_threshold": 1,
+                    "max_runtime": 60,
+                },
+                {
+                    "name": "batch-priv",
+                    "capacities": {"jobs": 2, "cpu": 8},
+                    "executor": [executor.to_str().unwrap()],
+                    "wait_threshold": 1,
+                    "max_runtime": 60,
+                    "privileged": true,
+                    "capabilities": ["ssd"],
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 2), ("cpu", 2)],
+        &["--local-userns", "unavailable"],
+    );
+
+    let snap = snapshot(&state).unwrap();
+    assert_eq!(snap["overflow_pools"][0]["name"], "cloud-run");
+    assert_eq!(snap["overflow_pools"][0]["privileged"], false);
+    assert_eq!(snap["overflow_pools"][0]["capabilities"], json!([]));
+    assert_eq!(snap["overflow_pools"][1]["name"], "batch-priv");
+    assert_eq!(snap["overflow_pools"][1]["privileged"], true);
+    assert_eq!(
+        snap["overflow_pools"][1]["capabilities"],
+        json!(["ssd", "userns"])
+    );
+
+    // Unknown runtime, overflow runtime without _AGCOORD_OVERFLOW=1, and split resource+capability
+    // combinations that no single runtime satisfies are refused at submission.
+    let probe_sub = Submission {
+        run_id: "check-refused",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec!["/bin/true".to_owned()],
+        gate_run_id: None,
+    };
+    let unknown_rt = submit_in_worktree(
+        &state,
+        &probe_sub,
+        &[("cpu", 1)],
+        &[
+            ("_AGCOORD_OVERFLOW", "1"),
+            ("_AGCOORD_RUNTIMES", "[\"missing\"]"),
+        ],
+        None,
+    );
+    assert!(!unknown_rt.status.success());
+    assert!(String::from_utf8_lossy(&unknown_rt.stderr).contains("broker-submission-invalid"));
+
+    let conflict_no_overflow = submit_in_worktree(
+        &state,
+        &probe_sub,
+        &[("cpu", 1)],
+        &[("_AGCOORD_RUNTIMES", "[\"batch-priv\"]")],
+        None,
+    );
+    assert!(!conflict_no_overflow.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict_no_overflow.stderr).contains("broker-submission-invalid")
+    );
+
+    let split_unsatisfied = submit_in_worktree(
+        &state,
+        &probe_sub,
+        &[("cpu", 4)],
+        &[
+            ("_AGCOORD_OVERFLOW", "1"),
+            ("_AGCOORD_CAPABILITIES", "[\"kvm\"]"),
+        ],
+        None,
+    );
+    assert!(!split_unsatisfied.status.success());
+    assert!(
+        String::from_utf8_lossy(&split_unsatisfied.stderr).contains("broker-resource-unavailable")
+    );
+
+    // Local run strips caller-spoofed AGCOORD_OVERFLOW_PRIVILEGED and satisfies configured "kvm".
+    let local_out = temporary.path().join("local-priv");
+    let local_cmd = format!(
+        "printf '%s' \"${{AGCOORD_OVERFLOW_PRIVILEGED:-unset}}\" >\"{}\"",
+        local_out.display()
+    );
+    let local_sub = Submission {
+        run_id: "check-local-kvm",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), local_cmd],
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &local_sub,
+        submit_in_worktree(
+            &state,
+            &local_sub,
+            &[("cpu", 1)],
+            &[
+                ("AGCOORD_OVERFLOW_PRIVILEGED", "1"),
+                ("_AGCOORD_CAPABILITIES", "[\"kvm\"]"),
+            ],
+            None,
+        ),
+    );
+    let local_done = wait_status(&state, "check-local-kvm", "passed");
+    assert_eq!(local_done["pool"], Value::Null);
+    assert_eq!(fs::read_to_string(&local_out).unwrap(), "unset");
+
+    // Requiring "userns" skips local (unavailable -> blocked_by capability:userns) and skips
+    // unprivileged cloud-run, placing onto batch-priv with AGCOORD_OVERFLOW_PRIVILEGED=1.
+    let userns_sub = Submission {
+        run_id: "check-userns",
+        kind: "check",
+        repository: "repo-b",
+        checkout: &checkout,
+        command: vec!["/bin/true".to_owned()],
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &userns_sub,
+        submit_in_worktree(
+            &state,
+            &userns_sub,
+            &[("cpu", 1)],
+            &[
+                ("_AGCOORD_OVERFLOW", "1"),
+                ("_AGCOORD_CAPABILITIES", "[\"userns\"]"),
+            ],
+            None,
+        ),
+    );
+    let waiting_userns = status(&state, "check-userns");
+    assert_eq!(waiting_userns["blocked_by"], json!(["capability:userns"]));
+    let finished_userns = wait_status(&state, "check-userns", "passed");
+    assert_eq!(finished_userns["pool"], "batch-priv");
+    assert_eq!(
+        fs::read_to_string(records.join("check-userns")).unwrap(),
+        "batch-priv:1\n"
+    );
+
+    // Explicit --runtime cloud-run skips idle local (blocked_by runtime:local) and runs with
+    // AGCOORD_OVERFLOW_PRIVILEGED=0.
+    let cloud_sub = Submission {
+        run_id: "check-cloud-only",
+        kind: "check",
+        repository: "repo-c",
+        checkout: &checkout,
+        command: vec!["/bin/true".to_owned()],
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &cloud_sub,
+        submit_in_worktree(
+            &state,
+            &cloud_sub,
+            &[("cpu", 1)],
+            &[
+                ("_AGCOORD_OVERFLOW", "1"),
+                ("_AGCOORD_RUNTIMES", "[\"cloud-run\"]"),
+            ],
+            None,
+        ),
+    );
+    let waiting_cloud = status(&state, "check-cloud-only");
+    assert_eq!(waiting_cloud["blocked_by"], json!(["runtime:local"]));
+    let finished_cloud = wait_status(&state, "check-cloud-only", "passed");
+    assert_eq!(finished_cloud["pool"], "cloud-run");
+    assert_eq!(
+        fs::read_to_string(records.join("check-cloud-only")).unwrap(),
+        "cloud-run:0\n"
+    );
+
+    // Ordinary overflow job without capability flags still places onto privileged pool cleanly.
+    let ordinary_wide = Submission {
+        run_id: "check-ordinary-wide",
+        kind: "check",
+        repository: "repo-d",
+        checkout: &checkout,
+        command: vec!["/bin/true".to_owned()],
+        gate_run_id: None,
+    };
+    submit_overflow_ok(&state, &ordinary_wide, &[("cpu", 6)]);
+    let finished_wide = wait_status(&state, "check-ordinary-wide", "passed");
+    assert_eq!(finished_wide["pool"], "batch-priv");
+    assert_eq!(
+        fs::read_to_string(records.join("check-ordinary-wide")).unwrap(),
+        "batch-priv:1\n"
+    );
+
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn local_userns_probe_availability_controls_local_userns_admission() {
+    let temporary = TestDirectory::new("local-userns-probe");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&checkout).unwrap();
+
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 2), ("cpu", 2)],
+        &["--local-userns", "available"],
+    );
+    let local_userns = Submission {
+        run_id: "check-local-userns",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec!["/bin/true".to_owned()],
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &local_userns,
+        submit_in_worktree(
+            &state,
+            &local_userns,
+            &[("cpu", 1)],
+            &[("_AGCOORD_CAPABILITIES", "[\"userns\"]")],
+            None,
+        ),
+    );
+    let done = wait_status(&state, "check-local-userns", "passed");
+    assert_eq!(done["pool"], Value::Null);
+    assert!(broker.terminate().success());
+}

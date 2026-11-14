@@ -28,6 +28,7 @@ from .queue import (
     CoordinatorUnreachable,
     EXIT_COORDINATOR_UNREACHABLE,
     follow,
+    parse_name_selectors,
     parse_resource_claims,
     queue_paths,
     wait,
@@ -312,6 +313,22 @@ def build_parser() -> argparse.ArgumentParser:
         group.add_argument(
             "--no-overflow", dest="overflow", action="store_false",
             help="keep this job on the local machine",
+        )
+        command.add_argument(
+            "--require-capability",
+            dest="require_capabilities",
+            action="append",
+            default=[],
+            metavar="NAME",
+            help="require a runtime capability such as userns (repeatable)",
+        )
+        command.add_argument(
+            "--runtime",
+            dest="runtimes",
+            action="append",
+            default=None,
+            metavar="NAME",
+            help="restrict execution to named runtimes: local or pool names (repeatable)",
         )
 
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
@@ -723,6 +740,14 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
     if not checkout.is_dir():
         raise CoordinatorError(f"checkout does not exist: {checkout}")
     claims = _resources(args.resource)
+    selected_capabilities = list(
+        parse_name_selectors(args.require_capabilities, subject="capability")
+    )
+    selected_runtimes = (
+        list(parse_name_selectors(args.runtimes, subject="runtime", allow_empty=False))
+        if args.runtimes is not None
+        else None
+    )
     command = list(args.worker_command)
     if command and command[0] == "--":
         command.pop(0)
@@ -747,6 +772,8 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             avoid_commits=args.avoid,
             reuse_full=args.reuse_full,
             overflow=args.overflow,
+            require_capabilities=selected_capabilities,
+            runtimes=selected_runtimes,
         )
     else:
         run_id = client.submit(
@@ -758,6 +785,8 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             agent=args.agent,
             repository=args.repository,
             overflow=args.overflow,
+            require_capabilities=selected_capabilities,
+            runtimes=selected_runtimes,
         )
 
     if emit:

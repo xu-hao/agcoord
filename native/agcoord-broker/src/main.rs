@@ -396,6 +396,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
     let mut worker_fault = None;
     let mut cgroup_fixture = None;
     let mut project_quota_fixture = None;
+    let mut local_userns = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -490,6 +491,21 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                     "--project-quota-fixture",
                 )?));
             }
+            "--local-userns" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --local-userns"));
+                }
+                let value = option_value(arguments, &mut index, "--local-userns")?;
+                local_userns = match value.as_str() {
+                    "available" => Some(true),
+                    "unavailable" => Some(false),
+                    _ => {
+                        return Err(AppError::usage(
+                            "--local-userns must be available or unavailable",
+                        ));
+                    }
+                };
+            }
             option => return Err(AppError::usage(format!("unknown option: {option}"))),
         }
         index += 1;
@@ -530,6 +546,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
         worker_fault,
         cgroup_fixture,
         project_quota_fixture,
+        local_userns,
     })
 }
 

@@ -72,6 +72,7 @@ class BatchOptions:
     spot: bool
     passed_environment: Sequence[str]
     poll_interval: float
+    privileged: bool = False
 
 
 def job_config(
@@ -89,7 +90,9 @@ def job_config(
         "entrypoint": command[0],
         "commands": list(command[1:]),
     }
-    limits = placed.limits.run_options()
+    limits = list(placed.limits.run_options())
+    if (options.privileged or placed.privileged) and "--privileged" not in limits:
+        limits.append("--privileged")
     if limits:
         container["options"] = " ".join(limits)
     runnable: dict[str, object] = {"container": container}
@@ -244,6 +247,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--runtime", help="local container tool (default: docker, else podman)")
     parser.add_argument(
+        "--privileged",
+        action="store_true",
+        help="run the container with --privileged (also enabled when AGCOORD_OVERFLOW_PRIVILEGED=1)",
+    )
+    parser.add_argument(
         "--env",
         action="append",
         default=[],
@@ -280,6 +288,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             spot=args.spot,
             passed_environment=args.env,
             poll_interval=max(args.poll_interval, 0.01),
+            privileged=args.privileged or placed.privileged,
         )
 
         toolchain = build_toolchain(tool, root, config)

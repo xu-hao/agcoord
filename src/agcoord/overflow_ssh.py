@@ -55,11 +55,13 @@ class SshExecutor:
         local_tool: str,
         remote_tool: str,
         passed_environment: Sequence[str],
+        privileged: bool = False,
     ) -> None:
         self.ssh = ["ssh", "-o", "BatchMode=yes", *ssh_options, destination]
         self.local_tool = local_tool
         self.remote_tool = remote_tool
         self.passed_environment = list(passed_environment)
+        self.privileged = privileged
 
     def remote(self, arguments: Sequence[str], **options: object) -> subprocess.Popen[bytes]:
         """Start one command on the destination."""
@@ -135,6 +137,7 @@ class SshExecutor:
                 "run",
                 "--rm",
                 f"--name={name}",
+                *(["--privileged"] if self.privileged else []),
                 *limits.run_options(),
                 *(f"--env={name}={value}" for name, value in environment.items()),
                 image,
@@ -197,6 +200,11 @@ def _parser() -> argparse.ArgumentParser:
         help="container tool on the destination (default: docker)",
     )
     parser.add_argument(
+        "--privileged",
+        action="store_true",
+        help="run the remote container with --privileged (also enabled when AGCOORD_OVERFLOW_PRIVILEGED=1)",
+    )
+    parser.add_argument(
         "--env",
         action="append",
         default=[],
@@ -225,6 +233,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             local_tool=local_tool,
             remote_tool=args.remote_runtime,
             passed_environment=args.env,
+            privileged=args.privileged or placed.privileged,
         )
         toolchain = build_toolchain(local_tool, root, config)
         executor.ensure_toolchain(toolchain)

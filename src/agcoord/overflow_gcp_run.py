@@ -328,6 +328,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--runtime", help="local container tool (default: docker, else podman)")
     parser.add_argument(
+        "--privileged",
+        action="store_true",
+        help="accepted for executor symmetry; Cloud Run always refuses privileged containers",
+    )
+    parser.add_argument(
         "--env",
         action="append",
         default=[],
@@ -353,6 +358,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         command = command_line(args.command)
         placed = placement(os.environ, CLOUD_RUN)
+        if args.privileged or placed.privileged:
+            raise ExecutorError("Cloud Run does not support privileged containers")
         # A job Cloud Run cannot hold is refused before anything is built or pushed.
         size = run_size(placed)
         root = repository_root(Path.cwd())
