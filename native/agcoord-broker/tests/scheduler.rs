@@ -1297,11 +1297,17 @@ fn front_row_ignores_repository_blocked_rows() {
     }
     assert_eq!(
         status(&state, "land-second")["blocked_by"],
-        json!(["repository:repo-a:active:land-active", "resource:cpu"])
+        json!([
+            "gate-tree:active:land-active",
+            "repository:repo-a:active:land-active",
+            "resource:cpu"
+        ])
     );
     assert_eq!(
         status(&state, "land-third")["blocked_by"],
         json!([
+            "gate-tree:active:land-active",
+            "gate-tree:fifo:land-second",
             "repository:repo-a:active:land-active",
             "repository:repo-a:fifo:land-second",
             "resource:cpu"
