@@ -74,3 +74,8 @@ Real cgroup, I/O, tmpfs, and project-quota opt-ins remain governed by the dedica
 in [the contributor workflow](contributing.md). The native host package adds its separate
 AppArmor/systemd enforcement receipt; deterministic conformance does not claim that a host
 resource was applied unless the corresponding real-host probe succeeded.
+
+For the disposable hosted recovery rehearsal, CI runs a private temporary copy of the client
+whose broker pin is the digest of the separately built native artifact. The package must match
+that pin through the ordinary recovery checks. The checked-in release pin is never changed by
+the rehearsal, and release-candidate validation still requires that pin to match the release.

@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -114,3 +115,60 @@ def test_checker_rejects_empty_binary_output(host_package):
     )
     assert completed.returncode != 0
     assert "binary compilation produced no output" in completed.stderr
+
+
+def test_ci_recovery_pin_uses_separate_artifact_and_preserves_release_pin(host_package, tmp_path):
+    package, env, _parser = host_package
+    artifact = tmp_path / "broker"
+    pin = ROOT / "src/agcoord/native_host_pin.json"
+    original_pin = pin.read_bytes()
+    env = {**env, "PYTHONPATH": str(ROOT / "src")}
+    env.pop("AGCOORD_RUN_ID", None)
+    env.pop("AGCOORD_STATE_DIR", None)
+    recover = [
+        sys.executable, "-m", "agcoord", "--json", "--state-dir", str(tmp_path / "no-state"),
+        "host", "recover", str(package),
+    ]
+
+    # The development bundle must fail against the genuine release pin.
+    baseline = subprocess.run(recover, env=env, capture_output=True, text=True, check=False)
+    assert baseline.returncode != 0
+    assert "native-host-pin-mismatch" in baseline.stdout + baseline.stderr
+
+    wrapper = ROOT / "scripts/with-native-ci-pin"
+    # The hosted rehearsal launches the public command as a child, so verify the temporary
+    # client selection also reaches a grandchild process.
+    launch_recover = [
+        sys.executable, "-c",
+        "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))",
+        *recover,
+    ]
+    prepared = subprocess.run(
+        [sys.executable, str(wrapper), "--artifact", str(artifact), "--", *launch_recover],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    # This deliberately fake development package has an invalid production release identity;
+    # reaching that later refusal proves that the public command passed its digest check.
+    assert prepared.returncode != 0
+    assert "native-host-pin-mismatch" not in prepared.stdout + prepared.stderr
+    assert "invalid release identity" in prepared.stdout + prepared.stderr
+    assert pin.read_bytes() == original_pin
+
+    wrong = tmp_path / "wrong-broker"
+    wrong.write_bytes(b"a different independent artifact")
+    mismatch = subprocess.run(
+        [sys.executable, str(wrapper), "--artifact", str(wrong), "--", *recover],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert mismatch.returncode != 0
+    assert "native-host-pin-mismatch" in mismatch.stdout + mismatch.stderr
+    assert pin.read_bytes() == original_pin
+
+    probe = subprocess.run(
+        [sys.executable, str(wrapper), "--artifact", str(artifact), "--", sys.executable,
+         "-c", "from agcoord.native_host import PIN_PATH; print(PIN_PATH)"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert Path(probe.stdout.strip()) != pin
+    assert not Path(probe.stdout.strip()).exists()

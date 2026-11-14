@@ -24,7 +24,8 @@ versioning; dates use ISO 8601.
 
 - Fix AppArmor binary compilation for gate Git while preserving its fixed Git helpers and
   confining other executables. Host-package validation now checks binary compilation when the
-  parser is available. #343 — fix gate Git policy compilation on supported Ubuntu hosts.
+  parser is available. The disposable hosted recovery rehearsal tests the current broker with a
+  private client pin. #343 — fix gate Git policy compilation on supported Ubuntu hosts.
 - Harden clean-host landing and worker recovery, stabilize warm gate-tree checks, and require
   green hosted workflows before release uploads. #341 — fix clean-host conformance and release order.
 
