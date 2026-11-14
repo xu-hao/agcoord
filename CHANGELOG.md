@@ -11,6 +11,9 @@ versioning; dates use ISO 8601.
   lint checks separate from heavy suites. #325 — add a portable inline runner and tighten
   overflow-aware check guidance.
 
+- Show used CPU-hours against the budget limit alongside estimated cost, and filter list and
+  TUI runs by overflow pool or `local`. #322 — make overflow budget units consistent and add a pool filter.
+
 - Preserve executable tmpfs bindings in SSH and Batch overflow containers, and set
   `TMPDIR`, `TMP`, and `TEMP` to `/tmp` when overflow scratch is applied. Cloud Run refuses
   required executable scratch because its volume API cannot guarantee executability.

@@ -190,6 +190,7 @@ class FakeClient:
         repository: str | None = None,
         agent: str | None = None,
         kind: str | None = None,
+        pool: str | None = None,
         limit: int | None = None,
     ) -> dict[str, object]:
         self._called("snapshot")
@@ -199,6 +200,7 @@ class FakeClient:
                 "repository": repository,
                 "agent": agent,
                 "kind": kind,
+                "pool": pool,
                 "limit": limit,
             }
         )
@@ -1272,7 +1274,7 @@ async def test_overflow_pool_column_detail_and_budget_status_are_visible_across_
         assert "2 active (1 overflow)" in subject
 
         status_bar = _widget_text(app.query_one("#gate-status", Static))
-        assert "overflow gcp-batch (jobs 1/4, cpu 2/32, budget 118.0/120 cpu-h left (~$0.08/$4.80))" in status_bar
+        assert "overflow gcp-batch (jobs 1/4, cpu 2/32, budget 2.0/120 cpu-h used (~$0.08/$4.80))" in status_bar
 
         detail_pane = _widget_text(app.query_one("#gate-detail", Static))
         assert "pool: gcp-batch" in detail_pane
@@ -1292,3 +1294,52 @@ async def test_overflow_pool_column_detail_and_budget_status_are_visible_across_
         assert "gcp-batch" in wide_overflow_line
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_choices", [True, False])
+async def test_pool_picker_filters_rows_and_refreshes_server(with_choices):
+    snapshot = _snapshot()
+    snapshot["active"] = [
+        _row("remote", 1, "running", pool="cloud"), _row("local", 2, "running")
+    ]
+    snapshot["queued"] = [_row("waiting", 3, "queued")]
+    snapshot["recent"] = [_row("done", 4, "passed", pool="cloud")]
+    if with_choices:
+        snapshot["available_filters"] = {"pools": ["local", "cloud", "hidden"]}
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    def visible_ids():
+        table = _table(app)
+        return [str(table.get_row_at(index)[3]) for index in range(table.row_count)]
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await _settled(pilot)
+        await pilot.press("o")
+        await pilot.pause()
+        options = app.screen.query_one("#filter-options", OptionList)
+        prompts = [str(options.get_option_at_index(i).prompt) for i in range(options.option_count)]
+        expected = ["All pools", "cloud", "hidden", "local"] if with_choices else [
+            "All pools", "cloud", "local"
+        ]
+        assert prompts == expected
+        for key in "cloud":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await _settled(pilot)
+        assert visible_ids() == ["remote", "done"]
+        assert any(call.get("pool") == "cloud" for call in client.snapshot_calls)
+        assert "cloud" in _widget_text(app.query_one("#gate-subject", Static))
+        await pilot.press("o")
+        await pilot.pause()
+        for key in "local":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await _settled(pilot)
+        assert visible_ids() == ["local", "waiting"]
+        assert any(call.get("pool") == "local" for call in client.snapshot_calls)
+        await pilot.press("o")
+        await pilot.pause()
+        await pilot.press("tab", "home", "enter")
+        await _settled(pilot)
+        assert visible_ids() == ["remote", "local", "waiting", "done"]
+        assert client.snapshot_calls[-1].get("pool") is None

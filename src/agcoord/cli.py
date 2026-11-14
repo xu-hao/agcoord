@@ -168,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--repository", help="filter runs by repository name or path")
     list_cmd.add_argument("--agent", help="filter runs by submitting agent")
     list_cmd.add_argument("--kind", help="filter runs by run kind")
+    list_cmd.add_argument("--pool", help="filter runs by pool (or local)")
     list_cmd.add_argument("--limit", type=int, help="maximum number of recent runs to return")
     show = state(commands.add_parser("show", help="show one run"))
     show.add_argument("run_id")
@@ -656,6 +657,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             repository=args.repository,
             agent=args.agent,
             kind=args.kind,
+            pool=args.pool,
             limit=args.limit,
         )
         if emit:

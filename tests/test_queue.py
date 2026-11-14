@@ -411,7 +411,7 @@ def test_submit_and_snapshot_have_the_strict_generic_schema(coordinator, tmp_pat
 
     assert set(row) == ROW_KEYS
     assert set(snapshot) == SNAPSHOT_KEYS
-    assert set(snapshot["available_filters"]) == {"repositories", "agents", "kinds"}
+    assert set(snapshot["available_filters"]) == {"repositories", "agents", "kinds", "pools"}
     assert snapshot["protocol"] == NATIVE_PROTOCOL
     assert snapshot["capacities"] == {"jobs": 2}
     assert snapshot["allocations"] == {"jobs": 0}
@@ -3122,6 +3122,12 @@ def test_snapshot_supports_repository_agent_kind_and_limit_filters(
     assert "agent-2" in available["agents"]
     assert "check" in available["kinds"]
     assert "full" in available["kinds"]
+
+    assert available["pools"] == ["local"]
+    assert len(client.snapshot(pool="local")["recent"]) == 5
+    assert client.snapshot(pool="missing")["recent"] == []
+    with pytest.raises(CoordinatorError, match="pool filter must be a non-empty string"):
+        client.snapshot(pool=" ")
 
     full_snapshot = client.snapshot(kind="full")
     assert len(full_snapshot["recent"]) == 1

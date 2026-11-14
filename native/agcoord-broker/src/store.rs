@@ -30,10 +30,15 @@ pub struct SnapshotFilter {
     pub repository: Option<String>,
     pub agent: Option<String>,
     pub kind: Option<String>,
+    pub pool: Option<String>,
     pub limit: Option<usize>,
 }
 
-fn matches_snapshot_filter(run: &RunRecord, filter: &SnapshotFilter) -> bool {
+fn matches_snapshot_filter(
+    run: &RunRecord,
+    filter: &SnapshotFilter,
+    placed: &BTreeMap<String, String>,
+) -> bool {
     if let Some(expected_repo) = &filter.repository {
         let repo_matched = run.repository == *expected_repo
             || run.repository_id == *expected_repo
@@ -49,6 +54,15 @@ fn matches_snapshot_filter(run: &RunRecord, filter: &SnapshotFilter) -> bool {
     }
     if let Some(expected_kind) = &filter.kind
         && run.kind != *expected_kind
+    {
+        return false;
+    }
+    if let Some(expected_pool) = &filter.pool
+        && placed
+            .get(&run.run_id)
+            .map(String::as_str)
+            .unwrap_or("local")
+            != expected_pool
     {
         return false;
     }
@@ -1924,10 +1938,19 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         ));
     }
     let runs = load_runs(&connection)?;
+    let placed = crate::overflow::all_placements(&connection)?;
+    let mut known_pools = BTreeSet::new();
     let mut known_repositories = BTreeMap::new();
     let mut known_agents = BTreeSet::new();
     let mut known_kinds = BTreeSet::new();
     for run in &runs {
+        known_pools.insert(
+            placed
+                .get(&run.run_id)
+                .map(String::as_str)
+                .unwrap_or("local")
+                .to_owned(),
+        );
         known_repositories.insert(run.repository_id.clone(), run.repository.clone());
         if !run.agent.is_empty() {
             known_agents.insert(run.agent.clone());
@@ -1948,17 +1971,17 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         .collect();
     let active: Vec<_> = all_active
         .iter()
-        .filter(|run| matches_snapshot_filter(run, filter))
+        .filter(|run| matches_snapshot_filter(run, filter, &placed))
         .cloned()
         .collect();
     let queued: Vec<_> = all_queued
         .iter()
-        .filter(|run| matches_snapshot_filter(run, filter))
+        .filter(|run| matches_snapshot_filter(run, filter, &placed))
         .cloned()
         .collect();
     let mut terminal: Vec<_> = runs
         .iter()
-        .filter(|run| is_terminal(&run.status) && matches_snapshot_filter(run, filter))
+        .filter(|run| is_terminal(&run.status) && matches_snapshot_filter(run, filter, &placed))
         .cloned()
         .collect();
     terminal.sort_by(|run_a, run_b| {
@@ -1995,7 +2018,6 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         Some(owner) => owner.overflow_pools.clone(),
         None => crate::overflow::load_pools(&paths.state_dir)?,
     };
-    let placed = crate::overflow::all_placements(&connection)?;
     let live_placed = crate::overflow::live_placements(&connection)?;
     let mut selected_allocations = BTreeMap::new();
     let used = local_allocations(&all_active, &live_placed);
@@ -2045,6 +2067,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
             "repositories": known_repositories,
             "agents": known_agents,
             "kinds": known_kinds,
+            "pools": known_pools,
         }),
         "active": active.iter().map(|run| public_run(paths, run, None, Vec::new(), &placed)).collect::<Vec<_>>(),
         "queued": queued_public,
