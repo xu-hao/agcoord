@@ -22,6 +22,9 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Harden clean-host landing and worker recovery, stabilize warm gate-tree checks, and require
+  green hosted workflows before release uploads. #341 — fix clean-host conformance and release order.
+
 ## 0.8.3 — 2026-11-13
 
 - Reserve local capacity for the oldest queued row blocked only by resources, across all

@@ -113,6 +113,7 @@ def _run(
     *,
     checkout: Path,
     input_text: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -123,6 +124,7 @@ def _run(
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            env=env,
         )
     except OSError as exc:
         raise _MergeRefusal(
@@ -459,6 +461,24 @@ def _synchronize_target(
             status=EXIT_STALE_MAIN,
             operation=f"cannot fetch exact target {base} {base_sha}",
         )
+        merge_env = dict(os.environ)
+        for field, default in (("name", "AGCoord"), ("email", "agcoord@localhost")):
+            configured = _run(
+                ["git", "-C", str(selected), "config", "--get", f"user.{field}"],
+                checkout=selected,
+            )
+            if configured.returncode not in (0, 1):
+                raise _MergeRefusal(
+                    EXIT_MERGE_ERROR,
+                    f"cannot read Git user.{field}: {configured.stderr.strip()}",
+                )
+            for role in ("AUTHOR", "COMMITTER"):
+                key = f"GIT_{role}_{field.upper()}"
+                if not merge_env.get(key):
+                    if configured.stdout.strip():
+                        merge_env.pop(key, None)
+                    else:
+                        merge_env[key] = default
         merge = _run(
             [
                 "git",
@@ -472,6 +492,7 @@ def _synchronize_target(
                 base_sha,
             ],
             checkout=selected,
+            env=merge_env,
         )
         if merge.returncode != 0:
             conflicts = _run(

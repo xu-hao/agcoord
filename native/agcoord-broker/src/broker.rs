@@ -2488,6 +2488,11 @@ impl Broker {
             self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
             return Ok(());
         }
+        if worker_setup.gate_tree.is_none() {
+            let connection = connect(&self.paths)?;
+            let refreshed = load_run(&connection, &current.run_id)?;
+            return self.complete_worker_setup(&connection, &refreshed, pending, worker_setup);
+        }
         self.pending_setups
             .insert(current.run_id, (pending, worker_setup));
         Ok(())

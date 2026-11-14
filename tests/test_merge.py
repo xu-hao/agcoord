@@ -1152,6 +1152,48 @@ def test_preflight_without_a_replaced_head_refuses_a_stale_forge_head_immediatel
     assert client.calls == [PR_NUMBER]
 
 
+@pytest.mark.parametrize(
+    ("configured", "environment", "expected"),
+    [
+        ({}, {}, ("AGCoord", "agcoord@localhost", "AGCoord", "agcoord@localhost")),
+        ({"user.name": "Configured", "user.email": "configured@example.invalid"}, {},
+         ("Configured", "configured@example.invalid", "Configured", "configured@example.invalid")),
+        ({"user.name": "Configured", "user.email": "configured@example.invalid"},
+         {"GIT_AUTHOR_NAME": "Author", "GIT_COMMITTER_EMAIL": "committer@example.invalid"},
+         ("Author", "configured@example.invalid", "Configured", "committer@example.invalid")),
+        ({"user.email": "configured@example.invalid"}, {"GIT_AUTHOR_NAME": "Author"},
+         ("Author", "configured@example.invalid", "AGCoord", "configured@example.invalid")),
+        ({"user.name": "Configured", "user.email": "configured@example.invalid"},
+         {"GIT_AUTHOR_NAME": "", "GIT_COMMITTER_EMAIL": ""},
+         ("Configured", "configured@example.invalid", "Configured", "configured@example.invalid")),
+    ],
+)
+def test_target_sync_identity_on_clean_host(repository, tmp_path, monkeypatch, configured, environment, expected):
+    from agcoord.merge import prepare
+
+    advanced = _advance_remote_main(repository, tmp_path / "target-checkout", {"target.txt": "advanced\n"})
+    for key in ("user.name", "user.email"):
+        _git(repository.checkout, "config", "--unset-all", key)
+    for key, value in configured.items():
+        _git(repository.checkout, "config", key, value)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    out, err = StringIO(), StringIO()
+    client = _metadata(repository)
+    status, head = prepare(
+        PR_NUMBER, checkout=str(repository.checkout), branch=BRANCH, head_sha=repository.head_sha,
+        metadata_client=client, publisher=Publisher(repository), out=out, err=err,
+        synchronize_target=True, head_changed=lambda _old, new: client.record.update(head_sha=new),
+    )
+    assert status == 0, err.getvalue()
+    assert _git(repository.checkout, "show", "-s", "--format=%an%n%ae%n%cn%n%ce", head).stdout.splitlines() == list(expected)
+    assert _git(repository.checkout, "show", "-s", "--format=%P", head).stdout.split() == [repository.head_sha, advanced]
+
+
 def test_land_tolerates_forge_lag_after_its_own_target_sync_push(
     repository: Repository,
     tmp_path: Path,
