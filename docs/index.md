@@ -17,6 +17,8 @@
 - [Using AGCoord from coding agents](agents.md) — the paragraph to paste into `CLAUDE.md`
   or `AGENTS.md`, the rules behind it, every refusal and handback with the next action,
   sizing claims, parallel tools, sandboxed shells, and orchestrators.
+- [Native Agent Skill](skills.md) — install the Codex, Claude Code, and Antigravity plugin
+  manifests and validate them without a global install.
 - [Where AGCoord sits](comparison.md) — hosted merge queues, local job queues, session
   managers, Gas Town in depth, sandboxes, and local CI runners, by the reader's situation.
 
@@ -75,6 +77,7 @@ changelog
 :caption: Integrate
 
 agents
+skills
 comparison
 ```
 

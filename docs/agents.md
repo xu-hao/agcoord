@@ -78,8 +78,13 @@ outside the commit; the coordinator then reuses that verdict instead of running 
 Never use `gh pr merge`, a direct push to the target branch, or a separate full-then-merge
 sequence; the coordinator's verdict and the merge are one step.
 Never run `agc` from inside an admitted job; nested submissions are refused.
-A `stale-main` or `head-changed` handback means: update the branch from the target, push,
-and submit a new land request. AGCoord never rebases or rewrites your commits.
+For high-risk or cross-suite changes, optionally run `agc full` before `agc land` and use
+`--reuse-full` when exact-head and external gate inputs are unchanged. Compatible queued lands
+may share one gate and publish atomically; a failed batch is bisected to isolate the first
+breaking PR. Keep `agc run` portable for overflow: use checkout-relative paths and `$TMPDIR`,
+declare scratch, and keep `.git` or host-bound checks separate with `--no-overflow`. A
+`stale-main` or `head-changed` handback means merge the current target into the request branch,
+push, and submit a new land request. AGCoord never rebases or rewrites your commits.
 Set `AGCOORD_AGENT` to your session name so the queue shows who submitted what.
 ```
 

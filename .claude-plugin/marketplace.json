@@ -1,0 +1,12 @@
+{
+  "name": "agcoord",
+  "description": "The agcoord skill for coordinated local and overflow checks and atomic pull request landing.",
+  "owner": {"name": "agcoord contributors"},
+  "plugins": [
+    {
+      "name": "agcoord",
+      "source": "./",
+      "description": "Coordinate resource-bounded checks and guarded pull request landings with agc."
+    }
+  ]
+}

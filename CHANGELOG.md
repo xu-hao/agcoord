@@ -5,6 +5,7 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Package the native agcoord Agent Skill for Codex, Claude Code, and Antigravity, with portable overflow, resource sizing, landing recovery guidance, plugin validation, and release artifact checks. #332 — package the three-host native agcoord agent skill plugin.
 - Model `local` and `overflow_pools` under one unified runtime capability model and support
   single-source privileged overflow containers. Probe host user-namespace/`bwrap` support at
   broker startup to derive `userns` on `local` alongside optional top-level `"capabilities"`,
