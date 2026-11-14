@@ -1475,7 +1475,7 @@ as a fresh branch from the current target and rerun the full gate.
 Every accepted job has one stable ID, durable row, and combined stdout/stderr log. Use:
 
 ```bash
-agc list [--repository <repo>] [--agent <agent>] [--kind <kind>] [--limit <n>]
+agc list [--repository <repo>] [--agent <agent>] [--kind <kind>] [--pool <pool>] [--limit <n>]
 agc list --json
 agc show <run-id>
 agc log <run-id> [--follow]
@@ -1485,8 +1485,9 @@ agc cancel <run-id>
 The non-JSON `list` table summarizes each row as `admission-only`, `applied`, `partial`,
 `unapplied`, or `failed`. `list --json` and `show` retain the complete binding, capability, and
 receipt fields so automation can distinguish scheduling, actual application, and measurement.
-Optional `--repository`, `--agent`, `--kind`, and `--limit` filter flags query the broker for
+Optional `--repository`, `--agent`, `--kind`, `--pool`, and `--limit` filter flags query the broker for
 matching runs across the durable spool rather than limiting matches to the global default window.
+`--pool local` selects runs without an overflow placement, including queued runs.
 
 Queued work is cancellable. Running checks and full gates, plus land preflight and gating,
 receive process-group cancellation and become terminal only after every descendant is gone.
@@ -1531,8 +1532,8 @@ declared resources, status, phase, label, timing, head, publication, gate exit, 
 remain inspectable without truncating the durable values. Persistent selection detail includes
 the pool and enforcement summary; the modal detail includes the pool, exact resource contract, and
 sanitized receipt events; and the status bar summarizes configured overflow pools' active
-allocations and remaining daily CPU-hour budgets (with estimated cost when `cpu_hour_price` is
-configured).
+allocations and used/limit daily CPU-hour budgets (with estimated used/limit cost when
+`cpu_hour_price` is configured).
 
 The expected key map is:
 
@@ -1545,17 +1546,18 @@ The expected key map is:
 | `h` | hide or restore terminal history without deleting it or rereading the spool |
 | `k` | open the searchable kind picker |
 | `p` | open the searchable repository picker |
+| `o` | open the searchable pool picker |
 | `a` | open the searchable agent picker |
 | `?` | show context-sensitive help |
 | `q` | quit the view; jobs continue |
 
 Each filter picker starts in a focused search field. Typing narrows the complete snapshot's
 choices, `Tab` moves into the scrollable result menu, and `Enter` applies the highlighted
-choice. `All repositories`, `All agents`, or `All kinds` clears that filter directly; `Esc` closes the picker
+choice. `All repositories`, `All agents`, `All kinds`, or `All pools` clears that filter directly; `Esc` closes the picker
 without changing the current filter. Repository choices show their complete readable remote or
 local identity rather than the internal hashed lane key.
 The broker includes `available_filters` in snapshots with all historically known repositories,
-agents, and kinds across the full spool so pickers remain fully populated with choices even while active
+agents, kinds, and pools across the full spool so pickers remain fully populated with choices even while active
 filters are narrowing visible table rows. Active filters request server-side filtered snapshots from
 the broker, displaying matching runs across the spool beyond the default global recent window.
 The agent picker includes stable named identities and the single `unnamed` value. It omits

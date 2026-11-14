@@ -162,12 +162,13 @@ def fake_client(monkeypatch):
                 }
             )
 
-        def snapshot(self, *, repository=None, agent=None, kind=None, limit=None):
+        def snapshot(self, *, repository=None, agent=None, kind=None, pool=None, limit=None):
             observations["snapshot_calls"].append(
                 {
                     "repository": repository,
                     "agent": agent,
                     "kind": kind,
+                    "pool": pool,
                     "limit": limit,
                 }
             )
@@ -402,6 +403,8 @@ def test_list_passes_filters_to_snapshot(fake_client):
                 "claude-1",
                 "--kind",
                 "check",
+                "--pool",
+                "local",
                 "--limit",
                 "10",
             ),
@@ -414,6 +417,7 @@ def test_list_passes_filters_to_snapshot(fake_client):
         "repository": "org/repo",
         "agent": "claude-1",
         "kind": "check",
+        "pool": "local",
         "limit": 10,
     }
 

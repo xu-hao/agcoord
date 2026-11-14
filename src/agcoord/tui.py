@@ -205,7 +205,7 @@ def _overflow_pools_summary(snapshot: dict) -> str:
             remaining = float(budget["remaining_cpu_hours"])
             limit = float(budget["cpu_hours_per_day"])
             used = float(budget.get("used_cpu_hours", max(0.0, limit - remaining)))
-            budget_text = f"budget {remaining:.1f}/{limit:g} cpu-h left"
+            budget_text = f"budget {used:.1f}/{limit:g} cpu-h used"
             price = pool.get("cpu_hour_price")
             if isinstance(price, (int, float)) and not isinstance(price, bool):
                 budget_text += f" (~${used * price:.2f}/${limit * price:.2f})"
@@ -495,6 +495,7 @@ def build_app(
             Binding("h", "history", "hide/show history"),
             Binding("k", "kind", "kind filter"),
             Binding("p", "repository", "repository filter"),
+            Binding("o", "pool", "pool filter"),
             Binding("a", "agent", "agent filter"),
             Binding("r", "refresh", "refresh"),
             Binding("q", "quit", "quit"),
@@ -515,9 +516,11 @@ def build_app(
             self._kind_filter: str | None = None
             self._repository_filter: str | None = None
             self._agent_filter: str | None = None
+            self._pool_filter: str | None = None
             self._known_repositories: dict[str, str] = {}
             self._known_agents: set[str] = set()
             self._known_kinds: set[str] = set()
+            self._known_pools: set[str] = {"local"}
             self._refresh_pending = False
 
         def compose(self) -> ComposeResult:
@@ -582,6 +585,7 @@ def build_app(
             repo_filter = self._repository_filter
             agent_filter = self._agent_filter
             kind_filter = self._kind_filter
+            pool_filter = self._pool_filter
 
             async def work() -> None:
                 try:
@@ -590,6 +594,7 @@ def build_app(
                             repository=repo_filter,
                             agent=agent_filter,
                             kind=kind_filter,
+                            pool=pool_filter,
                         )
                     )
                 except CoordinatorError as exc:
@@ -659,6 +664,17 @@ def build_app(
                         self._known_agents.add(str(row["agent"]))
                     if row.get("kind"):
                         self._known_kinds.add(str(row["kind"]))
+            if isinstance(available, dict) and isinstance(available.get("pools"), list):
+                self._known_pools.update(
+                    pool for pool in available["pools"] if isinstance(pool, str) and pool
+                )
+            else:
+                for row in (
+                    *snapshot.get("active", ()),
+                    *snapshot.get("queued", ()),
+                    *snapshot.get("recent", ()),
+                ):
+                    self._known_pools.add(str(row.get("pool") or "local"))
             self._snapshot = snapshot
             self._render_snapshot(snapshot)
             if self._refresh_pending:
@@ -686,6 +702,11 @@ def build_app(
                 ]
             if self._agent_filter is not None:
                 ordered = [row for row in ordered if row["agent"] == self._agent_filter]
+            if self._pool_filter is not None:
+                ordered = [
+                    row for row in ordered
+                    if (row.get("pool") or "local") == self._pool_filter
+                ]
             self._rows = {row["run_id"]: row for row in ordered}
             pool_width, branch_width, _ = _flexible_widths(table.size.width)
             table.ordered_columns[4].width = pool_width
@@ -791,9 +812,10 @@ def build_app(
                     ),
                 )
             agent = self._agent_filter or "all agents"
+            pool = self._pool_filter or "all pools"
             self.query_one("#gate-subject", Static).update(
                 f"MACHINE │ AGCOORD │ {active_summary} · {queued} queued · "
-                f"{kind} · {repository} · {agent} · history {history}"
+                f"{kind} · {repository} · {agent} · {pool} · history {history}"
             )
             allocation = ", ".join(
                 f"{name} {snapshot['allocations'].get(name, 0)}/{capacity}"
@@ -865,6 +887,27 @@ def build_app(
             if not accepted or self._repository_filter == repository:
                 return
             self._repository_filter = repository
+            if self._snapshot is not None:
+                self._render_snapshot(self._snapshot)
+            self.action_refresh()
+
+        def action_pool(self) -> None:
+            pools = sorted(self._known_pools, key=str.casefold)
+            self.push_screen(
+                FilterPicker(
+                    "Pool filter",
+                    "All pools",
+                    [(pool, pool) for pool in pools],
+                    self._pool_filter,
+                ),
+                self._pool_picked,
+            )
+
+        def _pool_picked(self, result: tuple[bool, str | None]) -> None:
+            accepted, pool = result
+            if not accepted or self._pool_filter == pool:
+                return
+            self._pool_filter = pool
             if self._snapshot is not None:
                 self._render_snapshot(self._snapshot)
             self.action_refresh()

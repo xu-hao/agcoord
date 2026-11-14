@@ -8347,6 +8347,43 @@ fn an_eligible_row_overflows_to_a_pool_after_its_wait_threshold() {
     // not allow overflow are unaffected.
     let snap = snapshot(&state).unwrap();
     assert_eq!(snap["allocations"], json!({"cpu": 1, "jobs": 1}));
+    assert_eq!(
+        snap["available_filters"]["pools"],
+        json!(["elsewhere", "local"])
+    );
+    let filtered = |pool: &str| {
+        let result = run(&[
+            "snapshot",
+            "--state-dir",
+            state_argument(&state),
+            "--pool",
+            pool,
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice::<Value>(&result.stdout).unwrap()
+    };
+    let remote = filtered("elsewhere");
+    assert_eq!(remote["active"][0]["run_id"], "check-over");
+    assert_eq!(remote["queued"], json!([]));
+    assert_eq!(
+        remote["available_filters"]["pools"],
+        json!(["elsewhere", "local"])
+    );
+    let missing = filtered("unknown");
+    assert_eq!(missing["active"], json!([]));
+    assert_eq!(missing["queued"], json!([]));
+    assert_eq!(missing["recent"], json!([]));
+    let local_snap = filtered("local");
+    assert_eq!(local_snap["active"][0]["run_id"], "check-first");
+    assert_eq!(local_snap["queued"][0]["run_id"], "check-local");
+    assert_eq!(
+        local_snap["available_filters"]["pools"],
+        json!(["elsewhere", "local"])
+    );
     let pool = &snap["overflow_pools"][0];
     assert_eq!(pool["name"], "elsewhere");
     assert_eq!(pool["allocations"], json!({"cpu": 2, "jobs": 1}));
@@ -8368,6 +8405,8 @@ fn an_eligible_row_overflows_to_a_pool_after_its_wait_threshold() {
         "admission-only claims record no enforcement"
     );
     let snap = snapshot(&state).unwrap();
+    assert_eq!(filtered("elsewhere")["recent"][0]["run_id"], "check-over");
+    assert_eq!(filtered("local")["recent"], json!([]));
     let pool = &snap["overflow_pools"][0];
     assert_eq!(pool["allocations"], json!({"cpu": 0, "jobs": 0}));
     // The unused part of the reservation is returned when the run ends.
