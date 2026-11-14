@@ -13,3 +13,10 @@ include scripts/*native*
 include scripts/check-conformance
 include scripts/verify-release-candidate
 recursive-include tests *.py
+include plugin.json
+include .agents/plugins/marketplace.json
+include .claude-plugin/plugin.json
+include .claude-plugin/marketplace.json
+include .antigravity-plugin/plugin.json
+include scripts/check-plugins.py
+recursive-include skills *.md

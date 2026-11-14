@@ -153,6 +153,8 @@ def _metadata(raw: bytes, subject: str) -> Any:
 def _wheel_metadata(wheel: Path, version: str) -> None:
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
+        if any(name.startswith("agcoord/skills/") for name in names):
+            raise CandidateError("wheel bundles top-level skills inside agcoord/")
         if any(
             PurePosixPath(name).is_absolute()
             or ".." in PurePosixPath(name).parts
@@ -193,6 +195,24 @@ def _wheel_metadata(wheel: Path, version: str) -> None:
             raise CandidateError(f"wheel pytest entry points are invalid: {pytest!r}")
 
 
+def _plugin_sources(version: str) -> None:
+    """Require plugin metadata to identify this exact source release."""
+    for relative in ("plugin.json", ".claude-plugin/plugin.json", ".antigravity-plugin/plugin.json"):
+        try:
+            manifest = json.loads((ROOT / relative).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CandidateError(f"cannot read plugin manifest {relative}: {exc}") from exc
+        if manifest.get("name") != "agcoord" or manifest.get("version") != version:
+            raise CandidateError(f"plugin manifest {relative} does not match agcoord {version}")
+    for relative in (".agents/plugins/marketplace.json", ".claude-plugin/marketplace.json"):
+        try:
+            marketplace = json.loads((ROOT / relative).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CandidateError(f"cannot read plugin marketplace {relative}: {exc}") from exc
+        if not any(plugin.get("name") == "agcoord" for plugin in marketplace.get("plugins", [])):
+            raise CandidateError(f"plugin marketplace {relative} does not declare agcoord")
+
+
 def _sdist_metadata(sdist: Path, version: str) -> None:
     prefix = f"agcoord-{version}/"
     required = {
@@ -200,6 +220,12 @@ def _sdist_metadata(sdist: Path, version: str) -> None:
         f"{prefix}docs/native_migration.md",
         f"{prefix}native/build-toolchain.json",
         f"{prefix}scripts/verify-release-candidate",
+        f"{prefix}plugin.json",
+        f"{prefix}.agents/plugins/marketplace.json",
+        f"{prefix}.claude-plugin/plugin.json",
+        f"{prefix}.claude-plugin/marketplace.json",
+        f"{prefix}.antigravity-plugin/plugin.json",
+        f"{prefix}skills/agcoord/SKILL.md",
     }
     with tarfile.open(sdist, "r:gz") as archive:
         members = archive.getmembers()
@@ -219,6 +245,22 @@ def _sdist_metadata(sdist: Path, version: str) -> None:
                 raise CandidateError(f"sdist contains an unsupported member: {member.name}")
         if not required <= names:
             raise CandidateError(f"sdist is missing release contracts: {sorted(required - names)}")
+        for relative in ("plugin.json", ".claude-plugin/plugin.json", ".antigravity-plugin/plugin.json"):
+            member = archive.extractfile(f"{prefix}{relative}")
+            try:
+                manifest = json.loads(member.read().decode("utf-8")) if member else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CandidateError(f"sdist plugin manifest {relative} is invalid") from exc
+            if manifest.get("name") != "agcoord" or manifest.get("version") != version:
+                raise CandidateError(f"sdist plugin manifest {relative} does not match agcoord {version}")
+        for relative in (".agents/plugins/marketplace.json", ".claude-plugin/marketplace.json"):
+            member = archive.extractfile(f"{prefix}{relative}")
+            try:
+                marketplace = json.loads(member.read().decode("utf-8")) if member else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CandidateError(f"sdist plugin marketplace {relative} is invalid") from exc
+            if not any(plugin.get("name") == "agcoord" for plugin in marketplace.get("plugins", [])):
+                raise CandidateError(f"sdist plugin marketplace {relative} does not declare agcoord")
         for member in members:
             if not member.isfile():
                 continue
@@ -528,6 +570,7 @@ def verify_candidate(
     if len(set(versions)) != 1 or not VERSION_PATTERN.fullmatch(versions[0]):
         raise CandidateError(f"source release versions are not exact and equal: {versions!r}")
     version = versions[0]
+    _plugin_sources(version)
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     if re.search(rf"^## {re.escape(version)} — [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$", changelog, re.MULTILINE) is None:
         raise CandidateError("changelog has no dated section for the release version")

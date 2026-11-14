@@ -76,6 +76,8 @@ def test_release_sources_declare_one_stable_version_and_ship_the_gate():
     manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
     assert "include scripts/verify-release-candidate" in manifest
     assert "include scripts/*native*" in manifest
+    assert "include plugin.json" in manifest
+    assert "recursive-include skills *.md" in manifest
 
     help_result = subprocess.run(
         [SCRIPT, "--help"],
@@ -112,6 +114,34 @@ def test_checksum_sidecar_binds_one_exact_basename(tmp_path: Path):
     sidecar.write_text(f"{digest}  ../artifact\n", encoding="ascii")
     with pytest.raises(CandidateError, match="canonical"):
         RELEASE["_sidecar"](sidecar, "artifact")
+
+
+def test_native_plugin_manifests_match_source_version_and_marketplaces():
+    version = RELEASE["source_versions"]()[0]
+    RELEASE["_plugin_sources"](version)
+    for relative in ("plugin.json", ".claude-plugin/plugin.json", ".antigravity-plugin/plugin.json"):
+        manifest = json.loads((ROOT / relative).read_text(encoding="utf-8"))
+        assert manifest["name"] == "agcoord"
+        assert manifest["version"] == version
+    for relative in (".agents/plugins/marketplace.json", ".claude-plugin/marketplace.json"):
+        marketplace = json.loads((ROOT / relative).read_text(encoding="utf-8"))
+        assert any(item["name"] == "agcoord" for item in marketplace["plugins"])
+
+
+def test_release_verifier_refuses_plugin_version_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    for relative, manifest in (
+        ("plugin.json", {"name": "agcoord", "version": "0.8.2"}),
+        (".claude-plugin/plugin.json", {"name": "agcoord", "version": "0.8.3"}),
+        (".antigravity-plugin/plugin.json", {"name": "agcoord", "version": "0.8.3"}),
+        (".agents/plugins/marketplace.json", {"plugins": [{"name": "agcoord"}]}),
+        (".claude-plugin/marketplace.json", {"plugins": [{"name": "agcoord"}]}),
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setitem(RELEASE["_plugin_sources"].__globals__, "ROOT", tmp_path)
+    with pytest.raises(CandidateError, match="plugin manifest .* does not match agcoord 0.8.3"):
+        RELEASE["_plugin_sources"]("0.8.3")
 
 
 def _pin_inputs(tmp_path: Path, broker: bytes = b"reproducible broker\n"):
@@ -193,7 +223,9 @@ def test_release_artifact_modes_are_exact_not_umask_dependent(tmp_path: Path):
         RELEASE["_require_mode"](artifact, 0o644)
 
 
-def _write_wheel(path: Path, *, legacy_console: bool = False) -> None:
+def _write_wheel(
+    path: Path, *, legacy_console: bool = False, include_skill: bool = False
+) -> None:
     console = "agc = agcoord.cli:main\n"
     if legacy_console:
         console += "agcoord = agcoord.cli:main\n"
@@ -214,6 +246,8 @@ def _write_wheel(path: Path, *, legacy_console: bool = False) -> None:
                     source,
                     f"agcoord/{source.relative_to(source_root).as_posix()}",
                 )
+        if include_skill:
+            archive.writestr("agcoord/skills/agcoord/SKILL.md", "packaging error")
 
 
 def test_wheel_contract_rejects_the_removed_console_name(tmp_path: Path):
@@ -225,6 +259,10 @@ def test_wheel_contract_rejects_the_removed_console_name(tmp_path: Path):
     with pytest.raises(CandidateError, match="console entry points"):
         RELEASE["_wheel_metadata"](wheel, "0.3.0")
 
+    _write_wheel(wheel, include_skill=True)
+    with pytest.raises(CandidateError, match="bundles top-level skills"):
+        RELEASE["_wheel_metadata"](wheel, "0.3.0")
+
 
 def _tar_file(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> None:
     member = tarfile.TarInfo(name)
@@ -234,9 +272,13 @@ def _tar_file(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> No
 
 
 def _write_sdist(
-    path: Path, *, executable: bool = True, toolchain_declaration: bool = True
+    path: Path,
+    *,
+    version: str = "0.8.3",
+    executable: bool = True,
+    toolchain_declaration: bool = True,
 ) -> None:
-    prefix = "agcoord-0.3.0/"
+    prefix = f"agcoord-{version}/"
     with tarfile.open(path, "w:gz") as archive:
         root = tarfile.TarInfo(prefix.rstrip("/"))
         root.type = tarfile.DIRTYPE
@@ -245,7 +287,7 @@ def _write_sdist(
         _tar_file(
             archive,
             f"{prefix}PKG-INFO",
-            b"Metadata-Version: 2.4\nName: agcoord\nVersion: 0.3.0\n\n",
+            f"Metadata-Version: 2.4\nName: agcoord\nVersion: {version}\n\n".encode(),
             0o644,
         )
         _tar_file(
@@ -268,25 +310,37 @@ def _write_sdist(
                 (ROOT / f"scripts/{script}").read_bytes(),
                 0o755 if executable else 0o644,
             )
+        for relative in (
+            "plugin.json",
+            ".agents/plugins/marketplace.json",
+            ".claude-plugin/plugin.json",
+            ".claude-plugin/marketplace.json",
+            ".antigravity-plugin/plugin.json",
+            "skills/agcoord/SKILL.md",
+        ):
+            contents = (ROOT / relative).read_bytes()
+            _tar_file(archive, f"{prefix}{relative}", contents, 0o644)
 
 
 def test_sdist_contract_requires_executable_release_procedures(tmp_path: Path):
-    sdist = tmp_path / "agcoord-0.3.0.tar.gz"
+    version = RELEASE["source_versions"]()[0]
+    sdist = tmp_path / f"agcoord-{version}.tar.gz"
     _write_sdist(sdist)
-    RELEASE["_sdist_metadata"](sdist, "0.3.0")
+    RELEASE["_sdist_metadata"](sdist, version)
 
     _write_sdist(sdist, executable=False)
     with pytest.raises(CandidateError, match="not executable"):
-        RELEASE["_sdist_metadata"](sdist, "0.3.0")
+        RELEASE["_sdist_metadata"](sdist, version)
 
 
 def test_sdist_must_carry_the_declared_native_build_toolchain(tmp_path: Path):
     # The declaration is a native source-identity input; an sdist without it cannot rebuild the
     # pinned broker.
-    sdist = tmp_path / "agcoord-0.3.0.tar.gz"
+    version = RELEASE["source_versions"]()[0]
+    sdist = tmp_path / f"agcoord-{version}.tar.gz"
     _write_sdist(sdist, toolchain_declaration=False)
     with pytest.raises(CandidateError, match="native/build-toolchain.json"):
-        RELEASE["_sdist_metadata"](sdist, "0.3.0")
+        RELEASE["_sdist_metadata"](sdist, version)
 
 
 def test_assembled_bundle_has_one_complete_aggregate_checksum_set(tmp_path: Path):

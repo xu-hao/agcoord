@@ -113,6 +113,9 @@ Never run agc from inside an admitted job. A stale-main or head-changed refusal 
 update the branch, push, and submit a new land request.
 ```
 
+Install the native [agcoord Agent Skill](docs/skills.md) for Codex, Claude Code, or
+Antigravity to give agents the portable check and guarded landing workflow.
+
 The [agent guide](docs/agents.md) has the long form, what every refusal and handback means
 and what to do next, and notes for sandboxed shells. This repository's own
 [AGENTS.md](https://github.com/xu-hao/agcoord/blob/main/AGENTS.md) is a worked example.
