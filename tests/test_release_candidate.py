@@ -274,7 +274,7 @@ def _tar_file(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> No
 def _write_sdist(
     path: Path,
     *,
-    version: str = "0.9.0",
+    version: str,
     executable: bool = True,
     toolchain_declaration: bool = True,
 ) -> None:
@@ -325,10 +325,10 @@ def _write_sdist(
 def test_sdist_contract_requires_executable_release_procedures(tmp_path: Path):
     version = RELEASE["source_versions"]()[0]
     sdist = tmp_path / f"agcoord-{version}.tar.gz"
-    _write_sdist(sdist)
+    _write_sdist(sdist, version=version)
     RELEASE["_sdist_metadata"](sdist, version)
 
-    _write_sdist(sdist, executable=False)
+    _write_sdist(sdist, version=version, executable=False)
     with pytest.raises(CandidateError, match="not executable"):
         RELEASE["_sdist_metadata"](sdist, version)
 
@@ -338,7 +338,7 @@ def test_sdist_must_carry_the_declared_native_build_toolchain(tmp_path: Path):
     # pinned broker.
     version = RELEASE["source_versions"]()[0]
     sdist = tmp_path / f"agcoord-{version}.tar.gz"
-    _write_sdist(sdist, toolchain_declaration=False)
+    _write_sdist(sdist, version=version, toolchain_declaration=False)
     with pytest.raises(CandidateError, match="native/build-toolchain.json"):
         RELEASE["_sdist_metadata"](sdist, version)
 
