@@ -9048,3 +9048,279 @@ fn gate_setup_refuses_missing_checkout_head_and_cache_failures() {
         assert!(broker.terminate().success());
     }
 }
+
+#[test]
+fn land_batch_selects_compatible_candidates_and_manages_claims() {
+    let temporary = TestDirectory::new("land-batch-broker");
+    let state = temporary.path().join("state");
+    let wt1 = temporary.path().join("wt1");
+    let wt2 = temporary.path().join("wt2");
+    let wt3 = temporary.path().join("wt3");
+    let wt4 = temporary.path().join("wt4");
+    for wt in [&wt1, &wt2, &wt3, &wt4] {
+        fs::create_dir(wt).unwrap();
+    }
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+
+    let entered_hold = temporary.path().join("hold-entered");
+    let release_hold = temporary.path().join("hold-release");
+    let _releases = ReleaseFiles(vec![release_hold.clone()]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "hold-slot",
+            kind: "check",
+            repository: "repo-batch",
+            checkout: &wt1,
+            command: blocking_command(&entered_hold, &release_hold, None),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || entered_hold.exists());
+
+    let submit_custom_land = |run_id: &str, wt: &Path, branch: &str, pr: &str, cmd: Vec<String>| {
+        if !wt.join(".git").exists() {
+            for args in [
+                vec!["init", "-q", "-b", branch],
+                vec!["config", "user.name", "AGCoord test"],
+                vec!["config", "user.email", "test@example.invalid"],
+                vec!["commit", "-q", "--allow-empty", "-m", "initial"],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(wt)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let passthrough = wt.join("agcoord-test-land-python");
+        fs::write(
+                &passthrough,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$0.argv\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            )
+            .unwrap();
+        fs::set_permissions(&passthrough, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut arguments = vec![
+            "submit".to_owned(),
+            "--state-dir".to_owned(),
+            state_argument(&state).to_owned(),
+            "--run-id".to_owned(),
+            run_id.to_owned(),
+            "--kind".to_owned(),
+            "land".to_owned(),
+            "--label".to_owned(),
+            run_id.to_owned(),
+            "--repository-id".to_owned(),
+            "repo-batch".to_owned(),
+            "--repository".to_owned(),
+            "repo-batch".to_owned(),
+            "--worktree-id".to_owned(),
+            format!("worktree-{run_id}"),
+            "--checkout".to_owned(),
+            wt.to_str().unwrap().to_owned(),
+            "--branch".to_owned(),
+            branch.to_owned(),
+            "--head".to_owned(),
+            head,
+            "--resource".to_owned(),
+            "jobs=1".to_owned(),
+            "--caller-pid".to_owned(),
+            std::process::id().to_string(),
+            "--publication-adapter".to_owned(),
+            "github".to_owned(),
+            "--publication-request-json".to_owned(),
+            pr.to_owned(),
+            "--env".to_owned(),
+            format!("_AGCOORD_LAND_PYTHON={}", passthrough.to_string_lossy()),
+            "--".to_owned(),
+        ];
+        arguments.extend(cmd);
+        let output = Command::new(BROKER).args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // Leader + compatible follower share the same command; third row has a different command.
+    let worker_entered = temporary.path().join("leader-entered");
+    let worker_release = temporary.path().join("leader-release");
+    let shared_gate_dir = temporary.path().join("shared-gate");
+    fs::create_dir(&shared_gate_dir).unwrap();
+    let leader_cmd = blocking_command(&worker_entered, &worker_release, None);
+    let incompat_cmd = touch_command(&temporary.path().join("other-gate-marker"));
+
+    submit_custom_land("land-1", &wt1, "feat/one", "101", leader_cmd.clone());
+    submit_custom_land("land-2", &wt2, "feat/two", "102", leader_cmd.clone());
+    submit_custom_land("land-3", &wt3, "feat/three", "103", incompat_cmd);
+    submit_custom_land("land-4", &wt4, "feat/four", "104", leader_cmd);
+
+    fs::write(&release_hold, b"").unwrap();
+    wait_for(Duration::from_secs(5), || worker_entered.exists());
+
+    let recorded = fs::read_to_string(wt1.join("agcoord-test-land-python.argv")).unwrap();
+    let arguments: Vec<&str> = recorded.lines().collect();
+    let batch_idx = arguments
+        .iter()
+        .position(|arg| *arg == "--batch-candidates-json")
+        .expect("leader land command should receive --batch-candidates-json");
+    let candidates: Value = serde_json::from_str(arguments[batch_idx + 1]).unwrap();
+    let candidate_ids: Vec<&str> = candidates
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["run_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(candidate_ids, vec!["land-2", "land-4"]);
+
+    // Use leader identity to claim land-2 and land-4 into the batch.
+    let leader_row = status(&state, "land-1");
+    let pid = leader_row["worker_pid"].as_u64().unwrap().to_string();
+    let db = rusqlite::Connection::open(state.join("queue.sqlite3")).unwrap();
+    let token: String = db
+        .query_row(
+            "SELECT worker_start_token FROM runs WHERE run_id = 'land-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let checkout_str = leader_row["checkout"].as_str().unwrap().to_owned();
+    let head_str = leader_row["head_sha"].as_str().unwrap().to_owned();
+
+    let members_json = serde_json::to_string(&vec!["land-2", "land-4"]).unwrap();
+    let claim_out = Command::new(BROKER)
+        .args([
+            "claim-batch",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "land-1",
+            "--worker-pid",
+            &pid,
+            "--worker-start-token",
+            &token,
+            "--checkout",
+            &checkout_str,
+            "--head",
+            &head_str,
+            "--members-json",
+            &members_json,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        claim_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim_out.stderr)
+    );
+    let claimed: Value = serde_json::from_slice(&claim_out.stdout).unwrap();
+    let claimed_ids: Vec<&str> = claimed["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["run_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(claimed_ids, vec!["land-1", "land-2", "land-4"]);
+
+    // Followers are active ('running') without double-counting machine allocations!
+    let snap = snapshot(&state).unwrap();
+    assert_eq!(snap["allocations"]["jobs"], 1);
+    assert_eq!(status(&state, "land-2")["status"], "running");
+
+    // Advance phase on land-2 and finish land-2 cleanly.
+    let phase_out = Command::new(BROKER)
+        .args([
+            "batch-phase",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "land-1",
+            "--worker-pid",
+            &pid,
+            "--worker-start-token",
+            &token,
+            "--checkout",
+            &checkout_str,
+            "--head",
+            &head_str,
+            "--member-run-id",
+            "land-2",
+            "--phase",
+            "gating",
+        ])
+        .output()
+        .unwrap();
+    assert!(phase_out.status.success());
+    assert_eq!(status(&state, "land-2")["phase"], "gating");
+
+    let finish_out = Command::new(BROKER)
+        .args([
+            "batch-finish",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "land-1",
+            "--worker-pid",
+            &pid,
+            "--worker-start-token",
+            &token,
+            "--checkout",
+            &checkout_str,
+            "--head",
+            &head_str,
+            "--member-run-id",
+            "land-2",
+            "--exit-status",
+            "0",
+            "--gate-exit-status",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        finish_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finish_out.stderr)
+    );
+    assert_eq!(status(&state, "land-2")["status"], "passed");
+
+    // Cancel leader while land-4 is still active -> land-4 must return cleanly to 'queued'!
+    assert!(
+        Command::new(BROKER)
+            .args([
+                "cancel",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-1"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(&worker_release, b"").unwrap();
+    wait_status(&state, "land-1", "cancelled");
+    wait_for(Duration::from_secs(5), || {
+        status(&state, "land-4")["status"] == "queued"
+    });
+    wait_status(&state, "land-3", "passed");
+    wait_status(&state, "land-4", "passed");
+    assert!(broker.terminate().success());
+}

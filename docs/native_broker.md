@@ -337,7 +337,11 @@ Clients continue to use short SQLite transactions rather than mutating live proc
 - an admitted land adapter reports phase and result only when run ID, kind, current durable
   checkout head, worker PID and start token all match. During `preflight` only, that authenticated
   adapter may atomically replace the durable head after a lease-protected target merge; later
-  phases cannot change it.
+  phases cannot change it;
+- an admitted land leader claiming or updating follower rows in a land batch (`claim-batch`,
+  `batch-status`, `batch-phase`, `batch-reuse-gate`, `batch-finish`) authenticates with its
+  admitted run ID, worker PID and start token, persists membership in `land_batch_members`, and
+  reconciles any un-finalized followers on leader exit.
 
 Every mutation is committed before success is returned. The broker independently validates the
 complete row before acting. Client code never performs admission, attaches resources, releases

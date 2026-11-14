@@ -20,8 +20,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use store::{
-    AdmissionRequest, ChildLeaseOwnerRequest, ChildLeaseRequest, LandResultRequest, PROTOCOL,
-    Paths, PhaseRequest, ReuseRequest, SnapshotFilter, SubmitRequest,
+    AdmissionRequest, BatchClaimRequest, BatchMemberFinishRequest, BatchMemberPhaseRequest,
+    BatchMemberReuseRequest, BatchStatusRequest, ChildLeaseOwnerRequest, ChildLeaseRequest,
+    LandResultRequest, PROTOCOL, Paths, PhaseRequest, ReuseRequest, SnapshotFilter, SubmitRequest,
 };
 use worker::WorkerFault;
 
@@ -782,6 +783,229 @@ fn parse_reuse(arguments: &[String]) -> Result<(Paths, ReuseRequest)> {
     ))
 }
 
+#[derive(Default)]
+struct BatchArgs {
+    state_dir: Option<PathBuf>,
+    run_id: Option<String>,
+    worker_pid: Option<u32>,
+    worker_start_token: Option<String>,
+    checkout: Option<PathBuf>,
+    head_sha: Option<String>,
+    members_json: Option<String>,
+    member_run_id: Option<String>,
+    phase: Option<String>,
+    new_head_sha: Option<String>,
+    gate_exit_status: Option<i64>,
+    exit_status: Option<i64>,
+    failure_reason: Option<String>,
+}
+
+fn parse_batch_args(arguments: &[String], allowed: &[&str]) -> Result<(Paths, BatchArgs)> {
+    let mut parsed = BatchArgs::default();
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].clone();
+        let is_common = matches!(
+            option.as_str(),
+            "--state-dir"
+                | "--run-id"
+                | "--worker-pid"
+                | "--worker-start-token"
+                | "--checkout"
+                | "--head"
+        );
+        if !is_common && !allowed.contains(&option.as_str()) {
+            return Err(AppError::usage(format!("unknown option: {option}")));
+        }
+        let value = option_value(arguments, &mut index, &option)?;
+        match option.as_str() {
+            "--state-dir" => parsed.state_dir = Some(PathBuf::from(value)),
+            "--run-id" => parsed.run_id = Some(value),
+            "--worker-pid" => {
+                parsed.worker_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| {
+                            AppError::usage("--worker-pid must be a positive integer")
+                        })?,
+                );
+            }
+            "--worker-start-token" => parsed.worker_start_token = Some(value),
+            "--checkout" => parsed.checkout = Some(PathBuf::from(value)),
+            "--head" => parsed.head_sha = Some(value),
+            "--members-json" => parsed.members_json = Some(value),
+            "--member-run-id" => parsed.member_run_id = Some(value),
+            "--phase" => parsed.phase = Some(value),
+            "--new-head" => parsed.new_head_sha = Some(value),
+            "--gate-exit-status" => {
+                parsed.gate_exit_status = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| AppError::usage("--gate-exit-status must be an integer"))?,
+                );
+            }
+            "--exit-status" => {
+                parsed.exit_status = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| AppError::usage("--exit-status must be an integer"))?,
+                );
+            }
+            "--failure-reason" => parsed.failure_reason = Some(value),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let state_dir = parsed
+        .state_dir
+        .clone()
+        .ok_or_else(|| AppError::usage("--state-dir is required"))?;
+    Ok((Paths::new(&state_dir).configured()?, parsed))
+}
+
+fn require_batch_identity(args: &BatchArgs) -> Result<(String, u32, String, PathBuf, String)> {
+    Ok((
+        args.run_id
+            .clone()
+            .ok_or_else(|| AppError::usage("--run-id is required"))?,
+        args.worker_pid
+            .ok_or_else(|| AppError::usage("--worker-pid is required"))?,
+        args.worker_start_token
+            .clone()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::usage("--worker-start-token is required"))?,
+        args.checkout
+            .clone()
+            .ok_or_else(|| AppError::usage("--checkout is required"))?,
+        args.head_sha
+            .clone()
+            .ok_or_else(|| AppError::usage("--head is required"))?,
+    ))
+}
+
+fn parse_claim_batch(arguments: &[String]) -> Result<(Paths, BatchClaimRequest)> {
+    let (paths, args) = parse_batch_args(arguments, &["--members-json"])?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    let raw_members = args
+        .members_json
+        .ok_or_else(|| AppError::usage("--members-json is required"))?;
+    let member_run_ids: Vec<String> = serde_json::from_str(&raw_members)
+        .map_err(|_| AppError::usage("--members-json must be a JSON string array"))?;
+    Ok((
+        paths,
+        BatchClaimRequest {
+            run_id,
+            worker_pid,
+            worker_start_token,
+            checkout,
+            head_sha,
+            member_run_ids,
+        },
+    ))
+}
+
+fn parse_batch_status(arguments: &[String]) -> Result<(Paths, BatchStatusRequest)> {
+    let (paths, args) = parse_batch_args(arguments, &[])?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    Ok((
+        paths,
+        BatchStatusRequest {
+            run_id,
+            worker_pid,
+            worker_start_token,
+            checkout,
+            head_sha,
+        },
+    ))
+}
+
+fn parse_batch_phase(arguments: &[String]) -> Result<(Paths, BatchMemberPhaseRequest)> {
+    let (paths, args) = parse_batch_args(
+        arguments,
+        &[
+            "--member-run-id",
+            "--phase",
+            "--new-head",
+            "--gate-exit-status",
+        ],
+    )?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    Ok((
+        paths,
+        BatchMemberPhaseRequest {
+            run_id,
+            worker_pid,
+            worker_start_token,
+            checkout,
+            head_sha,
+            member_run_id: args
+                .member_run_id
+                .ok_or_else(|| AppError::usage("--member-run-id is required"))?,
+            phase: args
+                .phase
+                .ok_or_else(|| AppError::usage("--phase is required"))?,
+            new_head_sha: args.new_head_sha,
+            gate_exit_status: args.gate_exit_status,
+        },
+    ))
+}
+
+fn parse_batch_reuse(arguments: &[String]) -> Result<(Paths, BatchMemberReuseRequest)> {
+    let (paths, args) = parse_batch_args(arguments, &["--member-run-id"])?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    Ok((
+        paths,
+        BatchMemberReuseRequest {
+            run_id,
+            worker_pid,
+            worker_start_token,
+            checkout,
+            head_sha,
+            member_run_id: args
+                .member_run_id
+                .ok_or_else(|| AppError::usage("--member-run-id is required"))?,
+        },
+    ))
+}
+
+fn parse_batch_finish(arguments: &[String]) -> Result<(Paths, BatchMemberFinishRequest)> {
+    let (paths, args) = parse_batch_args(
+        arguments,
+        &[
+            "--member-run-id",
+            "--exit-status",
+            "--failure-reason",
+            "--gate-exit-status",
+        ],
+    )?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    Ok((
+        paths,
+        BatchMemberFinishRequest {
+            run_id,
+            worker_pid,
+            worker_start_token,
+            checkout,
+            head_sha,
+            member_run_id: args
+                .member_run_id
+                .ok_or_else(|| AppError::usage("--member-run-id is required"))?,
+            exit_status: args
+                .exit_status
+                .ok_or_else(|| AppError::usage("--exit-status is required"))?,
+            failure_reason: args.failure_reason,
+            gate_exit_status: args.gate_exit_status,
+        },
+    ))
+}
+
 fn parse_admission(arguments: &[String]) -> Result<(Paths, AdmissionRequest)> {
     let mut state_dir = None;
     let mut run_id = None;
@@ -1181,6 +1405,26 @@ fn run_command(arguments: &[String]) -> Result<()> {
         [command, rest @ ..] if command == "report" => {
             let (paths, request) = parse_land_result(rest)?;
             emit_json(&store::report_land_result(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "claim-batch" => {
+            let (paths, request) = parse_claim_batch(rest)?;
+            emit_json(&store::claim_batch(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "batch-status" => {
+            let (paths, request) = parse_batch_status(rest)?;
+            emit_json(&store::batch_status(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "batch-phase" => {
+            let (paths, request) = parse_batch_phase(rest)?;
+            emit_json(&store::advance_batch_member_phase(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "batch-reuse-gate" => {
+            let (paths, request) = parse_batch_reuse(rest)?;
+            emit_json(&store::reuse_batch_member_gate(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "batch-finish" => {
+            let (paths, request) = parse_batch_finish(rest)?;
+            emit_json(&store::finish_batch_member(&paths, &request)?)
         }
         [command, rest @ ..] if command == "lease-request" => {
             let (paths, request) = parse_child_lease_request(rest)?;

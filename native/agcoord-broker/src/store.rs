@@ -289,6 +289,61 @@ pub struct LandResultRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct BatchClaimRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+    pub member_run_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchStatusRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchMemberPhaseRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+    pub member_run_id: String,
+    pub phase: String,
+    pub new_head_sha: Option<String>,
+    pub gate_exit_status: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchMemberFinishRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+    pub member_run_id: String,
+    pub exit_status: i64,
+    pub failure_reason: Option<String>,
+    pub gate_exit_status: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchMemberReuseRequest {
+    pub run_id: String,
+    pub worker_pid: u32,
+    pub worker_start_token: String,
+    pub checkout: PathBuf,
+    pub head_sha: String,
+    pub member_run_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ChildLeaseRequest {
     pub lease_id: String,
     pub run_id: String,
@@ -1319,6 +1374,7 @@ pub fn initialize_native(paths: &Paths, capacities: &BTreeMap<String, u64>) -> R
         load_runs(&connection)?;
     }
     crate::overflow::ensure_schema(&connection)?;
+    ensure_land_batch_schema(&connection)?;
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(map_database_error)?;
@@ -1690,6 +1746,58 @@ pub fn load_runs(connection: &Connection) -> Result<Vec<RunRecord>> {
     Ok(selected)
 }
 
+pub struct LiveSchedulerState {
+    pub active: Vec<RunRecord>,
+    pub queued: Vec<RunRecord>,
+    pub placed: BTreeMap<String, String>,
+    pub batch_followers: BTreeMap<String, String>,
+    pub batch_owners: BTreeMap<String, String>,
+}
+
+/// Load live runs, pool placements, and active land-batch membership from one snapshot.
+pub fn load_live_scheduler_state(connection: &Connection) -> Result<LiveSchedulerState> {
+    ensure_land_batch_schema(connection)?;
+    connection
+        .execute_batch("BEGIN DEFERRED")
+        .map_err(map_database_error)?;
+    let loaded = (|| {
+        let runs = load_live_runs(connection)?;
+        let active: Vec<_> = runs
+            .iter()
+            .filter(|run| run.status == "running")
+            .cloned()
+            .collect();
+        let mut queued: Vec<_> = runs
+            .iter()
+            .filter(|run| run.status == "queued")
+            .cloned()
+            .collect();
+        crate::recovery::filter_queued(connection, &mut queued)?;
+        let placed = crate::overflow::live_placements(connection)?;
+        let batch_followers = active_batch_followers(connection)?;
+        let batch_owners = active_batch_owners(connection)?;
+        Ok(LiveSchedulerState {
+            active,
+            queued,
+            placed,
+            batch_followers,
+            batch_owners,
+        })
+    })();
+    match loaded {
+        Ok(state) => {
+            connection
+                .execute_batch("COMMIT")
+                .map_err(map_database_error)?;
+            Ok(state)
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Load queued and running rows in submission order.
 ///
 /// Scheduling, observation, and a queued row's position depend only on live work, so these
@@ -1737,10 +1845,13 @@ pub fn allocations(active: &[RunRecord]) -> BTreeMap<String, u64> {
 pub fn local_allocations(
     active: &[RunRecord],
     placed: &BTreeMap<String, String>,
+    batch_followers: &BTreeMap<String, String>,
 ) -> BTreeMap<String, u64> {
     let local: Vec<_> = active
         .iter()
-        .filter(|run| !placed.contains_key(&run.run_id))
+        .filter(|run| {
+            !placed.contains_key(&run.run_id) && !batch_followers.contains_key(&run.run_id)
+        })
         .cloned()
         .collect();
     allocations(&local)
@@ -1752,12 +1863,13 @@ pub fn blocked_by(
     queued: &[RunRecord],
     capacities: &BTreeMap<String, u64>,
     placed: &BTreeMap<String, String>,
+    batch_followers: &BTreeMap<String, String>,
 ) -> Vec<String> {
     if run.status != "queued" {
         return Vec::new();
     }
     // Pool placements keep their repository exclusions but consume no local capacity.
-    let used = local_allocations(active, placed);
+    let used = local_allocations(active, placed, batch_followers);
     let front =
         front_row(active, queued, capacities, &used).filter(|front| run.sequence > front.sequence);
     row_blockers(run, active, queued, capacities, &used, front)
@@ -2032,8 +2144,9 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         None => crate::overflow::load_pools(&paths.state_dir)?,
     };
     let live_placed = crate::overflow::live_placements(&connection)?;
+    let batch_followers = active_batch_followers(&connection)?;
     let mut selected_allocations = BTreeMap::new();
-    let used = local_allocations(&all_active, &live_placed);
+    let used = local_allocations(&all_active, &live_placed, &batch_followers);
     for name in capacities.keys() {
         selected_allocations.insert(name.clone(), used.get(name).copied().unwrap_or(0));
     }
@@ -2045,7 +2158,14 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
                 paths,
                 run,
                 Some(index + 1),
-                blocked_by(run, &all_active, &all_queued, &capacities, &live_placed),
+                blocked_by(
+                    run,
+                    &all_active,
+                    &all_queued,
+                    &capacities,
+                    &live_placed,
+                    &batch_followers,
+                ),
                 &placed,
             )
         })
@@ -2125,11 +2245,19 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
         .unwrap_or_default();
     let live_placed = crate::overflow::live_placements(&connection)?;
     let placed = crate::overflow::all_placements(&connection)?;
+    let batch_followers = active_batch_followers(&connection)?;
     Ok(public_run(
         paths,
         &run,
         position,
-        blocked_by(&run, &active, &queued, &capacities, &live_placed),
+        blocked_by(
+            &run,
+            &active,
+            &queued,
+            &capacities,
+            &live_placed,
+            &batch_followers,
+        ),
         &placed,
     ))
 }
@@ -3261,52 +3389,14 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
             "land cancellation committed before publication became authoritative",
         ));
     }
-    let order = |phase: &str| match phase {
-        "preflight" => Some(0),
-        "gating" => Some(1),
-        "publishing" => Some(2),
-        _ => None,
-    };
-    let selected_gate_status = request.gate_exit_status.or(run.gate_exit_status);
-    let new_head_valid = request.new_head_sha.as_ref().is_none_or(|head| {
-        head.len() == 40
-            && head
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            && head != &request.head_sha
-            && run.phase == "preflight"
-            && request.phase == "preflight"
-            && selected_gate_status.is_none()
-    });
-    let valid = order(&run.phase)
-        .is_some_and(|current| order(&request.phase).is_some_and(|next| next >= current))
-        && request
-            .gate_exit_status
-            .is_none_or(|status| (0..=255).contains(&status))
-        && !(run.gate_exit_status.is_some()
-            && request.gate_exit_status.is_some()
-            && run.gate_exit_status != request.gate_exit_status)
-        && !(request.phase == "preflight" && selected_gate_status.is_some())
-        && !(request.phase == "publishing" && selected_gate_status != Some(0))
-        && new_head_valid;
-    if !valid {
-        return Err(AppError::new(
-            "broker-land-phase-invalid",
-            "land phase transition or gate exit status is invalid",
-        ));
-    }
-    connection
-        .execute(
-            "UPDATE runs SET phase = ?1, gate_exit_status = ?2, head_sha = ?3
-             WHERE run_id = ?4",
-            params![
-                request.phase,
-                selected_gate_status,
-                request.new_head_sha.as_ref().unwrap_or(&request.head_sha),
-                request.run_id,
-            ],
-        )
-        .map_err(map_database_error)?;
+    apply_land_phase_update(
+        &connection,
+        &run,
+        &request.phase,
+        &request.head_sha,
+        request.new_head_sha.as_ref(),
+        request.gate_exit_status,
+    )?;
     connection
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
@@ -3323,18 +3413,11 @@ pub fn advance_land_phase(paths: &Paths, request: &PhaseRequest) -> Result<Value
 /// `gate_run_id`; on a miss nothing changes and the worker runs the gate.
 pub fn reuse_gate(paths: &Paths, request: &ReuseRequest) -> Result<Value> {
     let _owner = owner_info(paths)?;
-    let max_age = land_gate_reuse_max_age(paths)?;
     let connection = open_protocol5(paths)?;
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(map_database_error)?;
     let run = load_run(&connection, &request.run_id)?;
-    if run.kind != "land" || run.status != "running" || run.phase != "preflight" {
-        return Err(AppError::new(
-            "broker-gate-reuse-invalid",
-            "only a running land still in preflight may reuse a gate",
-        ));
-    }
     if !admitted_worker_presents(&run, request.worker_pid, &request.worker_start_token)
         || run.checkout != request.checkout
         || run.head_sha.as_deref() != Some(&request.head_sha)
@@ -3344,66 +3427,13 @@ pub fn reuse_gate(paths: &Paths, request: &ReuseRequest) -> Result<Value> {
             "gate reuse requester does not match the admitted worker, checkout, and head",
         ));
     }
-    if run.cancel_requested {
-        return Err(AppError::new(
-            "broker-land-cancelled",
-            "land cancellation committed before a gate could be reused",
-        ));
+    let outcome = try_reuse_gate_for_run(paths, &connection, &run)?;
+    if outcome["reused"] == true {
+        connection
+            .execute_batch("COMMIT")
+            .map_err(map_database_error)?;
     }
-    if run.gate_exit_status.is_some() || run.gate_run_id.is_some() {
-        return Err(AppError::new(
-            "broker-gate-reuse-invalid",
-            "land already carries a gate verdict",
-        ));
-    }
-    if max_age.is_zero() {
-        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "disabled"}));
-    }
-    let command_json = serde_json::to_string(&run.command).map_err(|error| {
-        AppError::new(
-            "broker-row-invalid",
-            format!("cannot encode land gate command: {error}"),
-        )
-    })?;
-    let horizon = format!("-{} seconds", max_age.as_secs_f64());
-    let candidate = connection
-        .query_row(
-            "SELECT run_id, finished_at FROM runs
-             WHERE kind = 'full' AND status = 'passed'
-               AND repository_id = ?1 AND worktree_id = ?2
-               AND head_sha = ?3 AND command_json = ?4
-               AND finished_at IS NOT NULL
-               AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?5)
-             ORDER BY sequence DESC LIMIT 1",
-            params![
-                run.repository_id,
-                run.worktree_id,
-                request.head_sha,
-                command_json,
-                horizon
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(map_database_error)?;
-    let Some((source, finished_at)) = candidate else {
-        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "no-receipt"}));
-    };
-    connection
-        .execute(
-            "UPDATE runs SET phase = 'gating', gate_exit_status = 0, gate_run_id = ?1
-             WHERE run_id = ?2",
-            params![source, request.run_id],
-        )
-        .map_err(map_database_error)?;
-    connection
-        .execute_batch("COMMIT")
-        .map_err(map_database_error)?;
-    Ok(json!({
-        "reused": true,
-        "run_id": source,
-        "finished_at": finished_at,
-    }))
+    Ok(outcome)
 }
 
 pub fn report_land_result(paths: &Paths, request: &LandResultRequest) -> Result<Value> {
@@ -3445,6 +3475,893 @@ pub fn report_land_result(paths: &Paths, request: &LandResultRequest) -> Result<
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
     Ok(json!({"reported": true}))
+}
+
+/// Ensure the coordinator-private table tracking active land batches exists.
+pub fn ensure_land_batch_schema(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS land_batch_members (
+                leader_run_id TEXT NOT NULL,
+                member_run_id TEXT NOT NULL PRIMARY KEY,
+                position INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                original_checkout TEXT NOT NULL,
+                original_environment_json TEXT NOT NULL
+            );",
+        )
+        .map_err(map_database_error)
+}
+
+/// Active follower -> leader mapping for claimed land-batch members (excludes the leader).
+pub fn active_batch_followers(connection: &Connection) -> Result<BTreeMap<String, String>> {
+    ensure_land_batch_schema(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT member_run_id, leader_run_id
+             FROM land_batch_members
+             WHERE active = 1 AND member_run_id != leader_run_id",
+        )
+        .map_err(map_database_error)?;
+    let mut rows = statement.query([]).map_err(map_database_error)?;
+    let mut selected = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(map_database_error)? {
+        selected.insert(
+            row.get::<_, String>(0).map_err(map_database_error)?,
+            row.get::<_, String>(1).map_err(map_database_error)?,
+        );
+    }
+    Ok(selected)
+}
+
+/// Active member -> leader mapping for all active members of any running land batch.
+pub fn active_batch_owners(connection: &Connection) -> Result<BTreeMap<String, String>> {
+    ensure_land_batch_schema(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT member_run_id, leader_run_id
+             FROM land_batch_members
+             WHERE active = 1",
+        )
+        .map_err(map_database_error)?;
+    let mut rows = statement.query([]).map_err(map_database_error)?;
+    let mut selected = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(map_database_error)? {
+        selected.insert(
+            row.get::<_, String>(0).map_err(map_database_error)?,
+            row.get::<_, String>(1).map_err(map_database_error)?,
+        );
+    }
+    Ok(selected)
+}
+
+pub fn publication_failure_reason(run: &RunRecord, exit_status: i64) -> Option<&'static str> {
+    if !matches!(run.kind.as_str(), "merge" | "land") {
+        return None;
+    }
+    if run.kind == "land"
+        && run.phase == "gating"
+        && run.gate_exit_status.is_some_and(|status| status != 0)
+    {
+        return Some("gate-failed");
+    }
+    Some(publication_exit_reason(exit_status))
+}
+
+fn publication_exit_reason(exit_status: i64) -> &'static str {
+    match exit_status {
+        75 => "stale-main",
+        76 => "head-changed",
+        77 => "pr-not-ready",
+        78 => "publish-failed",
+        80 => "avoided-commit",
+        _ => "merge-error",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedLandOptions {
+    pub target_sync: bool,
+    pub reuse_full: bool,
+    pub avoid: Vec<String>,
+}
+
+pub fn parse_land_options(environment: &BTreeMap<String, String>) -> Result<ParsedLandOptions> {
+    let target_sync = match environment
+        .get("_AGCOORD_LAND_TARGET_SYNC")
+        .map(String::as_str)
+    {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(_) => {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "land run has an invalid target-sync setting",
+            ));
+        }
+    };
+    let reuse_full = match environment
+        .get("_AGCOORD_LAND_REUSE_FULL")
+        .map(String::as_str)
+    {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(_) => {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "land run has an invalid gate-reuse setting",
+            ));
+        }
+    };
+    let mut avoid = Vec::new();
+    if let Some(avoided) = environment.get("_AGCOORD_LAND_AVOID") {
+        for sha in avoided.split(',') {
+            if !commit_sha_valid(sha) {
+                return Err(AppError::new(
+                    "broker-row-invalid",
+                    "land run names an invalid avoided commit",
+                ));
+            }
+            avoid.push(sha.to_owned());
+        }
+    }
+    Ok(ParsedLandOptions {
+        target_sync,
+        reuse_full,
+        avoid,
+    })
+}
+
+pub fn normalize_gate_command(command: &[String]) -> Vec<String> {
+    command
+        .iter()
+        .map(|arg| {
+            let mut value = arg.as_str();
+            while let Some(rest) = value.strip_prefix("./") {
+                if rest.is_empty() {
+                    break;
+                }
+                value = rest;
+            }
+            value.to_owned()
+        })
+        .collect()
+}
+
+fn resource_envelope_compatible(candidate: &RunRecord, leader: &RunRecord) -> bool {
+    if !candidate
+        .resources
+        .iter()
+        .all(|(name, units)| leader.resources.get(name).is_some_and(|cap| units <= cap))
+    {
+        return false;
+    }
+    let Some(candidate_contract) = candidate.resource_contract.as_object() else {
+        return false;
+    };
+    let Some(leader_contract) = leader.resource_contract.as_object() else {
+        return false;
+    };
+    candidate_contract
+        .iter()
+        .all(|(name, value)| leader_contract.get(name) == Some(value))
+}
+
+struct BatchSelectionContext<'a> {
+    leader: &'a RunRecord,
+    leader_command: Vec<String>,
+    same_active: Vec<&'a RunRecord>,
+    repo_queued: Vec<&'a RunRecord>,
+    on_overflow_pool: bool,
+}
+
+impl<'a> BatchSelectionContext<'a> {
+    fn from_live(leader: &'a RunRecord, live: &'a [RunRecord], on_overflow_pool: bool) -> Self {
+        Self {
+            leader,
+            leader_command: normalize_gate_command(&leader.command),
+            same_active: live
+                .iter()
+                .filter(|run| run.status == "running" && run.repository_id == leader.repository_id)
+                .collect(),
+            repo_queued: live
+                .iter()
+                .filter(|run| run.status == "queued" && run.repository_id == leader.repository_id)
+                .collect(),
+            on_overflow_pool,
+        }
+    }
+
+    fn candidate_eligible(
+        &self,
+        candidate: &RunRecord,
+        seen_branches: &BTreeSet<String>,
+        seen_requests: &[Option<Value>],
+    ) -> bool {
+        if candidate.run_id == self.leader.run_id
+            || candidate.kind != "land"
+            || candidate.status != "queued"
+            || candidate.cancel_requested
+            || candidate.repository_id != self.leader.repository_id
+            || candidate.publication_adapter != self.leader.publication_adapter
+            || seen_branches.contains(&candidate.branch)
+            || seen_requests.contains(&candidate.publication_request)
+            || normalize_gate_command(&candidate.command) != self.leader_command
+            || !resource_envelope_compatible(candidate, self.leader)
+            || (self.on_overflow_pool
+                && !overflow_candidate(&candidate.kind, &candidate.environment))
+        {
+            return false;
+        }
+        let active_conflict = self.same_active.iter().any(|run| {
+            run.run_id != self.leader.run_id
+                && (run.barrier
+                    || run.worktree_id == candidate.worktree_id
+                    || (matches!(run.kind.as_str(), "full" | "land")
+                        && run.branch == candidate.branch))
+        });
+        if active_conflict {
+            return false;
+        }
+        let earlier_blocker = self.repo_queued.iter().any(|run| {
+            run.sequence < candidate.sequence
+                && run.run_id != self.leader.run_id
+                && !seen_branches.contains(&run.branch)
+                && (run.worktree_id == candidate.worktree_id
+                    || (matches!(run.kind.as_str(), "full" | "land")
+                        && run.branch == candidate.branch))
+        });
+        !earlier_blocker
+    }
+}
+
+fn member_descriptor(run: &RunRecord, is_leader: bool) -> Result<Value> {
+    let options = parse_land_options(&run.environment)?;
+    Ok(json!({
+        "run_id": run.run_id,
+        "sequence": run.sequence,
+        "branch": run.branch,
+        "head_sha": run.head_sha,
+        "worktree_id": run.worktree_id,
+        "publication_adapter": run.publication_adapter,
+        "publication_request": run.publication_request,
+        "gate_run_id": run.gate_run_id,
+        "is_leader": is_leader,
+        "environment_options": {
+            "target_sync": options.target_sync,
+            "reuse_full": options.reuse_full,
+            "avoid": options.avoid,
+        },
+    }))
+}
+
+pub fn select_land_batch_candidates(
+    connection: &Connection,
+    leader: &RunRecord,
+    on_overflow_pool: bool,
+) -> Result<Vec<Value>> {
+    if leader.kind != "land" {
+        return Ok(Vec::new());
+    }
+    let live = load_live_runs(connection)?;
+    let context = BatchSelectionContext::from_live(leader, &live, on_overflow_pool);
+    let mut seen_branches = BTreeSet::new();
+    seen_branches.insert(leader.branch.clone());
+    let mut seen_requests = vec![leader.publication_request.clone()];
+    let mut selected = Vec::new();
+    for candidate in &context.repo_queued {
+        if context.candidate_eligible(candidate, &seen_branches, &seen_requests) {
+            seen_branches.insert(candidate.branch.clone());
+            seen_requests.push(candidate.publication_request.clone());
+            selected.push(member_descriptor(candidate, false)?);
+        }
+    }
+    Ok(selected)
+}
+
+fn load_verified_batch_leader(
+    connection: &Connection,
+    run_id: &str,
+    worker_pid: u32,
+    worker_start_token: &str,
+    checkout: &Path,
+    head_sha: &str,
+    require_not_cancelled: bool,
+) -> Result<RunRecord> {
+    let leader = load_run(connection, run_id)?;
+    if leader.kind != "land" || leader.status != "running" {
+        return Err(AppError::new(
+            "broker-land-phase-invalid",
+            "only a running land worker may coordinate a land batch",
+        ));
+    }
+    if !admitted_worker_presents(&leader, worker_pid, worker_start_token)
+        || leader.checkout != checkout
+        || leader.head_sha.as_deref() != Some(head_sha)
+    {
+        return Err(AppError::new(
+            "broker-land-identity-mismatch",
+            "batch caller does not match the admitted land worker, checkout, and head",
+        ));
+    }
+    if require_not_cancelled && leader.cancel_requested {
+        return Err(AppError::new(
+            "broker-land-cancelled",
+            "land cancellation committed",
+        ));
+    }
+    Ok(leader)
+}
+
+fn apply_land_phase_update(
+    connection: &Connection,
+    run: &RunRecord,
+    phase: &str,
+    head_sha: &str,
+    new_head_sha: Option<&String>,
+    gate_exit_status: Option<i64>,
+) -> Result<()> {
+    let order = |value: &str| match value {
+        "preflight" => Some(0),
+        "gating" => Some(1),
+        "publishing" => Some(2),
+        _ => None,
+    };
+    let selected_gate_status = gate_exit_status.or(run.gate_exit_status);
+    let new_head_valid = new_head_sha.is_none_or(|head| {
+        head.len() == 40
+            && head
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && head != head_sha
+            && run.phase == "preflight"
+            && phase == "preflight"
+            && selected_gate_status.is_none()
+    });
+    let valid = order(&run.phase)
+        .is_some_and(|current| order(phase).is_some_and(|next| next >= current))
+        && gate_exit_status.is_none_or(|status| (0..=255).contains(&status))
+        && !(run.gate_exit_status.is_some()
+            && gate_exit_status.is_some()
+            && run.gate_exit_status != gate_exit_status)
+        && !(phase == "preflight" && selected_gate_status.is_some())
+        && !(phase == "publishing" && selected_gate_status != Some(0))
+        && new_head_valid;
+    if !valid {
+        return Err(AppError::new(
+            "broker-land-phase-invalid",
+            "land phase transition or gate exit status is invalid",
+        ));
+    }
+    connection
+        .execute(
+            "UPDATE runs SET phase = ?1, gate_exit_status = ?2, head_sha = ?3
+             WHERE run_id = ?4",
+            params![
+                phase,
+                selected_gate_status,
+                new_head_sha.map(String::as_str).unwrap_or(head_sha),
+                run.run_id,
+            ],
+        )
+        .map_err(map_database_error)?;
+    Ok(())
+}
+
+pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    ensure_land_batch_schema(&connection)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let leader = load_verified_batch_leader(
+        &connection,
+        &request.run_id,
+        request.worker_pid,
+        &request.worker_start_token,
+        &request.checkout,
+        &request.head_sha,
+        true,
+    )?;
+    let live = load_live_runs(&connection)?;
+    let on_overflow_pool =
+        crate::overflow::live_placements(&connection)?.contains_key(&leader.run_id);
+    let context = BatchSelectionContext::from_live(&leader, &live, on_overflow_pool);
+    let started_at = now(&connection)?;
+    let leader_env_json: String = connection
+        .query_row(
+            "SELECT environment_json FROM runs WHERE run_id = ?1",
+            params![leader.run_id],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO land_batch_members
+             (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
+             VALUES (?1, ?2, 0, 1, ?3, ?4)",
+            params![
+                leader.run_id,
+                leader.run_id,
+                leader.checkout.to_string_lossy().into_owned(),
+                leader_env_json,
+            ],
+        )
+        .map_err(map_database_error)?;
+
+    let mut seen_branches = BTreeSet::new();
+    seen_branches.insert(leader.branch.clone());
+    let mut seen_requests = vec![leader.publication_request.clone()];
+    let mut members = vec![member_descriptor(&leader, true)?];
+    let mut position: i64 = 1;
+    let leader_checkout_str = leader.checkout.to_string_lossy().into_owned();
+
+    for member_id in &request.member_run_ids {
+        let Some(candidate) = context
+            .repo_queued
+            .iter()
+            .copied()
+            .find(|run| run.run_id == *member_id)
+        else {
+            continue;
+        };
+        if !context.candidate_eligible(candidate, &seen_branches, &seen_requests) {
+            continue;
+        }
+        let (orig_checkout, orig_env): (String, String) = connection
+            .query_row(
+                "SELECT checkout, environment_json FROM runs WHERE run_id = ?1",
+                params![candidate.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(map_database_error)?;
+        connection
+            .execute(
+                "UPDATE runs
+                 SET status = 'running', phase = 'preflight', started_at = ?1,
+                     environment_json = '{}', checkout = ?2
+                 WHERE run_id = ?3 AND status = 'queued'",
+                params![started_at, leader_checkout_str, candidate.run_id],
+            )
+            .map_err(map_database_error)?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO land_batch_members
+                 (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![
+                    leader.run_id,
+                    candidate.run_id,
+                    position,
+                    orig_checkout,
+                    orig_env,
+                ],
+            )
+            .map_err(map_database_error)?;
+        seen_branches.insert(candidate.branch.clone());
+        seen_requests.push(candidate.publication_request.clone());
+        members.push(member_descriptor(candidate, false)?);
+        position += 1;
+    }
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({
+        "leader_run_id": leader.run_id,
+        "members": members,
+    }))
+}
+
+pub fn batch_status(paths: &Paths, request: &BatchStatusRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    ensure_land_batch_schema(&connection)?;
+    let leader = load_verified_batch_leader(
+        &connection,
+        &request.run_id,
+        request.worker_pid,
+        &request.worker_start_token,
+        &request.checkout,
+        &request.head_sha,
+        false,
+    )?;
+    let mut statement = connection
+        .prepare(
+            "SELECT runs.run_id, runs.status, runs.phase, runs.cancel_requested, land_batch_members.active
+             FROM land_batch_members
+             JOIN runs ON runs.run_id = land_batch_members.member_run_id
+             WHERE land_batch_members.leader_run_id = ?1
+             ORDER BY land_batch_members.position",
+        )
+        .map_err(map_database_error)?;
+    let mut rows = statement
+        .query(params![leader.run_id])
+        .map_err(map_database_error)?;
+    let mut members = Vec::new();
+    while let Some(row) = rows.next().map_err(map_database_error)? {
+        members.push(json!({
+            "run_id": row.get::<_, String>(0).map_err(map_database_error)?,
+            "status": row.get::<_, String>(1).map_err(map_database_error)?,
+            "phase": row.get::<_, String>(2).map_err(map_database_error)?,
+            "cancel_requested": row.get::<_, i64>(3).map_err(map_database_error)? != 0,
+            "active": row.get::<_, i64>(4).map_err(map_database_error)? != 0,
+        }));
+    }
+    Ok(json!({
+        "leader_run_id": leader.run_id,
+        "cancel_requested": leader.cancel_requested,
+        "members": members,
+    }))
+}
+
+fn verify_active_batch_member(
+    connection: &Connection,
+    leader_run_id: &str,
+    member_run_id: &str,
+) -> Result<RunRecord> {
+    let active_for_leader: Option<i64> = connection
+        .query_row(
+            "SELECT active FROM land_batch_members
+             WHERE leader_run_id = ?1 AND member_run_id = ?2",
+            params![leader_run_id, member_run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_database_error)?;
+    if active_for_leader != Some(1) {
+        return Err(AppError::new(
+            "broker-land-phase-invalid",
+            format!("run {member_run_id} is not an active member of batch {leader_run_id}"),
+        ));
+    }
+    let member = load_run(connection, member_run_id)?;
+    if member.kind != "land" || member.status != "running" {
+        return Err(AppError::new(
+            "broker-land-phase-invalid",
+            format!("batch member {member_run_id} is not running"),
+        ));
+    }
+    Ok(member)
+}
+
+pub fn advance_batch_member_phase(
+    paths: &Paths,
+    request: &BatchMemberPhaseRequest,
+) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    ensure_land_batch_schema(&connection)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let _leader = load_verified_batch_leader(
+        &connection,
+        &request.run_id,
+        request.worker_pid,
+        &request.worker_start_token,
+        &request.checkout,
+        &request.head_sha,
+        true,
+    )?;
+    let member = verify_active_batch_member(&connection, &request.run_id, &request.member_run_id)?;
+    if member.cancel_requested {
+        return Err(AppError::new(
+            "broker-land-cancelled",
+            "batch member cancellation committed before publication became authoritative",
+        ));
+    }
+    let member_head = member.head_sha.clone().ok_or_else(|| {
+        AppError::new(
+            "broker-row-invalid",
+            format!("batch member {} has no head SHA", member.run_id),
+        )
+    })?;
+    apply_land_phase_update(
+        &connection,
+        &member,
+        &request.phase,
+        &member_head,
+        request.new_head_sha.as_ref(),
+        request.gate_exit_status,
+    )?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    status(paths, &request.member_run_id)
+}
+
+fn try_reuse_gate_for_run(
+    paths: &Paths,
+    connection: &Connection,
+    run: &RunRecord,
+) -> Result<Value> {
+    let max_age = land_gate_reuse_max_age(paths)?;
+    if run.kind != "land" || run.status != "running" || run.phase != "preflight" {
+        return Err(AppError::new(
+            "broker-gate-reuse-invalid",
+            "only a running land still in preflight may reuse a gate",
+        ));
+    }
+    if run.cancel_requested {
+        return Err(AppError::new(
+            "broker-land-cancelled",
+            "land cancellation committed before a gate could be reused",
+        ));
+    }
+    if run.gate_exit_status.is_some() || run.gate_run_id.is_some() {
+        return Err(AppError::new(
+            "broker-gate-reuse-invalid",
+            "land already carries a gate verdict",
+        ));
+    }
+    if max_age.is_zero() {
+        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "disabled"}));
+    }
+    let Some(head_sha) = run.head_sha.as_deref() else {
+        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "no-receipt"}));
+    };
+    let command_json = serde_json::to_string(&run.command).map_err(|error| {
+        AppError::new(
+            "broker-row-invalid",
+            format!("cannot encode land gate command: {error}"),
+        )
+    })?;
+    let horizon = format!("-{} seconds", max_age.as_secs_f64());
+    let candidate = connection
+        .query_row(
+            "SELECT run_id, finished_at FROM runs
+             WHERE kind = 'full' AND status = 'passed'
+               AND repository_id = ?1 AND worktree_id = ?2
+               AND head_sha = ?3 AND command_json = ?4
+               AND finished_at IS NOT NULL
+               AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?5)
+             ORDER BY sequence DESC LIMIT 1",
+            params![
+                run.repository_id,
+                run.worktree_id,
+                head_sha,
+                command_json,
+                horizon
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_database_error)?;
+    let Some((source, finished_at)) = candidate else {
+        return Ok(json!({"reused": false, "run_id": Value::Null, "reason": "no-receipt"}));
+    };
+    connection
+        .execute(
+            "UPDATE runs SET phase = 'gating', gate_exit_status = 0, gate_run_id = ?1
+             WHERE run_id = ?2",
+            params![source, run.run_id],
+        )
+        .map_err(map_database_error)?;
+    Ok(json!({
+        "reused": true,
+        "run_id": source,
+        "finished_at": finished_at,
+    }))
+}
+
+pub fn reuse_batch_member_gate(paths: &Paths, request: &BatchMemberReuseRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    ensure_land_batch_schema(&connection)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let _leader = load_verified_batch_leader(
+        &connection,
+        &request.run_id,
+        request.worker_pid,
+        &request.worker_start_token,
+        &request.checkout,
+        &request.head_sha,
+        true,
+    )?;
+    let member = verify_active_batch_member(&connection, &request.run_id, &request.member_run_id)?;
+    let outcome = try_reuse_gate_for_run(paths, &connection, &member)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(outcome)
+}
+
+pub fn copy_leader_log_to_member(paths: &Paths, leader_run_id: &str, member_run_id: &str) {
+    if leader_run_id == member_run_id {
+        return;
+    }
+    let source = paths.logs.join(format!("{leader_run_id}.log"));
+    let target = paths.logs.join(format!("{member_run_id}.log"));
+    if let Ok(bytes) = fs::read(&source) {
+        let _ = fs::write(&target, bytes);
+    }
+}
+
+pub fn finish_batch_member(paths: &Paths, request: &BatchMemberFinishRequest) -> Result<Value> {
+    if !(0..=255).contains(&request.exit_status) {
+        return Err(AppError::new(
+            "broker-land-result-invalid",
+            "batch member exit status must be from 0 to 255",
+        ));
+    }
+    if request.member_run_id == request.run_id {
+        return Err(AppError::new(
+            "broker-land-result-invalid",
+            "batch leader reports its own result via report",
+        ));
+    }
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    ensure_land_batch_schema(&connection)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let _leader = load_verified_batch_leader(
+        &connection,
+        &request.run_id,
+        request.worker_pid,
+        &request.worker_start_token,
+        &request.checkout,
+        &request.head_sha,
+        false,
+    )?;
+    let member = verify_active_batch_member(&connection, &request.run_id, &request.member_run_id)?;
+    let effective_gate = request.gate_exit_status.or(member.gate_exit_status);
+    let (member_status, exit_status, failure_reason): (&str, i64, Option<String>) =
+        if member.cancel_requested {
+            ("cancelled", 130, None)
+        } else if request.exit_status == 0 {
+            ("passed", 0, None)
+        } else {
+            let inferred = if let Some(explicit) = &request.failure_reason {
+                explicit.clone()
+            } else if effective_gate.is_some_and(|code| code != 0) && member.phase == "gating" {
+                "gate-failed".to_owned()
+            } else {
+                publication_exit_reason(request.exit_status).to_owned()
+            };
+            ("failed", request.exit_status, Some(inferred))
+        };
+    connection
+        .execute(
+            "UPDATE runs
+             SET status = ?1, phase = 'complete', finished_at = ?2,
+                 exit_status = ?3, reported_exit_status = ?3,
+                 failure_reason = ?4, gate_exit_status = COALESCE(?5, gate_exit_status),
+                 environment_json = '{}'
+             WHERE run_id = ?6",
+            params![
+                member_status,
+                now(&connection)?,
+                exit_status,
+                failure_reason,
+                request.gate_exit_status,
+                member.run_id,
+            ],
+        )
+        .map_err(map_database_error)?;
+    connection
+        .execute(
+            "UPDATE land_batch_members SET active = 0 WHERE member_run_id = ?1",
+            params![member.run_id],
+        )
+        .map_err(map_database_error)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    copy_leader_log_to_member(paths, &request.run_id, &member.run_id);
+    status(paths, &request.member_run_id)
+}
+
+/// Finalize or re-queue any still-active batch followers inside the leader's finish transaction.
+pub fn reconcile_batch_on_leader_exit(
+    paths: &Paths,
+    connection: &Connection,
+    leader: &RunRecord,
+    leader_status: &str,
+    leader_exit_status: i64,
+    leader_failure_reason: Option<&str>,
+) -> Result<Vec<String>> {
+    ensure_land_batch_schema(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT member_run_id, original_checkout, original_environment_json
+             FROM land_batch_members
+             WHERE leader_run_id = ?1 AND active = 1",
+        )
+        .map_err(map_database_error)?;
+    let rows = statement
+        .query_map(params![leader.run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(map_database_error)?;
+    let entries: Vec<(String, String, String)> = rows
+        .collect::<std::result::Result<_, _>>()
+        .map_err(map_database_error)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    connection
+        .execute(
+            "UPDATE land_batch_members SET active = 0 WHERE leader_run_id = ?1 AND member_run_id = ?1",
+            params![leader.run_id],
+        )
+        .map_err(map_database_error)?;
+    let mut finalized_for_log_copy = Vec::new();
+    let leader_requeue =
+        leader.cancel_requested || matches!(leader_status, "cancelled" | "interrupted");
+    let finished_at = now(connection)?;
+    for (member_id, orig_checkout, orig_env) in entries {
+        if member_id == leader.run_id {
+            continue;
+        }
+        let Ok(member) = load_run(connection, &member_id) else {
+            continue;
+        };
+        if member.status != "running" {
+            connection
+                .execute(
+                    "UPDATE land_batch_members SET active = 0 WHERE member_run_id = ?1",
+                    params![member_id],
+                )
+                .map_err(map_database_error)?;
+            continue;
+        }
+        if leader_requeue && !member.cancel_requested {
+            connection
+                .execute(
+                    "UPDATE runs
+                     SET status = 'queued', phase = 'queued', started_at = NULL,
+                         finished_at = NULL, exit_status = NULL, reported_exit_status = NULL,
+                         failure_reason = NULL, gate_exit_status = NULL, gate_run_id = NULL,
+                         checkout = ?1, environment_json = ?2
+                     WHERE run_id = ?3",
+                    params![orig_checkout, orig_env, member_id],
+                )
+                .map_err(map_database_error)?;
+            connection
+                .execute(
+                    "DELETE FROM land_batch_members WHERE member_run_id = ?1",
+                    params![member_id],
+                )
+                .map_err(map_database_error)?;
+        } else {
+            let (status, exit_status, failure_reason) = if member.cancel_requested {
+                ("cancelled", 130, None)
+            } else {
+                (
+                    "failed",
+                    leader_exit_status,
+                    Some(leader_failure_reason.unwrap_or("batch-leader-failed")),
+                )
+            };
+            connection
+                .execute(
+                    "UPDATE runs
+                     SET status = ?1, phase = 'complete', finished_at = ?2,
+                         exit_status = ?3, failure_reason = ?4, environment_json = '{}'
+                     WHERE run_id = ?5",
+                    params![status, finished_at, exit_status, failure_reason, member_id],
+                )
+                .map_err(map_database_error)?;
+            connection
+                .execute(
+                    "UPDATE land_batch_members SET active = 0 WHERE member_run_id = ?1",
+                    params![member_id],
+                )
+                .map_err(map_database_error)?;
+            finalized_for_log_copy.push(member_id);
+        }
+    }
+    let _ = paths;
+    Ok(finalized_for_log_copy)
 }
 
 pub fn is_terminal(status: &str) -> bool {

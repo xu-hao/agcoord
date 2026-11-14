@@ -2229,6 +2229,136 @@ class CoordinatorClient:
             raise CoordinatorError("native broker returned an invalid gate reuse receipt")
         return source
 
+    def _admitted_leader_arguments(
+        self,
+        run_id: str,
+        *,
+        worker_pid: int,
+    ) -> list[str]:
+        self._assert_admitted_callback(run_id)
+        self._ensure_broker(admitted_callback=True)
+        token = _process_start_token(worker_pid)
+        if token is None:
+            raise CoordinatorError("cannot identify admitted land worker process")
+        row = self.admitted_run_status(run_id)
+        return [
+            "--run-id",
+            run_id,
+            "--worker-pid",
+            str(worker_pid),
+            "--worker-start-token",
+            token,
+            "--checkout",
+            str(row["checkout"]),
+            "--head",
+            str(row["head_sha"]),
+        ]
+
+    def claim_batch(
+        self,
+        leader_run_id: str,
+        *,
+        member_run_ids: Sequence[str],
+        worker_pid: int,
+    ) -> list[dict[str, object]]:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        arguments.extend(("--members-json", json.dumps(list(member_run_ids))))
+        result = self._native_callback_invoke("claim-batch", arguments)
+        if (
+            not isinstance(result, dict)
+            or result.get("leader_run_id") != leader_run_id
+            or not isinstance(result.get("members"), list)
+        ):
+            raise CoordinatorError("native broker returned an invalid batch claim receipt")
+        return list(result["members"])
+
+    def batch_status(
+        self,
+        leader_run_id: str,
+        *,
+        worker_pid: int,
+    ) -> dict[str, object]:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        result = self._native_callback_invoke("batch-status", arguments)
+        if (
+            not isinstance(result, dict)
+            or result.get("leader_run_id") != leader_run_id
+            or not isinstance(result.get("members"), list)
+        ):
+            raise CoordinatorError("native broker returned an invalid batch status receipt")
+        return result
+
+    def update_batch_member_phase(
+        self,
+        leader_run_id: str,
+        *,
+        member_run_id: str,
+        phase: str,
+        gate_exit_status: int | None,
+        worker_pid: int,
+        new_head_sha: str | None = None,
+    ) -> None:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        arguments.extend(("--member-run-id", member_run_id, "--phase", phase))
+        if gate_exit_status is not None:
+            arguments.extend(("--gate-exit-status", str(gate_exit_status)))
+        if new_head_sha is not None:
+            arguments.extend(
+                (
+                    "--new-head",
+                    _validate_head_sha(new_head_sha, required=True) or "",
+                )
+            )
+        result = self._native_callback_invoke("batch-phase", arguments)
+        if not isinstance(result, dict) or result.get("run_id") != member_run_id:
+            raise CoordinatorError("native broker returned an invalid batch member phase receipt")
+
+    def reuse_batch_member_gate(
+        self,
+        leader_run_id: str,
+        *,
+        member_run_id: str,
+        worker_pid: int,
+    ) -> str | None:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        arguments.extend(("--member-run-id", member_run_id))
+        result = self._native_callback_invoke("batch-reuse-gate", arguments)
+        if not isinstance(result, dict) or not isinstance(result.get("reused"), bool):
+            raise CoordinatorError("native broker returned an invalid batch gate reuse receipt")
+        if not result["reused"]:
+            return None
+        source = result.get("run_id")
+        if not isinstance(source, str) or not source:
+            raise CoordinatorError("native broker returned an invalid batch gate reuse receipt")
+        return source
+
+    def finish_batch_member(
+        self,
+        leader_run_id: str,
+        *,
+        member_run_id: str,
+        exit_status: int,
+        worker_pid: int,
+        failure_reason: str | None = None,
+        gate_exit_status: int | None = None,
+    ) -> None:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        arguments.extend(
+            (
+                "--member-run-id",
+                member_run_id,
+                "--exit-status",
+                str(exit_status),
+            )
+        )
+        if failure_reason is not None:
+            arguments.extend(("--failure-reason", failure_reason))
+        if gate_exit_status is not None:
+            arguments.extend(("--gate-exit-status", str(gate_exit_status)))
+        result = self._native_callback_invoke("batch-finish", arguments)
+        if not isinstance(result, dict) or result.get("run_id") != member_run_id:
+            raise CoordinatorError("native broker returned an invalid batch member finish receipt")
+
     def report_land_result(
         self,
         run_id: str,
