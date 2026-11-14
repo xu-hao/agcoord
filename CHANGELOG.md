@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add `--script FILE` and `--script -` to `agc run` and `agc full`, passing validated UTF-8
+  script bodies through portable `bash`, `sh`, or Python interpreter commands. Refresh agent
+  guidance to use inline scripts for multi-step checks and keep fast local documentation and
+  lint checks separate from heavy suites. #325 — add a portable inline runner and tighten
+  overflow-aware check guidance.
+
 - Show used CPU-hours against the budget limit alongside estimated cost, and filter list and
   TUI runs by overflow pool or `local`. #322 — make overflow budget units consistent and add a pool filter.
 

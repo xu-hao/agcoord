@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 import time
 from typing import Callable, Iterable, TextIO
@@ -330,6 +331,11 @@ def build_parser() -> argparse.ArgumentParser:
             help="repeatable machine resource claim",
         )
         overflow_options(command)
+        command.add_argument(
+            "--script",
+            metavar="FILE",
+            help="read a UTF-8 inline worker script from FILE, or from stdin when FILE is -",
+        )
         command.add_argument("worker_command", nargs=argparse.REMAINDER)
         return command
 
@@ -720,7 +726,12 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
     command = list(args.worker_command)
     if command and command[0] == "--":
         command.pop(0)
-    if not command:
+    script_path = getattr(args, "script", None)
+    if script_path is not None and command:
+        raise CoordinatorError("--script cannot be combined with a trailing worker command")
+    if script_path is not None:
+        command = _inline_script_command(script_path)
+    elif not command:
         raise CoordinatorError(f"agc {args.command} needs a command after --")
     if args.command == "land":
         run_id = client.submit_land(
@@ -765,6 +776,50 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         return int(final["exit_status"] if final["exit_status"] is not None else 70)
     print(f"AGCoord: accepted {run_id}", file=out, flush=True)
     return follow(client, run_id, out=out)
+
+
+def _inline_script_command(script_path: str) -> list[str]:
+    """Read a portable inline script and select its explicitly supported interpreter.
+
+    The body is passed unchanged, including a shebang comment on line one. This works
+    with ``sh -ec``, ``bash -ec``, and ``python3 -c`` and avoids host-local wrapper paths.
+    """
+    try:
+        if script_path == "-":
+            stream = sys.stdin
+            binary_stream = getattr(stream, "buffer", None)
+            body = (
+                binary_stream.read().decode("utf-8")
+                if binary_stream is not None
+                else stream.read()
+            )
+        else:
+            body = Path(script_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        source = "stdin" if script_path == "-" else repr(script_path)
+        raise CoordinatorError(f"cannot read UTF-8 script from {source}: {exc}") from exc
+    if not body.strip():
+        raise CoordinatorError("inline script is empty or whitespace-only")
+    if "\0" in body:
+        raise CoordinatorError("inline script contains a NUL character")
+
+    interpreter = "bash"
+    if body.startswith("#!"):
+        first_line = body.splitlines()[0]
+        try:
+            words = shlex.split(first_line[2:].strip())
+        except ValueError as exc:
+            raise CoordinatorError(f"unsupported script shebang: {first_line}") from exc
+        if words and Path(words[0]).name == "env" and len(words) == 2:
+            words = words[1:]
+        if len(words) != 1:
+            raise CoordinatorError(f"unsupported script shebang: {first_line}")
+        interpreter = Path(words[0]).name
+        if interpreter in {"python", "python3"}:
+            return ["python3", "-c", body]
+        if interpreter not in {"sh", "bash"}:
+            raise CoordinatorError(f"unsupported script shebang: {first_line}")
+    return [interpreter, "-ec", body]
 
 
 def main(argv: Iterable[str] | None = None) -> int:
