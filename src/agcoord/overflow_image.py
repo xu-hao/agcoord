@@ -92,6 +92,7 @@ class ContainerLimits:
     tmpfs: int | None = None
     tmpfs_inodes: int | None = None
     processes: int | None = None
+    tmpfs_exec: bool = False
 
     def run_options(self) -> list[str]:
         """Return the container-run options, shared by Docker and Podman."""
@@ -105,13 +106,25 @@ class ContainerLimits:
         if self.memory_reservation is not None:
             options.append(f"--memory-reservation={self.memory_reservation}")
         if self.tmpfs is not None:
-            mount = f"/tmp:rw,size={self.tmpfs}"
+            mount = "/tmp:rw," + ("exec," if self.tmpfs_exec else "") + f"size={self.tmpfs}"
             if self.tmpfs_inodes is not None:
                 mount += f",nr_inodes={self.tmpfs_inodes}"
             options.append(f"--tmpfs={mount}")
         if self.processes is not None:
             options.append(f"--pids-limit={self.processes}")
         return options
+
+
+def container_environment(
+    environment: Mapping[str, str],
+    passed_environment: Sequence[str],
+    limits: ContainerLimits,
+) -> dict[str, str]:
+    """Forward selected variables, advertising applied scratch at its container path."""
+    selected = {name: environment[name] for name in passed_environment if name in environment}
+    if limits.tmpfs is not None:
+        selected.update({name: "/tmp" for name in ("TMPDIR", "TMP", "TEMP")})
+    return selected
 
 
 def repository_root(checkout: str | os.PathLike[str]) -> Path:
@@ -256,11 +269,13 @@ class EnforcementTarget:
 
     ``dependencies`` lists limits the destination can apply only together with another:
     ``(dependent, base, explanation)`` over :class:`ContainerLimits` field names.
+    ``executable_tmpfs`` says whether it can guarantee executable scratch.
     """
 
     description: str
     kinds: frozenset[str]
     dependencies: tuple[tuple[str, str, str], ...] = ()
+    executable_tmpfs: bool = True
 
 
 #: A Docker or Podman container, which every executor that starts one itself can limit.
@@ -286,6 +301,7 @@ def container_limits(
     is skipped, as it would be on a host whose backend is unavailable.
     """
     selected: dict[str, int] = {}
+    tmpfs_exec = False
     for name, units in resources.items():
         binding = contract.get(name, {})
         mode = binding.get("mode", "admission-only")
@@ -309,8 +325,18 @@ def container_limits(
                     f"{target.description}"
                 )
             continue
+        if kind == "tmpfs":
+            executable = binding.get("exec", False) is True
+            if executable and not target.executable_tmpfs:
+                if mode == "required":
+                    raise ExecutorError(
+                        f"required claim {name} needs executable scratch, which cannot "
+                        f"be guaranteed in {target.description}"
+                    )
+                continue
+            tmpfs_exec = executable
         selected[field] = units
-    limits = ContainerLimits(**selected)
+    limits = ContainerLimits(**selected, tmpfs_exec=tmpfs_exec)
     for dependent, base, subject in target.dependencies:
         if getattr(limits, dependent) is not None and getattr(limits, base) is None:
             raise ExecutorError(f"{subject} to be enforced in {target.description}")

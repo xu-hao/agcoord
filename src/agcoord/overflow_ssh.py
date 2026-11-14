@@ -23,11 +23,13 @@ import sys
 from typing import Sequence
 
 from agcoord.overflow_image import (
+    ContainerLimits,
     EXIT_NO_VERDICT,
     ExecutorError,
     Stopped,
     build_toolchain,
     command_line,
+    container_environment,
     container_tool,
     ignore_stop_signals,
     load_repository_config,
@@ -116,15 +118,12 @@ class SshExecutor:
         *,
         name: str,
         image: str,
-        options: Sequence[str],
+        limits: ContainerLimits,
         max_runtime: int,
         command: Sequence[str],
     ) -> int:
         """Run the command in its limited container and return its exit status."""
-        environment: list[str] = []
-        for variable in self.passed_environment:
-            if variable in os.environ:
-                environment.append(f"--env={variable}={os.environ[variable]}")
+        environment = container_environment(os.environ, self.passed_environment, limits)
         process = self.remote(
             [
                 # The destination enforces the runtime limit itself, so a lost connection
@@ -136,8 +135,8 @@ class SshExecutor:
                 "run",
                 "--rm",
                 f"--name={name}",
-                *options,
-                *environment,
+                *limits.run_options(),
+                *(f"--env={name}={value}" for name, value in environment.items()),
                 image,
                 *command,
             ],
@@ -235,7 +234,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         status = executor.run(
             name=name,
             image=image,
-            options=placed.limits.run_options(),
+            limits=placed.limits,
             max_runtime=placed.max_runtime,
             command=command,
         )

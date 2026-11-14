@@ -18,6 +18,7 @@ import tarfile
 import pytest
 
 from gcp_fakes import (
+    CONTRACT,
     GCLOUD_PROGRESS,
     JOB_IMAGE,
     JOB_IMAGE_DIGEST,
@@ -249,6 +250,29 @@ def test_spot_machine_type_and_passed_environment_reach_the_job(cloud: Cloud):
     ]
     runnable = job["taskGroups"][0]["taskSpec"]["runnables"][0]
     assert runnable["environment"] == {"variables": {"CI": "1"}}
+
+
+@pytest.mark.parametrize("executable", [True, False, None])
+def test_scratch_mount_and_environment_reach_batch(cloud: Cloud, executable):
+    binding = {"backend": "cgroup-v2", "kind": "tmpfs", "mode": "required", "unit": "bytes"}
+    if executable is not None:
+        binding["exec"] = executable
+    completed = cloud.run(
+        "true", options=("--env=CI", "--env=TMPDIR", "--env=TMP", "--env=TEMP"),
+        CI="1", TMPDIR="/host/scratch", TMP="/host/tmp", TEMP="/host/temp",
+        AGCOORD_OVERFLOW_RESOURCES=json.dumps({**RESOURCES, "scratch": 1024, "files": 2000}),
+        AGCOORD_OVERFLOW_CONTRACT=json.dumps({
+            **CONTRACT, "scratch": binding,
+            "files": {"backend": "cgroup-v2", "kind": "inodes", "mode": "required", "unit": "inodes"},
+        }),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    runnable = cloud.job()["taskGroups"][0]["taskSpec"]["runnables"][0]
+    assert f"--tmpfs=/tmp:rw,{('exec,' if executable else '')}size=1024,nr_inodes=2000" in runnable["container"]["options"].split()
+    assert runnable["environment"]["variables"] == {
+        "CI": "1", "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp"
+    }
 
 
 def test_stopping_the_executor_deletes_the_batch_job(cloud: Cloud):

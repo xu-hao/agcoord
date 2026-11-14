@@ -98,6 +98,10 @@ policy. Do not pass host-local interpreter or script paths such as `/var/tmp/...
 services or daemons, or extras not bundled in the toolchain image. Pass it on `agc full` and
 `agc land` when gate scripts check local admission or host user-namespace sandboxes.
 
+Applied overflow scratch is mounted at `/tmp`, with `TMPDIR`, `TMP`, and `TEMP` set to
+that path automatically. SSH and Batch honor `"exec": true` on its binding. Cloud Run
+cannot guarantee that setting; see the [Cloud Run scratch contract](coordinator.md#gcp-cloud-run-executor).
+
 **Never submit from inside an admitted job.** A job that submits another job and waits for
 it would deadlock behind itself, so the client refuses before any broker is involved:
 
