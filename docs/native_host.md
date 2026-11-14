@@ -359,6 +359,14 @@ capabilities, but submitted code always runs as `agcoord-admitted//&agcoord-job`
 broker, AppArmor substitutes `agcoord-broker-client` for `agcoord-job` on the anchor; this keeps
 the anchor without requesting a replacement domain after `no_new_privs`.
 
+Before the admitted transition, exact-head gate setup may execute the fixed `/usr/bin/git`
+helper in `agcoord-gate-git`. This separate profile permits repository worktree metadata and
+spool-cache writes, denies capabilities, namespaces, ptrace and explicit profile changes,
+and sends arbitrary filter/helper executables into the admitted restriction. The launcher
+disables Git hooks and fsmonitor and clears inherited Git environment routing. Ordinary Git
+invoked by admitted work stays under its admitted restriction. See
+[gate-tree ownership](coordinator.md#coordinator-owned-gate-trees).
+
 One exec is widened on purpose: when admitted work runs the fixed system Bubblewrap executable
 `/usr/bin/bwrap`, AppArmor transitions it to `agcoord-admitted//&agcoord-bwrap`, which may create a
 user namespace and use capabilities inside that namespace to assemble and pivot into an
@@ -374,10 +382,10 @@ path is widened: a program of that name reached through another mount namespace 
 distinct disconnected prefix and never matches the rule, and submitted code that is not
 `/usr/bin/bwrap` still cannot create a user namespace at all. The `/usr/bin/bwrap` transition keeps
 the environment (matching the upstream profile), so the sandbox sees the job's variables such as
-`TMPDIR` unless Bubblewrap is told otherwise. All six profiles use explicit enforce mode and broad
+`TMPDIR` unless Bubblewrap is told otherwise. All seven profiles use explicit enforce mode and broad
 enumerated host permissions; `default_allow` is not accepted because Ubuntu 24.04 implements it as
 an unconfined profile that does not apply these denials. Activation fails closed unless every one of
-the six domains is loaded in enforce mode.
+the seven domains is loaded in enforce mode.
 
 Bubblewrap itself is an optional host package. AGCoord neither requires nor installs it; without
 `/usr/bin/bwrap` the `agcoord-bwrap` domains are inert and every other boundary is unchanged.
