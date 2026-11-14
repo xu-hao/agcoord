@@ -465,8 +465,11 @@ an unprivileged sandbox; everything it launches runs as
 `agcoord-admitted//&agcoord-bwrap-child//&agcoord-job` (AppArmor's sorted rendering of the stack),
 which is capability- and user-namespace-denied and sticky across further execs, so no other
 submitted code gains namespace permission. Bubblewrap is an optional host package; without
-`/usr/bin/bwrap` these domains are inert. Every one of the six domains is compiled in explicit enforce mode rather than
-Ubuntu 24.04's unconfined `default_allow` mode. A failure to verify the loaded setup profile, the
+`/usr/bin/bwrap` these domains are inert. Every one of the seven domains is compiled in explicit enforce mode rather than
+Ubuntu 24.04's unconfined `default_allow` mode. During gate preparation only, the trusted launcher
+executes fixed `/usr/bin/git` in `agcoord-gate-git`, which denies capabilities, namespaces,
+ptrace and explicit profile changes; arbitrary Git helpers enter admitted restrictions.
+Submitted Git never enters the setup helper profile. A failure to verify the loaded setup profile, the
 service cgroup, the global restriction, or the backend namespace probe makes required work
 unavailable; a missing `agcoord-job` profile makes the submitted command's exec transition fail
 closed so the command cannot start.

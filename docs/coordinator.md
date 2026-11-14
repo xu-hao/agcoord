@@ -140,6 +140,8 @@ the entire machine:
 branch below `<state-dir>/gate-trees/`. Checks continue to run in the submitted checkout.
 The broker reserves a branch tree from admission through completion, including pending
 setup. A full is still ordinary lane work; only other gates for its branch serialize.
+Queued gates report `gate-tree:active:<run_id>` while an admitted gate holds their tree,
+and `gate-tree:fifo:<run_id>` while an earlier queued gate for the same branch waits.
 
 After attaching the authenticated launcher and its resources, the launcher materializes
 and resets the tree with plain `git worktree add --detach` and `git reset --hard <head>`.
