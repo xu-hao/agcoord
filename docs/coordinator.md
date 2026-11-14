@@ -1369,7 +1369,29 @@ take the complete budget, give each an appropriate `--maxprocesses` cap. Across 
 adapter only sizes worker processes; cgroup CPU and PID limits remain the aggregate enforcement
 boundary.
 
-## Atomic landing
+### Inline scripts for `run` and `full`
+
+`agc run` and `agc full` accept either the existing trailing worker command or `--script FILE`;
+the two forms are mutually exclusive, and one is required. `--script -` reads UTF-8 text from
+standard input. A file is read as UTF-8 by the submitting client, then its text is sent as the
+worker command, so the worker does not need the submitter's script path. Missing, unreadable,
+non-UTF-8, whitespace-only, and NUL-containing scripts are refused before submission.
+
+The complete script body, including its first line, is passed unchanged to one portable
+interpreter command. With no shebang the command is `bash -ec BODY`. A first line beginning
+with `#!` dispatches `sh` to `sh -ec BODY`, `bash` to `bash -ec BODY`, and `python` or
+`python3` to `python3 -c BODY`. A simple absolute interpreter path and `/usr/bin/env NAME`
+form are accepted for those names. Any other shebang or shebang arguments are refused so a
+script cannot silently run under the wrong language. The leading shebang remains part of the
+body; each supported interpreter treats it as a comment.
+
+Inline scripts use the same `--overflow` and `--no-overflow` behavior as trailing commands.
+The default still opts into overflow when the checkout contains a valid
+`.agcoord/overflow.json`; `--no-overflow` keeps the run local, and `--overflow` explicitly
+requires a valid declaration. The script body itself is submitted as command data and does not
+change overflow eligibility.
+
+### Atomic landing
 
 The normal landing operation is one durable request containing the forge adapter/request,
 exact checkout/branch/head, gate command, private caller environment, and resource claim:
@@ -1526,7 +1548,7 @@ as a fresh branch from the current target and rerun the full gate.
 Every accepted job has one stable ID, durable row, and combined stdout/stderr log. Use:
 
 ```bash
-agc list [--repository <repo>] [--agent <agent>] [--kind <kind>] [--limit <n>]
+agc list [--repository <repo>] [--agent <agent>] [--kind <kind>] [--pool <pool>] [--limit <n>]
 agc list --json
 agc show <run-id>
 agc log <run-id> [--follow]
@@ -1536,8 +1558,9 @@ agc cancel <run-id>
 The non-JSON `list` table summarizes each row as `admission-only`, `applied`, `partial`,
 `unapplied`, or `failed`. `list --json` and `show` retain the complete binding, capability, and
 receipt fields so automation can distinguish scheduling, actual application, and measurement.
-Optional `--repository`, `--agent`, `--kind`, and `--limit` filter flags query the broker for
+Optional `--repository`, `--agent`, `--kind`, `--pool`, and `--limit` filter flags query the broker for
 matching runs across the durable spool rather than limiting matches to the global default window.
+`--pool local` selects runs without an overflow placement, including queued runs.
 
 Queued work is cancellable. Running checks and full gates, plus land preflight and gating,
 receive process-group cancellation and become terminal only after every descendant is gone.
@@ -1582,8 +1605,8 @@ declared resources, status, phase, label, timing, head, publication, gate exit, 
 remain inspectable without truncating the durable values. Persistent selection detail includes
 the pool and enforcement summary; the modal detail includes the pool, exact resource contract, and
 sanitized receipt events; and the status bar summarizes configured overflow pools' active
-allocations and remaining daily CPU-hour budgets (with estimated cost when `cpu_hour_price` is
-configured).
+allocations and used/limit daily CPU-hour budgets (with estimated used/limit cost when
+`cpu_hour_price` is configured).
 
 The expected key map is:
 
@@ -1596,17 +1619,18 @@ The expected key map is:
 | `h` | hide or restore terminal history without deleting it or rereading the spool |
 | `k` | open the searchable kind picker |
 | `p` | open the searchable repository picker |
+| `o` | open the searchable pool picker |
 | `a` | open the searchable agent picker |
 | `?` | show context-sensitive help |
 | `q` | quit the view; jobs continue |
 
 Each filter picker starts in a focused search field. Typing narrows the complete snapshot's
 choices, `Tab` moves into the scrollable result menu, and `Enter` applies the highlighted
-choice. `All repositories`, `All agents`, or `All kinds` clears that filter directly; `Esc` closes the picker
+choice. `All repositories`, `All agents`, `All kinds`, or `All pools` clears that filter directly; `Esc` closes the picker
 without changing the current filter. Repository choices show their complete readable remote or
 local identity rather than the internal hashed lane key.
 The broker includes `available_filters` in snapshots with all historically known repositories,
-agents, and kinds across the full spool so pickers remain fully populated with choices even while active
+agents, kinds, and pools across the full spool so pickers remain fully populated with choices even while active
 filters are narrowing visible table rows. Active filters request server-side filtered snapshots from
 the broker, displaying matching runs across the spool beyond the default global recent window.
 The agent picker includes stable named identities and the single `unnamed` value. It omits

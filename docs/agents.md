@@ -18,13 +18,17 @@ Run every check through the local coordinator and declare what it uses:
   PATH="<venv>/bin:$PATH" agc run --label "<what>" --resource cpu=2 -- pytest -q ...
 When .agcoord/overflow.json exists, agc run opts into overflow unless --no-overflow
 is passed. Built-in remote workers run in a container over a working-tree snapshot,
-without host venvs, pre-created host /tmp or /var/tmp files, .git, or host daemons.
-Use bare executable names, checkout-relative paths, and runtime scratch under $TMPDIR;
-never pass host-local interpreter or script paths (/var/tmp/..., host /tmp/ files,
-/home/..., or <venv>/bin/...) or .git commands without --no-overflow. Declare scratch
-resources when needed. Use --no-overflow for checks needing host files or venvs, .git,
-local services or daemons, or unbundled extras. Also use it on agc full and agc land
-when gate scripts check local admission or host user-namespace sandboxes.
+without host venvs, host-local files, .git, or host daemons. Use bare executable names,
+checkout-relative paths, and runtime scratch under $TMPDIR. Put multi-step checks in an
+existing checkout file with --script FILE or pass the script through stdin with --script -;
+the body runs as bash -ec by default, or sh -ec / python3 -c when its first line names
+that interpreter in a shebang. An inline `bash -ec '...'` command also works. Do not create
+host-local wrapper scripts. Keep fast documentation and lint checks that read .git separate,
+submitted with --no-overflow and small resources; do not bundle them with heavy test commands,
+so a heavy suite can overflow cleanly. Declare scratch resources when needed. Use --no-overflow
+for checks needing host files or venvs, .git, local services or daemons, or unbundled extras.
+Also use it on agc full and agc land when gate scripts check local admission or host
+user-namespace sandboxes.
 Land a pull request only through one gate-and-publish request; never merge directly:
   agc land <pr> --resource cpu=4 -- <full test command>
 Never run agc from inside an admitted job. A stale-main or head-changed refusal means:
@@ -40,16 +44,18 @@ Run every check through the local coordinator and declare the resources it uses:
   agc run --label "<ticket> <what>" --resource cpu=<n> -- <command>
 When .agcoord/overflow.json exists, agc run opts into overflow unless --no-overflow
 is passed. Built-in remote workers run in a container over a working-tree snapshot,
-without host venvs, pre-created host /tmp or /var/tmp files, .git, or host daemons.
-Keep commands portable: prepend a local venv to PATH and use bare executable names,
-checkout-relative paths, and runtime scratch under $TMPDIR, for example:
-  PATH="<venv>/bin:$PATH" agc run --label "<what>" --resource cpu=2 -- pytest -q ...
-Declare scratch resources when needed. Never pass host-local interpreter or script
-paths (/var/tmp/..., host /tmp/ files, /home/..., or <venv>/bin/...) or .git
-commands in agc run without --no-overflow. Use --no-overflow for checks needing host
-files or venvs, .git, local services or daemons, or unbundled extras. Also use it on
-agc full and agc land when gate scripts check local admission or host user-namespace
-sandboxes.
+without host venvs, host-local files, .git, or host daemons. Keep commands portable:
+prepend a local venv to PATH and use bare executable names, checkout-relative paths,
+and runtime scratch under $TMPDIR. Put multi-step checks in an existing checkout file
+with --script FILE, or pass the script through stdin with --script -. The body runs as
+bash -ec by default; a first-line shebang can select sh -ec, bash -ec, or python3 -c.
+An inline `bash -ec '...'` command also works. Do not create host-local wrapper scripts.
+Keep fast documentation and lint checks that read .git separate, submitted with
+--no-overflow and small resources; do not bundle them with heavy test commands, so a
+heavy suite can overflow cleanly. Declare scratch resources when needed. Use
+--no-overflow for checks needing host files or venvs, .git, local services or daemons,
+or unbundled extras. Also use it on agc full and agc land when gate scripts check local
+admission or host user-namespace sandboxes.
 Use `agc full` for a clean exact-head verdict when you need one without publishing.
 `full` and `land` execute in reusable coordinator-owned worktrees; checks use your
 checkout. Concurrent edits in your checkout cannot affect the gated files. The row's
@@ -94,18 +100,25 @@ needs temporary space declares the scratch names its broker binds. The
 A checkout containing `.agcoord/overflow.json` opts `agc run`, `agc full`, and `agc land`
 into overflow by default. Local capacity is preferred, but built-in executors can run the
 command in a remote container over a working-tree snapshot. That snapshot includes tracked
-and untracked files, but excludes `.git`, ignored files, and host `/tmp` and `/var/tmp`
-files. Host virtualenvs and daemons are unavailable there. See [overflow pools](coordinator.md#overflow-pools)
+and untracked files, but excludes `.git`, ignored files, and other host-local files. Host
+virtualenvs and daemons are unavailable there. See [overflow pools](coordinator.md#overflow-pools)
 for configuration, placement, and the job image.
 
 Keep `agc run` commands portable: prepend a local venv to `PATH` before invoking `agc`,
 then use bare executable names, checkout-relative paths, and runtime scratch under `$TMPDIR`.
-Declare scratch resources when needed; AGCoord does not provide `TMPDIR` without a scratch
-policy. Do not pass host-local interpreter or script paths such as `/var/tmp/...`, host
-`/tmp/...` files, `/home/...`, or `<venv>/bin/...`, or run `.git` commands, without
-`--no-overflow`. Pass `--no-overflow` for checks needing host files or venvs, `.git`, local
-services or daemons, or extras not bundled in the toolchain image. Pass it on `agc full` and
-`agc land` when gate scripts check local admission or host user-namespace sandboxes.
+For multi-step checks, pass an existing checkout script with `--script FILE` or send its
+UTF-8 body through stdin with `--script -`; AGCoord submits the body as one portable command
+without requiring a host-local wrapper path. The default interpreter is `bash -ec`. A first
+line shebang selects `sh -ec`, `bash -ec`, or `python3 -c`; unsupported interpreters are
+refused. A short one-line command can use `bash -ec '...'` directly. Declare scratch resources
+when needed; AGCoord does not provide `TMPDIR` without a scratch policy.
+
+Fast documentation and lint checks that inspect `.git` are local checks: submit them separately
+with `--no-overflow` and small resource claims. Keep them out of a heavy test command so that
+suite remains eligible to overflow cleanly. Pass `--no-overflow` for checks needing host files
+or venvs, `.git`, local services or daemons, or extras not bundled in the toolchain image. Pass
+it on `agc full` and `agc land` when gate scripts check local admission or host user-namespace
+sandboxes.
 
 Applied overflow scratch is mounted at `/tmp`, with `TMPDIR`, `TMP`, and `TEMP` set to
 that path automatically. SSH and Batch honor `"exec": true` on its binding. Cloud Run

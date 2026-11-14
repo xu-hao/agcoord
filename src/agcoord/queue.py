@@ -1738,6 +1738,7 @@ class CoordinatorClient:
         repository: str | None = None,
         agent: str | None = None,
         kind: str | None = None,
+        pool: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
         arguments: list[str] = []
@@ -1753,6 +1754,10 @@ class CoordinatorClient:
             if not isinstance(kind, str) or not kind.strip():
                 raise CoordinatorError("kind filter must be a non-empty string")
             arguments.extend(["--kind", kind.strip()])
+        if pool is not None:
+            if not isinstance(pool, str) or not pool.strip():
+                raise CoordinatorError("pool filter must be a non-empty string")
+            arguments.extend(["--pool", pool.strip()])
         if limit is not None:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
                 raise CoordinatorError("limit must be a positive integer")
