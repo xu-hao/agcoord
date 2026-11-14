@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Preserve executable tmpfs bindings in SSH and Batch overflow containers, and set
+  `TMPDIR`, `TMP`, and `TEMP` to `/tmp` when overflow scratch is applied. Cloud Run refuses
+  required executable scratch because its volume API cannot guarantee executability.
+  #321 — carry scratch executability and its environment through overflow placement.
+
 - Require Python 3.11 or newer for the `agcoord` client; Python 3.10 is no longer supported.
   #317 — drop Python 3.10 from the supported interpreters, package metadata, and CI matrix.
 

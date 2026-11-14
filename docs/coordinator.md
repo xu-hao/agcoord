@@ -457,6 +457,12 @@ sized `/tmp` (with `inodes` as its inode limit), and `processes` to a process li
 claim of any other kind is refused with exit status 125 before anything runs; a best-effort one
 is skipped.
 
+SSH and Batch preserve the `tmpfs` binding's executability: `"exec": true` adds `exec` to
+the `/tmp` mount options; false or omitted retains the container runtime's `noexec` default.
+Whenever a built-in executor applies scratch, it sets `TMPDIR`, `TMP`, and `TEMP` to `/tmp`
+inside the container, overriding those names passed with `--env`. Admission-only or skipped
+scratch claims do not mount scratch or inject these variables.
+
 #### SSH executor
 
 `agc overflow-ssh` runs a placed job in a container on another machine the operator owns:
@@ -633,6 +639,13 @@ scratch space at `/tmp` and is added to the memory the job is given. A job that 
 gets the most its CPU count allows, 4 GiB for each CPU; claim memory to pay for less. The job
 carries the pool's `max_runtime` as its own timeout and is created to never retry, and the
 executor reads the created job back and refuses to execute one that Cloud Run would retry.
+
+Cloud Run's [in-memory volume API](https://cloud.google.com/run/docs/reference/rest/v1/Volume#EmptyDirVolumeSource)
+exposes a medium and size limit, with no `exec`/`noexec` mount option or documented
+executability guarantee. The executor therefore refuses a required `tmpfs` binding with
+`"exec": true` before building or pushing an image, and skips a best-effort one. Other tmpfs
+bindings use Cloud Run's managed mount defaults; they carry no `noexec` guarantee. Use SSH or
+Batch when scratch executability must match the local binding.
 
 Cloud Run applies the CPU limit from outside the container, and the container cannot read it:
 `nproc` and the processor count Python or a test runner sees can be larger than the CPUs the job

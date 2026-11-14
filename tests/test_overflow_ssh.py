@@ -124,12 +124,15 @@ class Destination:
         environment.update(overrides)
         return environment
 
-    def start(self, *command: str, **overrides: str) -> subprocess.Popen[str]:
+    def start(
+        self, *command: str, options: tuple[str, ...] = (), **overrides: str
+    ) -> subprocess.Popen[str]:
         return subprocess.Popen(
             [
                 sys.executable,
                 "-m",
                 "agcoord.overflow_ssh",
+                *options,
                 "--ssh-option",
                 "Port=2222",
                 "builder@workstation",
@@ -143,8 +146,10 @@ class Destination:
             text=True,
         )
 
-    def run(self, *command: str, **overrides: str) -> subprocess.CompletedProcess[str]:
-        process = self.start(*command, **overrides)
+    def run(
+        self, *command: str, options: tuple[str, ...] = (), **overrides: str
+    ) -> subprocess.CompletedProcess[str]:
+        process = self.start(*command, options=options, **overrides)
         stdout, stderr = process.communicate(timeout=30)
         return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
@@ -225,6 +230,28 @@ def test_a_toolchain_the_destination_already_holds_is_not_sent_again(destination
     assert completed.returncode == 0, completed.stderr
     assert not any(call[0] == "save" for call in destination.calls(remote=False))
     assert not destination.state.joinpath("loaded").exists()
+
+
+@pytest.mark.parametrize("executable", [True, False, None])
+def test_scratch_mount_and_environment_reach_ssh(destination: Destination, executable):
+    binding = {"backend": "cgroup-v2", "kind": "tmpfs", "mode": "required", "unit": "bytes"}
+    if executable is not None:
+        binding["exec"] = executable
+    completed = destination.run(
+        "true",
+        options=("--env=CI", "--env=TMPDIR", "--env=TMP", "--env=TEMP"),
+        AGCOORD_OVERFLOW_RESOURCES=json.dumps({**RESOURCES, "scratch": 1024}),
+        AGCOORD_OVERFLOW_CONTRACT=json.dumps({**CONTRACT, "scratch": binding}),
+        CI="1", TMPDIR="/host/scratch", TMP="/host/tmp", TEMP="/host/temp",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    (run,) = [call for call in destination.calls(remote=True) if call[0] == "run"]
+    assert f"--tmpfs=/tmp:rw,{('exec,' if executable else '')}size=1024" in run
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        assert f"--env={name}=/tmp" in run
+        assert len([arg for arg in run if arg.startswith(f"--env={name}=")]) == 1
+    assert "--env=CI=1" in run
 
 
 def test_the_command_exit_status_is_the_executor_exit_status(destination: Destination):

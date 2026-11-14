@@ -51,6 +51,7 @@ from agcoord.overflow_image import (
     Stopped,
     build_toolchain,
     command_line,
+    container_environment,
     container_tool,
     ignore_stop_signals,
     load_repository_config,
@@ -73,9 +74,11 @@ SIZES = (
 )
 #: Cloud Run limits CPU and memory, and offers sized in-memory scratch space.  It has no
 #: swap, so a limit on swap always holds.  It cannot limit processes or inodes.
+#: Its in-memory volume API exposes no exec/noexec control or executability guarantee.
 CLOUD_RUN = EnforcementTarget(
     description="a Cloud Run job",
     kinds=frozenset({"cpu", "memory", "swap", "tmpfs"}),
+    executable_tmpfs=False,
 )
 #: Cloud Run job names leave room for the suffix Cloud Run adds to each execution's name.
 NAME_LIMIT = 49
@@ -146,13 +149,9 @@ def job_spec(
         "args": list(command[1:]),
         "resources": {"limits": {"cpu": str(size.cpus), "memory": f"{size.memory_mib}Mi"}},
     }
-    variables = [
-        {"name": name_, "value": os.environ[name_]}
-        for name_ in options.passed_environment
-        if name_ in os.environ
-    ]
+    variables = container_environment(os.environ, options.passed_environment, placed.limits)
     if variables:
-        container["env"] = variables
+        container["env"] = [{"name": name, "value": value} for name, value in variables.items()]
     task: dict[str, object] = {
         # Cloud Run retries a failed task three times unless told otherwise, which would
         # run the command again without the broker knowing.

@@ -233,12 +233,17 @@ def test_a_job_too_large_for_cloud_run_is_refused_before_anything_is_built(cloud
     assert cloud.gcloud() == []
 
 
-def test_a_scratch_claim_becomes_sized_in_memory_scratch_space(cloud: Cloud):
+@pytest.mark.parametrize("executable", [False, None])
+def test_a_scratch_claim_becomes_sized_in_memory_scratch_space(cloud: Cloud, executable):
     contract = dict(CONTRACT)
     contract["tmpfs"] = {"backend": "cgroup-v2", "kind": "tmpfs", "mode": "required", "unit": "bytes"}
+    if executable is not None:
+        contract["tmpfs"]["exec"] = executable
 
     completed = cloud.run(
         "true",
+        options=("--env=CI", "--env=TMPDIR", "--env=TMP", "--env=TEMP"),
+        CI="1", TMPDIR="/host/scratch", TMP="/host/tmp", TEMP="/host/temp",
         AGCOORD_OVERFLOW_RESOURCES=json.dumps({**RESOURCES, "tmpfs": 512 * MIB}),
         AGCOORD_OVERFLOW_CONTRACT=json.dumps(contract),
     )
@@ -250,8 +255,36 @@ def test_a_scratch_claim_becomes_sized_in_memory_scratch_space(cloud: Cloud):
     ]
     (container,) = task["containers"]
     assert container["volumeMounts"] == [{"name": "scratch", "mountPath": "/tmp"}]
+    assert {entry["name"]: entry["value"] for entry in container["env"]} == {
+        "CI": "1", "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp"
+    }
+    assert len(container["env"]) == 4
     # The scratch space is paid for out of the container's memory.
     assert container["resources"]["limits"] == {"cpu": "4", "memory": "3584Mi"}
+
+
+@pytest.mark.parametrize("mode", ["required", "best-effort"])
+def test_cloud_run_cannot_guarantee_executable_scratch(cloud: Cloud, mode):
+    completed = cloud.run(
+        "true",
+        AGCOORD_OVERFLOW_RESOURCES=json.dumps({**RESOURCES, "scratch": 512 * MIB}),
+        AGCOORD_OVERFLOW_CONTRACT=json.dumps({
+            **CONTRACT,
+            "scratch": {"backend": "cgroup-v2", "kind": "tmpfs", "mode": mode, "unit": "bytes", "exec": True},
+        }),
+    )
+
+    if mode == "required":
+        assert completed.returncode == 125
+        assert "executable scratch" in completed.stderr
+        assert cloud.docker() == []
+        assert cloud.gcloud() == []
+    else:
+        assert completed.returncode == 0, completed.stderr
+        task = _task(cloud)
+        assert "volumes" not in task
+        assert "volumeMounts" not in task["containers"][0]
+        assert "env" not in task["containers"][0]
 
 
 @pytest.mark.parametrize(
