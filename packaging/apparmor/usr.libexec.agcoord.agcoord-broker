@@ -180,5 +180,18 @@ profile agcoord-gate-git flags=(enforce,attach_disconnected,mediate_deleted) {
 
   /usr/bin/git ix,
   /usr/lib/git-core/git{,-*} ix,
-  /** px -> agcoord-admitted//&agcoord-job,
+
+  # Partition every other executable path by its first component that differs from the two
+  # trusted Git paths. `*` stays within a component; `{,/**}` also covers its descendants.
+  # Explicit short prefixes and the descendants of the trusted files close the gaps left by
+  # the divergence patterns. No px glob overlaps either ix glob, even at equal precedence.
+  /{[^u/]*,u,u[^s/]*,us,us[^r/]*,usr?*}{,/**} px -> agcoord-admitted//&agcoord-job,
+  /usr{,/bin,/lib,/lib/git-core} px -> agcoord-admitted//&agcoord-job,
+  /usr/{[^bl/]*,b,b[^i/]*,bi,bi[^n/]*,bin?*,l,l[^i/]*,li,li[^b/]*,lib?*}{,/**} px -> agcoord-admitted//&agcoord-job,
+  /usr/bin/{[^g/]*,g,g[^i/]*,gi,gi[^t/]*,git?*}{,/**} px -> agcoord-admitted//&agcoord-job,
+  /usr/bin/git/** px -> agcoord-admitted//&agcoord-job,
+  /usr/lib/{[^g/]*,g,g[^i/]*,gi,gi[^t/]*,git,git[^-/]*}{,/**} px -> agcoord-admitted//&agcoord-job,
+  /usr/lib/{git-,git-[^c/]*,git-c,git-c[^o/]*,git-co,git-co[^r/]*,git-cor,git-cor[^e/]*,git-core?*}{,/**} px -> agcoord-admitted//&agcoord-job,
+  /usr/lib/git-core/{[^g/]*,g,g[^i/]*,gi,gi[^t/]*,git[^-/]*}{,/**} px -> agcoord-admitted//&agcoord-job,
+  /usr/lib/git-core/git{,-*}/** px -> agcoord-admitted//&agcoord-job,
 }

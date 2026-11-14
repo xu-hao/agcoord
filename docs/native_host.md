@@ -22,8 +22,11 @@ depend on the invoking shell. The checker rejects a changed package checksum, un
 symlink, non-root archive owner, unsafe mode, changed embedded file, mismatched identity, or
 invalid AppArmor policy. It preserves the archived permissions in its test-owned extraction, so
 it validates the artifact's modes independently of the caller's umask, including the broker's
-restrictive admitted worker umask. The installer rechecks the package before staging and rechecks
-the installed binary's digest and identity after activation. A production activation also
+restrictive admitted worker umask. When `apparmor_parser` is available on `PATH` or in
+`/usr/sbin` or `/sbin`, the checker validates the profile names and enforce modes and compiles
+a non-empty binary without loading it into the kernel; this catches execute-rule conflicts that
+names and debug output alone do not detect. The installer rechecks the package before staging
+and rechecks the installed binary's digest and identity after activation. A production activation also
 requires a release musl identity and installs every live file as root-owned.
 
 The Python wheel intentionally contains no broker executable. “One executable” describes the
@@ -362,8 +365,10 @@ the anchor without requesting a replacement domain after `no_new_privs`.
 Before the admitted transition, exact-head gate setup may execute the fixed `/usr/bin/git`
 helper in `agcoord-gate-git`. This separate profile permits repository worktree metadata and
 spool-cache writes, denies capabilities, namespaces, ptrace and explicit profile changes,
-and sends arbitrary filter/helper executables into the admitted restriction. The launcher
-disables Git hooks and fsmonitor and clears inherited Git environment routing. Ordinary Git
+and retains that profile for the system Git binary and `/usr/lib/git-core/git` and its
+`git-*` helpers. All other executables, including filters and descendants of those paths,
+transition into the admitted restriction. The launcher disables Git hooks and fsmonitor and
+clears inherited Git environment routing. Ordinary Git
 invoked by admitted work stays under its admitted restriction. See
 [gate-tree ownership](coordinator.md#coordinator-owned-gate-trees).
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -55,7 +57,7 @@ def test_native_user_service_passes_systemd_verification(tmp_path: Path):
 
 
 def test_native_apparmor_policy_compiles_with_all_domains():
-    parser = shutil.which("apparmor_parser")
+    parser = shutil.which("apparmor_parser") or shutil.which("apparmor_parser", path="/usr/sbin:/sbin")
     if parser is None:
         pytest.skip("apparmor_parser is unavailable")
     completed = subprocess.run(
@@ -76,8 +78,23 @@ def test_native_apparmor_policy_compiles_with_all_domains():
     }
 
 
+def test_native_apparmor_policy_compiles_to_binary_without_loading(tmp_path: Path):
+    parser = shutil.which("apparmor_parser") or shutil.which("apparmor_parser", path="/usr/sbin:/sbin")
+    if parser is None:
+        pytest.skip("apparmor_parser is unavailable")
+    binary = tmp_path / "policy.bin"
+    completed = subprocess.run(
+        [parser, "--skip-kernel-load", "--skip-cache", "--ofile", str(binary), str(PROFILE)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert binary.stat().st_size > 0
+
+
 def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
-    parser = shutil.which("apparmor_parser")
+    parser = shutil.which("apparmor_parser") or shutil.which("apparmor_parser", path="/usr/sbin:/sbin")
     if parser is None:
         pytest.skip("apparmor_parser is unavailable")
     completed = subprocess.run(
@@ -90,6 +107,199 @@ def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
     diagnostics = completed.stdout + completed.stderr
     assert diagnostics.count("Mode: enforce") == 7, diagnostics
     assert "Mode: default_allow" not in diagnostics
+
+
+def _aare_path_pattern(pattern: str) -> re.Pattern[str]:
+    """Match the path-glob operators used by the shipped exec rules.
+
+    AppArmor's single star and question mark cannot cross a slash; a double star can.
+    Character classes and brace alternatives are kept as separate regex constructs.
+    """
+    parts: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern[index : index + 2] == "**":
+            parts.append(r"[\s\S]*")
+            index += 2
+        elif char == "*":
+            parts.append(r"[^/]*")
+            index += 1
+        elif char == "?":
+            parts.append(r"[^/]")
+            index += 1
+        elif char == "[":
+            end = pattern.index("]", index)
+            parts.append(pattern[index : end + 1])
+            index = end + 1
+        elif char in "{},":
+            parts.append({"{": "(?:", "}": ")", ",": "|"}[char])
+            index += 1
+        else:
+            parts.append(re.escape(char))
+            index += 1
+    return re.compile("".join(parts))
+
+
+def _assert_complete_exec_partition(rules):
+    """Explore every distinct state of the rules' glob automata, including unbounded tails."""
+    def expand(pattern):
+        if "{" not in pattern:
+            return [pattern]
+        start = pattern.index("{")
+        end = pattern.index("}", start)
+        return [
+            expanded
+            for alternative in pattern[start + 1 : end].split(",")
+            for expanded in expand(pattern[:start] + alternative + pattern[end + 1 :])
+        ]
+
+    def tokenize(pattern):
+        tokens = []
+        index = 0
+        while index < len(pattern):
+            char = pattern[index]
+            if pattern[index : index + 2] == "**":
+                tokens.append(("tree", ""))
+                index += 2
+            elif char == "*":
+                tokens.append(("star", ""))
+                index += 1
+            elif char == "?":
+                tokens.append(("any", ""))
+                index += 1
+            elif char == "[":
+                end = pattern.index("]", index)
+                excluded = pattern[index + 1 : end]
+                assert excluded.startswith("^")
+                tokens.append(("except", excluded[1:]))
+                index = end + 1
+            else:
+                tokens.append(("literal", char))
+                index += 1
+        return tokens
+
+    # The final two rules are an independent oracle for the only paths allowed to inherit.
+    oracle = len(rules)
+    patterns = [rule[0] for rule in rules] + ["/usr/bin/git", "/usr/lib/git-core/git{,-*}"]
+    automata = [
+        (rule, tokenize(expanded))
+        for rule, pattern in enumerate(patterns)
+        for expanded in expand(pattern)
+    ]
+    alphabet = {"/", "\x01"}
+    for _, tokens in automata:
+        for kind, value in tokens:
+            if kind in {"literal", "except"}:
+                alphabet.update(value)
+    # All other filename bytes are equivalent to \x01: no literal or class singles them out.
+    assert all("\x01" not in value for _, tokens in automata for _, value in tokens)
+
+    def closure(states):
+        result = set(states)
+        pending = list(result)
+        while pending:
+            pattern, position = pending.pop()
+            tokens = automata[pattern][1]
+            if position < len(tokens) and tokens[position][0] in {"star", "tree"}:
+                following = (pattern, position + 1)
+                if following not in result:
+                    result.add(following)
+                    pending.append(following)
+        return frozenset(result)
+
+    def advance(states, char):
+        following = set()
+        for pattern, position in states:
+            tokens = automata[pattern][1]
+            if position == len(tokens):
+                continue
+            kind, value = tokens[position]
+            if kind == "tree" or (kind == "star" and char != "/"):
+                following.add((pattern, position))
+            elif (kind == "literal" and char == value) or (
+                kind == "any" and char != "/"
+            ) or (kind == "except" and char not in value):
+                following.add((pattern, position + 1))
+        return closure(following)
+
+    start = closure((index, 0) for index in range(len(automata)))
+    first = advance(start, "/")
+    queue = deque([(first, True, "/")])
+    visited = {(first, True)}
+    while queue:
+        states, slash, path = queue.popleft()
+        if not slash:  # Executable paths have a non-empty final component.
+            accepted = {
+                automata[pattern][0]
+                for pattern, position in states
+                if position == len(automata[pattern][1])
+            }
+            matches = [rules[index] for index in accepted if index < oracle]
+            expected = ("ix", None) if any(index >= oracle for index in accepted) else (
+                "px", "agcoord-admitted//&agcoord-job"
+            )
+            assert len(matches) == 1 and matches[0][2:] == expected, (path, matches, expected)
+        for char in alphabet:
+            if slash and char == "/":
+                continue  # AppArmor sees normalized paths, without empty components.
+            following = advance(states, char)
+            key = (following, char == "/")
+            if key not in visited:
+                visited.add(key)
+                queue.append((following, char == "/", path + char))
+
+
+def test_gate_git_exec_rules_partition_paths_without_overlapping():
+    policy = PROFILE.read_text(encoding="utf-8")
+    gate = policy.split("profile agcoord-gate-git ", 1)[1].split("\n}", 1)[0]
+    rules = []
+    for line in gate.splitlines():
+        match = re.fullmatch(r"\s*(/\S+)\s+(ix|px)(?: -> (\S+))?,", line)
+        if match:
+            glob, mode, target = match.groups()
+            rules.append((glob, _aare_path_pattern(glob), mode, target))
+    assert rules
+    _assert_complete_exec_partition(rules)
+
+    cases = {
+        "/a", "/u", "/us", "/usr", "/usr/a", "/usr/b", "/usr/bi",
+        "/usr/bin", "/usr/bin2/x", "/usr/bin/g", "/usr/bin/gi", "/usr/bin/git",
+        "/usr/bin/gitx", "/usr/bin/git/x", "/usr/bin/sh", "/bin/sh", "/usr/l",
+        "/usr/li", "/usr/lib", "/usr/lib64/x", "/usr/lib/g", "/usr/lib/gi",
+        "/usr/lib/git", "/usr/lib/git-", "/usr/lib/git-c", "/usr/lib/git-co",
+        "/usr/lib/git-cor", "/usr/lib/git-core", "/usr/lib/git-core2/x",
+        "/usr/lib/git-core/g", "/usr/lib/git-core/gi", "/usr/lib/git-core/git",
+        "/usr/lib/git-core/git-", "/usr/lib/git-core/git-checkout--worker",
+        "/usr/lib/git-core/git-upload-pack", "/usr/lib/git-core/gitx",
+        "/usr/lib/git-core/git/x", "/usr/lib/git-core/git-upload-pack/x",
+        "/usr/lib/git-core/scalar", "/tmp/filter",
+    }
+    # Cover each byte at every divergence from a trusted path, plus both a component tail and
+    # deeper descendants. This checks short prefixes, arbitrary filenames and slash boundaries.
+    for trusted in ("/usr/bin/git", "/usr/lib/git-core/git", "/usr/lib/git-core/git-upload-pack"):
+        for index in range(1, len(trusted) + 1):
+            prefix = trusted[:index]
+            if not prefix.endswith("/"):
+                cases.add(prefix)
+            for byte in range(1, 256):
+                for suffix in ("", "x", "/x", "/x/y"):
+                    path = prefix + chr(byte) + suffix
+                    if "//" not in path and not path.endswith("/"):
+                        cases.add(path)
+
+    target = "agcoord-admitted//&agcoord-job"
+    for path in cases:
+        trusted_git = path == "/usr/bin/git" or re.fullmatch(
+            r"/usr/lib/git-core/git(?:-[^/]*)?", path
+        ) is not None
+        expected = ("ix", None) if trusted_git else ("px", target)
+        matched = [
+            (glob, mode, destination)
+            for glob, regex, mode, destination in rules
+            if regex.fullmatch(path)
+        ]
+        assert len(matched) == 1 and matched[0][1:] == expected, (path, matched, expected)
 
 
 def test_native_apparmor_transitions_are_safe_after_no_new_privileges():
