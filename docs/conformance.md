@@ -23,6 +23,11 @@ It also proves machine-wide front-row reservations across row kinds, backfilling
 unreserved capacity, exclusion of repository-blocked and oversized overflow-only rows from
 reservation, and overflow placement of reservation-blocked work after the pool threshold.
 
+Repository coverage also proves reusable coordinator-owned exact-head gate trees, stable
+logical worktree identity, same-branch serialization, warm artifact retention, and setup
+refusals. A deliberately blocked setup proves checks stay responsive and cancellation and
+owner replacement do not release the branch reservation while setup still lives.
+
 Contention coverage includes durable maintenance draining: competing submissions linearize
 entirely before or after the guard, accepted work and authoritative publication complete, a
 crashed owner is replaced only to recover live work, migration preserves the marker, host

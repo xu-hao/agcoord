@@ -633,6 +633,42 @@ fn submit_in_worktree(
     environment: &[(&str, &str)],
     worktree_id: Option<&str>,
 ) -> Output {
+    // Exact-head jobs exercise real Git materialization at admission. Other kinds
+    // share this fixture so a preceding receipt and publication name the same head.
+    if submission.checkout.is_dir() && !submission.checkout.join(".git").exists() {
+        for arguments in [
+            vec!["init", "-q", "-b", "ticket"],
+            vec!["config", "user.name", "AGCoord test"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["commit", "-q", "--allow-empty", "-m", "initial"],
+        ] {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(submission.checkout)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    let head_output = Command::new("git")
+        .arg("-C")
+        .arg(submission.checkout)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let head = if head_output.status.success() {
+        String::from_utf8(head_output.stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
+    } else {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+    };
     let selected_worktree = worktree_id
         .map(str::to_owned)
         .unwrap_or_else(|| format!("worktree-{}", submission.repository));
@@ -657,7 +693,7 @@ fn submit_in_worktree(
         "--branch".to_owned(),
         "ticket".to_owned(),
         "--head".to_owned(),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        head,
         "--resource".to_owned(),
         "jobs=1".to_owned(),
         "--caller-pid".to_owned(),
@@ -1261,11 +1297,17 @@ fn front_row_ignores_repository_blocked_rows() {
     }
     assert_eq!(
         status(&state, "land-second")["blocked_by"],
-        json!(["repository:repo-a:active:land-active", "resource:cpu"])
+        json!([
+            "gate-tree:active:land-active",
+            "repository:repo-a:active:land-active",
+            "resource:cpu"
+        ])
     );
     assert_eq!(
         status(&state, "land-third")["blocked_by"],
         json!([
+            "gate-tree:active:land-active",
+            "gate-tree:fifo:land-second",
             "repository:repo-a:active:land-active",
             "repository:repo-a:fifo:land-second",
             "resource:cpu"
@@ -1490,7 +1532,9 @@ fn land_barrier_excludes_only_lane_work_in_its_own_worktree() {
     // though a same-worktree check queued ahead of it; that check and the second land
     // stay behind the barrier.
     wait_status(&state, "check-other-worktree", "passed");
-    wait_status(&state, "full-other-worktree", "passed");
+    let full = status(&state, "full-other-worktree");
+    assert_eq!(full["status"], "queued");
+    assert_eq!(full["blocked_by"], json!(["gate-tree:active:land-first"]));
     assert!(!same.exists());
     assert!(!second_entered.exists());
     let same_worktree = status(&state, "check-same-worktree");
@@ -1503,7 +1547,12 @@ fn land_barrier_excludes_only_lane_work_in_its_own_worktree() {
     assert_eq!(second["status"], "queued");
     assert_eq!(
         second["blocked_by"],
-        json!(["repository:repo-a:active:land-first"])
+        json!([
+            "gate-tree:active:land-first",
+            "gate-tree:fifo:full-other-worktree",
+            "repository:repo-a:active:land-first",
+            "repository:repo-a:fifo:full-other-worktree"
+        ])
     );
     assert_eq!(status(&state, "land-first")["status"], "running");
 
@@ -1511,6 +1560,7 @@ fn land_barrier_excludes_only_lane_work_in_its_own_worktree() {
     // other worktree) overlap: two lands never do.
     fs::write(&first_release, "release").unwrap();
     wait_status(&state, "land-first", "passed");
+    wait_status(&state, "full-other-worktree", "passed");
     wait_status(&state, "check-same-worktree", "passed");
     wait_for(Duration::from_secs(5), || second_entered.exists());
     assert_eq!(status(&state, "land-second")["status"], "running");
@@ -5233,13 +5283,17 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
 
-    for (mode, expected_status, expected_event_status, user_code_runs) in [
-        ("required", "failed", "failed", false),
-        ("best-effort", "passed", "unapplied", true),
+    for (kind, mode, expected_status, expected_event_status, user_code_runs) in [
+        ("check", "required", "failed", "failed", false),
+        ("check", "best-effort", "passed", "unapplied", true),
+        ("full", "required", "failed", "failed", false),
+        ("full", "best-effort", "passed", "unapplied", true),
     ] {
-        let state = temporary.path().join(format!("state-{mode}"));
-        let root = temporary.path().join(format!("delegated-{mode}"));
-        let report = temporary.path().join(format!("environment-{mode}.json"));
+        let state = temporary.path().join(format!("state-{kind}-{mode}"));
+        let root = temporary.path().join(format!("delegated-{kind}-{mode}"));
+        let report = temporary
+            .path()
+            .join(format!("environment-{kind}-{mode}.json"));
         fs::create_dir(&state).unwrap();
         fs::create_dir(&root).unwrap();
         fs::write(
@@ -5274,13 +5328,13 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
         );
         let submission = Submission {
             run_id: mode,
-            kind: "check",
+            kind,
             repository: "repo-a",
             checkout: &checkout,
             command: vec![
                 "/usr/bin/python3".to_owned(),
                 "-c".to_owned(),
-                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}), encoding='ascii')".to_owned(),
+                "import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({**{name: os.environ.get(name) for name in ('TMPDIR','TMP','TEMP')}, 'checkout': os.getcwd()}), encoding='ascii')".to_owned(),
                 report.to_string_lossy().into_owned(),
             ],
             gate_run_id: None,
@@ -5304,8 +5358,11 @@ fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
         if user_code_runs {
             assert_eq!(
                 serde_json::from_str::<Value>(&fs::read_to_string(&report).unwrap()).unwrap(),
-                json!({"TMPDIR": null, "TMP": null, "TEMP": null})
+                json!({"TMPDIR": null, "TMP": null, "TEMP": null, "checkout": finished["checkout"]})
             );
+        }
+        if kind == "full" && user_code_runs {
+            assert_ne!(finished["checkout"], checkout.to_string_lossy().as_ref());
         }
         assert_eq!(
             finished["failure_reason"],
@@ -7520,8 +7577,8 @@ fn migration_requires_a_complete_wal_checkpoint_before_backup() {
 fn admission_probe(checkout: &Path, report: &Path, depth: usize) -> Vec<String> {
     let verify = concat!(
         "python3 -m agcoord verify-admission --state-dir \"$AGCOORD_STATE_DIR\" ",
-        "--checkout \"$1\" --run-id \"$AGCOORD_RUN_ID\" --kind \"$AGCOORD_RUN_KIND\" ",
-        "--head-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --worker-pid $$ 2>\"$2.err\"; ",
+        "--checkout \"$PWD\" --run-id \"$AGCOORD_RUN_ID\" --kind \"$AGCOORD_RUN_KIND\" ",
+        "--head-sha \"$(git rev-parse HEAD)\" --worker-pid $$ 2>\"$2.err\"; ",
         "printf '%s %s' $? $$ >\"$2\"",
     );
     // Each nesting level is one more real child process presenting its own `$$`.
@@ -8747,4 +8804,247 @@ fn an_executor_that_cannot_obtain_a_verdict_ends_the_run_without_one() {
     assert_eq!(lost["exit_status"], 125);
     assert!(!must_not_run.exists());
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn gate_trees_isolate_exact_heads_and_serialize_one_branch() {
+    let temporary = TestDirectory::new("gate-isolation");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 3)]);
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let second = temporary.path().join("second");
+    let _releases = ReleaseFiles(vec![release.clone()]);
+    // Initialize the real source through the common submission fixture.
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "initialize",
+            kind: "check",
+            repository: "repo",
+            checkout: &checkout,
+            command: vec!["/bin/true".into()],
+            gate_run_id: None,
+        },
+    );
+    wait_status(&state, "initialize", "passed");
+    fs::write(checkout.join("tracked"), "committed\n").unwrap();
+    fs::write(checkout.join(".gitignore"), "cache/\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "tracked"]] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut command = blocking_command(&entered, &release, None);
+    // The wrapper waits in the gate tree, then verifies committed content there.
+    let wait = command[2].clone();
+    command[2] = format!(
+        "mkdir -p cache; echo warm >cache/artifact; {wait}; test \"$(cat tracked)\" = committed"
+    );
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "full-first",
+            kind: "full",
+            repository: "repo",
+            checkout: &checkout,
+            command,
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || entered.exists());
+    let first = status(&state, "full-first");
+    let gate = PathBuf::from(first["checkout"].as_str().unwrap());
+    assert_ne!(gate, checkout);
+    assert_eq!(first["worktree_id"], "worktree-repo");
+    let stamp = fs::metadata(gate.join("tracked"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::write(checkout.join("tracked"), "concurrent edit\n").unwrap();
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "full-second",
+            kind: "full",
+            repository: "repo",
+            checkout: &checkout,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "test \"$(cat cache/artifact)\" = warm && touch '{}'",
+                    second.display()
+                ),
+            ],
+            gate_run_id: None,
+        },
+    );
+    let queued = status(&state, "full-second");
+    assert!(
+        queued["blocked_by"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("gate-tree:active:full-first"))
+    );
+    assert!(!second.exists());
+    fs::write(&release, "go").unwrap();
+    wait_status(&state, "full-first", "passed");
+    let finished = wait_status(&state, "full-second", "passed");
+    assert_eq!(finished["checkout"], first["checkout"]);
+    assert_eq!(
+        fs::metadata(gate.join("tracked"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        stamp
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("tracked")).unwrap(),
+        "concurrent edit\n"
+    );
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn pending_gate_setup_is_nonblocking_cancellable_and_recoverable() {
+    use std::os::fd::AsRawFd;
+    let temporary = TestDirectory::new("gate-pending");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 3)]);
+    let root = state.join("gate-trees");
+    fs::create_dir(&root).unwrap();
+    let lock = fs::File::create(root.join("setup.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let marker = temporary.path().join("must-not-run");
+    for run_id in ["full-cancel", "full-recovery"] {
+        submit_ok(
+            &state,
+            &Submission {
+                run_id,
+                kind: "full",
+                repository: "repo",
+                checkout: &checkout,
+                command: touch_command(&marker),
+                gate_run_id: None,
+            },
+        );
+    }
+    wait_for(Duration::from_secs(5), || {
+        status(&state, "full-cancel")["worker_pid"].is_number()
+    });
+    let check = temporary.path().join("check");
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "check-responsive",
+            kind: "check",
+            repository: "repo",
+            checkout: &checkout,
+            command: touch_command(&check),
+            gate_run_id: None,
+        },
+    );
+    wait_status(&state, "check-responsive", "passed");
+    assert!(check.exists());
+    assert!(
+        run(&[
+            "cancel",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "full-cancel"
+        ])
+        .status
+        .success()
+    );
+    wait_status(&state, "full-cancel", "cancelled");
+    wait_for(Duration::from_secs(5), || {
+        status(&state, "full-recovery")["worker_pid"].is_number()
+    });
+    // Simulate owner loss while the authenticated launcher is still waiting on setup.
+    broker.child.as_mut().unwrap().kill().unwrap();
+    broker.child.as_mut().unwrap().wait().unwrap();
+    broker.child.take();
+    let mut replacement = RunningBroker::start(&state, &[("jobs", 3)]);
+    let recovered = wait_status(&state, "full-recovery", "interrupted");
+    assert_eq!(recovered["failure_reason"], "worker-setup-lost");
+    assert!(!marker.exists());
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "full-retry",
+            kind: "full",
+            repository: "repo",
+            checkout: &checkout,
+            command: vec!["/bin/true".into()],
+            gate_run_id: None,
+        },
+    );
+    wait_status(&state, "full-retry", "passed");
+    assert!(replacement.terminate().success());
+}
+
+#[test]
+fn gate_setup_refuses_missing_checkout_head_and_cache_failures() {
+    for (damage, reason) in [
+        ("checkout", "gate-tree-checkout-missing"),
+        ("head", "gate-tree-head-missing"),
+        ("cache", "gate-tree-setup-failed"),
+    ] {
+        let temporary = TestDirectory::new(&format!("gate-refusal-{damage}"));
+        let state = temporary.path().join("state");
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+        let entered = temporary.path().join("entered");
+        let release = temporary.path().join("release");
+        let _releases = ReleaseFiles(vec![release.clone()]);
+        submit_ok(
+            &state,
+            &Submission {
+                run_id: "hold",
+                kind: "check",
+                repository: "repo",
+                checkout: &checkout,
+                command: blocking_command(&entered, &release, None),
+                gate_run_id: None,
+            },
+        );
+        wait_for(Duration::from_secs(5), || entered.exists());
+        let marker = temporary.path().join("must-not-run");
+        submit_ok(
+            &state,
+            &Submission {
+                run_id: "full-refused",
+                kind: "full",
+                repository: "repo",
+                checkout: &checkout,
+                command: touch_command(&marker),
+                gate_run_id: None,
+            },
+        );
+        match damage {
+            "checkout" => fs::rename(&checkout, temporary.path().join("moved")).unwrap(),
+            "head" => fs::remove_dir_all(checkout.join(".git")).unwrap(),
+            _ => fs::write(state.join("gate-trees"), "not a directory").unwrap(),
+        }
+        fs::write(&release, "go").unwrap();
+        let row = wait_status(&state, "full-refused", "failed");
+        assert_eq!(row["failure_reason"], reason);
+        assert_eq!(row["exit_status"], 125);
+        assert!(!marker.exists());
+        assert!(broker.terminate().success());
+    }
 }

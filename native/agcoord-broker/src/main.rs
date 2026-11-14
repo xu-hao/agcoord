@@ -1,6 +1,7 @@
 mod broker;
 mod cgroup;
 mod error;
+mod gate_tree;
 mod host;
 mod overflow;
 mod platform;

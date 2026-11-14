@@ -166,7 +166,7 @@ case "$action" in
             loaded=$(sed -n 's/ (enforce)$//p' \
                 /sys/kernel/security/apparmor/profiles | LC_ALL=C sort -u)
             for domain in agcoord-admitted agcoord-broker agcoord-broker-client \
-                agcoord-bwrap agcoord-bwrap-child agcoord-job; do
+                agcoord-bwrap agcoord-bwrap-child agcoord-job agcoord-gate-git; do
                 if ! grep -qxF "$domain" <<<"$loaded"; then
                     printf 'AppArmor domain %s is not loaded in enforce mode\n' "$domain" >&2
                     exit 1

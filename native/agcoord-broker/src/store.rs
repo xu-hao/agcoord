@@ -1811,6 +1811,19 @@ fn row_blockers(
         })
         .collect();
     let mut reasons = Vec::new();
+    // Exact-head gates for a branch share a coordinator-owned checkout.  Reserve it
+    // from admission through completion, including while the launcher prepares it.
+    if matches!(run.kind.as_str(), "full" | "land") {
+        let same_gate_tree = |candidate: &&RunRecord| {
+            matches!(candidate.kind.as_str(), "full" | "land") && candidate.branch == run.branch
+        };
+        if let Some(candidate) = same_active.iter().copied().find(same_gate_tree) {
+            reasons.push(format!("gate-tree:active:{}", candidate.run_id));
+        }
+        if let Some(candidate) = earlier.iter().copied().find(same_gate_tree) {
+            reasons.push(format!("gate-tree:fifo:{}", candidate.run_id));
+        }
+    }
     // A barrier (land or retained merge) excludes every other barrier in its lane and
     // every job that shares its worktree.  Ordinary work in another worktree of the same
     // repository only competes for capacity.

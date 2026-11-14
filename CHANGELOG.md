@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Run `full` and `land` in coordinator-owned reusable Git worktrees, preserving warm
+  ignored caches and unchanged tracked mtimes while isolating verdicts from concurrent
+  submitter edits. Prepare trees asynchronously, serialize gates on one branch, retain
+  logical receipt identity for `--reuse-full`, bound idle cache retention, and synchronize
+  landing targets without advancing the submitter's checkout. #230 — isolate exact-head
+  gating and publication in coordinator-owned worktrees.
+
 - Add `--script FILE` and `--script -` to `agc run` and `agc full`, passing validated UTF-8
   script bodies through portable `bash`, `sh`, or Python interpreter commands. Refresh agent
   guidance to use inline scripts for multi-step checks and keep fast local documentation and

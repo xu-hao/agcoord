@@ -374,6 +374,7 @@ def _synchronize_target(
     out: TextIO,
     err: TextIO,
     avoid_commits: Mapping[str, str] | None = None,
+    allow_detached: bool = False,
 ) -> tuple[int, str]:
     """Merge one observed target into the source and push it with an exact lease."""
     expected_head = _sha(head_sha, field="submitted head")
@@ -381,9 +382,8 @@ def _synchronize_target(
         selected = Path(checkout).expanduser().resolve()
         current_branch = _git(
             selected,
-            "symbolic-ref",
-            "--quiet",
-            "--short",
+            "rev-parse",
+            "--abbrev-ref",
             "HEAD",
             operation="target synchronization requires the submitted branch",
         )
@@ -400,7 +400,11 @@ def _synchronize_target(
             "--untracked-files=all",
             operation="cannot inspect source before target synchronization",
         )
-        if current_branch != branch or current_head != expected_head or dirty:
+        if (
+            (current_branch != branch and not (allow_detached and current_branch == "HEAD"))
+            or current_head != expected_head
+            or dirty
+        ):
             raise _MergeRefusal(
                 EXIT_HEAD_CHANGED,
                 "source checkout changed before target synchronization",
@@ -631,6 +635,7 @@ def execute(
     err: TextIO,
     replaced_head: str | None = None,
     wait: Wait | None = None,
+    allow_detached: bool = False,
 ) -> int:
     """Validate and conditionally publish one exact gated head.
 
@@ -684,13 +689,12 @@ def execute(
             )
         current_branch = _git(
             selected,
-            "symbolic-ref",
-            "--quiet",
-            "--short",
+            "rev-parse",
+            "--abbrev-ref",
             "HEAD",
             operation="merge checkout must be on the receipted branch and head",
         )
-        if current_branch != branch:
+        if current_branch != branch and not (allow_detached and current_branch == "HEAD"):
             raise _MergeRefusal(
                 EXIT_MERGE_ERROR,
                 f"merge checkout branch is {current_branch!r}, expected {branch!r}",
@@ -934,6 +938,7 @@ def preflight(
     err: TextIO,
     replaced_head: str | None = None,
     wait: Wait | None = None,
+    allow_detached: bool = False,
 ) -> int:
     """Run exact publication validation without creating a forge object.
 
@@ -945,6 +950,7 @@ def preflight(
         status = execute(
             pull_request,
             checkout=checkout,
+            allow_detached=allow_detached,
             branch=branch,
             head_sha=head_sha,
             metadata_client=metadata_client,
@@ -977,6 +983,7 @@ def prepare(
     head_changed: Callable[[str, str], None] | None = None,
     wait: Wait | None = None,
     avoid_commits: Mapping[str, str] | None = None,
+    allow_detached: bool = False,
 ) -> tuple[int, str]:
     """Reach one exact preflight head, synchronizing an advanced target by default."""
     effective_head = _sha(head_sha, field="submitted head")
@@ -988,6 +995,7 @@ def prepare(
         status = preflight(
             pull_request,
             checkout=checkout,
+            allow_detached=allow_detached,
             branch=branch,
             head_sha=effective_head,
             metadata_client=metadata_client,
@@ -1011,6 +1019,7 @@ def prepare(
         status, synchronized_head = _synchronize_target(
             pull_request,
             checkout=checkout,
+            allow_detached=allow_detached,
             branch=branch,
             head_sha=effective_head,
             metadata_client=metadata_client,

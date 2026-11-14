@@ -92,6 +92,10 @@ enum SetupCode {
     TmpfsReportFailed = 17,
     ProfileTransitionFailed = 18,
     ProfileTransitionUnverified = 19,
+    GateCheckoutMissing = 20,
+    GateHeadMissing = 21,
+    GateSetupFailed = 22,
+    GateCapacity = 23,
 }
 
 impl SetupCode {
@@ -117,6 +121,10 @@ impl SetupCode {
             17 => Some(Self::TmpfsReportFailed),
             18 => Some(Self::ProfileTransitionFailed),
             19 => Some(Self::ProfileTransitionUnverified),
+            20 => Some(Self::GateCheckoutMissing),
+            21 => Some(Self::GateHeadMissing),
+            22 => Some(Self::GateSetupFailed),
+            23 => Some(Self::GateCapacity),
             _ => None,
         }
     }
@@ -154,6 +162,10 @@ impl SetupCode {
     fn stable_code(self) -> Option<&'static str> {
         match self {
             Self::Ok => None,
+            Self::GateCheckoutMissing => Some("gate-tree-checkout-missing"),
+            Self::GateHeadMissing => Some("gate-tree-head-missing"),
+            Self::GateSetupFailed => Some("gate-tree-setup-failed"),
+            Self::GateCapacity => Some("gate-tree-capacity"),
             Self::PrivilegeDropFailed => Some("worker-privilege-drop-failed"),
             Self::PrivilegeDropUnverified => Some("worker-privilege-drop-unverified"),
             Self::DescriptorLeak => Some("worker-descriptor-leak"),
@@ -208,7 +220,11 @@ impl SetupCode {
             | Self::PrivilegeDropUnverified
             | Self::DescriptorLeak
             | Self::ProfileTransitionFailed
-            | Self::ProfileTransitionUnverified => None,
+            | Self::ProfileTransitionUnverified
+            | Self::GateCheckoutMissing
+            | Self::GateHeadMissing
+            | Self::GateSetupFailed
+            | Self::GateCapacity => None,
             code => code.stable_code(),
         }
     }
@@ -216,6 +232,7 @@ impl SetupCode {
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkerSetup {
+    pub gate_tree: Option<crate::gate_tree::GateTree>,
     pub isolate_cgroup: bool,
     pub tmpfs: Option<TmpfsSetup>,
     pub project_quota: Option<PathBuf>,
@@ -238,6 +255,8 @@ struct CapabilityData {
 
 struct ExecPlan {
     executable: CString,
+    command: Vec<String>,
+    environment: BTreeMap<String, String>,
     _arguments: Vec<CString>,
     argument_pointers: Vec<*const libc::c_char>,
     _environment: Vec<CString>,
@@ -259,7 +278,12 @@ impl ExecPlan {
         fault: Option<WorkerFault>,
         setup: WorkerSetup,
     ) -> Result<Self> {
-        let executable = resolve_executable(&command[0], environment, checkout)?;
+        let executable = if setup.gate_tree.is_some() {
+            CString::new(command[0].as_bytes())
+                .map_err(|_| AppError::new("broker-worker-start-failed", "invalid executable"))?
+        } else {
+            resolve_executable(&command[0], environment, checkout)?
+        };
         let arguments = command
             .iter()
             .map(|argument| {
@@ -314,6 +338,8 @@ impl ExecPlan {
         no_scratch_environment_pointers.push(ptr::null());
         Ok(Self {
             executable,
+            command: command.to_vec(),
+            environment: environment.clone(),
             _arguments: arguments,
             argument_pointers,
             _environment: environment_values,
@@ -842,6 +868,14 @@ fn cleanup_emulated_tmpfs(setup: &TmpfsSetup) {
 }
 
 fn exec_plan(plan: &ExecPlan, scratch_available: bool) -> ! {
+    let executable = if let Some(tree) = &plan.setup.gate_tree {
+        match resolve_executable(&plan.command[0], &plan.environment, &tree.checkout) {
+            Ok(path) => path,
+            Err(_) => unsafe { libc::_exit(127) },
+        }
+    } else {
+        plan.executable.clone()
+    };
     close_all_except(&[]);
     if !descriptors_are_exactly(&[]) {
         unsafe { libc::_exit(125) }
@@ -858,7 +892,7 @@ fn exec_plan(plan: &ExecPlan, scratch_available: bool) -> ! {
             &plan.no_scratch_environment_pointers
         };
         libc::execve(
-            plan.executable.as_ptr(),
+            executable.as_ptr(),
             plan.argument_pointers.as_ptr(),
             environment.as_ptr(),
         );
@@ -995,9 +1029,24 @@ fn child_main(
 
     let mut tmpfs_baseline = None;
     let mut code = SetupCode::Ok;
-    if plan.fault == Some(WorkerFault::NamespaceIsolationUnavailable) {
+    if let Some(tree) = &plan.setup.gate_tree
+        && let Err(error) = tree.prepare()
+    {
+        eprintln!(
+            "gate tree setup refused ({}): {}",
+            error.code, error.message
+        );
+        code = match error.code {
+            "gate-tree-checkout-missing" => SetupCode::GateCheckoutMissing,
+            "gate-tree-head-missing" => SetupCode::GateHeadMissing,
+            "gate-tree-capacity" => SetupCode::GateCapacity,
+            _ => SetupCode::GateSetupFailed,
+        };
+    }
+    if code == SetupCode::Ok && plan.fault == Some(WorkerFault::NamespaceIsolationUnavailable) {
         code = SetupCode::NamespaceIsolationUnavailable;
-    } else if plan.setup.isolate_cgroup
+    } else if code == SetupCode::Ok
+        && plan.setup.isolate_cgroup
         && let Err(error) = isolate_current_cgroup()
     {
         code = SetupCode::from_resource_error(&error.code);
@@ -1123,6 +1172,7 @@ pub struct PendingWorker {
     start_token: String,
     fault: Option<WorkerFault>,
     setup_verified: bool,
+    setup_started: Option<Instant>,
 }
 
 impl PendingWorker {
@@ -1198,6 +1248,7 @@ impl PendingWorker {
             start_token: String::new(),
             fault,
             setup_verified: false,
+            setup_started: None,
         };
         let mut hello = [0_u8; HELLO_BYTES];
         read_exact_timeout(pending.setup.as_ref().unwrap().as_raw_fd(), &mut hello).map_err(
@@ -1241,7 +1292,7 @@ impl PendingWorker {
         &self.start_token
     }
 
-    pub fn verify_setup(&mut self) -> Result<Option<&'static str>> {
+    pub fn begin_setup(&mut self) -> Result<()> {
         if self.fault == Some(WorkerFault::SubstitutedChannel) {
             if let Ok((substitute_read, substitute_write)) = create_pipe() {
                 let mut substitute = unsafe { File::from_raw_fd(substitute_write) };
@@ -1271,6 +1322,33 @@ impl PendingWorker {
                     "native worker release channel closed before setup",
                 )
             })?;
+        self.setup_started = Some(Instant::now());
+        Ok(())
+    }
+
+    pub fn setup_ready(&self) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.setup.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // A large repository may take minutes. Bound setup without blocking any tick.
+        (unsafe { libc::poll(&mut poll, 1, 0) > 0 })
+            || self
+                .setup_started
+                .is_some_and(|start| start.elapsed() >= Duration::from_secs(300))
+    }
+
+    pub fn verify_setup(&mut self) -> Result<Option<&'static str>> {
+        if self
+            .setup_started
+            .is_some_and(|start| start.elapsed() >= Duration::from_secs(300))
+        {
+            return Err(AppError::new(
+                "gate-tree-setup-failed",
+                "worker setup exceeded five minutes",
+            ));
+        }
         let mut setup = [0_u8; SETUP_BYTES];
         read_exact_timeout(self.setup.as_ref().unwrap().as_raw_fd(), &mut setup).map_err(|_| {
             AppError::new(
@@ -1299,6 +1377,12 @@ impl PendingWorker {
         }
         self.setup_verified = true;
         Ok(None)
+    }
+
+    pub fn abort(mut self) -> NativeWorker {
+        let worker = self.worker.take().unwrap();
+        let _ = signal_process_group(worker.pid(), libc::SIGTERM);
+        worker
     }
 
     pub fn release(mut self) -> Result<NativeWorker> {
@@ -1484,6 +1568,7 @@ mod tests {
                 &log,
                 None,
                 WorkerSetup {
+                    gate_tree: None,
                     isolate_cgroup: false,
                     tmpfs: Some(setup.clone()),
                     project_quota: None,

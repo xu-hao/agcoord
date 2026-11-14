@@ -22,6 +22,7 @@ profile agcoord-broker /usr/libexec/agcoord/agcoord-broker flags=(enforce,attach
 
   # The trusted launcher changes to admitted before no_new_privs. Any setup-domain exec fallback
   # still leaves this profile, and never for the unstacked admitted anchor.
+  /usr/bin/git px -> agcoord-gate-git,
   /usr/libexec/agcoord/agcoord-broker px -> agcoord-broker-client,
   /** px -> agcoord-admitted//&agcoord-job,
 }
@@ -158,4 +159,26 @@ profile agcoord-bwrap-child flags=(enforce,attach_disconnected,mediate_deleted) 
   deny /proc/thread-self/attr/{,apparmor/}{current,exec} w,
 
   /** ix,
+}
+
+# Fixed Git helper used only by the trusted forked launcher to materialize gate trees.
+# It needs repository .git/worktrees and the spool cache, but no launcher privileges.
+# Filters/helpers leave this profile for the admitted stack. Hooks and fsmonitor are
+# also disabled by the fixed invocation. Ordinary admitted Git never enters here.
+profile agcoord-gate-git flags=(enforce,attach_disconnected,mediate_deleted) {
+  allow network,
+  allow signal,
+  allow file rwlkm /{,**},
+  allow unix,
+  deny capability,
+  deny userns,
+  deny ptrace,
+  deny change_profile,
+  deny /proc/@{pid}/attr/{,apparmor/}{current,exec} w,
+  deny /proc/self/attr/{,apparmor/}{current,exec} w,
+  deny /proc/thread-self/attr/{,apparmor/}{current,exec} w,
+
+  /usr/bin/git ix,
+  /usr/lib/git-core/git{,-*} ix,
+  /** px -> agcoord-admitted//&agcoord-job,
 }
