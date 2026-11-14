@@ -40,6 +40,10 @@ fn git(path: &Path, arguments: &[&str]) -> Result<String> {
             "core.fsmonitor=false",
             "-c",
             "submodule.recurse=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
             "-C",
         ])
         .arg(path)
@@ -125,13 +129,15 @@ impl GateTree {
             return Err(failure("cannot lock gate-tree setup"));
         }
         let state = root.parent().unwrap();
-        let connection = crate::store::connect(&crate::store::Paths::new(state))?;
-        let protected: Vec<_> = crate::store::load_live_runs(&connection)?
-            .into_iter()
-            .filter(|run| run.status == "running" && matches!(run.kind.as_str(), "full" | "land"))
-            .map(|run| Self::path(state, &run.repository_id, &run.branch))
-            .collect();
-        drop(connection);
+        // SQLite must never be reopened after fork: its inherited inode/descriptor
+        // bookkeeping belongs to the broker. Admission atomically publishes this
+        // reservation snapshot before forking any new gate launcher. Read it only
+        // while holding setup.lock so a later admission cannot prepare ahead of us.
+        let protected: Vec<PathBuf> = serde_json::from_slice(
+            &fs::read(state.join("gate-reservations.json"))
+                .map_err(|error| failure(error.to_string()))?,
+        )
+        .map_err(|error| failure(error.to_string()))?;
         let mut candidates = Vec::new();
         for entry in fs::read_dir(root).map_err(|error| failure(error.to_string()))? {
             let path = entry.map_err(|error| failure(error.to_string()))?.path();
@@ -164,7 +170,7 @@ impl GateTree {
                     &["show-ref", "--verify", &format!("refs/heads/{branch}")],
                 )
                 .is_err();
-            if gone && !protected {
+            if gone && (!protected || tree == self.checkout) {
                 Self::remove(&path, repository)?;
                 continue;
             }
@@ -361,6 +367,7 @@ mod tests {
             &BTreeMap::from([("jobs".to_owned(), 1)]),
         )
         .unwrap();
+        fs::write(state.join("gate-reservations.json"), "[]").unwrap();
         let tree = GateTree {
             source: source.clone(),
             checkout: GateTree::path(&state, "repo", "ticket"),

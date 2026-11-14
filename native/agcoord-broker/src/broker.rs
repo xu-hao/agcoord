@@ -2218,6 +2218,51 @@ impl Broker {
         }
         let mut current = current;
         if matches!(current.kind.as_str(), "full" | "land") {
+            // Publish before fork. A preparer reads this atomically under its setup
+            // lock; any later admission waits on that lock before touching a tree.
+            // Persisting reservations also protects surviving workers across owner loss.
+            let reserved: Vec<_> = load_live_runs(&connection)?
+                .into_iter()
+                .filter(|run| {
+                    run.status == "running" && matches!(run.kind.as_str(), "full" | "land")
+                })
+                .map(|run| {
+                    crate::gate_tree::GateTree::path(
+                        &self.paths.state_dir,
+                        &run.repository_id,
+                        &run.branch,
+                    )
+                })
+                .collect();
+            let snapshot = self.paths.state_dir.join("gate-reservations.json");
+            let temporary = self.paths.state_dir.join("gate-reservations.json.tmp");
+            let written = std::fs::write(&temporary, serde_json::to_vec(&reserved).unwrap())
+                .and_then(|()| std::fs::rename(&temporary, &snapshot));
+            if let Err(error) = written {
+                use std::io::Write;
+                if let Ok(mut log) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(self.paths.logs.join(format!("{}.log", current.run_id)))
+                {
+                    let _ = writeln!(
+                        log,
+                        "gate tree setup refused (gate-tree-setup-failed): cannot commit gate reservations: {error}"
+                    );
+                }
+                self.finish_and_cleanup_resources(&connection, &current)?;
+                let refreshed = load_run(&connection, &current.run_id)?;
+                self.finish_run(
+                    &connection,
+                    &refreshed,
+                    "failed",
+                    125,
+                    Some("gate-tree-setup-failed"),
+                )?;
+                return Ok(());
+            }
+
             let checkout = crate::gate_tree::GateTree::path(
                 &self.paths.state_dir,
                 &current.repository_id,

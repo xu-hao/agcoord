@@ -3389,6 +3389,7 @@ def test_pending_gate_setup_recovers_after_owner_loss(tmp_path):
     ("checkout", "gate-tree-checkout-missing"),
     ("head", "gate-tree-head-missing"),
     ("cache", "gate-tree-setup-failed"),
+    ("reservation", "gate-tree-setup-failed"),
 ])
 def test_gate_setup_refuses_unavailable_inputs(coordinator, tmp_path, damage, reason):
     broker, client = coordinator
@@ -3404,6 +3405,8 @@ def test_gate_setup_refuses_unavailable_inputs(coordinator, tmp_path, damage, re
             # Replace only this test's repository after the immutable head was queued.
             shutil.rmtree(repository)
             _repository(repository, content="replacement\n")
+        elif damage == "reservation":
+            (broker.paths.state_dir / "gate-reservations.json.tmp").mkdir()
         else:
             (broker.paths.state_dir / "gate-trees").write_text("not a directory")
     finally:
@@ -3455,6 +3458,11 @@ def test_gate_tree_reuses_one_logical_branch_across_independent_clones(coordinat
     assert row["worktree_id"] != first_row["worktree_id"]
     assert _head(first) == old_head
     assert (first / "tracked.txt").read_text() == "candidate\n"
+    # If the original clone disappears, its idle linked tree is recreated from
+    # the still-valid submitting clone instead of pinning a broken Git pointer.
+    shutil.rmtree(first)
+    third = _submit(client, _python("assert open('tracked.txt').read() == 'second clone\\n'"), second, kind="full")
+    assert _row(client, third, "passed", "failed")["status"] == "passed"
 
 
 def test_gate_tree_recovers_stale_tree_locks_and_unregistered_setup(coordinator, tmp_path):

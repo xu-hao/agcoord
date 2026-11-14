@@ -173,7 +173,10 @@ repository is gone, then evicts least recently prepared idle trees to retain at 
 admission refuses if those prevent eviction or a materialized tree exceeds the budget.
 This is a setup-time cache budget, not a runtime filesystem quota: a running gate may
 grow ignored artifacts, which the next setup accounts for. Setup/eviction is serialized
-under a spool-owned file lock. Only exact spool-owned worktree paths are removed; no
+under a spool-owned file lock. Before forking a gate launcher, the broker atomically
+publishes the active gate paths in `gate-reservations.json`; setup reads that snapshot
+under the lock without reopening the broker's inherited SQLite state. Only exact
+spool-owned worktree paths are removed; no
 repository-wide `git worktree prune` or contributor cleanup runs.
 
 The broker now has authority to update the source repository's `.git/worktrees` metadata
