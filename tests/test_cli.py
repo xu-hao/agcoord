@@ -1209,6 +1209,7 @@ def _verify_from_inside_a_worker(
     tmp_path: Path,
     *,
     head_sha: str | None = None,
+    submitted_checkout: bool = False,
 ) -> tuple[str, str, str]:
     """Run `agc verify-admission` from inside an admitted full worker.
 
@@ -1223,13 +1224,14 @@ def _verify_from_inside_a_worker(
     exact_head = _clean_repository(checkout)
     report = tmp_path / "report.txt"
     stderr_log = tmp_path / "stderr.txt"
+    verifier_checkout = '"$2"' if submitted_checkout else '"$PWD"'
     try:
         run_id = client.submit(
             [
                 "/bin/sh",
                 "-c",
                 '"$1" -m agcoord verify-admission --state-dir "$AGCOORD_STATE_DIR" '
-                '--checkout "$2" --run-id "$AGCOORD_RUN_ID" --kind "$AGCOORD_RUN_KIND" '
+                f'--checkout {verifier_checkout} --run-id "$AGCOORD_RUN_ID" --kind "$AGCOORD_RUN_KIND" '
                 '--head-sha "$3" --worker-pid $$ 2>"$4"; printf %s $? >"$5"',
                 "agcoord-test",
                 sys.executable,
@@ -1262,6 +1264,14 @@ def test_verify_admission_is_a_public_subcommand_for_an_admitted_worker(tmp_path
     assert exit_code == "0", stderr
     assert status == "passed"
     assert "invalid choice" not in stderr
+
+
+def test_verify_admission_refuses_the_submitter_checkout_for_a_gate(tmp_path: Path):
+    exit_code, stderr, status = _verify_from_inside_a_worker(tmp_path, submitted_checkout=True)
+
+    assert exit_code == "2", stderr
+    assert status == "passed"
+    assert "no exact broker admission" in stderr
 
 
 def test_verify_admission_refuses_a_wrong_head_with_the_verifier_s_message(tmp_path: Path):
