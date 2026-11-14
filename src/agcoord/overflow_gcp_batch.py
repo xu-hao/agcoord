@@ -45,6 +45,7 @@ from agcoord.overflow_image import (
     Stopped,
     build_toolchain,
     command_line,
+    container_environment,
     container_tool,
     ignore_stop_signals,
     load_repository_config,
@@ -92,9 +93,7 @@ def job_config(
     if limits:
         container["options"] = " ".join(limits)
     runnable: dict[str, object] = {"container": container}
-    variables = {
-        name: os.environ[name] for name in options.passed_environment if name in os.environ
-    }
+    variables = container_environment(os.environ, options.passed_environment, placed.limits)
     if variables:
         runnable["environment"] = {"variables": variables}
 
