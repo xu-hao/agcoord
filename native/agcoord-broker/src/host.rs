@@ -9,6 +9,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+// Only launcher setup may enter the gate Git helper profile. Submitted Git
+// remains in the admitted restriction; this path is part of the host ABI.
+pub(crate) const GATE_GIT_EXECUTABLE: &str = "/usr/bin/git";
+
 const INSTALLED_EXECUTABLE: &str = "/usr/libexec/agcoord/agcoord-broker";
 const APPARMOR_PROFILE: &str = "agcoord-broker";
 const APPARMOR_ADMITTED_PROFILE: &str = "agcoord-admitted";

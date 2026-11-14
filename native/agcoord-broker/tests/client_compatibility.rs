@@ -559,10 +559,7 @@ else:
     assert_eq!(row["gate_exit_status"], 0);
     let synchronized_head = row["head_sha"].as_str().unwrap();
     assert_ne!(synchronized_head, head);
-    assert_eq!(
-        git_output(&checkout, &["rev-parse", "HEAD"]),
-        synchronized_head
-    );
+    assert_eq!(git_output(&checkout, &["rev-parse", "HEAD"]), head);
     assert_eq!(
         git_output(&checkout, &["show", "-s", "--format=%P", synchronized_head])
             .split_whitespace()
@@ -1515,7 +1512,14 @@ fn a_full_row_leaves_one_exact_terminal_record() {
     assert_eq!(record["kind"], "full");
     assert_eq!(record["status"], "passed");
     assert_eq!(record["head_sha"], head);
-    assert_eq!(record["checkout"], checkout.to_string_lossy().into_owned());
+    assert_ne!(record["checkout"], checkout.to_string_lossy().into_owned());
+    assert_eq!(
+        git_output(
+            Path::new(record["checkout"].as_str().unwrap()),
+            &["rev-parse", "HEAD"]
+        ),
+        head
+    );
     assert_eq!(record["command"], json!(["/bin/true"]));
 }
 

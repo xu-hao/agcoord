@@ -327,7 +327,9 @@ unverified tree.
 Clients continue to use short SQLite transactions rather than mutating live processes:
 
 - submission inserts one complete `runs` row in `queued` state with an immutable command,
-  environment, checkout identity, resource request and contract;
+  environment, logical worktree identity, resource request and contract;
+  for `full`/`land`, the forked launcher prepares the coordinator-owned gate tree and the
+  broker commits its executed `checkout` before final release;
 - cancellation sets the durable cancellation request, except that a queued row may be made
   terminal atomically;
 - child lease acquisition inserts a waiting lease tied to the admitted run, PID and start token;

@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Run `full` and `land` in coordinator-owned reusable Git worktrees, preserving warm
+  ignored caches and unchanged tracked mtimes while isolating verdicts from concurrent
+  submitter edits. Prepare trees asynchronously, serialize gates on one branch, retain
+  logical receipt identity for `--reuse-full`, bound idle cache retention, and synchronize
+  landing targets without advancing the submitter's checkout. #230 — isolate exact-head
+  gating and publication in coordinator-owned worktrees.
+
 - Preserve executable tmpfs bindings in SSH and Batch overflow containers, and set
   `TMPDIR`, `TMP`, and `TEMP` to `/tmp` when overflow scratch is applied. Cloud Run refuses
   required executable scratch because its volume API cannot guarantee executability.

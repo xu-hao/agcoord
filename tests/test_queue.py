@@ -1246,9 +1246,11 @@ def test_land_barrier_excludes_only_lane_work_in_its_own_worktree(tmp_path: Path
 
         # Work in another worktree of the same repository passes the running land, even
         # though a same-worktree check queued ahead of it; that check and the second land
-        # stay behind the barrier.
+        # stay behind the barrier. A full on the same branch also waits for its gate tree.
         wait_for(entered_other.exists, "other-worktree work did not overlap the land")
-        full = _row(client, full_id, "passed")
+        full = client.status(full_id)
+        assert full["status"] == "queued"
+        assert full["blocked_by"] == [f"gate-tree:active:{first_id}"]
         assert full["barrier"] is False
         assert client.status(first_id)["status"] == "running"
         assert not entered_same.exists()
@@ -1259,25 +1261,24 @@ def test_land_barrier_excludes_only_lane_work_in_its_own_worktree(tmp_path: Path
         # own worktree, but not for the same-worktree check queued behind the first land.
         second = client.status(second_id)
         assert second["status"] == "queued"
-        assert second["blocked_by"] == [
-            f"repository:{second['repository_id']}:active:{first_id}",
-            f"repository:{second['repository_id']}:active:{other_id}",
-        ]
+        assert f"gate-tree:active:{first_id}" in second["blocked_by"]
+        assert f"gate-tree:fifo:{full_id}" in second["blocked_by"]
+        assert f"repository:{second['repository_id']}:active:{other_id}" in second["blocked_by"]
         assert client.snapshot()["allocations"] == {"jobs": 2, "cpu": 2}
 
         release_other.touch()
         _row(client, other_id, "passed")
         second = client.status(second_id)
         assert second["status"] == "queued"
-        assert second["blocked_by"] == [
-            f"repository:{second['repository_id']}:active:{first_id}"
-        ]
+        assert f"gate-tree:active:{first_id}" in second["blocked_by"]
+        assert f"gate-tree:fifo:{full_id}" in second["blocked_by"]
 
         # Once the first land publishes, the same-worktree check and the second land (in
         # the other worktree) overlap; two lands never do.
         first_gate_release.touch()
         first = _row(client, first_id, "passed")
         assert first["phase"] == "complete"
+        _row(client, full_id, "passed")
         wait_for(entered_same.exists, "the same-worktree check never started after the land")
         wait_for(second_gate_entered.exists, "the second land never overlapped other-worktree work")
         assert client.status(same_id)["status"] == "running"
@@ -1424,6 +1425,8 @@ def test_land_target_sync_updates_the_durable_head_before_the_gate(
     bin_dir = _install_land_gh(tmp_path)
     events = tmp_path / "events"
     gate_report = tmp_path / "gate-report.json"
+    gate_entered = tmp_path / "sync-gate-entered"
+    gate_release = tmp_path / "sync-gate-release"
     environment = _land_environment(
         bin_dir,
         branch=branch,
@@ -1438,9 +1441,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 from agcoord.queue import CoordinatorClient
 
+Path(os.environ["AGCOORD_TEST_GATE_ENTERED"]).touch()
+while not Path(os.environ["AGCOORD_TEST_GATE_RELEASE"]).exists():
+    time.sleep(0.02)
 head = subprocess.run(
     ["git", "rev-parse", "HEAD"],
     check=True,
@@ -1459,6 +1466,8 @@ Path(os.environ["AGCOORD_TEST_GATE_REPORT"]).write_text(
 """
     )
     environment["AGCOORD_TEST_GATE_REPORT"] = str(gate_report)
+    environment["AGCOORD_TEST_GATE_ENTERED"] = str(gate_entered)
+    environment["AGCOORD_TEST_GATE_RELEASE"] = str(gate_release)
 
     land_id = client.submit_land(
         "github",
@@ -1469,6 +1478,11 @@ Path(os.environ["AGCOORD_TEST_GATE_REPORT"]).write_text(
         caller_pid=os.getpid(),
         environment=environment,
     )
+    try:
+        wait_for(gate_entered.exists, "synchronized gate did not start")
+        (checkout / "tracked.txt").write_text("concurrent work\n", encoding="utf-8")
+    finally:
+        gate_release.touch()
     receipt = _row(client, land_id, "passed")
     observed = json.loads(gate_report.read_text(encoding="utf-8"))
     merge_head = observed["checkout_head"]
@@ -1476,7 +1490,9 @@ Path(os.environ["AGCOORD_TEST_GATE_REPORT"]).write_text(
     assert merge_head != old_head
     assert observed["durable_head"] == merge_head
     assert receipt["head_sha"] == merge_head
-    assert _head(checkout) == merge_head
+    assert _head(checkout) == old_head
+    assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "concurrent work\n"
+    assert Path(receipt["checkout"]) != checkout.resolve()
     assert _git(
         checkout,
         "show",
@@ -2711,6 +2727,8 @@ def test_land_reuses_a_passed_full_receipt_for_the_same_exact_head(
 
     assert _executions(ledger) == ["shared"]
     assert row["gate_run_id"] == receipt_id
+    assert row["checkout"] == receipt["checkout"]
+    assert row["worktree_id"] == receipt["worktree_id"]
     assert row["gate_exit_status"] == 0
     assert row["head_sha"] == head_sha
     assert row["phase"] == "complete"
@@ -3232,3 +3250,202 @@ def test_resume_cancels_active_draining_state_without_stopping_running_work_and_
         running.stop()
 
 
+def test_full_gate_isolated_from_submitter_edits(coordinator, tmp_path: Path):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    entered = tmp_path / "gate-entered"
+    release = tmp_path / "gate-release"
+    command = _python(
+        "import pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.02)\n"
+        "assert pathlib.Path('tracked.txt').read_text() == 'base\\n'\n",
+        entered,
+        release,
+    )
+    run_id = _submit(client, command, repository, kind="full")
+    try:
+        wait_for(entered.exists, "the full gate did not start")
+        (repository / "tracked.txt").write_text("concurrent edit\n", encoding="utf-8")
+    finally:
+        release.touch()
+    row = _row(client, run_id, "passed", "failed")
+    assert row["status"] == "passed"
+    assert Path(row["checkout"]) != repository.resolve()
+    assert (repository / "tracked.txt").read_text(encoding="utf-8") == "concurrent edit\n"
+
+
+def test_full_gates_on_same_branch_are_serialized(coordinator, tmp_path: Path):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    first_entered = tmp_path / "first-entered"
+    first_release = tmp_path / "first-release"
+    second_entered = tmp_path / "second-entered"
+    first = _submit(
+        client, _blocking_command(first_entered, first_release, "first"),
+        repository, kind="full",
+    )
+    try:
+        wait_for(first_entered.exists, "first gate did not start")
+        second = _submit(
+            client, _python("from pathlib import Path; import sys; Path(sys.argv[1]).touch()", second_entered),
+            repository, kind="full",
+        )
+        wait_for(
+            lambda: f"gate-tree:active:{first}" in client.status(second)["blocked_by"],
+            "second gate did not wait for the first gate tree",
+        )
+        assert not second_entered.exists()
+    finally:
+        first_release.touch()
+    _row(client, first, "passed")
+    _row(client, second, "passed")
+    assert second_entered.exists()
+
+
+def test_full_reuses_gate_tree_and_preserves_warm_artifacts(coordinator, tmp_path: Path):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    (repository / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(repository, "add", ".gitignore")
+    _git(repository, "commit", "-m", "ignore build cache")
+    first = _submit(client, _python(
+        "from pathlib import Path; p=Path('cache'); p.mkdir(exist_ok=True); "
+        "(p/'artifact').write_text('warm'); "
+        "Path('tracked.txt').touch()"
+    ), repository, kind="full")
+    first_row = _row(client, first, "passed", "failed")
+    assert first_row["status"] == "passed"
+    gate_tree = Path(first_row["checkout"])
+    stamp = (gate_tree / "tracked.txt").stat().st_mtime_ns
+    assert not (repository / "cache").exists()
+    second = _submit(client, _python(
+        "from pathlib import Path; assert Path('cache/artifact').read_text() == 'warm'"
+    ), repository, kind="full")
+    second_row = _row(client, second, "passed", "failed")
+    assert second_row["status"] == "passed"
+    assert second_row["checkout"] == str(gate_tree)
+    assert (gate_tree / "tracked.txt").stat().st_mtime_ns == stamp
+
+
+def test_gate_setup_does_not_block_checks_and_can_be_cancelled(coordinator, tmp_path):
+    import fcntl
+
+    broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    root = broker.paths.state_dir / "gate-trees"
+    root.mkdir(mode=0o700)
+    with (root / "setup.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        marker = tmp_path / "must-not-run"
+        first = _submit(client, _python("from pathlib import Path; import sys; Path(sys.argv[1]).touch()", marker), repository, kind="full")
+        wait_for(lambda: client.status(first)["worker_pid"], "setup worker was not attached")
+        second = _submit(client, _python("pass"), repository, kind="full")
+        wait_for(lambda: f"gate-tree:active:{first}" in client.status(second)["blocked_by"], "setup did not reserve branch")
+        check = _submit(client, _python("assert open('tracked.txt').read() == 'base\\n'"), repository)
+        _row(client, check, "passed")
+        client.cancel(first)
+        _row(client, first, "cancelled")
+        assert not marker.exists()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    _row(client, second, "passed")
+
+
+def test_pending_gate_setup_recovers_after_owner_loss(tmp_path):
+    import fcntl
+
+    broker = RunningCoordinator(tmp_path / "state", capacities={"jobs": 2})
+    replacement = RunningCoordinator(tmp_path / "state", capacities={"jobs": 2})
+    client = broker.start()
+    repository = _repository(tmp_path / "repository")
+    root = broker.paths.state_dir / "gate-trees"
+    root.mkdir(mode=0o700)
+    marker = tmp_path / "must-not-run"
+    try:
+        with (root / "setup.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            run = _submit(client, _python("from pathlib import Path; import sys; Path(sys.argv[1]).touch()", marker), repository, kind="full")
+            wait_for(lambda: client.status(run)["worker_pid"], "pending worker never attached")
+            broker.kill()
+            replacement.start()
+            recovered = _row(client, run, "interrupted")
+            assert recovered["failure_reason"] == "worker-setup-lost"
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        assert not marker.exists()
+        next_run = _submit(client, _python("pass"), repository, kind="full")
+        _row(client, next_run, "passed")
+    finally:
+        broker.stop()
+        replacement.stop()
+
+
+@pytest.mark.parametrize("damage,reason", [
+    ("checkout", "gate-tree-checkout-missing"),
+    ("head", "gate-tree-head-missing"),
+    ("cache", "gate-tree-setup-failed"),
+])
+def test_gate_setup_refuses_unavailable_inputs(coordinator, tmp_path, damage, reason):
+    broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    entered, release = tmp_path / "entered", tmp_path / "release"
+    running = _submit(client, _blocking_command(entered, release, "hold"), repository, resources={"jobs": 2})
+    wait_for(entered.exists, "capacity holder did not start")
+    try:
+        run = _submit(client, _python("raise AssertionError('must not run')"), repository, kind="full")
+        if damage == "checkout":
+            repository.rename(tmp_path / "moved")
+        elif damage == "head":
+            # Replace only this test's repository after the immutable head was queued.
+            shutil.rmtree(repository)
+            _repository(repository, content="replacement\n")
+        else:
+            (broker.paths.state_dir / "gate-trees").write_text("not a directory")
+    finally:
+        release.touch()
+    _row(client, running, "passed")
+    row = _row(client, run, "failed")
+    assert row["exit_status"] == 125
+    assert row["failure_reason"] == reason
+    assert reason in client.log(run)["text"]
+
+
+def test_gate_tree_prunes_gone_branches_and_bounds_tree_count(coordinator, tmp_path):
+    _broker, client = coordinator
+    repository = _repository(tmp_path / "repository")
+    first = _submit(client, _python("pass"), repository, kind="full")
+    first_tree = Path(_row(client, first, "passed")["checkout"])
+    _git(repository, "switch", "-c", "next")
+    _git(repository, "branch", "-D", "main")
+    next_run = _submit(client, _python("pass"), repository, kind="full")
+    next_tree = Path(_row(client, next_run, "passed")["checkout"])
+    assert not first_tree.exists()
+    assert next_tree.exists()
+    trees = [next_tree]
+    for index in range(16):
+        _git(repository, "switch", "-c", f"ticket-{index}")
+        run = _submit(client, _python("pass"), repository, kind="full")
+        trees.append(Path(_row(client, run, "passed")["checkout"]))
+    assert sum(tree.exists() for tree in trees) == 16
+    assert not next_tree.exists()
+    registered = _git(repository, "worktree", "list", "--porcelain")
+    assert str(next_tree) not in registered
+
+
+def test_gate_tree_reuses_one_logical_branch_across_independent_clones(coordinator, tmp_path):
+    _broker, client = coordinator
+    first, remote, branch, old_head = _publication_repository(tmp_path / "first")
+    first_run = _submit(client, _python("pass"), first, kind="full")
+    first_row = _row(client, first_run, "passed")
+    second = tmp_path / "second"
+    _git(tmp_path, "clone", "--branch", branch, str(remote), str(second))
+    _git(second, "config", "user.name", "AGCoord test")
+    _git(second, "config", "user.email", "test@example.invalid")
+    (second / "tracked.txt").write_text("second clone\n")
+    _git(second, "commit", "-am", "second clone head")
+    second_run = _submit(client, _python("assert open('tracked.txt').read() == 'second clone\\n'"), second, kind="full")
+    row = _row(client, second_run, "passed", "failed")
+    assert row["status"] == "passed", client.log(second_run)
+    assert row["checkout"] == first_row["checkout"]
+    assert row["worktree_id"] != first_row["worktree_id"]
+    assert _head(first) == old_head
+    assert (first / "tracked.txt").read_text() == "candidate\n"

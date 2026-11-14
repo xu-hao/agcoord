@@ -51,6 +51,15 @@ files or venvs, .git, local services or daemons, or unbundled extras. Also use i
 agc full and agc land when gate scripts check local admission or host user-namespace
 sandboxes.
 Use `agc full` for a clean exact-head verdict when you need one without publishing.
+`full` and `land` execute in reusable coordinator-owned worktrees; checks use your
+checkout. Concurrent edits in your checkout cannot affect the gated files. The row's
+`checkout` names the executed tree, while receipt reuse keeps your logical worktree
+identity. Ignored build caches are retained in each gate tree but are not copied from
+your checkout; use committed tools or absolute installed paths. Gates on the same branch
+serialize. Target synchronization pushes its merge from the gate tree, so fetch and
+reconcile your local branch afterwards. See [gate trees](coordinator.md#coordinator-owned-gate-trees)
+for cache limits and setup refusals.
+
 Land only through one gate-and-publish request, from a clean checkout of the pushed
 head, after the pull request is open and ready:
   agc land <pr> --label "<ticket> land" --resource cpu=<n> -- <full test command>
@@ -136,6 +145,8 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | --- | --- | --- |
 | `error: … is not inside a Git repository; agc schedules work per repository and worktree, so run it from a checkout or pass --checkout PATH` | The working directory is not in a Git repository. | Run from inside the checkout, or pass `--checkout PATH`. |
 | `error: checkout is dirty; commit or remove changes before a full run` | `full` and `land` bind an exact clean head. | Commit or remove the changes; for `land`, push the head first. |
+| `gate-tree-checkout-missing` / `gate-tree-head-missing` | The queued gate lost its source checkout or commit. | Restore the checkout and head, then resubmit. |
+| `gate-tree-setup-failed` / `gate-tree-capacity` | The coordinator could not prepare its gate tree or retain it within the cache budget. | Read the run log; resolve the filesystem failure or allow active gates to finish, then resubmit. |
 | `error: resource 'gpu' has no configured machine capacity` | The broker's `config.json` has no such capacity. | Claim only configured names; ask the operator to add one. |
 | `error: resource 'cpu' requests 99, above capacity 4` | The claim can never be admitted. | Lower the claim; `agc --json list` shows `capacities`. |
 | `error: a coordinated job cannot submit another coordinated job; …` | Nested submission. | Run the tool directly inside the job. |

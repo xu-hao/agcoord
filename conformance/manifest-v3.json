@@ -65,6 +65,18 @@
       }
     },
     {
+      "id": "repositories.coordinator-gate-trees",
+      "domain": "repositories",
+      "description": "Full and land prepare reusable detached exact-head gate trees off the scheduler, preserve logical worktree identity and warm artifacts, serialize one branch, and refuse missing inputs. Pending setup remains responsive, cancellable and recoverable after owner loss.",
+      "tests": {
+        "rust_native": [
+          "scheduler::gate_trees_isolate_exact_heads_and_serialize_one_branch",
+          "scheduler::pending_gate_setup_is_nonblocking_cancellable_and_recoverable",
+          "scheduler::gate_setup_refuses_missing_checkout_head_and_cache_failures"
+        ]
+      }
+    },
+    {
       "id": "publication.one-atomic-land",
       "domain": "publication",
       "description": "A land request may durably synchronize its exact head during preflight, then holds one barrier through its gate and publication authority transition.",

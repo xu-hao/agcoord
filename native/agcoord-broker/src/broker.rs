@@ -63,6 +63,7 @@ pub struct Broker {
     /// Overflow pools in the configured order of preference.
     overflow_pools: Vec<Pool>,
     children: HashMap<String, NativeWorker>,
+    pending_setups: HashMap<String, (PendingWorker, WorkerSetup)>,
     cancellation_started: HashMap<String, Instant>,
     group_drain_started: HashMap<String, Instant>,
     last_repository: Option<String>,
@@ -481,6 +482,7 @@ impl Broker {
             _spool_anchor: connection,
             overflow_pools,
             children: HashMap::new(),
+            pending_setups: HashMap::new(),
             cancellation_started: HashMap::new(),
             group_drain_started: HashMap::new(),
             last_repository: None,
@@ -586,6 +588,17 @@ impl Broker {
                 .push(run);
         }
         for (repository, runs) in repositories {
+            let mut gate_branches = BTreeSet::new();
+            for run in &runs {
+                if matches!(run.kind.as_str(), "full" | "land")
+                    && !gate_branches.insert(&run.branch)
+                {
+                    return Err(AppError::new(
+                        "broker-active-state-invalid",
+                        format!("repository {repository} has overlapping branch gates"),
+                    ));
+                }
+            }
             let barriers: Vec<_> = runs.iter().filter(|run| run.barrier).collect();
             let Some(barrier) = barriers.first() else {
                 continue;
@@ -780,6 +793,18 @@ impl Broker {
     }
 
     fn observe(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
+        if let Some((pending, setup)) = self.pending_setups.remove(&run.run_id) {
+            if run.cancel_requested {
+                let child = pending.abort();
+                self.children.insert(run.run_id.clone(), child);
+            } else if pending.setup_ready() {
+                return self.complete_worker_setup(connection, run, pending, setup);
+            } else {
+                self.pending_setups
+                    .insert(run.run_id.clone(), (pending, setup));
+                return Ok(());
+            }
+        }
         let cgroup_managed = run.resource_state.contains_key(resources::CGROUP_BACKEND);
         let resource_managed = !run.resource_state.is_empty();
         if resource_managed {
@@ -853,6 +878,23 @@ impl Broker {
         }
 
         if same_worker_process(run.worker_pid, run.worker_start_token.as_deref()) {
+            if matches!(run.kind.as_str(), "full" | "land")
+                && run.checkout
+                    != crate::gate_tree::GateTree::path(
+                        &self.paths.state_dir,
+                        &run.repository_id,
+                        &run.branch,
+                    )
+                && !run.cancel_requested
+            {
+                // An owner was lost before prepared checkout commit/final release.
+                // No command could have run; stop its setup group rather than leave a
+                // forgotten launcher waiting on a lock without its setup deadline.
+                connection.execute("UPDATE runs SET cancel_requested = 1, cancel_requested_at = ?1, failure_reason = 'worker-setup-lost' WHERE run_id = ?2 AND status = 'running'", params![now(connection)?, run.run_id]).map_err(map_database_error)?;
+                let refreshed = load_run(connection, &run.run_id)?;
+                Self::signal_cancel(&mut self.cancellation_started, &refreshed)?;
+                return Ok(());
+            }
             if run.cancel_requested {
                 if resource_managed {
                     let refreshed = load_run(connection, &run.run_id)?;
@@ -2160,7 +2202,7 @@ impl Broker {
             return Ok(());
         }
         let current = load_run(&connection, &current.run_id)?;
-        let (worker_setup, setup_ready) = self.prepare_worker_setup(&connection, &current)?;
+        let (mut worker_setup, setup_ready) = self.prepare_worker_setup(&connection, &current)?;
         if !setup_ready {
             let refreshed = load_run(&connection, &current.run_id)?;
             self.finish_and_cleanup_resources(&connection, &refreshed)?;
@@ -2173,6 +2215,24 @@ impl Broker {
                 Some("resource-enforcement-failed"),
             )?;
             return Ok(());
+        }
+        let mut current = current;
+        if matches!(current.kind.as_str(), "full" | "land") {
+            let checkout = crate::gate_tree::GateTree::path(
+                &self.paths.state_dir,
+                &current.repository_id,
+                &current.branch,
+            );
+            worker_setup.gate_tree = Some(crate::gate_tree::GateTree {
+                source: current.checkout.clone(),
+                checkout: checkout.clone(),
+                branch: current.branch.clone(),
+                head: current
+                    .head_sha
+                    .clone()
+                    .ok_or_else(|| AppError::new("broker-row-invalid", "gate has no head"))?,
+            });
+            current.checkout = checkout;
         }
         let log_path = self.paths.logs.join(format!("{}.log", current.run_id));
         let output = OpenOptions::new()
@@ -2314,13 +2374,34 @@ impl Broker {
             )?;
             return Ok(());
         }
+        if let Err(error) = pending.begin_setup() {
+            drop(pending);
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_and_cleanup_resources(&connection, &refreshed)?;
+            let refreshed = load_run(&connection, &current.run_id)?;
+            self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+            return Ok(());
+        }
+        self.pending_setups
+            .insert(current.run_id, (pending, worker_setup));
+        Ok(())
+    }
+
+    fn complete_worker_setup(
+        &mut self,
+        connection: &Connection,
+        current: &RunRecord,
+        mut pending: PendingWorker,
+        worker_setup: WorkerSetup,
+    ) -> Result<()> {
         let setup_failure = match pending.verify_setup() {
             Ok(code) => code,
             Err(error) => {
                 let refreshed = load_run(&connection, &current.run_id)?;
-                let quota_failure = refreshed
-                    .resource_state
-                    .contains_key(project_quota::PROJECT_QUOTA_BACKEND);
+                let quota_failure = !error.code.starts_with("gate-tree-")
+                    && refreshed
+                        .resource_state
+                        .contains_key(project_quota::PROJECT_QUOTA_BACKEND);
                 if quota_failure {
                     let _ = Self::record_worker_setup_failure(&connection, &refreshed, error.code)?;
                 }
@@ -2344,6 +2425,16 @@ impl Broker {
                 return Ok(());
             }
         };
+        if setup_failure.is_none()
+            && let Some(tree) = &worker_setup.gate_tree
+        {
+            connection
+                .execute(
+                    "UPDATE runs SET checkout = ?1 WHERE run_id = ?2 AND status = 'running'",
+                    params![tree.checkout.to_string_lossy(), current.run_id],
+                )
+                .map_err(map_database_error)?;
+        }
         let refreshed = load_run(&connection, &current.run_id)?;
         if let Some(code) = setup_failure {
             if Self::record_worker_setup_failure(&connection, &refreshed, code)? {
@@ -2389,7 +2480,7 @@ impl Broker {
             }
         };
         self.crash("worker-release");
-        self.children.insert(current.run_id, child);
+        self.children.insert(current.run_id.clone(), child);
         Ok(())
     }
 
@@ -2454,7 +2545,9 @@ impl Broker {
     /// The terminal outcome of a job whose stop was requested. A broker stop is an
     /// interruption that claims no verdict; any other request is the caller's cancellation.
     fn requested_stop_outcome(run: &RunRecord) -> (&'static str, i64, Option<&'static str>) {
-        if run.failure_reason.as_deref() == Some(BROKER_STOPPED) {
+        if run.failure_reason.as_deref() == Some("worker-setup-lost") {
+            ("interrupted", 125, Some("worker-setup-lost"))
+        } else if run.failure_reason.as_deref() == Some(BROKER_STOPPED) {
             ("interrupted", 125, Some(BROKER_STOPPED))
         } else if run.failure_reason.as_deref() == Some(overflow::RUNTIME_EXCEEDED) {
             (

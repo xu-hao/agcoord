@@ -1,8 +1,9 @@
 """One owner-only machine scheduler for development agents and repositories.
 
 Clients append strict requests to SQLite; one detached, flock-owned broker admits them
-against machine resource capacities and per-repository FIFO barriers.  Workers run in
-their submitted checkouts with private scratch roots and process-group supervision.  The
+against machine resource capacities and per-repository FIFO barriers.  Checks run in
+their submitted checkouts; exact-head gates use reusable coordinator-owned worktrees.
+Workers have private scratch roots and process-group supervision.  The
 module opens no network listener and has no dependency on a product repository.
 """
 

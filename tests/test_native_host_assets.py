@@ -54,7 +54,7 @@ def test_native_user_service_passes_systemd_verification(tmp_path: Path):
     assert "Unknown key" not in completed.stderr
 
 
-def test_native_apparmor_policy_compiles_with_all_three_domains():
+def test_native_apparmor_policy_compiles_with_all_domains():
     parser = shutil.which("apparmor_parser")
     if parser is None:
         pytest.skip("apparmor_parser is unavailable")
@@ -72,6 +72,7 @@ def test_native_apparmor_policy_compiles_with_all_three_domains():
         "agcoord-bwrap",
         "agcoord-bwrap-child",
         "agcoord-job",
+        "agcoord-gate-git",
     }
 
 
@@ -87,7 +88,7 @@ def test_native_apparmor_policy_compiles_all_domains_in_enforce_mode():
     )
     assert completed.returncode == 0, completed.stderr
     diagnostics = completed.stdout + completed.stderr
-    assert diagnostics.count("Mode: enforce") == 6, diagnostics
+    assert diagnostics.count("Mode: enforce") == 7, diagnostics
     assert "Mode: default_allow" not in diagnostics
 
 

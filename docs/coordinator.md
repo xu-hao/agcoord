@@ -126,12 +126,61 @@ the entire machine:
   kinds whenever the declared resources fit.
 - `full` is ordinary lane work with a clean exact-head submission requirement and a durable
   receipt. It is not a barrier: checks, other fulls, and lands in other worktrees overlap it
-  when their resources fit.
+  when their resources fit and the gates name different branches.
 - `land` is the only barrier. It is one gate-and-publication barrier in its lane: no other
   land in the lane, and no job from the same worktree, can begin between its preflight, gate,
   and atomic publication. Work from other worktrees of the same repository only competes for
-  capacity. Retained legacy `merge` rows are barriers of the same shape, remain identifiable
+  capacity, except that exact-head gates for the same branch serialize. Retained legacy
+  `merge` rows are barriers of the same shape, remain identifiable
   in migrated history, and are not the normal public landing workflow.
+
+### Coordinator-owned gate trees
+
+`full` and `land` run in a reusable detached Git worktree per repository identity and
+branch below `<state-dir>/gate-trees/`. Checks continue to run in the submitted checkout.
+The broker reserves a branch tree from admission through completion, including pending
+setup. A full is still ordinary lane work; only other gates for its branch serialize.
+
+After attaching the authenticated launcher and its resources, the launcher materializes
+and resets the tree with plain `git worktree add --detach` and `git reset --hard <head>`.
+It removes nonignored untracked outputs before reuse. Unchanged tracked files keep their
+mtimes and ignored build caches survive. The first gate on a branch is cold; ignored
+files from the submitter's checkout are not copied. Commands and tools must be available
+in the committed tree or through absolute paths and the submitted environment.
+
+Git operations and cache scans run in the forked worker setup path, never in the
+single-threaded scheduler. While setup is pending, other lanes and checks remain
+admissible, cancellation stops the setup process group, and replacement owners retain
+its reservation until that process group is gone. A replacement owner interrupts unfinished
+setup with `worker-setup-lost` (exit 125); resubmit the job. Setup has a five-minute deadline.
+A setup failure returns exit 125 with `gate-tree-checkout-missing`,
+`gate-tree-head-missing`, `gate-tree-setup-failed`, or `gate-tree-capacity`; the run log
+contains the detail. Restore the source checkout/head or resolve the reported filesystem
+failure, then resubmit. No gate command or publication runs on a setup refusal.
+
+The executed row's `checkout` becomes the prepared gate tree before command release.
+`worktree_id` remains the submitter's logical identity, so `--reuse-full` still matches
+receipts from that worktree, exact head and command. Workers verify their executed
+checkout. Overflow executors start there too and hand off that tree's source; target
+synchronization and publication run there without changing the submitter's files or
+local branch. Independent clones with the same repository identity reuse that branch tree
+by importing the requested commit objects from the current source clone. After synchronization, fetch the pushed branch and reconcile the local
+checkout before another submission.
+
+At each gate setup, the spool prunes idle trees whose local branch ref or source Git
+repository is gone, then evicts least recently prepared idle trees to retain at most
+16 trees and 20 GiB of allocated cache blocks. Active and pending trees are protected;
+admission refuses if those prevent eviction or a materialized tree exceeds the budget.
+This is a setup-time cache budget, not a runtime filesystem quota: a running gate may
+grow ignored artifacts, which the next setup accounts for. Setup/eviction is serialized
+under a spool-owned file lock. Only exact spool-owned worktree paths are removed; no
+repository-wide `git worktree prune` or contributor cleanup runs.
+
+The broker now has authority to update the source repository's `.git/worktrees` metadata
+and its own gate cache. On managed hosts, only the trusted launcher enters the fixed
+`/usr/bin/git` helper's `agcoord-gate-git` AppArmor profile; hooks and fsmonitor are
+disabled, helper programs transition to admitted restrictions, and submitted Git retains
+its ordinary admitted profile.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
@@ -380,7 +429,8 @@ local front row. Pool allocations are excluded from local shortages and reservat
 their repository and worktree exclusions still apply.
 
 A placed job's row moves to `running` with its `pool` set. Its worker on this machine is
-`EXECUTOR... -- COMMAND...`, started in the submitted checkout with the usual admission
+`EXECUTOR... -- COMMAND...`, started in the executed checkout (the gate tree for
+`full`/`land`) with the usual admission
 environment plus `AGCOORD_OVERFLOW_POOL`, `AGCOORD_OVERFLOW_MAX_RUNTIME` in seconds,
 `AGCOORD_OVERFLOW_RESOURCES`, the claim as a JSON object, and `AGCOORD_OVERFLOW_CONTRACT`, the
 row's `resource_contract`, which gives each claim's kind and unit. The executor runs the command
@@ -1345,7 +1395,8 @@ the verdict came from; a land that ran its own gate keeps it null.
 The worker first validates local and forge identity, readiness, and the current target and
 source refs. If the target advanced while an open, ready, same-repository request waited, the
 default GitHub adapter fetches that exact target commit and creates one ordinary `--no-ff` merge
-commit in the submitted checkout. It verifies the ordered parents `(old source, target)`, pushes
+commit in the coordinator-owned detached gate tree. It verifies the ordered parents
+`(old source, target)`, pushes
 the commit to the request branch with an exact `--force-with-lease`, and atomically replaces the
 row's durable head while it is still in `preflight`. Preflight is then repeated against the new
 head. This retry is bounded if the target keeps moving. `--no-target-sync` instead returns the
@@ -1359,7 +1410,7 @@ the wait ends, is the ordinary `head-changed` refusal. The tolerance applies onl
 coordinator itself just replaced and never relaxes the remote-ref comparison or the atomic
 before-OID checks, so lag cannot admit a real concurrent source change.
 
-A merge conflict is aborted before the gate, restores the exact clean source checkout, and
+A merge conflict is aborted before the gate, restores the exact clean gate tree, and
 reports the conflicting paths. A concurrent source update or rejected push also fails before
 the gate; the lease prevents overwriting another writer. Once preflight succeeds, the worker
 runs the gate once with the captured environment and combined transcript. A red gate records
