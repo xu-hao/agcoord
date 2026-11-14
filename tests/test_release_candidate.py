@@ -130,9 +130,9 @@ def test_native_plugin_manifests_match_source_version_and_marketplaces():
 
 def test_release_verifier_refuses_plugin_version_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     for relative, manifest in (
-        ("plugin.json", {"name": "agcoord", "version": "0.8.2"}),
-        (".claude-plugin/plugin.json", {"name": "agcoord", "version": "0.8.3"}),
-        (".antigravity-plugin/plugin.json", {"name": "agcoord", "version": "0.8.3"}),
+        ("plugin.json", {"name": "agcoord", "version": "0.8.3"}),
+        (".claude-plugin/plugin.json", {"name": "agcoord", "version": "0.9.0"}),
+        (".antigravity-plugin/plugin.json", {"name": "agcoord", "version": "0.9.0"}),
         (".agents/plugins/marketplace.json", {"plugins": [{"name": "agcoord"}]}),
         (".claude-plugin/marketplace.json", {"plugins": [{"name": "agcoord"}]}),
     ):
@@ -140,8 +140,8 @@ def test_release_verifier_refuses_plugin_version_drift(tmp_path: Path, monkeypat
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setitem(RELEASE["_plugin_sources"].__globals__, "ROOT", tmp_path)
-    with pytest.raises(CandidateError, match="plugin manifest .* does not match agcoord 0.8.3"):
-        RELEASE["_plugin_sources"]("0.8.3")
+    with pytest.raises(CandidateError, match="plugin manifest .* does not match agcoord 0.9.0"):
+        RELEASE["_plugin_sources"]("0.9.0")
 
 
 def _pin_inputs(tmp_path: Path, broker: bytes = b"reproducible broker\n"):
@@ -274,7 +274,7 @@ def _tar_file(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> No
 def _write_sdist(
     path: Path,
     *,
-    version: str = "0.8.3",
+    version: str = "0.9.0",
     executable: bool = True,
     toolchain_declaration: bool = True,
 ) -> None:
