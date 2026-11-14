@@ -3,6 +3,17 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## 0.9.1 — 2026-11-14
+
+- Publish the coupled PyPI distribution and native Linux x86_64 musl host bundle on
+  GitHub Releases, superseding the uncoupled `0.9.0` PyPI upload.
+- Fix AppArmor binary compilation for gate Git while preserving its fixed Git helpers and
+  confining other executables. Host-package validation now checks binary compilation when the
+  parser is available. The disposable hosted recovery rehearsal tests the current broker with a
+  private client pin. #343 — fix gate Git policy compilation on supported Ubuntu hosts.
+- Harden clean-host landing and worker recovery, stabilize warm gate-tree checks, and require
+  green hosted workflows before release uploads. #341 — fix clean-host conformance and release order.
+
 ## 0.9.0 — 2026-11-14
 
 - Advance the supported native broker minor line to `0.9.x`. The `0.9.0` client and
@@ -19,15 +30,6 @@ versioning; dates use ISO 8601.
 - Add portable inline scripts to `agc run` and `agc full`, and package the three-host native
   Agent Skill plugin with validation and release artifact checks. #325 — add inline scripts;
   #332 — package the Codex, Claude Code, and Antigravity plugin.
-
-## Unreleased
-
-- Fix AppArmor binary compilation for gate Git while preserving its fixed Git helpers and
-  confining other executables. Host-package validation now checks binary compilation when the
-  parser is available. The disposable hosted recovery rehearsal tests the current broker with a
-  private client pin. #343 — fix gate Git policy compilation on supported Ubuntu hosts.
-- Harden clean-host landing and worker recovery, stabilize warm gate-tree checks, and require
-  green hosted workflows before release uploads. #341 — fix clean-host conformance and release order.
 
 ## 0.8.3 — 2026-11-13
 
