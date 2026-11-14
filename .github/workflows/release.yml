@@ -36,7 +36,10 @@ jobs:
           GIT_AUTHOR_EMAIL: agcoord-release-tests@example.invalid
           GIT_COMMITTER_NAME: AGCoord Release Tests
           GIT_COMMITTER_EMAIL: agcoord-release-tests@example.invalid
-        run: ./scripts/check-conformance
+        shell: bash
+        run: |
+          trap '' HUP
+          ./scripts/check-conformance
       - run: ./scripts/build-native-broker
       - run: ./scripts/audit-native-broker dist/native/agcoord-broker-x86_64-unknown-linux-musl
       - run: ./scripts/check-native-licenses dist/native/agcoord-broker-x86_64-unknown-linux-musl
