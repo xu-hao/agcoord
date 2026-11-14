@@ -5,6 +5,7 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Batch queued `land` requests on the same target branch and binary-bisect on gate failure (#326).
 - Run `full` and `land` in coordinator-owned reusable Git worktrees, preserving warm
   ignored caches and unchanged tracked mtimes while isolating verdicts from concurrent
   submitter edits. Prepare trees asynchronously, serialize gates on one branch, retain

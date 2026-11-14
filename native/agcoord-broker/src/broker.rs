@@ -6,10 +6,12 @@ use crate::platform::{
     worker_identity_conflicts,
 };
 use crate::store::{
-    Paths, RunRecord, blocked_by, commit_sha_valid, configured_stop_grace, connect, front_row,
-    initialize_native, load_live_runs, load_run, load_runs, local_allocations,
-    maintain_child_cpu_leases, maintenance_record, map_database_error, mark_maintenance_drained,
-    now, overflow_candidate, validate_child_cpu_leases,
+    Paths, RunRecord, blocked_by, configured_stop_grace, connect, copy_leader_log_to_member,
+    front_row, initialize_native, load_live_runs, load_live_scheduler_state, load_run, load_runs,
+    local_allocations, maintain_child_cpu_leases, maintenance_record, map_database_error,
+    mark_maintenance_drained, now, overflow_candidate, parse_land_options,
+    publication_failure_reason, reconcile_batch_on_leader_exit, select_land_batch_candidates,
+    validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
 use crate::{cgroup, overflow, project_quota, resources};
@@ -75,65 +77,19 @@ pub struct Broker {
 
 /// The documented reason for one failed publication run: a red gate keeps its shell status
 /// under `gate-failed`; every other handback carries the stable code of its exit status.
-fn publication_failure_reason(run: &RunRecord, exit_status: i64) -> Option<&'static str> {
-    if !matches!(run.kind.as_str(), "merge" | "land") {
-        return None;
-    }
-    if run.kind == "land" && run.phase == "gating" && run.gate_exit_status.is_some() {
-        return Some("gate-failed");
-    }
-    Some(match exit_status {
-        75 => "stale-main",
-        76 => "head-changed",
-        77 => "pr-not-ready",
-        78 => "publish-failed",
-        80 => "avoided-commit",
-        _ => "merge-error",
-    })
-}
-
 /// The coordinator-reserved land facts travel to the worker as arguments: every
 /// `_AGCOORD_` name is removed from worker environments before launch.
 fn land_request_options(run: &RunRecord) -> Result<Vec<String>> {
+    let parsed = parse_land_options(&run.environment)?;
     let mut options = Vec::new();
-    match run
-        .environment
-        .get("_AGCOORD_LAND_TARGET_SYNC")
-        .map(String::as_str)
-    {
-        None | Some("1") => {}
-        Some("0") => options.push("--no-target-sync".to_owned()),
-        Some(_) => {
-            return Err(AppError::new(
-                "broker-row-invalid",
-                "land run has an invalid target-sync setting",
-            ));
-        }
+    if !parsed.target_sync {
+        options.push("--no-target-sync".to_owned());
     }
-    match run
-        .environment
-        .get("_AGCOORD_LAND_REUSE_FULL")
-        .map(String::as_str)
-    {
-        None | Some("0") => {}
-        Some("1") => options.push("--reuse-full".to_owned()),
-        Some(_) => {
-            return Err(AppError::new(
-                "broker-row-invalid",
-                "land run has an invalid gate-reuse setting",
-            ));
-        }
+    if parsed.reuse_full {
+        options.push("--reuse-full".to_owned());
     }
-    if let Some(avoided) = run.environment.get("_AGCOORD_LAND_AVOID") {
-        for sha in avoided.split(',') {
-            if !commit_sha_valid(sha) {
-                return Err(AppError::new(
-                    "broker-row-invalid",
-                    "land run names an invalid avoided commit",
-                ));
-            }
-            options.extend(["--avoid".to_owned(), sha.to_owned()]);
-        }
+    for sha in parsed.avoid {
+        options.extend(["--avoid".to_owned(), sha]);
     }
     Ok(options)
 }
@@ -143,7 +99,12 @@ impl Broker {
     /// machine's worker and carries the submitted command to the pool.  A land keeps its
     /// local worker for preflight and publication, and only its gate goes through the
     /// executor.
-    fn worker_command(&self, run: &RunRecord, pool: Option<&Pool>) -> Result<Vec<String>> {
+    fn worker_command(
+        &self,
+        connection: &Connection,
+        run: &RunRecord,
+        pool: Option<&Pool>,
+    ) -> Result<Vec<String>> {
         let submitted = match pool {
             Some(pool) => {
                 let mut command = pool.executor.clone();
@@ -203,6 +164,16 @@ impl Broker {
             })?,
         ]);
         command.extend(land_request_options(run)?);
+        let candidates = select_land_batch_candidates(connection, run, pool.is_some())?;
+        if !candidates.is_empty() {
+            command.push("--batch-candidates-json".to_owned());
+            command.push(serde_json::to_string(&candidates).map_err(|error| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!("cannot encode land batch candidates: {error}"),
+                )
+            })?);
+        }
         command.push("--".to_owned());
         command.extend(submitted);
         Ok(command)
@@ -571,8 +542,10 @@ impl Broker {
         &self,
         active: &[RunRecord],
         placed: &BTreeMap<String, String>,
+        batch_followers: &BTreeMap<String, String>,
+        batch_owners: &BTreeMap<String, String>,
     ) -> Result<()> {
-        for (name, units) in local_allocations(active, placed) {
+        for (name, units) in local_allocations(active, placed, batch_followers) {
             if units > self.capacities.get(&name).copied().unwrap_or(0) {
                 return Err(AppError::new(
                     "broker-active-state-invalid",
@@ -600,13 +573,25 @@ impl Broker {
                 }
             }
             let barriers: Vec<_> = runs.iter().filter(|run| run.barrier).collect();
-            let Some(barrier) = barriers.first() else {
+            if barriers.is_empty() {
                 continue;
+            }
+            let owner_of = |run_id: &str| -> String {
+                batch_owners
+                    .get(run_id)
+                    .cloned()
+                    .unwrap_or_else(|| run_id.to_owned())
             };
-            let overlap = barriers.len() > 1
-                || runs
-                    .iter()
-                    .any(|run| !run.barrier && run.worktree_id == barrier.worktree_id);
+            let first_owner = owner_of(&barriers[0].run_id);
+            let overlap = barriers
+                .iter()
+                .any(|barrier| owner_of(&barrier.run_id) != first_owner)
+                || runs.iter().any(|run| {
+                    !run.barrier
+                        && barriers
+                            .iter()
+                            .any(|barrier| run.worktree_id == barrier.worktree_id)
+                });
             if overlap {
                 return Err(AppError::new(
                     "broker-active-state-invalid",
@@ -620,20 +605,13 @@ impl Broker {
     fn pump_once(&mut self) -> Result<()> {
         let connection = connect(&self.paths)?;
         maintain_child_cpu_leases(&connection)?;
-        let runs = load_live_runs(&connection)?;
-        let active: Vec<_> = runs
-            .iter()
-            .filter(|run| run.status == "running")
-            .cloned()
-            .collect();
-        let placed = overflow::live_placements(&connection)?;
-        self.validate_active(&active, &placed)?;
-        let mut queued: Vec<_> = runs
-            .iter()
-            .filter(|run| run.status == "queued")
-            .cloned()
-            .collect();
-        crate::recovery::filter_queued(&connection, &mut queued)?;
+        let snapshot_state = load_live_scheduler_state(&connection)?;
+        let active = snapshot_state.active;
+        let queued = snapshot_state.queued;
+        let placed = snapshot_state.placed;
+        let batch_followers = snapshot_state.batch_followers;
+        let batch_owners = snapshot_state.batch_owners;
+        self.validate_active(&active, &placed, &batch_followers, &batch_owners)?;
         // Remember the reservation before observation releases completed workers' claims.
         // Once it fits, the front's raw shortages disappear; lane rotation must not let
         // another repository take those newly freed units before the front starts.
@@ -641,47 +619,56 @@ impl Broker {
             &active,
             &queued,
             &self.capacities,
-            &local_allocations(&active, &placed),
+            &local_allocations(&active, &placed, &batch_followers),
         )
         .map(|run| run.run_id.clone());
-        for run in active {
+        for run in &active {
+            if batch_followers.contains_key(&run.run_id) {
+                continue;
+            }
             if let Some(pool) = placed
                 .get(&run.run_id)
                 .and_then(|name| self.overflow_pools.iter().find(|pool| pool.name == *name))
             {
-                Self::expire_overflow(&connection, &run, pool)?;
+                Self::expire_overflow(&connection, run, pool)?;
             }
-            self.observe(&connection, &run)?;
+            self.observe(&connection, run)?;
         }
         maintain_child_cpu_leases(&connection)?;
         drop(connection);
 
         loop {
             let connection = connect(&self.paths)?;
-            let runs = load_live_runs(&connection)?;
-            let active: Vec<_> = runs
-                .iter()
-                .filter(|run| run.status == "running")
-                .cloned()
-                .collect();
-            let mut queued: Vec<_> = runs
-                .iter()
-                .filter(|run| run.status == "queued")
-                .cloned()
-                .collect();
-            crate::recovery::filter_queued(&connection, &mut queued)?;
-            let placed = overflow::live_placements(&connection)?;
-            self.validate_active(&active, &placed)?;
+            let snapshot_state = load_live_scheduler_state(&connection)?;
+            let active = snapshot_state.active;
+            let queued = snapshot_state.queued;
+            let placed = snapshot_state.placed;
+            let batch_followers = snapshot_state.batch_followers;
+            let batch_owners = snapshot_state.batch_owners;
+            self.validate_active(&active, &placed, &batch_followers, &batch_owners)?;
             // This machine is always preferred: a pool is considered only when nothing
             // more can be admitted locally in this pass.
-            let (next, pool) =
-                match self.next_admissible(&active, &queued, &placed, reserved_front.as_deref()) {
-                    Some(next) => (next, None),
-                    None => match self.next_overflow(&connection, &active, &queued, &placed)? {
+            let (next, pool) = match self.next_admissible(
+                &active,
+                &queued,
+                &placed,
+                &batch_followers,
+                reserved_front.as_deref(),
+            ) {
+                Some(next) => (next, None),
+                None => {
+                    match self.next_overflow(
+                        &connection,
+                        &active,
+                        &queued,
+                        &placed,
+                        &batch_followers,
+                    )? {
                         Some((next, pool)) => (next, Some(pool)),
                         None => return Ok(()),
-                    },
-                };
+                    }
+                }
+            };
             drop(connection);
             self.start_worker(&next, pool.as_ref())?;
             self.last_repository = Some(next.repository_id);
@@ -701,6 +688,7 @@ impl Broker {
         active: &[RunRecord],
         queued: &[RunRecord],
         placed: &BTreeMap<String, String>,
+        batch_followers: &BTreeMap<String, String>,
     ) -> Result<Option<(RunRecord, Pool)>> {
         if self.overflow_pools.is_empty() {
             return Ok(None);
@@ -709,7 +697,14 @@ impl Broker {
             if !overflow_candidate(&run.kind, &run.environment) {
                 continue;
             }
-            let blockers = blocked_by(run, active, queued, &self.capacities, placed);
+            let blockers = blocked_by(
+                run,
+                active,
+                queued,
+                &self.capacities,
+                placed,
+                batch_followers,
+            );
             if blockers.is_empty()
                 || blockers.iter().any(|blocker| {
                     !blocker.starts_with("resource:") && !blocker.starts_with("reservation:")
@@ -765,11 +760,20 @@ impl Broker {
         active: &[RunRecord],
         queued: &[RunRecord],
         placed: &BTreeMap<String, String>,
+        batch_followers: &BTreeMap<String, String>,
         reserved_front: Option<&str>,
     ) -> Option<RunRecord> {
         if let Some(run) = queued.iter().find(|run| {
             reserved_front == Some(run.run_id.as_str())
-                && blocked_by(run, active, queued, &self.capacities, placed).is_empty()
+                && blocked_by(
+                    run,
+                    active,
+                    queued,
+                    &self.capacities,
+                    placed,
+                    batch_followers,
+                )
+                .is_empty()
         }) {
             return Some(run.clone());
         }
@@ -779,7 +783,16 @@ impl Broker {
             if seen.contains(&run.repository_id) {
                 continue;
             }
-            if blocked_by(run, active, queued, &self.capacities, placed).is_empty() {
+            if blocked_by(
+                run,
+                active,
+                queued,
+                &self.capacities,
+                placed,
+                batch_followers,
+            )
+            .is_empty()
+            {
                 seen.insert(run.repository_id.clone());
                 heads.push(run.clone());
             }
@@ -1027,9 +1040,21 @@ impl Broker {
             )
             .map_err(map_database_error)?;
         overflow::settle(connection, &current)?;
+        let finalized_followers = reconcile_batch_on_leader_exit(
+            &self.paths,
+            connection,
+            &current,
+            status,
+            exit_status,
+            failure_reason,
+        )?;
         connection
             .execute_batch("COMMIT")
-            .map_err(map_database_error)
+            .map_err(map_database_error)?;
+        for member_id in finalized_followers {
+            copy_leader_log_to_member(&self.paths, &run.run_id, &member_id);
+        }
+        Ok(())
     }
 
     fn run_bindings(run: &RunRecord) -> Result<BTreeMap<String, resources::Binding>> {
@@ -2332,7 +2357,7 @@ impl Broker {
             environment.insert("TMP".to_owned(), target.clone());
             environment.insert("TEMP".to_owned(), target);
         }
-        let worker_command = self.worker_command(&current, pool)?;
+        let worker_command = self.worker_command(&connection, &current, pool)?;
         let mut pending = match PendingWorker::spawn(
             &worker_command,
             &environment,
@@ -2442,22 +2467,22 @@ impl Broker {
         let setup_failure = match pending.verify_setup() {
             Ok(code) => code,
             Err(error) => {
-                let refreshed = load_run(&connection, &current.run_id)?;
+                let refreshed = load_run(connection, &current.run_id)?;
                 let quota_failure = !error.code.starts_with("gate-tree-")
                     && refreshed
                         .resource_state
                         .contains_key(project_quota::PROJECT_QUOTA_BACKEND);
                 if quota_failure {
-                    let _ = Self::record_worker_setup_failure(&connection, &refreshed, error.code)?;
+                    let _ = Self::record_worker_setup_failure(connection, &refreshed, error.code)?;
                 }
-                let refreshed = load_run(&connection, &current.run_id)?;
-                let _ = self.cancel_resources(&connection, &refreshed)?;
+                let refreshed = load_run(connection, &current.run_id)?;
+                let _ = self.cancel_resources(connection, &refreshed)?;
                 drop(pending);
-                let refreshed = load_run(&connection, &current.run_id)?;
-                self.finish_and_cleanup_resources(&connection, &refreshed)?;
-                let refreshed = load_run(&connection, &current.run_id)?;
+                let refreshed = load_run(connection, &current.run_id)?;
+                self.finish_and_cleanup_resources(connection, &refreshed)?;
+                let refreshed = load_run(connection, &current.run_id)?;
                 self.finish_run(
-                    &connection,
+                    connection,
                     &refreshed,
                     "failed",
                     125,
@@ -2481,17 +2506,17 @@ impl Broker {
                 )
                 .map_err(map_database_error)?;
         }
-        let refreshed = load_run(&connection, &current.run_id)?;
+        let refreshed = load_run(connection, &current.run_id)?;
         if let Some(code) = setup_failure {
-            if Self::record_worker_setup_failure(&connection, &refreshed, code)? {
-                let refreshed = load_run(&connection, &current.run_id)?;
-                let _ = self.cancel_resources(&connection, &refreshed)?;
+            if Self::record_worker_setup_failure(connection, &refreshed, code)? {
+                let refreshed = load_run(connection, &current.run_id)?;
+                let _ = self.cancel_resources(connection, &refreshed)?;
                 drop(pending);
-                let refreshed = load_run(&connection, &current.run_id)?;
-                self.finish_and_cleanup_resources(&connection, &refreshed)?;
-                let refreshed = load_run(&connection, &current.run_id)?;
+                let refreshed = load_run(connection, &current.run_id)?;
+                self.finish_and_cleanup_resources(connection, &refreshed)?;
+                let refreshed = load_run(connection, &current.run_id)?;
                 self.finish_run(
-                    &connection,
+                    connection,
                     &refreshed,
                     "failed",
                     125,
@@ -2500,28 +2525,28 @@ impl Broker {
                 return Ok(());
             }
         } else {
-            Self::record_worker_setup(&connection, &refreshed, &worker_setup)?;
+            Self::record_worker_setup(connection, &refreshed, &worker_setup)?;
         }
         self.crash("worker-setup-commit");
-        let refreshed = load_run(&connection, &current.run_id)?;
+        let refreshed = load_run(connection, &current.run_id)?;
         if refreshed.cancel_requested {
-            let _ = self.cancel_resources(&connection, &refreshed)?;
+            let _ = self.cancel_resources(connection, &refreshed)?;
             drop(pending);
-            let refreshed = load_run(&connection, &current.run_id)?;
-            self.finish_and_cleanup_resources(&connection, &refreshed)?;
-            let refreshed = load_run(&connection, &current.run_id)?;
-            self.finish_run(&connection, &refreshed, "cancelled", 130, None)?;
+            let refreshed = load_run(connection, &current.run_id)?;
+            self.finish_and_cleanup_resources(connection, &refreshed)?;
+            let refreshed = load_run(connection, &current.run_id)?;
+            self.finish_run(connection, &refreshed, "cancelled", 130, None)?;
             return Ok(());
         }
         let child = match pending.release() {
             Ok(child) => child,
             Err(error) => {
-                let refreshed = load_run(&connection, &current.run_id)?;
-                let _ = self.cancel_resources(&connection, &refreshed)?;
-                let refreshed = load_run(&connection, &current.run_id)?;
-                self.finish_and_cleanup_resources(&connection, &refreshed)?;
-                let refreshed = load_run(&connection, &current.run_id)?;
-                self.finish_run(&connection, &refreshed, "failed", 125, Some(error.code))?;
+                let refreshed = load_run(connection, &current.run_id)?;
+                let _ = self.cancel_resources(connection, &refreshed)?;
+                let refreshed = load_run(connection, &current.run_id)?;
+                self.finish_and_cleanup_resources(connection, &refreshed)?;
+                let refreshed = load_run(connection, &current.run_id)?;
+                self.finish_run(connection, &refreshed, "failed", 125, Some(error.code))?;
                 return Ok(());
             }
         };
@@ -2610,14 +2635,16 @@ impl Broker {
         let connection = connect(&self.paths)?;
         // Running jobs keep their child CPU leases granted while the owner drains.
         maintain_child_cpu_leases(&connection)?;
-        let runs = load_live_runs(&connection)?;
-        let active: Vec<_> = runs
-            .iter()
-            .filter(|run| run.status == "running")
-            .cloned()
-            .collect();
-        self.validate_active(&active, &overflow::live_placements(&connection)?)?;
+        let snapshot_state = load_live_scheduler_state(&connection)?;
+        let active = snapshot_state.active;
+        let placed = snapshot_state.placed;
+        let batch_followers = snapshot_state.batch_followers;
+        let batch_owners = snapshot_state.batch_owners;
+        self.validate_active(&active, &placed, &batch_followers, &batch_owners)?;
         for run in &active {
+            if batch_followers.contains_key(&run.run_id) {
+                continue;
+            }
             self.observe(&connection, run)?;
         }
         connection

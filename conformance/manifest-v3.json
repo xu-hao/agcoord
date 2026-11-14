@@ -108,6 +108,16 @@
       }
     },
     {
+      "id": "publication.land-batch-and-bisect",
+      "domain": "publication",
+      "description": "Compatible queued lands on the same target merge sequentially in the coordinator gate tree, gate once for clean publication via atomic ref updates, exclude pre-gate conflicts as merge-error, and binary-bisect failing slices while advancing the target branch on green Left slices and re-verifying target and PR head freshness.",
+      "tests": {
+        "rust_native": [
+          "scheduler::land_batch_selects_compatible_candidates_and_manages_claims"
+        ]
+      }
+    },
+    {
       "id": "tui.real-snapshot-refresh",
       "domain": "tui",
       "description": "The real Textual application renders public queue identity and refreshes a live native snapshot.",

@@ -1475,6 +1475,30 @@ atomic mutation would leave the outcome indeterminate. A graceful broker stop le
 finish; once `stop_grace` elapses it interrupts earlier phases as `broker-stopped` but still
 waits for publishing and records its authoritative result.
 
+### Batching and bisecting queued lands
+
+When an admitted `land` row starts while other queued `land` rows target the same repository,
+target branch, normalized gate command, and compatible resource envelope, the coordinator passes
+those compatible candidates to the leader worker so multiple ready PRs can share one gate:
+
+1. **Pre-gate assembly (`T_i = merge(T_{i-1}, P_i)`):** Starting from `T_0 = main`, the leader
+   inspects each candidate's live PR state and head SHA (skipping `pr-not-ready`,
+   `head-changed`, or `avoided-commit` rows without pulling them into the batch), checks out
+   `T_0`, and sequentially runs `git merge --no-ff` in the coordinator gate tree. Any candidate
+   that conflicts with `T_{i-1}` is claimed/recorded immediately as `merge-error` and dropped so
+   the remaining clean candidates continue assembling from `T_{i-1}`.
+2. **Combined gating and atomic multi-PR publication:** The leader runs the gate command once on
+   the combined merge tree `T_k`. When the gate succeeds and `main` plus all `P_1..P_k` head SHAs
+   still match, the leader constructs chained merge commits `M_1..M_k` on GitHub and advances
+   `main` to `M_k` along with each PR's `avoid-commit` / closure ref via `update_refs` in one
+   atomic transaction, closing every member row as `passed` with the batch log.
+3. **Binary-split bisection on gate failure:** If `T_k` fails its gate (`k > 1`), the batch
+   splits `[P_1..P_k]` into `Left` and `Right` halves. `Left` is assembled and gated first
+   against the current `main`; when `Left` is green and fresh, it is published immediately so
+   `main` advances before `Right` is re-merged and gated against the updated target. Failing
+   halves recurse down to singletons (`len == 1 -> gate-failed`), re-checking `main` (`stale-main`)
+   and PR head SHAs (`head-changed`) before gating and before publishing each slice.
+
 ### Reusing a full receipt as the land gate
 
 The two-step a worktree usually follows — `agc full`, then `agc land` — exists so that a red gate

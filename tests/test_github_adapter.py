@@ -258,3 +258,132 @@ def test_github_publisher_fails_closed_on_bad_or_unsuccessful_responses(
             )
         else:
             publisher.is_ancestor(ancestor_sha=HEAD, descendant_sha=CANDIDATE)
+
+
+def test_update_refs_accepts_target_and_multiple_pull_request_refs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    log = _install_recording_gh(monkeypatch, tmp_path)
+    publisher = GitHubMergePublisher(tmp_path)
+    head_two = "3" * 40
+
+    publisher.update_refs(
+        (
+            {
+                "name": "refs/heads/main",
+                "before_oid": MAIN,
+                "after_oid": CANDIDATE,
+                "force": False,
+            },
+            {
+                "name": f"refs/heads/{BRANCH}",
+                "before_oid": HEAD,
+                "after_oid": HEAD,
+                "force": False,
+            },
+            {
+                "name": "refs/heads/feature/second-pr",
+                "before_oid": head_two,
+                "after_oid": head_two,
+                "force": False,
+            },
+        )
+    )
+
+    calls = _calls(log)
+    assert len(calls) == 2
+    assert len(calls[1]["payload"]["variables"]["input"]["refUpdates"]) == 3
+
+
+def test_create_merge_commit_uploads_missing_tree_from_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for cmd in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.name", "Test"],
+        ["git", "config", "user.email", "test@example.invalid"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "batch.txt").write_text("merged batch\n", encoding="utf-8")
+    subprocess.run(["git", "add", "batch.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "batch"], cwd=repo, check=True, capture_output=True)
+    tree_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    log = tmp_path / "gh-upload.jsonl"
+    executable = tmp_path / "gh"
+    executable.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+raw = sys.stdin.read()
+payload = json.loads(raw) if raw else None
+with Path(os.environ["GH_TEST_LOG"]).open("a", encoding="utf-8") as s:
+    s.write(json.dumps({{"args": args, "payload": payload}}) + "\\n")
+
+created_flag = Path({str(tmp_path / "tree-created")!r})
+if args[:2] == ["repo", "view"]:
+    print(json.dumps({{"id": "R_1", "nameWithOwner": "example/widgets"}}))
+elif args == ["api", "--method", "POST", "repos/example/widgets/git/commits", "--input", "-"]:
+    if not created_flag.exists():
+        print("Tree does not exist (422)", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps({{
+        "sha": "e" * 40,
+        "tree": {{"sha": payload["tree"]}},
+        "parents": [{{"sha": p}} for p in payload["parents"]],
+    }}))
+elif args == ["api", "--method", "POST", "repos/example/widgets/git/blobs", "--input", "-"]:
+    print(json.dumps({{"sha": "f" * 40}}))
+elif args == ["api", "--method", "POST", "repos/example/widgets/git/trees", "--input", "-"]:
+    created_flag.write_text("1", encoding="utf-8")
+    print(json.dumps({{"sha": {tree_sha!r}}}))
+else:
+    raise SystemExit(f"unexpected gh call: {{args!r}}")
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("GH_TEST_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+    publisher = GitHubMergePublisher(repo)
+    created = publisher.create_merge_commit(
+        message="Batch merge",
+        tree_sha=tree_sha,
+        parent_shas=(base_sha, head_sha),
+    )
+    assert created["tree_sha"] == tree_sha
+    assert created["sha"] == "e" * 40
+    recorded = _calls(log)
+    assert any("git/trees" in " ".join(c["args"]) for c in recorded)

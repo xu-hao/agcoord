@@ -9,6 +9,7 @@ compares and updates both refs. A changed source or post-gate target rejects pub
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -1095,6 +1096,7 @@ class GitHubMergePublisher:
     def __init__(self, checkout: str | os.PathLike[str]):
         self.checkout = Path(checkout).expanduser().resolve()
         self._repository_value: tuple[str, str] | None = None
+        self._commit_trees: dict[str, str] = {}
 
     def _invoke(self, arguments: list[str], payload: dict[str, object]) -> object:
         result = _run(
@@ -1137,6 +1139,91 @@ class GitHubMergePublisher:
         self._repository_value = (repository_id, name_with_owner)
         return self._repository_value
 
+    def _ensure_tree_on_remote(
+        self,
+        name_with_owner: str,
+        *,
+        tree_sha: str,
+        base_commit: str,
+    ) -> None:
+        base_tree = self._commit_trees.get(base_commit) or _git(
+            self.checkout,
+            "rev-parse",
+            f"{base_commit}^{{tree}}",
+            operation="resolve base tree",
+        )
+        raw_diff = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.checkout),
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-abbrev",
+                base_tree,
+                tree_sha,
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if raw_diff.returncode != 0:
+            detail = raw_diff.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"cannot inspect tree difference: {detail}")
+        tokens = [token for token in raw_diff.stdout.split(b"\0") if token]
+        if not tokens:
+            return
+        tree_entries: list[dict[str, object]] = []
+        idx = 0
+        while idx + 1 < len(tokens):
+            header = tokens[idx].decode("utf-8", errors="strict")
+            path = tokens[idx + 1].decode("utf-8", errors="strict")
+            idx += 2
+            # Format: :<old_mode> <new_mode> <old_sha> <new_sha> <status>
+            parts = header.lstrip(":").split()
+            if len(parts) < 5:
+                raise RuntimeError(f"unexpected diff-tree header: {header!r}")
+            old_mode, new_mode, _old_sha, new_sha, status = parts[:5]
+            if status.startswith("D"):
+                tree_entries.append(
+                    {"path": path, "mode": old_mode, "type": "blob", "sha": None}
+                )
+            elif new_mode == "160000":
+                tree_entries.append(
+                    {"path": path, "mode": "160000", "type": "commit", "sha": new_sha}
+                )
+            else:
+                blob_res = subprocess.run(
+                    ["git", "-C", str(self.checkout), "cat-file", "blob", new_sha],
+                    capture_output=True,
+                    check=False,
+                )
+                if blob_res.returncode != 0:
+                    raise RuntimeError(f"cannot read blob {new_sha} for {path}")
+                blob_resp = self._invoke(
+                    ["api", "--method", "POST", f"repos/{name_with_owner}/git/blobs"],
+                    {
+                        "content": base64.b64encode(blob_res.stdout).decode("ascii"),
+                        "encoding": "base64",
+                    },
+                )
+                if not isinstance(blob_resp, dict) or not isinstance(blob_resp.get("sha"), str):
+                    raise RuntimeError("GitHub returned a malformed blob response")
+                tree_entries.append(
+                    {
+                        "path": path,
+                        "mode": new_mode,
+                        "type": "blob",
+                        "sha": blob_resp["sha"],
+                    }
+                )
+        created = self._invoke(
+            ["api", "--method", "POST", f"repos/{name_with_owner}/git/trees"],
+            {"base_tree": base_tree, "tree": tree_entries},
+        )
+        if not isinstance(created, dict) or created.get("sha") != tree_sha:
+            raise RuntimeError("GitHub tree upload did not match the expected gated tree")
+
     def create_merge_commit(
         self,
         *,
@@ -1153,14 +1240,23 @@ class GitHubMergePublisher:
             _sha(parent, field="merge candidate parent") for parent in parent_shas
         )
         _repository_id, name_with_owner = self._repository()
-        raw = self._invoke(
-            ["api", "--method", "POST", f"repos/{name_with_owner}/git/commits"],
-            {
-                "message": message,
-                "tree": selected_tree,
-                "parents": list(selected_parents),
-            },
-        )
+        commit_payload = {
+            "message": message,
+            "tree": selected_tree,
+            "parents": list(selected_parents),
+        }
+        endpoint = ["api", "--method", "POST", f"repos/{name_with_owner}/git/commits"]
+        try:
+            raw = self._invoke(endpoint, commit_payload)
+        except RuntimeError as first_error:
+            if "tree" not in str(first_error).lower() or not self.checkout.exists():
+                raise
+            self._ensure_tree_on_remote(
+                name_with_owner,
+                tree_sha=selected_tree,
+                base_commit=selected_parents[0],
+            )
+            raw = self._invoke(endpoint, commit_payload)
         if not isinstance(raw, dict):
             raise RuntimeError("GitHub returned a malformed merge commit")
         try:
@@ -1171,9 +1267,12 @@ class GitHubMergePublisher:
             raise RuntimeError("GitHub returned a malformed merge commit") from exc
         if len(response_parents) != 2:
             raise RuntimeError("GitHub merge candidate does not have two parents")
+        normalized_sha = _sha(response_sha, field="GitHub merge candidate")
+        normalized_tree = _sha(response_tree, field="GitHub merge candidate tree")
+        self._commit_trees[normalized_sha] = normalized_tree
         return {
-            "sha": _sha(response_sha, field="GitHub merge candidate"),
-            "tree_sha": _sha(response_tree, field="GitHub merge candidate tree"),
+            "sha": normalized_sha,
+            "tree_sha": normalized_tree,
             "parent_shas": tuple(
                 _sha(parent, field="GitHub merge candidate parent")
                 for parent in response_parents
@@ -1181,8 +1280,8 @@ class GitHubMergePublisher:
         }
 
     def update_refs(self, updates: tuple[dict[str, object], ...]) -> None:
-        if not isinstance(updates, tuple) or len(updates) != 2:
-            raise RuntimeError("atomic publication requires exactly two ref updates")
+        if not isinstance(updates, tuple) or len(updates) < 2:
+            raise RuntimeError("atomic publication requires at least two ref updates")
         normalized: list[dict[str, object]] = []
         for update in updates:
             if not isinstance(update, dict) or set(update) != {
