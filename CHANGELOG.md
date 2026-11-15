@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.9.2 — 2026-11-15
+
 - Verify admission against the exact active batch slice head and expose its ordered members in
   run status, including during bisection. #349 — record batch slice head and members for
   admission and status.
