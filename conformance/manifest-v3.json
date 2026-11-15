@@ -118,6 +118,17 @@
       }
     },
     {
+      "id": "publication.batch-slice-admission",
+      "domain": "publication",
+      "description": "A batched land gate authorizes exactly its recorded merged slice head, exposes its ordered members, rejects other heads, and clears slice state before publication or leader termination, including both bisection failure orders.",
+      "tests": {
+        "rust_native": [
+          "scheduler::batch_slice_gate_verifies_real_heads_through_both_bisection_orders",
+          "scheduler::land_batch_selects_compatible_candidates_and_manages_claims"
+        ]
+      }
+    },
+    {
       "id": "tui.real-snapshot-refresh",
       "domain": "tui",
       "description": "The real Textual application renders public queue identity and refreshes a live native snapshot.",
