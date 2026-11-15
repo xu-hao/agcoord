@@ -3,6 +3,12 @@
 All notable user-facing changes to AGCoord are recorded here. Versions follow semantic
 versioning; dates use ISO 8601.
 
+## Unreleased
+
+- Verify admission against the exact active batch slice head and expose its ordered members in
+  run status, including during bisection. #349 — record batch slice head and members for
+  admission and status.
+
 ## 0.9.1 — 2026-11-14
 
 - Publish the coupled PyPI distribution and native Linux x86_64 musl host bundle on

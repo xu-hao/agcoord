@@ -309,6 +309,13 @@ pub struct BatchStatusRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct BatchSliceRequest {
+    pub identity: BatchStatusRequest,
+    pub gating_head_sha: String,
+    pub member_run_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct BatchMemberPhaseRequest {
     pub run_id: String,
     pub worker_pid: u32,
@@ -1428,6 +1435,7 @@ pub fn open_protocol5(paths: &Paths) -> Result<Connection> {
         ));
     }
     validate_schema(&connection)?;
+    ensure_land_batch_schema(&connection)?;
     maintenance_record(&connection)?;
     Ok(connection)
 }
@@ -2288,7 +2296,7 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
     let live_placed = crate::overflow::live_placements(&connection)?;
     let placed = crate::overflow::all_placements(&connection)?;
     let batch_followers = active_batch_followers(&connection)?;
-    Ok(public_run(
+    let mut result = public_run(
         paths,
         &run,
         position,
@@ -2301,7 +2309,9 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
             &batch_followers,
         ),
         &placed,
-    ))
+    );
+    result["batch_slice"] = batch_slice(&connection, &run.run_id)?;
+    Ok(result)
 }
 
 pub fn log(paths: &Paths, run_id: &str, offset: u64, limit: usize) -> Result<Value> {
@@ -3456,10 +3466,22 @@ pub fn verify_admission(paths: &Paths, request: &AdmissionRequest) -> Result<Val
     }
     let connection = open_protocol5(paths)?;
     let run = load_run(&connection, &request.run_id)?;
+    let slice_head: Option<String> = if run.kind == "land" {
+        connection
+            .query_row(
+                "SELECT gating_head_sha FROM land_batch_slices WHERE leader_run_id = ?1",
+                params![run.run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_database_error)?
+    } else {
+        None
+    };
     let matches = run.status == "running"
         && run.kind == request.kind
         && run.checkout == request.checkout
-        && run.head_sha.as_deref() == Some(&request.head_sha)
+        && slice_head.as_deref().or(run.head_sha.as_deref()) == Some(&request.head_sha)
         && admitted_worker_presents(&run, request.worker_pid, &request.worker_start_token);
     if !matches {
         return Err(AppError::new(
@@ -3597,9 +3619,43 @@ pub fn ensure_land_batch_schema(connection: &Connection) -> Result<()> {
                 active INTEGER NOT NULL DEFAULT 1,
                 original_checkout TEXT NOT NULL,
                 original_environment_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS land_batch_slices (
+                leader_run_id TEXT PRIMARY KEY,
+                gating_head_sha TEXT NOT NULL,
+                slice_member_ids_json TEXT NOT NULL
             );",
         )
         .map_err(map_database_error)
+}
+
+fn batch_slice(connection: &Connection, run_id: &str) -> Result<Value> {
+    let slice: Option<(String, String)> = connection.query_row(
+        "SELECT gating_head_sha, slice_member_ids_json FROM land_batch_slices WHERE leader_run_id = ?1",
+        params![run_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(map_database_error)?;
+    let Some((head, raw)) = slice else {
+        return Ok(Value::Null);
+    };
+    let ids: Vec<String> = serde_json::from_str(&raw)
+        .map_err(|_| AppError::new("broker-row-invalid", "invalid batch slice members"))?;
+    let mut members = Vec::new();
+    for id in ids {
+        let run = load_run(connection, &id)?;
+        let original_checkout: String = connection.query_row(
+            "SELECT original_checkout FROM land_batch_members WHERE leader_run_id = ?1 AND member_run_id = ?2",
+            params![run_id, id], |row| row.get(0),
+        ).map_err(map_database_error)?;
+        let publication = run
+            .publication_adapter
+            .as_ref()
+            .map(|adapter| json!({"adapter": adapter, "request": run.publication_request}));
+        members.push(
+            json!({"run_id": run.run_id, "branch": run.branch, "head_sha": run.head_sha,
+            "original_checkout": original_checkout, "publication": publication}),
+        );
+    }
+    Ok(json!({"gating_head_sha": head, "members": members}))
 }
 
 /// Active follower -> leader mapping for claimed land-batch members (excludes the leader).
@@ -3917,6 +3973,88 @@ fn load_verified_batch_leader(
     Ok(leader)
 }
 
+pub fn set_batch_slice(paths: &Paths, request: &BatchSliceRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let identity = &request.identity;
+    load_verified_batch_leader(
+        &connection,
+        &identity.run_id,
+        identity.worker_pid,
+        &identity.worker_start_token,
+        &identity.checkout,
+        &identity.head_sha,
+        true,
+    )?;
+    let sha = &request.gating_head_sha;
+    if sha.len() != 40
+        || !sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(AppError::new(
+            "broker-batch-slice-invalid",
+            "batch slice head must be 40 lowercase hexadecimal characters",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    if request.member_run_ids.is_empty() {
+        return Err(AppError::new(
+            "broker-batch-slice-invalid",
+            "batch slice must contain members",
+        ));
+    }
+    for id in &request.member_run_ids {
+        let active: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM land_batch_members JOIN runs ON runs.run_id = land_batch_members.member_run_id WHERE leader_run_id = ?1 AND member_run_id = ?2 AND active = 1 AND runs.status = 'running')",
+            params![identity.run_id, id], |row| row.get(0),
+        ).map_err(map_database_error)?;
+        if !active || !seen.insert(id) {
+            return Err(AppError::new(
+                "broker-batch-slice-invalid",
+                "batch slice members must be distinct running batch members",
+            ));
+        }
+    }
+    let raw = serde_json::to_string(&request.member_run_ids)
+        .map_err(|_| AppError::new("broker-batch-slice-invalid", "invalid members"))?;
+    connection.execute("INSERT OR REPLACE INTO land_batch_slices (leader_run_id, gating_head_sha, slice_member_ids_json) VALUES (?1, ?2, ?3)", params![identity.run_id, sha, raw]).map_err(map_database_error)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({"leader_run_id": identity.run_id}))
+}
+
+pub fn clear_batch_slice(paths: &Paths, request: &BatchStatusRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    load_verified_batch_leader(
+        &connection,
+        &request.run_id,
+        request.worker_pid,
+        &request.worker_start_token,
+        &request.checkout,
+        &request.head_sha,
+        false,
+    )?;
+    connection
+        .execute(
+            "DELETE FROM land_batch_slices WHERE leader_run_id = ?1",
+            params![request.run_id],
+        )
+        .map_err(map_database_error)?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({"leader_run_id": request.run_id}))
+}
+
 fn apply_land_phase_update(
     connection: &Connection,
     run: &RunRecord,
@@ -4018,9 +4156,10 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
         .map_err(map_database_error)?;
     connection
         .execute(
-            "INSERT OR IGNORE INTO land_batch_members
+            "INSERT INTO land_batch_members
              (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
-             VALUES (?1, ?2, 0, 1, ?3, ?4)",
+             VALUES (?1, ?2, 0, 1, ?3, ?4)
+             ON CONFLICT(member_run_id) DO UPDATE SET active = 1",
             params![
                 leader.run_id,
                 leader.run_id,
@@ -4406,6 +4545,12 @@ pub fn reconcile_batch_on_leader_exit(
     leader_failure_reason: Option<&str>,
 ) -> Result<Vec<String>> {
     ensure_land_batch_schema(connection)?;
+    connection
+        .execute(
+            "DELETE FROM land_batch_slices WHERE leader_run_id = ?1",
+            params![leader.run_id],
+        )
+        .map_err(map_database_error)?;
     let mut statement = connection
         .prepare(
             "SELECT member_run_id, original_checkout, original_environment_json
@@ -4425,15 +4570,15 @@ pub fn reconcile_batch_on_leader_exit(
     let entries: Vec<(String, String, String)> = rows
         .collect::<std::result::Result<_, _>>()
         .map_err(map_database_error)?;
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
     connection
         .execute(
-            "UPDATE land_batch_members SET active = 0 WHERE leader_run_id = ?1 AND member_run_id = ?1",
+            "DELETE FROM land_batch_members WHERE leader_run_id = ?1 AND member_run_id = ?1",
             params![leader.run_id],
         )
         .map_err(map_database_error)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut finalized_for_log_copy = Vec::new();
     let leader_requeue =
         leader.cancel_requested || matches!(leader_status, "cancelled" | "interrupted");

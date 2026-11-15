@@ -250,6 +250,12 @@ elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/trees"):
         tmp_idx.unlink()
     print(json.dumps({{"sha": res.stdout.strip()}}))
 elif args[:2] == ["api", "graphql"]:
+    if os.environ.get("BATCH_CLEAR_LOG"):
+        from agcoord.queue import CoordinatorClient
+        leader = os.environ["AGCOORD_RUN_ID"]
+        row = CoordinatorClient(state_dir=os.environ["AGCOORD_STATE_DIR"]).admitted_run_status(leader)
+        with open(os.environ["BATCH_CLEAR_LOG"], "a", encoding="utf-8") as cleared:
+            cleared.write(json.dumps(row.get("batch_slice")) + "\\n")
     updates = payload["variables"]["input"]["refUpdates"]
     # Atomically verify all beforeOid values and update remote refs + mark PRs MERGED.
     with STATE_FILE.open("r+", encoding="utf-8") as stream:
@@ -324,6 +330,66 @@ while not Path(sys.argv[2]).exists():
     )
     wait_for(entered.exists, "hold check did not start")
     return hold_id, release
+
+
+@pytest.mark.parametrize("bad_pr", [None, 1, 2])
+def test_batch_slice_admission_and_status(coordinator, tmp_path: Path, bad_pr):
+    _broker, client = coordinator
+    remote, state_file, checkouts, pr_state = _setup_remote_and_worktrees(
+        tmp_path,
+        [
+            {"pr": pr, "branch": f"feat/p{pr}", "files": {f"p{pr}.txt": "yes\n"}}
+            for pr in (1, 2)
+        ],
+    )
+    bin_dir = _install_stateful_gh(tmp_path, remote, state_file, tmp_path / "gh.jsonl")
+    gate_log = tmp_path / "slice-gates.jsonl"
+    gate = _python('''
+import json, os, subprocess, sys
+from pathlib import Path
+from agcoord.queue import CoordinatorClient
+head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+args = [sys.executable, "-m", "agcoord", "--json", "verify-admission", "--state-dir", os.environ["AGCOORD_STATE_DIR"],
+        "--checkout", os.getcwd(), "--run-id", os.environ["AGCOORD_RUN_ID"], "--kind", "land",
+        "--worker-pid", str(os.getppid()), "--head-sha"]
+good = subprocess.run(args + [head], capture_output=True, text=True)
+wrong = subprocess.run(args + ["f" * 40], capture_output=True, text=True)
+row = CoordinatorClient(state_dir=os.environ["AGCOORD_STATE_DIR"]).admitted_run_status(os.environ["AGCOORD_RUN_ID"])
+with open(os.environ["BATCH_GATE_LOG"], "a") as output:
+    output.write(json.dumps({"head": head, "slice": row.get("batch_slice"), "good": good.returncode,
+                             "good_err": good.stderr, "wrong": wrong.returncode, "wrong_err": wrong.stderr}) + "\\n")
+if good.returncode or not wrong.returncode:
+    sys.exit(91)
+if os.environ["BAD_PR"] and Path("p" + os.environ["BAD_PR"] + ".txt").exists():
+    sys.exit(5)
+''')
+    hold_id, release = _submit_hold(client, tmp_path, checkouts[1], "slice")
+    clear_log = tmp_path / "cleared-slices.jsonl"
+    env = _env_with_gh(bin_dir, {"BATCH_GATE_LOG": str(gate_log), "BAD_PR": str(bad_pr or ""),
+                                 "BATCH_CLEAR_LOG": str(clear_log)})
+    run_ids = {pr: client.submit_land("github", pr, gate, checkout=str(checkouts[pr]),
+                resources={"jobs": 1}, caller_pid=os.getpid(), environment=env) for pr in (1, 2)}
+    release.touch()
+    _wait_terminal(client, hold_id, "passed")
+    rows = {pr: _wait_terminal(client, run_ids[pr]) for pr in (1, 2)}
+    gates = [json.loads(line) for line in gate_log.read_text().splitlines()]
+    assert all(json.loads(line) is None for line in clear_log.read_text().splitlines())
+    expected_slices = [[1, 2]] if bad_pr is None else [[1, 2], [1], [2]]
+    assert len(gates) == len(expected_slices), gates
+    for observed, members in zip(gates, expected_slices):
+        assert observed["good"] == 0, observed
+        assert observed["wrong"] != 0 and "broker-admission-mismatch" in observed["wrong_err"]
+        assert observed["slice"]["gating_head_sha"] == observed["head"]
+        assert observed["slice"]["members"] == [
+            {"run_id": run_ids[pr], "branch": f"feat/p{pr}",
+             "head_sha": pr_state[str(pr)]["headRefOid"], "original_checkout": str(checkouts[pr]),
+             "publication": rows[pr]["publication"]} for pr in members
+        ]
+    for pr in (1, 2):
+        assert rows[pr]["status"] == ("failed" if pr == bad_pr else "passed")
+        assert rows[pr]["batch_slice"] is None
+        if pr == bad_pr:
+            assert rows[pr]["failure_reason"] == "gate-failed"
 
 
 def test_land_batch_merges_and_publishes_clean_prs_with_one_gate(

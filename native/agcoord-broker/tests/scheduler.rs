@@ -9239,6 +9239,157 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
         .collect();
     assert_eq!(claimed_ids, vec!["land-1", "land-2", "land-4"]);
 
+    // The recorded slice is the only head accepted while the gate is active.
+    let slice_head = "1234567890abcdef1234567890abcdef12345678";
+    let slice_members = r#"["land-1","land-2"]"#;
+    let identity = [
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "land-1",
+        "--worker-pid",
+        &pid,
+        "--worker-start-token",
+        &token,
+        "--checkout",
+        &checkout_str,
+        "--head",
+        &head_str,
+    ];
+    let set = Command::new(BROKER)
+        .arg("set-batch-slice")
+        .args(identity)
+        .args(["--slice-head", slice_head, "--members-json", slice_members])
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let slice = status(&state, "land-1")["batch_slice"].clone();
+    assert_eq!(slice["gating_head_sha"], slice_head);
+    assert_eq!(slice["members"][0]["branch"], "feat/one");
+    assert_eq!(slice["members"][0]["head_sha"], head_str);
+    assert_eq!(
+        slice["members"][0]["original_checkout"],
+        wt1.to_str().unwrap()
+    );
+    assert_eq!(
+        slice["members"][1]["original_checkout"],
+        wt2.to_str().unwrap()
+    );
+    assert_eq!(
+        slice["members"][1]["publication"],
+        json!({"adapter": "github", "request": 102})
+    );
+    assert_eq!(
+        slice["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["run_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["land-1", "land-2"]
+    );
+    let verify = |head: &str| {
+        Command::new(BROKER)
+            .args([
+                "verify",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-1",
+                "--kind",
+                "land",
+                "--worker-pid",
+                &pid,
+                "--worker-start-token",
+                &token,
+                "--checkout",
+                &checkout_str,
+                "--head",
+                head,
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(verify(slice_head).status.success());
+    let refused = verify("ffffffffffffffffffffffffffffffffffffffff");
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-admission-mismatch"
+    );
+    let clear = Command::new(BROKER)
+        .arg("clear-batch-slice")
+        .args(identity)
+        .output()
+        .unwrap();
+    assert!(clear.status.success());
+    assert!(status(&state, "land-1")["batch_slice"].is_null());
+    let mut invalid_identity = identity;
+    invalid_identity[7] = "invalid-start-token";
+    for command in ["set-batch-slice", "clear-batch-slice"] {
+        let mut call = Command::new(BROKER);
+        call.arg(command).args(invalid_identity);
+        if command == "set-batch-slice" {
+            call.args(["--slice-head", slice_head, "--members-json", slice_members]);
+        }
+        let rejected = call.output().unwrap();
+        assert!(!rejected.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rejected.stderr).unwrap()["code"],
+            "broker-land-identity-mismatch"
+        );
+    }
+    assert!(verify(&head_str).status.success());
+    assert!(!verify(slice_head).status.success());
+    for (head, members) in [
+        ("ABCDEF7890abcdef1234567890abcdef12345678", slice_members),
+        (slice_head, r#"["land-3"]"#),
+        (slice_head, r#"["land-1","land-1"]"#),
+        (slice_head, "[]"),
+    ] {
+        let bad = Command::new(BROKER)
+            .arg("set-batch-slice")
+            .args(identity)
+            .args(["--slice-head", head, "--members-json", members])
+            .output()
+            .unwrap();
+        assert!(!bad.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bad.stderr).unwrap()["code"],
+            "broker-batch-slice-invalid"
+        );
+        assert!(status(&state, "land-1")["batch_slice"].is_null());
+    }
+    let follower_only = Command::new(BROKER)
+        .arg("set-batch-slice")
+        .args(identity)
+        .args([
+            "--slice-head",
+            slice_head,
+            "--members-json",
+            r#"["land-2"]"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(follower_only.status.success());
+    assert_eq!(
+        status(&state, "land-1")["batch_slice"]["members"][0]["run_id"],
+        "land-2"
+    );
+    assert!(verify(slice_head).status.success());
+    assert!(
+        Command::new(BROKER)
+            .arg("clear-batch-slice")
+            .args(identity)
+            .status()
+            .unwrap()
+            .success()
+    );
+
     // Followers are active ('running') without double-counting machine allocations!
     let snap = snapshot(&state).unwrap();
     assert_eq!(snap["allocations"]["jobs"], 1);
@@ -9301,6 +9452,21 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
     );
     assert_eq!(status(&state, "land-2")["status"], "passed");
 
+    // Cancellation clears an active slice while the remaining follower returns to the queue.
+    assert!(
+        Command::new(BROKER)
+            .arg("set-batch-slice")
+            .args(identity)
+            .args([
+                "--slice-head",
+                slice_head,
+                "--members-json",
+                r#"["land-4"]"#
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
     // Cancel leader while land-4 is still active -> land-4 must return cleanly to 'queued'!
     assert!(
         Command::new(BROKER)
@@ -9317,12 +9483,236 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
     );
     fs::write(&worker_release, b"").unwrap();
     wait_status(&state, "land-1", "cancelled");
+    assert!(status(&state, "land-1")["batch_slice"].is_null());
     wait_for(Duration::from_secs(5), || {
         status(&state, "land-4")["status"] == "queued"
     });
     wait_status(&state, "land-3", "passed");
     wait_status(&state, "land-4", "passed");
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn batch_slice_gate_verifies_real_heads_through_both_bisection_orders() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let python = String::from_utf8(
+        Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    for bad in ["", "1", "2"] {
+        let temporary = TestDirectory::new("slice-gate-bisect");
+        let base = temporary.path();
+        let setup = Command::new(&python)
+            .current_dir(root)
+            .args([
+                "-c",
+                r#"
+import json, sys
+from pathlib import Path
+sys.path.insert(0, 'tests')
+from test_land_batch import _setup_remote_and_worktrees, _install_stateful_gh
+base = Path(sys.argv[1])
+remote, state, checkouts, prs = _setup_remote_and_worktrees(base, [
+    {'pr': n, 'branch': f'feat/p{n}', 'files': {f'p{n}.txt': 'yes\n'}} for n in (1, 2)
+])
+bin_dir = _install_stateful_gh(base, remote, state, base / 'gh.jsonl')
+print(json.dumps({'remote': str(remote), 'state': str(state), 'bin': str(bin_dir),
+                  'checkouts': {str(n): str(p) for n, p in checkouts.items()}, 'prs': prs}))
+"#,
+                base.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let config: Value = serde_json::from_slice(&setup.stdout).unwrap();
+        let wt1 = PathBuf::from(config["checkouts"]["1"].as_str().unwrap());
+        let state = base.join("broker-state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("config.json"),
+            json!({"native_broker": {
+                "path": BROKER, "allow_development": true
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+        let hold_entered = base.join("hold-entered");
+        let hold_release = base.join("hold-release");
+        let _releases = ReleaseFiles(vec![hold_release.clone()]);
+        submit_ok(
+            &state,
+            &Submission {
+                run_id: "hold-slice",
+                kind: "check",
+                repository: "repo-slice",
+                checkout: &wt1,
+                command: blocking_command(&hold_entered, &hold_release, None),
+                gate_run_id: None,
+            },
+        );
+        wait_for(Duration::from_secs(5), || hold_entered.exists());
+        let gate = base.join("gate.py");
+        let gate_log = base.join("gates.jsonl");
+        fs::write(&gate, r#"
+import json, os, subprocess, sys
+from pathlib import Path
+from agcoord.queue import CoordinatorClient
+head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+args = [sys.executable, '-m', 'agcoord', '--json', 'verify-admission',
+        '--state-dir', os.environ['AGCOORD_STATE_DIR'], '--checkout', os.getcwd(),
+        '--run-id', os.environ['AGCOORD_RUN_ID'], '--kind', 'land',
+        '--worker-pid', str(os.getppid()), '--head-sha']
+good = subprocess.run(args + [head], capture_output=True, text=True)
+wrong = subprocess.run(args + ['f' * 40], capture_output=True, text=True)
+row = CoordinatorClient(state_dir=os.environ['AGCOORD_STATE_DIR']).admitted_run_status(os.environ['AGCOORD_RUN_ID'])
+with open(os.environ['SLICE_GATE_LOG'], 'a') as stream:
+    stream.write(json.dumps({'head': head, 'slice': row['batch_slice'], 'good': good.returncode,
+                             'wrong': wrong.returncode, 'wrong_error': wrong.stderr}) + '\n')
+if good.returncode or not wrong.returncode:
+    sys.exit(91)
+if os.environ['BAD_PR'] and Path('p' + os.environ['BAD_PR'] + '.txt').exists():
+    sys.exit(5)
+"#).unwrap();
+        let path = format!(
+            "{}:{}",
+            config["bin"].as_str().unwrap(),
+            std::env::var("PATH").unwrap()
+        );
+        for pr in [1, 2] {
+            let id = format!("land-slice-{pr}");
+            let branch = format!("feat/p{pr}");
+            let checkout = config["checkouts"][pr.to_string()].as_str().unwrap();
+            let head = config["prs"][pr.to_string()]["headRefOid"]
+                .as_str()
+                .unwrap();
+            let result = Command::new(BROKER)
+                .args([
+                    "submit",
+                    "--state-dir",
+                    state_argument(&state),
+                    "--run-id",
+                    &id,
+                    "--kind",
+                    "land",
+                    "--label",
+                    &id,
+                    "--repository-id",
+                    "repo-slice",
+                    "--repository",
+                    "repo-slice",
+                    "--worktree-id",
+                    &format!("wt-{pr}"),
+                    "--checkout",
+                    checkout,
+                    "--branch",
+                    &branch,
+                    "--head",
+                    head,
+                    "--resource",
+                    "jobs=1",
+                    "--caller-pid",
+                    &std::process::id().to_string(),
+                    "--publication-adapter",
+                    "github",
+                    "--publication-request-json",
+                    &pr.to_string(),
+                    "--env",
+                    &format!("_AGCOORD_LAND_PYTHON={python}"),
+                    "--env",
+                    &format!("PATH={path}"),
+                    "--env",
+                    &format!("PYTHONPATH={}", root.join("src").display()),
+                    "--env",
+                    &format!("SLICE_GATE_LOG={}", gate_log.display()),
+                    "--env",
+                    &format!("BAD_PR={bad}"),
+                    "--",
+                    &python,
+                    gate.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fs::write(&hold_release, b"").unwrap();
+        for pr in [1, 2] {
+            let id = format!("land-slice-{pr}");
+            let expected = if bad == pr.to_string() {
+                "failed"
+            } else {
+                "passed"
+            };
+            let row = wait_status(&state, &id, expected);
+            if expected == "failed" {
+                assert_eq!(row["failure_reason"], "gate-failed");
+            }
+            assert!(row["batch_slice"].is_null());
+        }
+        let gates: Vec<Value> = fs::read_to_string(&gate_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let expected: Vec<Vec<usize>> = if bad.is_empty() {
+            vec![vec![1, 2]]
+        } else {
+            vec![vec![1, 2], vec![1], vec![2]]
+        };
+        assert_eq!(gates.len(), expected.len());
+        for (observed, members) in gates.iter().zip(expected) {
+            assert_eq!(observed["good"], 0, "{observed}");
+            assert_ne!(observed["wrong"], 0);
+            assert_eq!(
+                serde_json::from_str::<Value>(observed["wrong_error"].as_str().unwrap()).unwrap()["code"],
+                "broker-admission-mismatch"
+            );
+            assert_eq!(observed["slice"]["gating_head_sha"], observed["head"]);
+            let expected_members: Vec<Value> = members
+                .into_iter()
+                .map(|pr| {
+                    json!({
+                        "run_id": format!("land-slice-{pr}"), "branch": format!("feat/p{pr}"),
+                        "head_sha": config["prs"][pr.to_string()]["headRefOid"],
+                        "original_checkout": config["checkouts"][pr.to_string()],
+                        "publication": {"adapter": "github", "request": pr}
+                    })
+                })
+                .collect();
+            assert_eq!(observed["slice"]["members"], json!(expected_members));
+        }
+        let prs: Value =
+            serde_json::from_slice(&fs::read(config["state"].as_str().unwrap()).unwrap()).unwrap();
+        for pr in [1, 2] {
+            assert_eq!(
+                prs[pr.to_string()]["state"],
+                if bad == pr.to_string() {
+                    "OPEN"
+                } else {
+                    "MERGED"
+                }
+            );
+        }
+        assert!(broker.terminate().success());
+    }
 }
 
 #[test]

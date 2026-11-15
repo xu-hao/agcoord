@@ -1543,6 +1543,14 @@ those compatible candidates to the leader worker so multiple ready PRs can share
    halves recurse down to singletons (`len == 1 -> gate-failed`), re-checking `main` (`stale-main`)
    and PR head SHAs (`head-changed`) before gating and before publishing each slice.
 
+While a batch slice's gate runs, the leader's `admitted_run_status` and `agc --json show`
+include `batch_slice`: its exact `gating_head_sha` and an ordered `members` array containing
+each member's `run_id`, `branch`, `head_sha`, `original_checkout`, and `publication`.
+The field is `null` outside an active slice. A gate invoking `verify-admission` with its
+checkout's `git rev-parse HEAD` verifies that exact recorded slice head, including during
+bisection when the slice does not contain the leader. Any other head is refused. Outside an
+active slice, admission continues to require the leader run's recorded head.
+
 ### Reusing a full receipt as the land gate
 
 The two-step a worktree usually follows — `agc full`, then `agc land` — exists so that a red gate

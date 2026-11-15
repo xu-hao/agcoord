@@ -2528,6 +2528,23 @@ class CoordinatorClient:
             raise CoordinatorError("native broker returned an invalid batch status receipt")
         return result
 
+    def set_batch_slice(
+        self, leader_run_id: str, *, gating_head_sha: str,
+        member_run_ids: Sequence[str], worker_pid: int,
+    ) -> None:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        arguments.extend(("--slice-head", _validate_head_sha(gating_head_sha, required=True) or "",
+                          "--members-json", json.dumps(list(member_run_ids))))
+        result = self._native_callback_invoke("set-batch-slice", arguments)
+        if not isinstance(result, dict) or result.get("leader_run_id") != leader_run_id:
+            raise CoordinatorError("native broker returned an invalid batch slice receipt")
+
+    def clear_batch_slice(self, leader_run_id: str, *, worker_pid: int) -> None:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        result = self._native_callback_invoke("clear-batch-slice", arguments)
+        if not isinstance(result, dict) or result.get("leader_run_id") != leader_run_id:
+            raise CoordinatorError("native broker returned an invalid batch slice receipt")
+
     def update_batch_member_phase(
         self,
         leader_run_id: str,

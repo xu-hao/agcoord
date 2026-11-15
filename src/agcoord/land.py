@@ -789,12 +789,20 @@ class _BatchRunner:
                 file=self.out,
                 flush=True,
             )
-            gate_status = _run_gate(
-                self.gate_command,
-                checkout=self.checkout,
-                environment=self.environment,
-                out=self.out,
+            self.client.set_batch_slice(
+                self.leader_run_id, gating_head_sha=combined_tip,
+                member_run_ids=[member.run_id for member, _tree in merged],
+                worker_pid=self.worker_pid,
             )
+            try:
+                gate_status = _run_gate(
+                    self.gate_command,
+                    checkout=self.checkout,
+                    environment=self.environment,
+                    out=self.out,
+                )
+            finally:
+                self.client.clear_batch_slice(self.leader_run_id, worker_pid=self.worker_pid)
 
         if gate_status == 0:
             self._publish_slice(target_branch, t0_sha, merged)

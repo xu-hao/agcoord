@@ -21,8 +21,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 use store::{
     AdmissionRequest, BatchClaimRequest, BatchMemberFinishRequest, BatchMemberPhaseRequest,
-    BatchMemberReuseRequest, BatchStatusRequest, ChildLeaseOwnerRequest, ChildLeaseRequest,
-    LandResultRequest, PROTOCOL, Paths, PhaseRequest, ReuseRequest, SnapshotFilter, SubmitRequest,
+    BatchMemberReuseRequest, BatchSliceRequest, BatchStatusRequest, ChildLeaseOwnerRequest,
+    ChildLeaseRequest, LandResultRequest, PROTOCOL, Paths, PhaseRequest, ReuseRequest,
+    SnapshotFilter, SubmitRequest,
 };
 use worker::WorkerFault;
 
@@ -809,6 +810,7 @@ struct BatchArgs {
     checkout: Option<PathBuf>,
     head_sha: Option<String>,
     members_json: Option<String>,
+    slice_head: Option<String>,
     member_run_id: Option<String>,
     phase: Option<String>,
     new_head_sha: Option<String>,
@@ -853,6 +855,7 @@ fn parse_batch_args(arguments: &[String], allowed: &[&str]) -> Result<(Paths, Ba
             "--checkout" => parsed.checkout = Some(PathBuf::from(value)),
             "--head" => parsed.head_sha = Some(value),
             "--members-json" => parsed.members_json = Some(value),
+            "--slice-head" => parsed.slice_head = Some(value),
             "--member-run-id" => parsed.member_run_id = Some(value),
             "--phase" => parsed.phase = Some(value),
             "--new-head" => parsed.new_head_sha = Some(value),
@@ -936,6 +939,35 @@ fn parse_batch_status(arguments: &[String]) -> Result<(Paths, BatchStatusRequest
             worker_start_token,
             checkout,
             head_sha,
+        },
+    ))
+}
+
+fn parse_batch_slice(arguments: &[String]) -> Result<(Paths, BatchSliceRequest)> {
+    let (paths, args) = parse_batch_args(arguments, &["--members-json", "--slice-head"])?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    let member_run_ids = serde_json::from_str(
+        &args
+            .members_json
+            .ok_or_else(|| AppError::usage("--members-json is required"))?,
+    )
+    .map_err(|_| AppError::usage("--members-json must be a JSON string array"))?;
+    let gating_head_sha = args
+        .slice_head
+        .ok_or_else(|| AppError::usage("--slice-head is required"))?;
+    Ok((
+        paths,
+        BatchSliceRequest {
+            identity: BatchStatusRequest {
+                run_id,
+                worker_pid,
+                worker_start_token,
+                checkout,
+                head_sha,
+            },
+            gating_head_sha,
+            member_run_ids,
         },
     ))
 }
@@ -1426,6 +1458,14 @@ fn run_command(arguments: &[String]) -> Result<()> {
         [command, rest @ ..] if command == "claim-batch" => {
             let (paths, request) = parse_claim_batch(rest)?;
             emit_json(&store::claim_batch(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "set-batch-slice" => {
+            let (paths, request) = parse_batch_slice(rest)?;
+            emit_json(&store::set_batch_slice(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "clear-batch-slice" => {
+            let (paths, request) = parse_batch_status(rest)?;
+            emit_json(&store::clear_batch_slice(&paths, &request)?)
         }
         [command, rest @ ..] if command == "batch-status" => {
             let (paths, request) = parse_batch_status(rest)?;
