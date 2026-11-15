@@ -9239,6 +9239,157 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
         .collect();
     assert_eq!(claimed_ids, vec!["land-1", "land-2", "land-4"]);
 
+    // The recorded slice is the only head accepted while the gate is active.
+    let slice_head = "1234567890abcdef1234567890abcdef12345678";
+    let slice_members = r#"["land-1","land-2"]"#;
+    let identity = [
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "land-1",
+        "--worker-pid",
+        &pid,
+        "--worker-start-token",
+        &token,
+        "--checkout",
+        &checkout_str,
+        "--head",
+        &head_str,
+    ];
+    let set = Command::new(BROKER)
+        .arg("set-batch-slice")
+        .args(identity)
+        .args(["--slice-head", slice_head, "--members-json", slice_members])
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let slice = status(&state, "land-1")["batch_slice"].clone();
+    assert_eq!(slice["gating_head_sha"], slice_head);
+    assert_eq!(slice["members"][0]["branch"], "feat/one");
+    assert_eq!(slice["members"][0]["head_sha"], head_str);
+    assert_eq!(
+        slice["members"][0]["original_checkout"],
+        wt1.to_str().unwrap()
+    );
+    assert_eq!(
+        slice["members"][1]["original_checkout"],
+        wt2.to_str().unwrap()
+    );
+    assert_eq!(
+        slice["members"][1]["publication"],
+        json!({"adapter": "github", "request": 102})
+    );
+    assert_eq!(
+        slice["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["run_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["land-1", "land-2"]
+    );
+    let verify = |head: &str| {
+        Command::new(BROKER)
+            .args([
+                "verify",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-1",
+                "--kind",
+                "land",
+                "--worker-pid",
+                &pid,
+                "--worker-start-token",
+                &token,
+                "--checkout",
+                &checkout_str,
+                "--head",
+                head,
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(verify(slice_head).status.success());
+    let refused = verify("ffffffffffffffffffffffffffffffffffffffff");
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "broker-admission-mismatch"
+    );
+    let clear = Command::new(BROKER)
+        .arg("clear-batch-slice")
+        .args(identity)
+        .output()
+        .unwrap();
+    assert!(clear.status.success());
+    assert!(status(&state, "land-1")["batch_slice"].is_null());
+    let mut invalid_identity = identity;
+    invalid_identity[7] = "invalid-start-token";
+    for command in ["set-batch-slice", "clear-batch-slice"] {
+        let mut call = Command::new(BROKER);
+        call.arg(command).args(invalid_identity);
+        if command == "set-batch-slice" {
+            call.args(["--slice-head", slice_head, "--members-json", slice_members]);
+        }
+        let rejected = call.output().unwrap();
+        assert!(!rejected.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rejected.stderr).unwrap()["code"],
+            "broker-land-identity-mismatch"
+        );
+    }
+    assert!(verify(&head_str).status.success());
+    assert!(!verify(slice_head).status.success());
+    for (head, members) in [
+        ("ABCDEF7890abcdef1234567890abcdef12345678", slice_members),
+        (slice_head, r#"["land-3"]"#),
+        (slice_head, r#"["land-1","land-1"]"#),
+        (slice_head, "[]"),
+    ] {
+        let bad = Command::new(BROKER)
+            .arg("set-batch-slice")
+            .args(identity)
+            .args(["--slice-head", head, "--members-json", members])
+            .output()
+            .unwrap();
+        assert!(!bad.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bad.stderr).unwrap()["code"],
+            "broker-batch-slice-invalid"
+        );
+        assert!(status(&state, "land-1")["batch_slice"].is_null());
+    }
+    let follower_only = Command::new(BROKER)
+        .arg("set-batch-slice")
+        .args(identity)
+        .args([
+            "--slice-head",
+            slice_head,
+            "--members-json",
+            r#"["land-2"]"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(follower_only.status.success());
+    assert_eq!(
+        status(&state, "land-1")["batch_slice"]["members"][0]["run_id"],
+        "land-2"
+    );
+    assert!(verify(slice_head).status.success());
+    assert!(
+        Command::new(BROKER)
+            .arg("clear-batch-slice")
+            .args(identity)
+            .status()
+            .unwrap()
+            .success()
+    );
+
     // Followers are active ('running') without double-counting machine allocations!
     let snap = snapshot(&state).unwrap();
     assert_eq!(snap["allocations"]["jobs"], 1);
@@ -9301,6 +9452,21 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
     );
     assert_eq!(status(&state, "land-2")["status"], "passed");
 
+    // Cancellation clears an active slice while the remaining follower returns to the queue.
+    assert!(
+        Command::new(BROKER)
+            .arg("set-batch-slice")
+            .args(identity)
+            .args([
+                "--slice-head",
+                slice_head,
+                "--members-json",
+                r#"["land-4"]"#
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
     // Cancel leader while land-4 is still active -> land-4 must return cleanly to 'queued'!
     assert!(
         Command::new(BROKER)
@@ -9317,6 +9483,7 @@ fn land_batch_selects_compatible_candidates_and_manages_claims() {
     );
     fs::write(&worker_release, b"").unwrap();
     wait_status(&state, "land-1", "cancelled");
+    assert!(status(&state, "land-1")["batch_slice"].is_null());
     wait_for(Duration::from_secs(5), || {
         status(&state, "land-4")["status"] == "queued"
     });

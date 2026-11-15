@@ -2540,6 +2540,12 @@ impl Broker {
         // release user code. Gate preparation succeeded on every Ok setup result,
         // so commit the executed checkout even for that best-effort fallback.
         if let Some(tree) = &worker_setup.gate_tree {
+            if current.kind == "land" {
+                connection.execute(
+                    "INSERT OR IGNORE INTO land_batch_members (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json) VALUES (?1, ?1, 0, 0, ?2, '{}')",
+                    params![current.run_id, tree.source.to_string_lossy()],
+                ).map_err(map_database_error)?;
+            }
             connection
                 .execute(
                     "UPDATE runs SET checkout = ?1 WHERE run_id = ?2 AND status = 'running'",
