@@ -192,7 +192,7 @@ its ordinary admitted profile.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
-`database_timeout`, `land_gate_reuse_max_age`, `stop_grace`, `native_broker`, and
+`database_timeout`, `land_gate_reuse_max_age`, `land_max_batch_size`, `stop_grace`, `native_broker`, and
 `overflow_pools`; invalid JSON, a top-level
 value that is not an object,
 an unknown key, a section that is not an object, or an empty `cgroup_root` is refused when the
@@ -201,7 +201,9 @@ nonempty `paths` list of unique absolute strings. `database_timeout` is a positi
 of seconds no greater than `2147483.647` (SQLite's millisecond limit) and defaults to `10`.
 `land_gate_reuse_max_age` is a finite number of seconds from `0` to `2147483.647`, defaults to
 `3600`, and bounds how long a passed `full` receipt may stand in for a land gate; `0` refuses
-every reuse on that host even when a caller asks for one. `stop_grace` is a finite number of
+every reuse on that host even when a caller asks for one. `land_max_batch_size` is an integer from
+`1` to `1024`, defaults to `8`, and bounds the adaptive power-of-two batch size ceiling (`1`
+disables batch claiming so queued lands execute one at a time). `stop_grace` is a finite number of
 seconds from `0` to `2147483.647`, defaults to `600`, and bounds how long a gracefully stopping
 broker lets running jobs finish before it interrupts them; `0` interrupts them at once. An
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
@@ -1522,26 +1524,37 @@ waits for publishing and records its authoritative result.
 ### Batching and bisecting queued lands
 
 When an admitted `land` row starts while other queued `land` rows target the same repository,
-target branch, normalized gate command, and compatible resource envelope, the coordinator passes
-those compatible candidates to the leader worker so multiple ready PRs can share one gate:
+target branch, normalized gate command, and compatible resource envelope, the coordinator bounds the
+batch to an adaptive power-of-two size $B = 2^k$ (clamped by `land_max_batch_size`, default `8`)
+from the sliding window of the last 16 `passed`/`failed` `land` runs on that `repository_id`:
+cold-start (`< 4` runs) uses $B = 4$; failure rate $\hat{p} < 0.11 \rightarrow B = 8$ (or the
+configured power-of-two ceiling); $0.11 \le \hat{p} < 0.21 \rightarrow B = 4$;
+$0.21 \le \hat{p} < 0.38 \rightarrow B = 2$; and $\hat{p} \ge 0.38 \rightarrow B = 1$ (falling back
+to sequential single-PR runs above Ungar's ~38.2% group-testing crossover until pass rate recovers).
+When $Q$ ready compatible `land` requests are available, the leader claims the largest power of two
+$\le \min(Q, B)$ (leaving trailing requests queued for the next batch):
 
 1. **Pre-gate assembly (`T_i = merge(T_{i-1}, P_i)`):** Starting from `T_0 = main`, the leader
    inspects each candidate's live PR state and head SHA (skipping `pr-not-ready`,
-   `head-changed`, or `avoided-commit` rows without pulling them into the batch), checks out
-   `T_0`, and sequentially runs `git merge --no-ff` in the coordinator gate tree. Any candidate
-   that conflicts with `T_{i-1}` is claimed/recorded immediately as `merge-error` and dropped so
-   the remaining clean candidates continue assembling from `T_{i-1}`.
+   `head-changed`, or `avoided-commit` rows without pulling them into the batch), claims a
+   power-of-two batch $\le B$, checks out `T_0`, and sequentially runs `git merge --no-ff` in the
+   coordinator gate tree. Any candidate that conflicts with `T_{i-1}` is recorded immediately as
+   `merge-error` and dropped so the remaining clean candidates continue assembling from `T_{i-1}`.
 2. **Combined gating and atomic multi-PR publication:** The leader runs the gate command once on
    the combined merge tree `T_k`. When the gate succeeds and `main` plus all `P_1..P_k` head SHAs
    still match, the leader constructs chained merge commits `M_1..M_k` on GitHub and advances
    `main` to `M_k` along with each PR's `avoid-commit` / closure ref via `update_refs` in one
    atomic transaction, closing every member row as `passed` with the batch log.
-3. **Binary-split bisection on gate failure:** If `T_k` fails its gate (`k > 1`), the batch
-   splits `[P_1..P_k]` into `Left` and `Right` halves. `Left` is assembled and gated first
-   against the current `main`; when `Left` is green and fresh, it is published immediately so
-   `main` advances before `Right` is re-merged and gated against the updated target. Failing
-   halves recurse down to singletons (`len == 1 -> gate-failed`), re-checking `main` (`stale-main`)
-   and PR head SHAs (`head-changed`) before gating and before publishing each slice.
+3. **Deductive power-of-two bisection on gate failure:** If `T_k` fails its gate (`k > 1`), the
+   slice splits at the largest power of two strictly less than `k` into `Left` and `Right`. `Left`
+   is assembled and gated first against the current `main`; when every member of `Left` publishes
+   cleanly onto `main` ($M' = M + \text{Left}$) and `Right` re-merges onto $M'$ with zero drops to
+   the exact root tree SHA that already failed in the parent slice, `Right` is deductively known to
+   fail without re-running its combined or singleton gate (`deduced-bisected` for $|Right| \ge 2$,
+   or `deduced-gate-failed` finalizing a singleton immediately as `gate-failed`). Any cancellation,
+   preflight invalidation, merge conflict, or external target move changes the tree and invalidates
+   `known_bad`, running an explicit gate instead. Pass `--no-deductive-bisect` on `agc land` when a
+   flaky non-deterministic gate requires an explicit singleton failure log on every rejected PR.
 
 While a batch slice's gate runs, the leader's `admitted_run_status` and `agc --json show`
 include `batch_slice`: its exact `gating_head_sha` and an ordered `members` array containing
@@ -1557,13 +1570,14 @@ also exposes a durable `batch` provenance object on `status` (`agc --json show`)
 (`agc --json list`, `agc tui`). Standalone runs (including a `land` row that found zero eligible
 followers) and followers requeued to `queued` on leader cancellation or crash report `batch: null`;
 if a requeued follower is later claimed into a new batch, `batch` reflects that newer batch.
-A populated `batch` object records `leader_run_id`, `role`, `target_branch`, `created_at`, ordered
-`members` (`position`, `run_id`, `branch`, `head_sha`, `publication`, `status`, `failure_reason`),
-and chronological `steps` (`step`, `label`, `target_sha`, `gating_head_sha`, `member_run_ids`,
-`dropped`, `gate_reused_from`, `gate_exit_status`, `outcome`, `published_commit_sha`, `started_at`,
-`finished_at`) across clean multi-PR gates, recursive binary-split bisections, merge-conflict drops,
-`--reuse-full` substitutions, stale-target or changed-head handbacks, publication failures, and
-cancellations.
+A populated `batch` object records `leader_run_id`, `role`, `target_branch`, `max_batch_size`,
+`created_at`, ordered `members` (`position`, `run_id`, `branch`, `head_sha`, `publication`,
+`status`, `failure_reason`), and chronological `steps` (`step`, `base_sha`, `gating_head_sha`,
+`member_run_ids`, `gated_member_run_ids`, `dropped`, `gate_reused_from`, `gate_exit_status`,
+`outcome`, `split`, `published_sha`, `started_at`, `finished_at`) across clean multi-PR gates,
+recursive and deductive binary-split bisections (`bisected`, `deduced-bisected`,
+`deduced-gate-failed`), merge-conflict drops, `--reuse-full` substitutions, stale-target or
+changed-head handbacks, publication failures, and cancellations.
 
 ### Reusing a full receipt as the land gate
 

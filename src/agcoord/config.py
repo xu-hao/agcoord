@@ -31,6 +31,7 @@ _CONFIG_KEYS = frozenset(
         "cgroup_io",
         "database_timeout",
         "land_gate_reuse_max_age",
+        "land_max_batch_size",
         "stop_grace",
         "native_broker",
         "overflow_pools",
@@ -65,6 +66,7 @@ class BrokerConfig:
     native_broker: NativeBrokerConfig
     overflow_pools: tuple[Mapping[str, Any], ...] = ()
     capabilities: tuple[str, ...] = ()
+    land_max_batch_size: int | None = None
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -124,6 +126,7 @@ def parse_broker_config(
     cgroup_io = _cgroup_io_section(document, source=source)
     database_timeout = _database_timeout(document, source=source)
     land_gate_reuse_max_age = _land_gate_reuse_max_age(document, source=source)
+    land_max_batch_size = _land_max_batch_size(document, source=source)
     stop_grace = _stop_grace(document, source=source)
     native_broker = _native_broker_section(document, source=source)
     overflow_pools = _overflow_pools_section(document, source=source)
@@ -145,6 +148,7 @@ def parse_broker_config(
         native_broker=native_broker,
         overflow_pools=overflow_pools,
         capabilities=capabilities,
+        land_max_batch_size=land_max_batch_size,
     )
 
 
@@ -315,6 +319,22 @@ def _land_gate_reuse_max_age(
 ) -> float | None:
     """How long a passed full receipt may stand in for a land gate; zero disables reuse."""
     return _nonnegative_seconds(document, "land_gate_reuse_max_age", source=source)
+
+
+def _land_max_batch_size(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> int | None:
+    """Maximum power-of-two size ceiling for batched lands; 1 disables batching."""
+    value = document.get("land_max_batch_size")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1024:
+        raise BrokerConfigError(
+            f"broker configuration {source} land_max_batch_size must be an integer from 1 to 1024"
+        )
+    return value
 
 
 def _stop_grace(

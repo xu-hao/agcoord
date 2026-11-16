@@ -1497,15 +1497,15 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
             {
                 "step": 3,
                 "member_run_ids": ["land-follow02"],
-                "gated_member_run_ids": ["land-follow02"],
+                "gated_member_run_ids": [],
                 "dropped": [],
                 "base_sha": "c" * 40,
                 "gating_head_sha": "d" * 40,
                 "started_at": "2026-08-30T12:00:29+00:00",
-                "finished_at": "2026-08-30T12:00:35+00:00",
+                "finished_at": "2026-08-30T12:00:29+00:00",
                 "gate_reused_from": None,
-                "gate_exit_status": 5,
-                "outcome": "gate-failed",
+                "gate_exit_status": None,
+                "outcome": "deduced-gate-failed",
                 "split": None,
                 "published_sha": None,
             },
@@ -1521,6 +1521,7 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
                 "leader_run_id": "land-leader01",
                 "role": "leader",
                 "target_branch": "main",
+                "max_batch_size": 4,
                 "members": deepcopy(completed_members),
                 "steps": deepcopy(completed_steps),
             },
@@ -1537,6 +1538,7 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
                 "leader_run_id": "land-leader01",
                 "role": "follower",
                 "target_branch": "main",
+                "max_batch_size": 4,
                 "members": deepcopy(completed_members),
                 "steps": deepcopy(completed_steps),
             },
@@ -1550,10 +1552,10 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
         app.action_refresh()
         await _settled(pilot)
         modal_done = _screen_text(app)
-        assert "Bisected: yes" in modal_done
+        assert "Bisected: yes · Max batch (B): 4" in modal_done
         assert "gate failed (exit 1) -> bisected 2 into 1 + 1" in modal_done
         assert f"published -> {'c' * 40}" in modal_done
-        assert "gate failed (exit 5)" in modal_done
+        assert "gate skipped (deduced) · deduced gate-failed" in modal_done
 
         await pilot.press("escape")
         await _settled(pilot)
@@ -1563,3 +1565,4 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
         assert len(compact_lines[1]) <= 78, compact_lines[1]
         assert len(compact_lines[3]) <= 78, compact_lines[3]
         assert "batch 2/2 (3 slices, bisected)" in compact_after
+        assert "batch: follower of land-leader01 (B=4)" in compact_after

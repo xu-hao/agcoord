@@ -333,6 +333,18 @@ def _avoid_refusal_for_heads(
     return None
 
 
+def _largest_power_of_two_le(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value.bit_length() - 1)
+
+
+def _largest_power_of_two_lt(value: int) -> int:
+    if value <= 2:
+        return 1
+    return _largest_power_of_two_le(value - 1)
+
+
 @dataclass
 class _BatchMember:
     run_id: str
@@ -343,6 +355,7 @@ class _BatchMember:
     target_sync: bool
     reuse_full: bool
     avoid_commits: dict[str, str]
+    deductive_bisect: bool = True
     phase: str = "preflight"
     gate_exit_status: int | None = None
     title: str = ""
@@ -623,7 +636,7 @@ class _BatchRunner:
         *,
         step: int,
         dropped: list[dict[str, str]],
-    ) -> None:
+    ) -> bool:
         slice_members = [member for member, _tree in merged]
         remaining_after_cancel = self._poll_cancellations(slice_members)
         if self.leader_cancelled:
@@ -634,7 +647,7 @@ class _BatchRunner:
                 gate_exit_status=0,
                 outcome="cancelled",
             )
-            return
+            return False
         if len(remaining_after_cancel) != len(slice_members):
             remaining_ids = {member.run_id for member in remaining_after_cancel}
             updated_dropped = [
@@ -654,7 +667,7 @@ class _BatchRunner:
                 outcome="cancelled",
             )
             self.bisect_and_land(target_branch, remaining_after_cancel)
-            return
+            return False
 
         try:
             current_t0, remote_heads = self._fetch_remote_refs(
@@ -675,7 +688,7 @@ class _BatchRunner:
             )
             for member in slice_members:
                 self._finalize_member(member, EXIT_MERGE_ERROR, "merge-error", None)
-            return
+            return False
 
         if current_t0 != t0_sha:
             print(
@@ -693,7 +706,7 @@ class _BatchRunner:
             )
             for member in slice_members:
                 self._finalize_member(member, EXIT_STALE_MAIN, "stale-main", None)
-            return
+            return False
 
         clean_members: list[_BatchMember] = []
         post_gate_dropped: list[dict[str, str]] = []
@@ -729,7 +742,7 @@ class _BatchRunner:
                 self._finalize_member(member, exit_code, reason, None)
             if clean_members:
                 self.bisect_and_land(target_branch, clean_members)
-            return
+            return False
 
         for member in slice_members:
             self._advance_phase(member, "publishing", 0)
@@ -779,7 +792,7 @@ class _BatchRunner:
             )
             for member in slice_members:
                 self._finalize_member(member, EXIT_PUBLISH_FAILED, "publish-failed", 0)
-            return
+            return False
 
         self.client.record_batch_step(
             self.leader_run_id,
@@ -797,14 +810,22 @@ class _BatchRunner:
         )
         for member in slice_members:
             self._finalize_member(member, 0, None, 0)
+        return not dropped
 
-    def bisect_and_land(self, target_branch: str, members: list[_BatchMember]) -> None:
+    def bisect_and_land(
+        self,
+        target_branch: str,
+        members: list[_BatchMember],
+        *,
+        known_bad_tree_sha: str | None = None,
+        known_bad_exit_status: int | None = None,
+    ) -> bool:
         if not members:
-            return
+            return True
         attempted_ids = [member.run_id for member in members]
         members = self._poll_cancellations(members)
         if self.leader_cancelled:
-            return
+            return False
         remaining_ids = {member.run_id for member in members}
         dropped: list[dict[str, str]] = [
             {"run_id": rid, "reason": "cancelled"}
@@ -820,7 +841,7 @@ class _BatchRunner:
                 dropped=dropped,
                 outcome="cancelled",
             )
-            return
+            return False
 
         try:
             t0_sha, remote_heads = self._fetch_remote_refs(target_branch, members)
@@ -844,7 +865,7 @@ class _BatchRunner:
             )
             for member in members:
                 self._finalize_member(member, EXIT_MERGE_ERROR, "merge-error", None)
-            return
+            return False
 
         valid_members: list[_BatchMember] = []
         preflight_failures: list[tuple[_BatchMember, int, str]] = []
@@ -878,7 +899,7 @@ class _BatchRunner:
             )
             for member, exit_code, reason in preflight_failures:
                 self._finalize_member(member, exit_code, reason, None)
-            return
+            return False
         for member, exit_code, reason in preflight_failures:
             self._finalize_member(member, exit_code, reason, None)
 
@@ -896,7 +917,76 @@ class _BatchRunner:
                 base_sha=t0_sha,
                 outcome="merge-conflict",
             )
-            return
+            return False
+
+        combined_tree = merged[-1][1]
+        deductive_allowed = all(member.deductive_bisect for member, _tree in merged)
+        if (
+            known_bad_tree_sha is not None
+            and not dropped
+            and deductive_allowed
+            and combined_tree == known_bad_tree_sha
+        ):
+            clean_slice = [member for member, _tree in merged]
+            if len(clean_slice) == 1:
+                singleton = clean_slice[0]
+                deduced_exit = (
+                    known_bad_exit_status
+                    if known_bad_exit_status is not None and known_bad_exit_status != 0
+                    else 1
+                )
+                self._advance_phase(singleton, "gating", deduced_exit)
+                print(
+                    f"Land coordinator: deduced gate failure for PR #{singleton.pull_request} "
+                    "without re-running gate",
+                    file=self.err,
+                    flush=True,
+                )
+                self.client.record_batch_step(
+                    self.leader_run_id,
+                    worker_pid=self.worker_pid,
+                    member_run_ids=attempted_ids,
+                    gated_member_run_ids=[],
+                    dropped=dropped,
+                    base_sha=t0_sha,
+                    gating_head_sha=combined_tip,
+                    outcome="deduced-gate-failed",
+                )
+                self._finalize_member(
+                    singleton, deduced_exit, "gate-failed", deduced_exit
+                )
+                return False
+
+            mid = _largest_power_of_two_lt(len(clean_slice))
+            left = clean_slice[:mid]
+            right = clean_slice[mid:]
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=[],
+                dropped=dropped,
+                base_sha=t0_sha,
+                gating_head_sha=combined_tip,
+                outcome="deduced-bisected",
+                split=(len(left), len(right)),
+            )
+            print(
+                f"Land coordinator: deduced failing slice of {len(clean_slice)} PR(s); "
+                f"bisecting into {len(left)} + {len(right)} without re-running gate",
+                file=self.out,
+                flush=True,
+            )
+            left_clean = self.bisect_and_land(target_branch, left)
+            if self.leader_cancelled:
+                return False
+            self.bisect_and_land(
+                target_branch,
+                right,
+                known_bad_tree_sha=known_bad_tree_sha if left_clean else None,
+                known_bad_exit_status=known_bad_exit_status if left_clean else None,
+            )
+            return False
 
         gated_ids = [member.run_id for member, _tree in merged]
         reused_source: str | None = None
@@ -974,10 +1064,9 @@ class _BatchRunner:
                 self.client.clear_batch_slice(self.leader_run_id, worker_pid=self.worker_pid)
 
         if gate_status == 0:
-            self._publish_slice(
+            return self._publish_slice(
                 target_branch, t0_sha, merged, step=step, dropped=dropped
             )
-            return
 
         status_payload = self.client.batch_status(
             self.leader_run_id,
@@ -992,7 +1081,7 @@ class _BatchRunner:
                 gate_exit_status=gate_status,
                 outcome="cancelled",
             )
-            return
+            return False
 
         clean_slice = [member for member, _tree in merged]
         if len(clean_slice) == 1:
@@ -1011,7 +1100,7 @@ class _BatchRunner:
                     outcome="cancelled",
                 )
                 self._finalize_member(singleton, 130, "cancelled", None)
-                return
+                return False
             self._advance_phase(singleton, "gating", gate_status)
             print(
                 f"Land coordinator: gate failed for PR #{singleton.pull_request} "
@@ -1027,9 +1116,9 @@ class _BatchRunner:
                 outcome="gate-failed",
             )
             self._finalize_member(singleton, gate_status, "gate-failed", gate_status)
-            return
+            return False
 
-        mid = len(clean_slice) // 2
+        mid = _largest_power_of_two_lt(len(clean_slice))
         left = clean_slice[:mid]
         right = clean_slice[mid:]
         self.client.record_batch_step(
@@ -1046,10 +1135,17 @@ class _BatchRunner:
             file=self.out,
             flush=True,
         )
-        self.bisect_and_land(target_branch, left)
+        left_clean = self.bisect_and_land(target_branch, left)
         if self.leader_cancelled:
-            return
-        self.bisect_and_land(target_branch, right)
+            return False
+        next_bad_tree = combined_tree if (left_clean and deductive_allowed) else None
+        self.bisect_and_land(
+            target_branch,
+            right,
+            known_bad_tree_sha=next_bad_tree,
+            known_bad_exit_status=gate_status if next_bad_tree is not None else None,
+        )
+        return False
 
 
 def _execute_batch_if_applicable(
@@ -1093,9 +1189,19 @@ def _execute_batch_if_applicable(
     ):
         return None
 
+    max_batch_size = (
+        _largest_power_of_two_le(int(args.batch_max_size))
+        if getattr(args, "batch_max_size", None) is not None
+        else 4
+    )
+    if max_batch_size <= 1:
+        return None
+
     selected_ids: list[str] = []
     checkout_path = Path(args.checkout).expanduser().resolve()
     for entry in raw_candidates:
+        if len(selected_ids) >= max_batch_size - 1:
+            break
         try:
             cand_run_id = str(entry["run_id"])
             cand_pr_num = int(entry["publication_request"])
@@ -1128,6 +1234,8 @@ def _execute_batch_if_applicable(
             continue
         selected_ids.append(cand_run_id)
 
+    target_total = _largest_power_of_two_le(min(1 + len(selected_ids), max_batch_size))
+    selected_ids = selected_ids[: target_total - 1]
     if not selected_ids:
         return None
 
@@ -1136,6 +1244,7 @@ def _execute_batch_if_applicable(
         member_run_ids=selected_ids,
         worker_pid=os.getpid(),
         target_branch=target_branch,
+        max_batch_size=max_batch_size,
     )
     if len(claimed) <= 1:
         return None
@@ -1163,6 +1272,11 @@ def _execute_batch_if_applicable(
             if is_leader
             else bool(opts.get("reuse_full", False))
         )
+        member_deductive = (
+            (not bool(getattr(args, "no_deductive_bisect", False)))
+            if is_leader
+            else bool(opts.get("deductive_bisect", True))
+        )
         batch_members.append(
             _BatchMember(
                 run_id=str(entry["run_id"]),
@@ -1173,6 +1287,7 @@ def _execute_batch_if_applicable(
                 target_sync=member_sync,
                 reuse_full=member_reuse,
                 avoid_commits=member_avoid,
+                deductive_bisect=member_deductive,
             )
         )
 
@@ -1208,7 +1323,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-json", required=True)
     parser.add_argument("--no-target-sync", action="store_true")
     parser.add_argument("--reuse-full", action="store_true")
+    parser.add_argument("--no-deductive-bisect", action="store_true")
     parser.add_argument("--avoid", action="append", default=[])
+    parser.add_argument("--batch-max-size", type=int, default=None)
     parser.add_argument("--batch-candidates-json", default=None)
     parser.add_argument("gate_command", nargs=argparse.REMAINDER)
     return parser

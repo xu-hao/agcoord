@@ -9674,8 +9674,10 @@ if os.environ['BAD_PR'] and Path('p' + os.environ['BAD_PR'] + '.txt').exists():
             .collect();
         let expected: Vec<Vec<usize>> = if bad.is_empty() {
             vec![vec![1, 2]]
-        } else {
+        } else if bad == "1" {
             vec![vec![1, 2], vec![1], vec![2]]
+        } else {
+            vec![vec![1, 2], vec![1]]
         };
         assert_eq!(gates.len(), expected.len());
         for (observed, members) in gates.iter().zip(expected) {
@@ -10560,6 +10562,10 @@ fn land_batch_retains_history_across_bisect_follower_views_and_requeue() {
         "requeued"
     );
     assert!(recent_by_id["land-3"]["batch"].is_null());
+
+    // Deduced step outcomes ("deduced-bisected", "deduced-gate-failed") and adaptive B = 2^k clamping:
+    // After 1 failed ("land-2") + 2 passed ("land-4", "land-5") = 3 runs (< 4 cold-start), B is 4.
+    assert_eq!(recent_by_id["land-4"]["batch"]["max_batch_size"], 4);
 
     assert!(broker.terminate().success());
 }

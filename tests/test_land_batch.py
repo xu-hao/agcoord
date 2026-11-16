@@ -175,7 +175,12 @@ if args[:2] == ["pr", "view"]:
         data = json.load(stream)
     if number not in data:
         raise SystemExit(f"unknown pr {{number}}")
-    print(json.dumps(data[number]))
+    entry = dict(data[number])
+    if entry.get("state") == "OPEN" and entry.get("headRefName"):
+        live_oid = rev_parse(f"refs/heads/{{entry['headRefName']}}")
+        if live_oid:
+            entry["headRefOid"] = live_oid
+    print(json.dumps(entry))
 elif args[:2] == ["repo", "view"]:
     print(json.dumps({{"id": "R_batch_test", "nameWithOwner": "test/repository"}}))
 elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/commits"):
@@ -374,7 +379,12 @@ if os.environ["BAD_PR"] and Path("p" + os.environ["BAD_PR"] + ".txt").exists():
     rows = {pr: _wait_terminal(client, run_ids[pr]) for pr in (1, 2)}
     gates = [json.loads(line) for line in gate_log.read_text().splitlines()]
     assert all(json.loads(line) is None for line in clear_log.read_text().splitlines())
-    expected_slices = [[1, 2]] if bad_pr is None else [[1, 2], [1], [2]]
+    if bad_pr is None:
+        expected_slices = [[1, 2]]
+    elif bad_pr == 1:
+        expected_slices = [[1, 2], [1], [2]]
+    else:
+        expected_slices = [[1, 2], [1]]
     assert len(gates) == len(expected_slices), gates
     for observed, members in zip(gates, expected_slices):
         assert observed["good"] == 0, observed
@@ -403,7 +413,8 @@ def test_land_batch_merges_and_publishes_clean_prs_with_one_gate(
             {"pr": 1, "base": "main", "branch": "feat/one", "files": {"one.txt": "1\n"}},
             {"pr": 2, "base": "main", "branch": "feat/two", "files": {"two.txt": "2\n"}},
             {"pr": 3, "base": "main", "branch": "feat/three", "files": {"three.txt": "3\n"}},
-            {"pr": 4, "base": "release-1", "branch": "feat/rel", "files": {"rel.txt": "r\n"}},
+            {"pr": 4, "base": "main", "branch": "feat/four", "files": {"four.txt": "4\n"}},
+            {"pr": 5, "base": "release-1", "branch": "feat/rel", "files": {"rel.txt": "r\n"}},
         ],
     )
     gh_log = tmp_path / "gh.jsonl"
@@ -426,7 +437,7 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
 
     env = _env_with_gh(bin_dir, {"BATCH_GATE_LOG": str(gate_log)})
     run_ids = {}
-    for pr in (1, 2, 3, 4):
+    for pr in (1, 2, 3, 4, 5):
         run_ids[pr] = client.submit_land(
             "github",
             pr,
@@ -445,30 +456,32 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
     assert len(gated_runs) == 2
     main_gate = next(entry for entry in gated_runs if "one.txt" in entry["files"])
     rel_gate = next(entry for entry in gated_runs if "rel.txt" in entry["files"])
-    assert set(main_gate["files"]) == {"base.txt", "one.txt", "two.txt", "three.txt"}
+    assert set(main_gate["files"]) == {"base.txt", "one.txt", "two.txt", "three.txt", "four.txt"}
     assert set(rel_gate["files"]) == {"base.txt", "rel.txt"}
 
-    # All 3 main-target PR rows share the batch gate log.
-    log_texts = {pr: str(client.log(run_ids[pr], offset=0, limit=65536)["text"]) for pr in (1, 2, 3)}
-    assert all("one.txt" in text and "three.txt" in text for text in log_texts.values())
+    # All 4 main-target PR rows share the batch gate log.
+    log_texts = {pr: str(client.log(run_ids[pr], offset=0, limit=65536)["text"]) for pr in (1, 2, 3, 4)}
+    assert all("one.txt" in text and "four.txt" in text for text in log_texts.values())
 
-    # Structured batch history is exposed on leader and all followers, and null on standalone PR #4.
+    # Structured batch history is exposed on leader and all followers, and null on standalone PR #5.
     main_final_sha = _git(remote, "rev-parse", "refs/heads/main")
-    assert results[4]["batch"] is None
-    for idx, pr in enumerate((1, 2, 3)):
+    assert results[5]["batch"] is None
+    expected_ids = [run_ids[1], run_ids[2], run_ids[3], run_ids[4]]
+    for idx, pr in enumerate((1, 2, 3, 4)):
         batch = results[pr]["batch"]
         assert batch is not None
         assert batch["leader_run_id"] == run_ids[1]
         assert batch["role"] == ("leader" if pr == 1 else "follower")
         assert batch["target_branch"] == "main"
-        assert [m["run_id"] for m in batch["members"]] == [run_ids[1], run_ids[2], run_ids[3]]
-        assert [m["status"] for m in batch["members"]] == ["passed", "passed", "passed"]
+        assert batch["max_batch_size"] == 4
+        assert [m["run_id"] for m in batch["members"]] == expected_ids
+        assert [m["status"] for m in batch["members"]] == ["passed", "passed", "passed", "passed"]
         assert batch["members"][idx]["position"] == idx
         assert len(batch["steps"]) == 1
         step = batch["steps"][0]
         assert step["step"] == 1
-        assert step["member_run_ids"] == [run_ids[1], run_ids[2], run_ids[3]]
-        assert step["gated_member_run_ids"] == [run_ids[1], run_ids[2], run_ids[3]]
+        assert step["member_run_ids"] == expected_ids
+        assert step["gated_member_run_ids"] == expected_ids
         assert step["dropped"] == []
         assert step["gating_head_sha"] == main_gate["head"]
         assert step["gate_exit_status"] == 0
@@ -478,18 +491,18 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
     snap = client.snapshot()
     snap_by_id = {row["run_id"]: row for row in snap["recent"]}
     assert snap_by_id[run_ids[2]]["batch"] == results[2]["batch"]
-    assert snap_by_id[run_ids[4]]["batch"] is None
+    assert snap_by_id[run_ids[5]]["batch"] is None
 
-    # Remote refs/heads/main has all 3 PR files; refs/heads/release-1 stays isolated.
+    # Remote refs/heads/main has all 4 PR files; refs/heads/release-1 stays isolated.
     main_tree = _git(remote, "ls-tree", "--name-only", "refs/heads/main").splitlines()
     rel_tree = _git(remote, "ls-tree", "--name-only", "refs/heads/release-1").splitlines()
-    assert set(main_tree) == {"base.txt", "one.txt", "two.txt", "three.txt"}
+    assert set(main_tree) == {"base.txt", "one.txt", "two.txt", "three.txt", "four.txt"}
     assert set(rel_tree) == {"base.txt", "rel.txt"}
 
     gh_calls = [json.loads(line) for line in gh_log.read_text(encoding="utf-8").splitlines() if line]
     graphql_calls = [c for c in gh_calls if c["args"][:2] == ["api", "graphql"]]
     assert len(graphql_calls) == 2
-    assert sorted(len(c["payload"]["variables"]["input"]["refUpdates"]) for c in graphql_calls) == [2, 4]
+    assert sorted(len(c["payload"]["variables"]["input"]["refUpdates"]) for c in graphql_calls) == [2, 5]
 
 
 def test_land_batch_excludes_pre_gate_conflict_with_merge_error(
@@ -637,18 +650,19 @@ if not ok:
     assert main_tree == {"base.txt", "p21.txt", "left.txt", "p24.txt"}
 
     gated_runs = [json.loads(line) for line in gate_log.read_text(encoding="utf-8").splitlines() if line]
-    # Exact binary split sequence: [21,22,23,24] fail -> [21,22] pass & publish ->
-    # [23,24] fail -> [23] fail -> [24] pass & publish = 5 gate invocations.
-    assert [entry["ok"] for entry in gated_runs] == [False, True, False, False, True]
+    # Deductive binary split sequence: [21,22,23,24] fail -> [21,22] pass & publish ->
+    # [23,24] deduced-bisected (same tree as step 1!) -> [23] fail -> [24] pass & publish = 4 gate invocations.
+    assert [entry["ok"] for entry in gated_runs] == [False, True, False, True]
 
     # Early-finalized follower #22 (finalized at Step 2) exposes ALL 5 steps of the batch
     # in status, snapshot, agc --json show, and plain agc show!
     final_rows = {pr: client.status(run_ids[pr]) for pr in (21, 22, 23, 24)}
-    expected_outcomes = ["bisected", "published", "bisected", "gate-failed", "published"]
+    expected_outcomes = ["bisected", "published", "deduced-bisected", "gate-failed", "published"]
     for pr in (21, 22, 23, 24):
         batch = final_rows[pr]["batch"]
         assert batch is not None
         assert batch["role"] == ("leader" if pr == 21 else "follower")
+        assert batch["max_batch_size"] == 4
         assert [s["outcome"] for s in batch["steps"]] == expected_outcomes
         assert batch["steps"][0]["split"] == [2, 2]
         assert batch["steps"][2]["split"] == [1, 1]
@@ -674,8 +688,9 @@ if not ok:
         check=True,
     )
     assert "Batch & Bisect History:" in shown_plain.stdout
+    assert "Max batch (B): 4" in shown_plain.stdout
     assert "gate failed (exit 5) -> bisected 4 into 2 + 2" in shown_plain.stdout
-    assert "gate failed (exit 5) -> bisected 2 into 1 + 1" in shown_plain.stdout
+    assert "deduced failing slice -> bisected 2 into 1 + 1" in shown_plain.stdout
     assert f"Step 5: [#24 ({run_ids[24]})]" in shown_plain.stdout
 
 
@@ -939,5 +954,226 @@ if Path("bad63.txt").exists():
     assert b2["role"] == "leader"
     assert row63["batch"]["leader_run_id"] == r62
     assert row63["batch"]["role"] == "follower"
-    assert [s["outcome"] for s in b2["steps"]] == ["bisected", "published", "gate-failed"]
+    assert [s["outcome"] for s in b2["steps"]] == [
+        "bisected",
+        "published",
+        "deduced-gate-failed",
+    ]
     assert b2["steps"][1]["gate_reused_from"] == full62
+
+
+def test_land_batch_deductive_bisect_invalidation_opt_out_and_adaptive_power_of_two_sizing(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+
+    # 1. Pair run-count verification across (pass, fail), (fail, pass), (fail, fail), and --no-deductive-bisect.
+    def run_pair_case(name: str, bad_prs: tuple[int, ...], *, deductive: bool = True) -> tuple[int, dict[int, dict]]:
+        case_dir = tmp_path / name
+        remote, state_file, checkouts, _ = _setup_remote_and_worktrees(
+            case_dir,
+            [
+                {"pr": 1, "base": "main", "branch": "feat/p1", "files": {"p1.txt": "bad\n" if 1 in bad_prs else "ok\n"}},
+                {"pr": 2, "base": "main", "branch": "feat/p2", "files": {"p2.txt": "bad\n" if 2 in bad_prs else "ok\n"}},
+            ],
+        )
+        bin_dir = _install_stateful_gh(case_dir / "bin", remote, state_file, case_dir / "gh.jsonl")
+        gate_log = case_dir / "gates.jsonl"
+        gate_cmd = _python(
+            """
+import json, os, sys
+from pathlib import Path
+bad = any(
+    Path(f).exists() and Path(f).read_text(encoding="utf-8").strip() == "bad"
+    for f in ("p1.txt", "p2.txt")
+)
+with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
+    s.write(json.dumps({"bad": bad}) + "\\n")
+if bad:
+    sys.exit(3)
+""",
+        )
+        hold_id, release = _submit_hold(client, case_dir, checkouts[1], name)
+        env = _env_with_gh(bin_dir, {"BATCH_GATE_LOG": str(gate_log)})
+        ids = {
+            pr: client.submit_land(
+                "github",
+                pr,
+                gate_cmd,
+                checkout=str(checkouts[pr]),
+                resources={"jobs": 1},
+                caller_pid=os.getpid(),
+                deductive_bisect=deductive,
+                environment=env,
+            )
+            for pr in (1, 2)
+        }
+        release.touch()
+        _wait_terminal(client, hold_id, "passed")
+        rows = {
+            pr: _wait_terminal(client, ids[pr], "failed" if pr in bad_prs else "passed")
+            for pr in (1, 2)
+        }
+        count = len(gate_log.read_text(encoding="utf-8").splitlines())
+        return count, rows
+
+    pf_runs, pf_rows = run_pair_case("pair-pass-fail", (2,))
+    assert pf_runs == 2
+    assert [s["outcome"] for s in pf_rows[2]["batch"]["steps"]] == [
+        "bisected",
+        "published",
+        "deduced-gate-failed",
+    ]
+
+    pf_optout_runs, pf_optout_rows = run_pair_case("pair-opt-out", (2,), deductive=False)
+    assert pf_optout_runs == 3
+    assert [s["outcome"] for s in pf_optout_rows[2]["batch"]["steps"]] == [
+        "bisected",
+        "published",
+        "gate-failed",
+    ]
+
+    fp_runs, _ = run_pair_case("pair-fail-pass", (1,))
+    assert fp_runs == 3
+    ff_runs, _ = run_pair_case("pair-fail-fail", (1, 2))
+    assert ff_runs == 3
+
+    # 2. Member-drop invalidation of known_bad: [71, 72, 73, 74] where #73 is bad;
+    # while [71, 72] gates and publishes, #73's PR head changes so [73, 74] drops #73 as head-changed.
+    # Remaining singleton #74 MUST NOT be deduced gate-failed — it runs its gate and passes!
+    inv_dir = tmp_path / "drop-invalidates-known-bad"
+    remote_i, state_file_i, checkouts_i, pr_state_i = _setup_remote_and_worktrees(
+        inv_dir,
+        [
+            {"pr": 71, "base": "main", "branch": "feat/p71", "files": {"p71.txt": "ok\n"}},
+            {"pr": 72, "base": "main", "branch": "feat/p72", "files": {"p72.txt": "ok\n"}},
+            {"pr": 73, "base": "main", "branch": "feat/p73", "files": {"bad73.txt": "boom\n"}},
+            {"pr": 74, "base": "main", "branch": "feat/p74", "files": {"p74.txt": "ok\n"}},
+        ],
+    )
+    bin_i = _install_stateful_gh(inv_dir / "bin", remote_i, state_file_i, inv_dir / "gh.jsonl")
+    left_gate_hit = inv_dir / "left-gate-hit"
+    left_gate_go = inv_dir / "left-gate-go"
+    inv_gate = _python(
+        """
+import sys, time
+from pathlib import Path
+if Path("bad73.txt").exists():
+    sys.exit(6)
+if Path("p71.txt").exists() and not Path(sys.argv[1]).exists():
+    Path(sys.argv[1]).touch()
+    while not Path(sys.argv[2]).exists():
+        time.sleep(0.02)
+""",
+        left_gate_hit,
+        left_gate_go,
+    )
+    hold_i, release_i = _submit_hold(client, inv_dir, checkouts_i[71], "inv")
+    env_i = _env_with_gh(bin_i)
+    ids_i = {
+        pr: client.submit_land(
+            "github", pr, inv_gate, checkout=str(checkouts_i[pr]),
+            resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_i,
+        )
+        for pr in (71, 72, 73, 74)
+    }
+    release_i.touch()
+    _wait_terminal(client, hold_i, "passed")
+    wait_for(left_gate_hit.exists, "left slice [71, 72] did not enter gate")
+    # Advance PR #73 on remote while [71, 72] is gating so #73 drops as head-changed in right slice!
+    (checkouts_i[73] / "extra.txt").write_text("moved\n", encoding="utf-8")
+    _git(checkouts_i[73], "add", "extra.txt")
+    _git(checkouts_i[73], "commit", "-m", "move 73")
+    _git(checkouts_i[73], "push", "origin", "feat/p73")
+    pr_state_i["73"]["headRefOid"] = _git(checkouts_i[73], "rev-parse", "HEAD")
+    state_file_i.write_text(json.dumps(pr_state_i), encoding="utf-8")
+    left_gate_go.touch()
+
+    _wait_terminal(client, ids_i[71], "passed")
+    _wait_terminal(client, ids_i[72], "passed")
+    row73 = _wait_terminal(client, ids_i[73], "failed")
+    row74 = _wait_terminal(client, ids_i[74], "passed")
+    assert row73["failure_reason"] == "head-changed"
+    assert row74["status"] == "passed"
+
+    # 3. N = 6 multi-failure vector at cold-start B = 4 -> adaptive B = 2 -> adaptive B = 1:
+    # 6 queued PRs (#81..#86) where #82 and #86 fail -> chunks into batch of 4 (B=4) + batch of 2 (B=2)!
+    # With deductive skipping: [81..84] (root fail -> [81,82] fail -> [81] pass -> [82] deduced!
+    # -> [83,84] pass = 4 gates) + [85,86] (root fail -> [85] pass -> [86] deduced! = 2 gates) = 6 gates total!
+    six_dir = tmp_path / "six-vector"
+    remote_6, state_file_6, checkouts_6, _ = _setup_remote_and_worktrees(
+        six_dir,
+        [
+            {
+                "pr": pr,
+                "base": "main",
+                "branch": f"feat/p{pr}",
+                "files": {
+                    f"p{pr}.txt": "bad\n" if pr in {82, 86, 87, 88} else "ok\n"
+                },
+            }
+            for pr in range(81, 91)
+        ],
+    )
+    bin_6 = _install_stateful_gh(six_dir / "bin", remote_6, state_file_6, six_dir / "gh.jsonl")
+    six_gate_log = six_dir / "gates.jsonl"
+    six_gate = _python(
+        """
+import json, os, sys
+from pathlib import Path
+bad = any(
+    Path(f"p{pr}.txt").exists() and Path(f"p{pr}.txt").read_text(encoding="utf-8").strip() == "bad"
+    for pr in range(81, 91)
+)
+with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
+    s.write(json.dumps({"bad": bad}) + "\\n")
+if bad:
+    sys.exit(4)
+""",
+    )
+    hold_6, release_6 = _submit_hold(client, six_dir, checkouts_6[81], "six")
+    env_6 = _env_with_gh(bin_6, {"BATCH_GATE_LOG": str(six_gate_log)})
+    ids_6 = {
+        pr: client.submit_land(
+            "github", pr, six_gate, checkout=str(checkouts_6[pr]),
+            resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
+        )
+        for pr in range(81, 87)
+    }
+    release_6.touch()
+    _wait_terminal(client, hold_6, "passed")
+    rows_6 = {
+        pr: _wait_terminal(client, ids_6[pr], "failed" if pr in {82, 86} else "passed")
+        for pr in range(81, 87)
+    }
+    assert len(rows_6[81]["batch"]["members"]) == 4
+    assert rows_6[81]["batch"]["max_batch_size"] == 4
+    assert len(rows_6[85]["batch"]["members"]) == 2
+    assert rows_6[85]["batch"]["max_batch_size"] == 2
+    assert len(six_gate_log.read_text(encoding="utf-8").splitlines()) == 6
+
+    # Submit two more failing PRs (#87, #88) so repository history reaches 4 passed + 4 failed
+    # (p_hat = 0.50 >= 0.38), clamping adaptive B = 1 so #89 and #90 execute sequentially unbatched!
+    for pr in (87, 88):
+        rid = client.submit_land(
+            "github", pr, six_gate, checkout=str(checkouts_6[pr]),
+            resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
+        )
+        _wait_terminal(client, rid, "failed")
+
+    hold_b1, release_b1 = _submit_hold(client, six_dir, checkouts_6[89], "b1")
+    r89 = client.submit_land(
+        "github", 89, six_gate, checkout=str(checkouts_6[89]),
+        resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
+    )
+    r90 = client.submit_land(
+        "github", 90, six_gate, checkout=str(checkouts_6[90]),
+        resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
+    )
+    release_b1.touch()
+    _wait_terminal(client, hold_b1, "passed")
+    row89 = _wait_terminal(client, r89, "passed")
+    row90 = _wait_terminal(client, r90, "passed")
+    assert row89["batch"] is None
+    assert row90["batch"] is None

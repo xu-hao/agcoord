@@ -470,6 +470,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     land.add_argument(
+        "--no-deductive-bisect",
+        dest="deductive_bisect",
+        action="store_false",
+        help=(
+            "always run explicit singleton/sub-slice gates during batch bisection "
+            "instead of deductively skipping slices proved broken by an earlier tree"
+        ),
+    )
+    land.add_argument(
         "--avoid",
         action="append",
         default=[],
@@ -853,6 +862,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             synchronize_target=args.synchronize_target,
             avoid_commits=args.avoid,
             reuse_full=args.reuse_full,
+            deductive_bisect=args.deductive_bisect,
             overflow=args.overflow,
             require_capabilities=selected_capabilities,
             runtimes=selected_runtimes,

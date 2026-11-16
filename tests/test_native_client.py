@@ -115,6 +115,13 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
         with pytest.raises(BrokerConfigError, match="stop_grace"):
             parse_broker_config(json.dumps({"stop_grace": invalid}))
 
+    assert parse_broker_config(json.dumps({})).land_max_batch_size is None
+    assert parse_broker_config(json.dumps({"land_max_batch_size": 1})).land_max_batch_size == 1
+    assert parse_broker_config(json.dumps({"land_max_batch_size": 8})).land_max_batch_size == 8
+    for invalid in (0, -2, 1025, 2.5, "8", True):
+        with pytest.raises(BrokerConfigError, match="land_max_batch_size"):
+            parse_broker_config(json.dumps({"land_max_batch_size": invalid}))
+
 
 def test_explicit_development_selection_rejects_mutable_symlinked_and_wrong_target_binaries(
     tmp_path: Path,
