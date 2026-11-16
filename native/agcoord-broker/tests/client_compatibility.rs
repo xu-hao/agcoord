@@ -282,13 +282,27 @@ fn python_public_commands_keep_the_protocol_five_json_contract() {
     let run_id = check_row["run_id"].as_str().unwrap().to_owned();
 
     let shown = python_cli(&[
+        "--json".to_owned(),
         "--state-dir".to_owned(),
         state.to_string_lossy().into_owned(),
         "show".to_owned(),
         run_id.clone(),
     ]);
-    assert_success(&shown, "native show");
-    assert_eq!(parse_json_output(&shown)["run_id"], run_id);
+    assert_success(&shown, "native json show");
+    let shown_row = parse_json_output(&shown);
+    assert_eq!(shown_row["run_id"], run_id);
+    assert!(shown_row["batch"].is_null());
+
+    let shown_plain = python_cli(&[
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "show".to_owned(),
+        run_id.clone(),
+    ]);
+    assert_success(&shown_plain, "native plain show");
+    let plain_text = String::from_utf8_lossy(&shown_plain.stdout);
+    assert!(plain_text.contains(&format!("Run: {run_id}")), "{plain_text}");
+    assert!(plain_text.contains("Status: passed"), "{plain_text}");
 
     let log = python_cli(&[
         "--json".to_owned(),
@@ -667,6 +681,7 @@ print(run_id)
     let deadline = Instant::now() + Duration::from_secs(10);
     let terminal = loop {
         let shown = python_cli(&[
+            "--json".to_owned(),
             "--state-dir".to_owned(),
             state.to_string_lossy().into_owned(),
             "show".to_owned(),

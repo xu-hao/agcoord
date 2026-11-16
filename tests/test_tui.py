@@ -92,6 +92,7 @@ def _row(
         "pool": pool,
         "gate_run_id": gate_run_id,
         "publication": publication,
+        "batch": None,
         "failure_reason": failure_reason,
         "phase": selected_phase,
         "gate_exit_status": gate_exit_status,
@@ -332,7 +333,11 @@ async def test_front_row_reservation_is_visible_in_public_views(tmp_path: Path, 
         later_id = submit("later", 2, 2 * gib)
         reasons = [f"reservation:{front_id}:cpu", f"reservation:{front_id}:tmpfs"]
         if surface in {"list", "show"}:
-            arguments = ["list", "--json"] if surface == "list" else ["show", later_id]
+            arguments = (
+                ["list", "--json"]
+                if surface == "list"
+                else ["show", "--json", later_id]
+            )
             result = subprocess.run(
                 [sys.executable, "-m", "agcoord", *arguments, "--state-dir", str(state)],
                 capture_output=True, text=True, env=caller_environment(), check=True,
@@ -345,6 +350,13 @@ async def test_front_row_reservation_is_visible_in_public_views(tmp_path: Path, 
                 )
             assert record["blocked_by"] == reasons
             assert record["status"] == "queued"
+            if surface == "show":
+                plain = subprocess.run(
+                    [sys.executable, "-m", "agcoord", "show", later_id, "--state-dir", str(state)],
+                    capture_output=True, text=True, env=caller_environment(), check=True,
+                )
+                for reason in reasons:
+                    assert reason in plain.stdout
         else:
             app = build_app(lambda: client, refresh_interval=60)
             async with app.run_test(size=(100, 30)) as pilot:
@@ -1343,3 +1355,211 @@ async def test_pool_picker_filters_rows_and_refreshes_server(with_choices):
         await _settled(pilot)
         assert visible_ids() == ["remote", "local", "waiting", "done"]
         assert client.snapshot_calls[-1].get("pool") is None
+
+
+@pytest.mark.asyncio
+async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
+    snapshot = _snapshot()
+    leader = _row(
+        "land-leader01",
+        10,
+        "running",
+        kind="land",
+        label="land PR 21",
+        head_sha="1" * 40,
+        publication={"adapter": "github", "request": 21},
+        phase="gating",
+    )
+    follower = _row(
+        "land-follow02",
+        11,
+        "running",
+        kind="land",
+        label="land PR 22",
+        head_sha="2" * 40,
+        publication={"adapter": "github", "request": 22},
+        phase="gating",
+    )
+    members = [
+        {
+            "position": 0,
+            "run_id": "land-leader01",
+            "branch": "feature/10",
+            "head_sha": "1" * 40,
+            "publication": {"adapter": "github", "request": 21},
+            "status": "running",
+            "failure_reason": None,
+        },
+        {
+            "position": 1,
+            "run_id": "land-follow02",
+            "branch": "feature/11",
+            "head_sha": "2" * 40,
+            "publication": {"adapter": "github", "request": 22},
+            "status": "running",
+            "failure_reason": None,
+        },
+    ]
+    step1_running = {
+        "step": 1,
+        "member_run_ids": ["land-leader01", "land-follow02"],
+        "gated_member_run_ids": ["land-leader01", "land-follow02"],
+        "dropped": [],
+        "base_sha": "0" * 40,
+        "gating_head_sha": "a" * 40,
+        "started_at": "2026-08-30T12:00:10+00:00",
+        "finished_at": None,
+        "gate_reused_from": None,
+        "gate_exit_status": None,
+        "outcome": "running",
+        "split": None,
+        "published_sha": None,
+    }
+    leader["batch"] = {
+        "leader_run_id": "land-leader01",
+        "role": "leader",
+        "target_branch": "main",
+        "members": deepcopy(members),
+        "steps": [deepcopy(step1_running)],
+    }
+    follower["batch"] = {
+        "leader_run_id": "land-leader01",
+        "role": "follower",
+        "target_branch": "main",
+        "members": deepcopy(members),
+        "steps": [deepcopy(step1_running)],
+    }
+    snapshot["active"] = [leader, follower]
+    snapshot["queued"] = []
+    snapshot["recent"] = []
+    client = FakeClient(snapshot)
+    app = build_app(lambda: client, refresh_interval=60)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _settled(pilot)
+        table = _table(app)
+        assert table.max_scroll_x == 0
+
+        detail_widget = app.query_one("#gate-detail", Static)
+        leader_detail = _widget_text(detail_widget)
+        assert len(leader_detail.splitlines()) == 9
+        assert detail_widget.size.height == 9
+        assert "batch 1/2 (1 slice)" in leader_detail
+        assert "batch: leader" in leader_detail
+        assert "finished:" in leader_detail
+
+        await pilot.press("down")
+        await pilot.pause()
+        follower_detail = _widget_text(detail_widget)
+        follower_lines = follower_detail.splitlines()
+        assert len(follower_lines) == 9
+        assert len(follower_lines[1]) <= 78, follower_lines[1]
+        assert len(follower_lines[3]) <= 78, follower_lines[3]
+        assert "batch 2/2 (1 slice)" in follower_detail
+        assert "batch: follower of land-leader01" in follower_detail
+
+        # Open Enter modal on follower while batch is running and verify live refresh updates it.
+        await pilot.press("enter")
+        await pilot.pause()
+        modal_live = _screen_text(app)
+        assert "Batch & Bisect History:" in modal_live
+        assert "Leader: land-leader01 · Role: follower · Target: main · Bisected: no" in modal_live
+        assert "35s (live) · gate running · running" in modal_live
+
+        # Advance snapshot to completed bisection in recent history while modal stays open.
+        completed_members = [
+            {**members[0], "status": "passed"},
+            {**members[1], "status": "failed", "failure_reason": "gate-failed"},
+        ]
+        completed_steps = [
+            {
+                **step1_running,
+                "finished_at": "2026-08-30T12:00:22+00:00",
+                "gate_exit_status": 1,
+                "outcome": "bisected",
+                "split": [1, 1],
+            },
+            {
+                "step": 2,
+                "member_run_ids": ["land-leader01"],
+                "gated_member_run_ids": ["land-leader01"],
+                "dropped": [],
+                "base_sha": "0" * 40,
+                "gating_head_sha": "b" * 40,
+                "started_at": "2026-08-30T12:00:23+00:00",
+                "finished_at": "2026-08-30T12:00:28+00:00",
+                "gate_reused_from": None,
+                "gate_exit_status": 0,
+                "outcome": "published",
+                "split": None,
+                "published_sha": "c" * 40,
+            },
+            {
+                "step": 3,
+                "member_run_ids": ["land-follow02"],
+                "gated_member_run_ids": ["land-follow02"],
+                "dropped": [],
+                "base_sha": "c" * 40,
+                "gating_head_sha": "d" * 40,
+                "started_at": "2026-08-30T12:00:29+00:00",
+                "finished_at": "2026-08-30T12:00:35+00:00",
+                "gate_reused_from": None,
+                "gate_exit_status": 5,
+                "outcome": "gate-failed",
+                "split": None,
+                "published_sha": None,
+            },
+        ]
+        done_leader = {
+            **leader,
+            "status": "passed",
+            "phase": "complete",
+            "gate_exit_status": 0,
+            "exit_status": 0,
+            "finished_at": "2026-08-30T12:00:35+00:00",
+            "batch": {
+                "leader_run_id": "land-leader01",
+                "role": "leader",
+                "target_branch": "main",
+                "members": deepcopy(completed_members),
+                "steps": deepcopy(completed_steps),
+            },
+        }
+        done_follower = {
+            **follower,
+            "status": "failed",
+            "phase": "complete",
+            "gate_exit_status": 5,
+            "exit_status": 5,
+            "failure_reason": "gate-failed",
+            "finished_at": "2026-08-30T12:00:35+00:00",
+            "batch": {
+                "leader_run_id": "land-leader01",
+                "role": "follower",
+                "target_branch": "main",
+                "members": deepcopy(completed_members),
+                "steps": deepcopy(completed_steps),
+            },
+        }
+        next_snap = deepcopy(snapshot)
+        next_snap["captured_at"] = "2026-08-30T12:01:00+00:00"
+        next_snap["active"] = []
+        next_snap["recent"] = [done_follower, done_leader]
+        client.result = next_snap
+
+        app.action_refresh()
+        await _settled(pilot)
+        modal_done = _screen_text(app)
+        assert "Bisected: yes" in modal_done
+        assert "gate failed (exit 1) -> bisected 2 into 1 + 1" in modal_done
+        assert f"published -> {'c' * 40}" in modal_done
+        assert "gate failed (exit 5)" in modal_done
+
+        await pilot.press("escape")
+        await _settled(pilot)
+        compact_after = _widget_text(detail_widget)
+        compact_lines = compact_after.splitlines()
+        assert len(compact_lines) == 9
+        assert len(compact_lines[1]) <= 78, compact_lines[1]
+        assert len(compact_lines[3]) <= 78, compact_lines[3]
+        assert "batch 2/2 (3 slices, bisected)" in compact_after

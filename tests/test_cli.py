@@ -69,6 +69,7 @@ def _row(
         "blocked_by": [],
         "gate_run_id": gate_run_id,
         "publication": publication,
+        "batch": None,
         "failure_reason": failure_reason,
         "phase": selected_phase,
         "gate_exit_status": gate_exit_status,
@@ -347,16 +348,25 @@ def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_
         "backend-unavailable"
     )
 
-    shown = StringIO()
-    assert cli.run(_args("show", "land-failed"), out=shown) == 0
-    shown_row = json.loads(shown.getvalue())
+    shown_json = StringIO()
+    assert cli.run(_args("--json", "show", "land-failed"), out=shown_json) == 0
+    shown_row = json.loads(shown_json.getvalue())
     assert shown_row["publication"] == {"adapter": "github", "request": 123}
+    assert shown_row["batch"] is None
     assert shown_row["gate_run_id"] is None
     assert shown_row["head_sha"] == "a" * 40
     assert shown_row["phase"] == "complete"
     assert shown_row["gate_exit_status"] == 0
     assert shown_row["failure_reason"] == "stale-main"
     assert shown_row["resource_receipt"]["requested"] == {"cpu": 1, "jobs": 1}
+
+    shown_plain = StringIO()
+    assert cli.run(_args("show", "land-failed"), out=shown_plain) == 0
+    plain_text = shown_plain.getvalue()
+    assert "Run: land-failed" in plain_text
+    assert "Publication: github #123" in plain_text
+    assert "Failure reason: stale-main" in plain_text
+    assert "Batch & Bisect History:" not in plain_text
 
     log = StringIO()
     assert cli.run(_args("log", "check-active"), out=log) == 0
@@ -450,14 +460,130 @@ def test_show_uses_the_narrow_callback_only_for_its_exact_admitted_run(
     monkeypatch.setenv("AGCOORD_RUN_ID", "land-own")
 
     own = StringIO()
-    assert cli.run(_args("show", "land-own"), out=own) == 0
+    assert cli.run(_args("--json", "show", "land-own"), out=own) == 0
     assert json.loads(own.getvalue())["run_id"] == "land-own"
     assert fake_client["admitted_status"] == ["land-own"]
 
     other = StringIO()
-    assert cli.run(_args("show", "land-other"), out=other) == 0
+    assert cli.run(_args("--json", "show", "land-other"), out=other) == 0
     assert json.loads(other.getvalue())["run_id"] == "land-other"
     assert fake_client["status"][-1] == "land-other"
+
+
+def test_show_renders_batch_and_bisect_history_in_plain_text_and_json(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    batch_payload = {
+        "leader_run_id": "land-leader",
+        "role": "follower",
+        "target_branch": "main",
+        "members": [
+            {
+                "position": 0,
+                "run_id": "land-leader",
+                "branch": "feat/p1",
+                "head_sha": "1" * 40,
+                "publication": {"adapter": "github", "request": 101},
+                "status": "passed",
+                "failure_reason": None,
+            },
+            {
+                "position": 1,
+                "run_id": "land-follower",
+                "branch": "feat/p2",
+                "head_sha": "2" * 40,
+                "publication": {"adapter": "github", "request": 102},
+                "status": "failed",
+                "failure_reason": "gate-failed",
+            },
+        ],
+        "steps": [
+            {
+                "step": 1,
+                "member_run_ids": ["land-leader", "land-follower"],
+                "gated_member_run_ids": ["land-leader", "land-follower"],
+                "dropped": [],
+                "base_sha": "0" * 40,
+                "gating_head_sha": "a" * 40,
+                "started_at": "2026-08-30T12:00:05+00:00",
+                "finished_at": "2026-08-30T12:00:17+00:00",
+                "gate_reused_from": None,
+                "gate_exit_status": 1,
+                "outcome": "bisected",
+                "split": [1, 1],
+                "published_sha": None,
+            },
+            {
+                "step": 2,
+                "member_run_ids": ["land-leader"],
+                "gated_member_run_ids": ["land-leader"],
+                "dropped": [],
+                "base_sha": "0" * 40,
+                "gating_head_sha": "b" * 40,
+                "started_at": "2026-08-30T12:00:18+00:00",
+                "finished_at": "2026-08-30T12:00:22+00:00",
+                "gate_reused_from": "full-receipt-1",
+                "gate_exit_status": 0,
+                "outcome": "published",
+                "split": None,
+                "published_sha": "c" * 40,
+            },
+            {
+                "step": 3,
+                "member_run_ids": ["land-follower"],
+                "gated_member_run_ids": ["land-follower"],
+                "dropped": [],
+                "base_sha": "c" * 40,
+                "gating_head_sha": "d" * 40,
+                "started_at": "2026-08-30T12:00:23+00:00",
+                "finished_at": "2026-08-30T12:00:29+00:00",
+                "gate_reused_from": None,
+                "gate_exit_status": 5,
+                "outcome": "gate-failed",
+                "split": None,
+                "published_sha": None,
+            },
+        ],
+    }
+
+    class BatchClient:
+        def __init__(self, **_options):
+            pass
+
+        def status(self, run_id: str):
+            row = _row(
+                run_id,
+                "failed",
+                "land",
+                "land PR 102",
+                head_sha="2" * 40,
+                publication={"adapter": "github", "request": 102},
+                failure_reason="gate-failed",
+                phase="complete",
+                gate_exit_status=5,
+            )
+            row["batch"] = deepcopy(batch_payload)
+            return row
+
+    monkeypatch.setattr(cli, "CoordinatorClient", BatchClient)
+
+    plain = StringIO()
+    assert cli.run(_args("show", "land-follower"), out=plain) == 0
+    rendered = plain.getvalue()
+    assert "Run: land-follower" in rendered
+    assert "Batch & Bisect History:" in rendered
+    assert "Leader: land-leader · Role: follower · Target: main · Bisected: yes" in rendered
+    assert "[0] land-leader (leader) · feat/p1 · github #101 · passed" in rendered
+    assert "[1] land-follower (follower) · feat/p2 · github #102 · failed (gate-failed)" in rendered
+    assert "gate failed (exit 1) -> bisected 2 into 1 + 1" in rendered
+    assert "reused full-receipt-1" in rendered
+    assert f"published -> {'c' * 40}" in rendered
+    assert "gate failed (exit 5)" in rendered
+
+    as_json = StringIO()
+    assert cli.run(_args("--json", "show", "land-follower"), out=as_json) == 0
+    parsed = json.loads(as_json.getvalue())
+    assert parsed["batch"] == batch_payload
 
 
 @pytest.mark.parametrize("command_kind", ["run", "full"])

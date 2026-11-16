@@ -1551,6 +1551,20 @@ checkout's `git rev-parse HEAD` verifies that exact recorded slice head, includi
 bisection when the slice does not contain the leader. Any other head is refused. Outside an
 active slice, admission continues to require the leader run's recorded head.
 
+Every member of a batch — both the leader (`role: "leader"`) and each follower (`role: "follower"`,
+whether dropped on a merge conflict, finalized early on a bisected slice, or published at the end) —
+also exposes a durable `batch` provenance object on `status` (`agc --json show`) and `snapshot`
+(`agc --json list`, `agc tui`). Standalone runs (including a `land` row that found zero eligible
+followers) and followers requeued to `queued` on leader cancellation or crash report `batch: null`;
+if a requeued follower is later claimed into a new batch, `batch` reflects that newer batch.
+A populated `batch` object records `leader_run_id`, `role`, `target_branch`, `created_at`, ordered
+`members` (`position`, `run_id`, `branch`, `head_sha`, `publication`, `status`, `failure_reason`),
+and chronological `steps` (`step`, `label`, `target_sha`, `gating_head_sha`, `member_run_ids`,
+`dropped`, `gate_reused_from`, `gate_exit_status`, `outcome`, `published_commit_sha`, `started_at`,
+`finished_at`) across clean multi-PR gates, recursive binary-split bisections, merge-conflict drops,
+`--reuse-full` substitutions, stale-target or changed-head handbacks, publication failures, and
+cancellations.
+
 ### Reusing a full receipt as the land gate
 
 The two-step a worktree usually follows — `agc full`, then `agc land` — exists so that a red gate
@@ -1635,14 +1649,17 @@ Every accepted job has one stable ID, durable row, and combined stdout/stderr lo
 ```bash
 agc list [--repository <repo>] [--agent <agent>] [--kind <kind>] [--pool <pool>] [--limit <n>]
 agc list --json
-agc show <run-id>
+agc show [--json] <run-id>
 agc log <run-id> [--follow]
 agc cancel <run-id>
 ```
 
 The non-JSON `list` table summarizes each row as `admission-only`, `applied`, `partial`,
-`unapplied`, or `failed`. `list --json` and `show` retain the complete binding, capability, and
-receipt fields so automation can distinguish scheduling, actual application, and measurement.
+`unapplied`, or `failed`, and `agc show <run-id>` prints a readable summary of one durable row
+(including chronological `Batch & Bisect History:` when the row participated in a land batch).
+`list --json` and `show --json` (or `agc --json show`) retain the complete binding, capability,
+receipt, and batch fields as JSON so automation can distinguish scheduling, actual application,
+and measurement.
 Optional `--repository`, `--agent`, `--kind`, `--pool`, and `--limit` filter flags query the broker for
 matching runs across the durable spool rather than limiting matches to the global default window.
 `--pool local` selects runs without an overflow placement, including queued runs.
@@ -1688,8 +1705,10 @@ shortcut that deletes coordinator state.
 version. It shows active, queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
 remain inspectable without truncating the durable values. Persistent selection detail includes
-the pool and enforcement summary; the modal detail includes the pool, exact resource contract, and
-sanitized receipt events; and the status bar summarizes configured overflow pools' active
+the pool, enforcement summary, and compact batch position, slice/bisect summary, and leader/follower
+role when batched; the modal detail (`Enter`) includes the pool, exact resource contract,
+sanitized receipt events, and live-updating chronological **Batch & Bisect History** across active
+and completed batched lands; and the status bar summarizes configured overflow pools' active
 allocations and used/limit daily CPU-hour budgets (with estimated used/limit cost when
 `cpu_hour_price` is configured).
 

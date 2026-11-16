@@ -66,8 +66,9 @@ agc tui
 
 `list` prints one line per job with its status, kind, repository, agent, label, declared
 resources, and an enforcement summary, which reads `admission-only` in this spool. `show`
-prints the complete durable row as JSON, including the exact command, checkout, branch, and
-resource contract. `log` prints the combined stdout and stderr, and `--follow` waits through
+prints a readable summary of one durable row, including the exact command, checkout, branch,
+resource summary, and batch/bisect history when present (`agc --json show` prints the complete
+durable row as JSON). `log` prints the combined stdout and stderr, and `--follow` waits through
 completion. The TUI shows every repository on the machine; `r` refreshes, `Enter` opens a
 row, `l` shows its log, `c` cancels, `p` and `a` filter by repository and agent, and `q`
 leaves the jobs running. Set `AGCOORD_AGENT` in each agent's environment, or pass `--agent`,

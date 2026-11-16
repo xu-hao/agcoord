@@ -355,6 +355,146 @@ def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _format_elapsed(start: datetime | None, end: datetime | None) -> str:
+    if start is None or end is None:
+        return "—"
+    seconds = max(0, round((end - start).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _format_publication_target(publication: object) -> str:
+    if not isinstance(publication, Mapping) or not publication.get("adapter"):
+        return "—"
+    adapter = str(publication["adapter"])
+    request = publication.get("request")
+    if isinstance(request, int) and not isinstance(request, bool):
+        return f"{adapter} #{request}"
+    if request is None:
+        return adapter
+    return f"{adapter} {request}"
+
+
+def format_batch_history(
+    batch: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Format durable land-batch membership and chronological slice/bisect steps."""
+    leader_run_id = str(batch.get("leader_run_id") or "—")
+    role = str(batch.get("role") or "member")
+    target_branch = batch.get("target_branch") or "—"
+    members = list(batch.get("members") or ())
+    steps = list(batch.get("steps") or ())
+    bisected = any(
+        isinstance(step, Mapping) and step.get("outcome") == "bisected"
+        for step in steps
+    )
+    lines = [
+        "Batch & Bisect History:",
+        f"  Leader: {leader_run_id} · Role: {role} · Target: {target_branch} · "
+        f"Bisected: {'yes' if bisected else 'no'}",
+        f"  Members ({len(members)}):",
+    ]
+    member_labels: dict[str, str] = {}
+    for member in members:
+        if not isinstance(member, Mapping):
+            continue
+        run_id = str(member.get("run_id") or "—")
+        position = member.get("position", 0)
+        branch = str(member.get("branch") or "—")
+        publication = member.get("publication")
+        pub_text = _format_publication_target(publication)
+        if (
+            isinstance(publication, Mapping)
+            and isinstance(publication.get("request"), int)
+            and not isinstance(publication.get("request"), bool)
+        ):
+            member_labels[run_id] = f"#{publication['request']} ({run_id})"
+        else:
+            member_labels[run_id] = run_id
+        member_role = "leader" if run_id == leader_run_id else "follower"
+        status_text = str(member.get("status") or "unknown")
+        failure_reason = member.get("failure_reason")
+        if failure_reason:
+            status_text += f" ({failure_reason})"
+        lines.append(
+            f"    [{position}] {run_id} ({member_role}) · {branch} · {pub_text} · {status_text}"
+        )
+    lines.append(f"  Steps ({len(steps)}):")
+    if not steps:
+        lines.append("    (no slices recorded yet)")
+        return "\n".join(lines)
+
+    ref_now = now or datetime.now(timezone.utc)
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        step_index = step.get("step", "?")
+        attempted_ids = [str(rid) for rid in (step.get("member_run_ids") or ())]
+        attempted = ", ".join(member_labels.get(rid, rid) for rid in attempted_ids)
+        dropped_entries = step.get("dropped") or ()
+        dropped_parts = [
+            f"{member_labels.get(str(item['run_id']), str(item['run_id']))}: {item['reason']}"
+            for item in dropped_entries
+            if isinstance(item, Mapping) and "run_id" in item and "reason" in item
+        ]
+        dropped_text = f" · dropped {', '.join(dropped_parts)}" if dropped_parts else ""
+        gating_head = step.get("gating_head_sha")
+        head_text = f"head {gating_head}" if gating_head else "head —"
+        started = _parse_time(step.get("started_at"))
+        finished = _parse_time(step.get("finished_at"))
+        outcome = str(step.get("outcome") or "unknown")
+        if finished is not None:
+            dur_text = _format_elapsed(started, finished)
+        elif outcome == "running" and started is not None:
+            dur_text = f"{_format_elapsed(started, ref_now)} (live)"
+        else:
+            dur_text = "—"
+        reused = step.get("gate_reused_from")
+        exit_code = step.get("gate_exit_status")
+        if reused:
+            gate_text = f"reused {reused}"
+        elif exit_code is not None:
+            gate_text = f"gate exit {exit_code}"
+        elif outcome == "running":
+            gate_text = "gate running"
+        else:
+            gate_text = "gate not run"
+        split = step.get("split")
+        if (
+            outcome == "bisected"
+            and isinstance(split, Sequence)
+            and not isinstance(split, (str, bytes))
+            and len(split) == 2
+        ):
+            left_count, right_count = int(split[0]), int(split[1])
+            prefix = f"gate failed (exit {exit_code}) -> " if exit_code is not None else ""
+            outcome_text = (
+                f"{prefix}bisected {left_count + right_count} into "
+                f"{left_count} + {right_count}"
+            )
+        elif outcome == "published":
+            published_sha = step.get("published_sha")
+            outcome_text = (
+                f"published -> {published_sha}" if published_sha else "published"
+            )
+        elif outcome == "gate-failed" and exit_code is not None:
+            outcome_text = f"gate failed (exit {exit_code})"
+        else:
+            outcome_text = outcome
+        lines.append(
+            f"    Step {step_index}: [{attempted}]{dropped_text} · {head_text} · "
+            f"{dur_text} · {gate_text} · {outcome_text}"
+        )
+    return "\n".join(lines)
+
+
 def _shell_status(returncode: int) -> int:
     return 128 + abs(returncode) if returncode < 0 else returncode
 
@@ -2500,9 +2640,12 @@ class CoordinatorClient:
         *,
         member_run_ids: Sequence[str],
         worker_pid: int,
+        target_branch: str | None = None,
     ) -> list[dict[str, object]]:
         arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
         arguments.extend(("--members-json", json.dumps(list(member_run_ids))))
+        if target_branch is not None:
+            arguments.extend(("--target-branch", target_branch))
         result = self._native_callback_invoke("claim-batch", arguments)
         if (
             not isinstance(result, dict)
@@ -2511,6 +2654,61 @@ class CoordinatorClient:
         ):
             raise CoordinatorError("native broker returned an invalid batch claim receipt")
         return list(result["members"])
+
+    def record_batch_step(
+        self,
+        leader_run_id: str,
+        *,
+        worker_pid: int,
+        outcome: str,
+        step: int | None = None,
+        member_run_ids: Sequence[str] | None = None,
+        gated_member_run_ids: Sequence[str] | None = None,
+        dropped: Sequence[Mapping[str, str]] | None = None,
+        base_sha: str | None = None,
+        gating_head_sha: str | None = None,
+        gate_reused_from: str | None = None,
+        gate_exit_status: int | None = None,
+        split: tuple[int, int] | None = None,
+        published_sha: str | None = None,
+    ) -> int:
+        arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
+        payload: dict[str, object] = {"outcome": outcome}
+        if step is not None:
+            payload["step"] = int(step)
+        if member_run_ids is not None:
+            payload["member_run_ids"] = list(member_run_ids)
+        if gated_member_run_ids is not None:
+            payload["gated_member_run_ids"] = list(gated_member_run_ids)
+        if dropped is not None:
+            payload["dropped"] = [
+                {"run_id": str(item["run_id"]), "reason": str(item["reason"])}
+                for item in dropped
+            ]
+        if base_sha is not None:
+            payload["base_sha"] = _validate_head_sha(base_sha, required=True)
+        if gating_head_sha is not None:
+            payload["gating_head_sha"] = _validate_head_sha(
+                gating_head_sha, required=True
+            )
+        if gate_reused_from is not None:
+            payload["gate_reused_from"] = gate_reused_from
+        if gate_exit_status is not None:
+            payload["gate_exit_status"] = int(gate_exit_status)
+        if split is not None:
+            payload["split"] = [int(split[0]), int(split[1])]
+        if published_sha is not None:
+            payload["published_sha"] = _validate_head_sha(published_sha, required=True)
+        arguments.extend(("--step-json", json.dumps(payload)))
+        result = self._native_callback_invoke("record-batch-step", arguments)
+        if (
+            not isinstance(result, dict)
+            or result.get("leader_run_id") != leader_run_id
+            or not isinstance(result.get("step"), int)
+            or isinstance(result.get("step"), bool)
+        ):
+            raise CoordinatorError("native broker returned an invalid batch step receipt")
+        return int(result["step"])
 
     def batch_status(
         self,

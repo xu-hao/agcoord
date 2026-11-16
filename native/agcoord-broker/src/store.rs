@@ -297,6 +297,7 @@ pub struct BatchClaimRequest {
     pub checkout: PathBuf,
     pub head_sha: String,
     pub member_run_ids: Vec<String>,
+    pub target_branch: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +314,190 @@ pub struct BatchSliceRequest {
     pub identity: BatchStatusRequest,
     pub gating_head_sha: String,
     pub member_run_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedBatchMember {
+    pub run_id: String,
+    pub reason: String,
+}
+
+impl DroppedBatchMember {
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "run_id": self.run_id,
+            "reason": self.reason,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchStepPayload {
+    pub step: Option<u64>,
+    pub member_run_ids: Option<Vec<String>>,
+    pub gated_member_run_ids: Option<Vec<String>>,
+    pub dropped: Option<Vec<DroppedBatchMember>>,
+    pub base_sha: Option<String>,
+    pub gating_head_sha: Option<String>,
+    pub gate_reused_from: Option<String>,
+    pub gate_exit_status: Option<i64>,
+    pub outcome: String,
+    pub split: Option<[u64; 2]>,
+    pub published_sha: Option<String>,
+}
+
+impl BatchStepPayload {
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        let value: Value = serde_json::from_str(raw)
+            .map_err(|error| AppError::usage(format!("--step-json is invalid: {error}")))?;
+        let Some(object) = value.as_object() else {
+            return Err(AppError::usage("--step-json must be a JSON object"));
+        };
+        const ALLOWED: &[&str] = &[
+            "step",
+            "member_run_ids",
+            "gated_member_run_ids",
+            "dropped",
+            "base_sha",
+            "gating_head_sha",
+            "gate_reused_from",
+            "gate_exit_status",
+            "outcome",
+            "split",
+            "published_sha",
+        ];
+        for key in object.keys() {
+            if !ALLOWED.contains(&key.as_str()) {
+                return Err(AppError::usage(format!(
+                    "--step-json contains unknown field {key}"
+                )));
+            }
+        }
+        let parse_opt_str = |field: &str| -> Result<Option<String>> {
+            match object.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
+                _ => Err(AppError::usage(format!(
+                    "--step-json field {field} must be a string or null"
+                ))),
+            }
+        };
+        let parse_opt_str_list = |field: &str| -> Result<Option<Vec<String>>> {
+            match object.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Some(s) = item.as_str() else {
+                            return Err(AppError::usage(format!(
+                                "--step-json field {field} must contain only strings"
+                            )));
+                        };
+                        out.push(s.to_owned());
+                    }
+                    Ok(Some(out))
+                }
+                _ => Err(AppError::usage(format!(
+                    "--step-json field {field} must be a string array or null"
+                ))),
+            }
+        };
+        let step = match object.get("step") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| AppError::usage("--step-json field step must be a u64"))?,
+            ),
+        };
+        let dropped = match object.get("dropped") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(obj) = item.as_object() else {
+                        return Err(AppError::usage(
+                            "--step-json field dropped must contain objects",
+                        ));
+                    };
+                    if obj.len() != 2
+                        || !obj.contains_key("run_id")
+                        || !obj.contains_key("reason")
+                    {
+                        return Err(AppError::usage(
+                            "--step-json dropped items must have exact keys run_id and reason",
+                        ));
+                    }
+                    let Some(run_id) = obj.get("run_id").and_then(Value::as_str) else {
+                        return Err(AppError::usage(
+                            "--step-json dropped.run_id must be a string",
+                        ));
+                    };
+                    let Some(reason) = obj.get("reason").and_then(Value::as_str) else {
+                        return Err(AppError::usage(
+                            "--step-json dropped.reason must be a string",
+                        ));
+                    };
+                    out.push(DroppedBatchMember {
+                        run_id: run_id.to_owned(),
+                        reason: reason.to_owned(),
+                    });
+                }
+                Some(out)
+            }
+            _ => {
+                return Err(AppError::usage(
+                    "--step-json field dropped must be an array or null",
+                ))
+            }
+        };
+        let gate_exit_status = match object.get("gate_exit_status") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_i64().ok_or_else(|| {
+                AppError::usage("--step-json field gate_exit_status must be an integer")
+            })?),
+        };
+        let outcome = object
+            .get("outcome")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::usage("--step-json field outcome is required"))?
+            .to_owned();
+        let split = match object.get("split") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) if items.len() == 2 => {
+                let l = items[0]
+                    .as_u64()
+                    .ok_or_else(|| AppError::usage("--step-json split[0] must be a u64"))?;
+                let r = items[1]
+                    .as_u64()
+                    .ok_or_else(|| AppError::usage("--step-json split[1] must be a u64"))?;
+                Some([l, r])
+            }
+            _ => {
+                return Err(AppError::usage(
+                    "--step-json field split must be a 2-element u64 array or null",
+                ))
+            }
+        };
+        Ok(Self {
+            step,
+            member_run_ids: parse_opt_str_list("member_run_ids")?,
+            gated_member_run_ids: parse_opt_str_list("gated_member_run_ids")?,
+            dropped,
+            base_sha: parse_opt_str("base_sha")?,
+            gating_head_sha: parse_opt_str("gating_head_sha")?,
+            gate_reused_from: parse_opt_str("gate_reused_from")?,
+            gate_exit_status,
+            outcome,
+            split,
+            published_sha: parse_opt_str("published_sha")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchStepRequest {
+    pub identity: BatchStatusRequest,
+    pub payload: BatchStepPayload,
 }
 
 #[derive(Clone, Debug)]
@@ -2038,6 +2223,7 @@ pub fn public_run(
     position: Option<usize>,
     blockers: Vec<String>,
     placed: &BTreeMap<String, String>,
+    batch: Value,
 ) -> Value {
     let log_bytes = fs::metadata(paths.logs.join(format!("{}.log", run.run_id)))
         .map(|metadata| metadata.len())
@@ -2070,6 +2256,7 @@ pub fn public_run(
         "pool": placed.get(&run.run_id),
         "gate_run_id": run.gate_run_id,
         "publication": publication,
+        "batch": batch,
         "failure_reason": run.failure_reason,
         "gate_exit_status": run.gate_exit_status,
         "caller_pid": run.caller_pid,
@@ -2194,32 +2381,38 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     for name in capacities.keys() {
         selected_allocations.insert(name.clone(), used.get(name).copied().unwrap_or(0));
     }
-    let queued_public: Vec<_> = queued
-        .iter()
-        .enumerate()
-        .map(|(index, run)| {
-            public_run(
-                paths,
-                run,
-                Some(index + 1),
-                blocked_by(
-                    run,
-                    &all_active,
-                    &all_queued,
-                    &local_runtime,
-                    &live_placed,
-                    &batch_followers,
-                ),
-                &placed,
-            )
-        })
-        .collect();
     let limit = filter.limit.unwrap_or(RECENT_LIMIT);
-    let recent: Vec<_> = terminal
-        .iter()
-        .take(limit)
-        .map(|run| public_run(paths, run, None, Vec::new(), &placed))
-        .collect();
+    let recent_runs: Vec<_> = terminal.iter().take(limit).collect();
+    let mut batch_cache: BTreeMap<i64, (String, Value)> = BTreeMap::new();
+    let mut active_public = Vec::with_capacity(active.len());
+    for run in &active {
+        let batch = batch_for_run_cached(&connection, run, &mut batch_cache)?;
+        active_public.push(public_run(paths, run, None, Vec::new(), &placed, batch));
+    }
+    let mut queued_public = Vec::with_capacity(queued.len());
+    for (index, run) in queued.iter().enumerate() {
+        let batch = batch_for_run_cached(&connection, run, &mut batch_cache)?;
+        queued_public.push(public_run(
+            paths,
+            run,
+            Some(index + 1),
+            blocked_by(
+                run,
+                &all_active,
+                &all_queued,
+                &local_runtime,
+                &live_placed,
+                &batch_followers,
+            ),
+            &placed,
+            batch,
+        ));
+    }
+    let mut recent = Vec::with_capacity(recent_runs.len());
+    for run in recent_runs {
+        let batch = batch_for_run_cached(&connection, run, &mut batch_cache)?;
+        recent.push(public_run(paths, run, None, Vec::new(), &placed, batch));
+    }
     Ok(json!({
         "protocol": PROTOCOL,
         "broker_pid": owner.as_ref().map(|owner| owner.pid),
@@ -2246,7 +2439,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
             "kinds": known_kinds,
             "pools": known_pools,
         }),
-        "active": active.iter().map(|run| public_run(paths, run, None, Vec::new(), &placed)).collect::<Vec<_>>(),
+        "active": active_public,
         "queued": queued_public,
         "recent": recent,
     }))
@@ -2296,6 +2489,8 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
     let live_placed = crate::overflow::live_placements(&connection)?;
     let placed = crate::overflow::all_placements(&connection)?;
     let batch_followers = active_batch_followers(&connection)?;
+    let mut batch_cache = BTreeMap::new();
+    let batch = batch_for_run_cached(&connection, &run, &mut batch_cache)?;
     let mut result = public_run(
         paths,
         &run,
@@ -2309,6 +2504,7 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
             &batch_followers,
         ),
         &placed,
+        batch,
     );
     result["batch_slice"] = batch_slice(&connection, &run.run_id)?;
     Ok(result)
@@ -3558,7 +3754,17 @@ pub fn reuse_gate(paths: &Paths, request: &ReuseRequest) -> Result<Value> {
             "gate reuse requester does not match the admitted worker, checkout, and head",
         ));
     }
-    let outcome = try_reuse_gate_for_run(paths, &connection, &run)?;
+    let in_active_batch = land_batch_schema_present(&connection)?
+        && connection
+            .query_row(
+                "SELECT 1 FROM land_batch_members WHERE member_run_id = ?1 AND active = 1",
+                params![run.run_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_database_error)?
+            .is_some();
+    let outcome = try_reuse_gate_for_run(paths, &connection, &run, in_active_batch)?;
     if outcome["reused"] == true {
         connection
             .execute_batch("COMMIT")
@@ -3608,8 +3814,30 @@ pub fn report_land_result(paths: &Paths, request: &LandResultRequest) -> Result<
     Ok(json!({"reported": true}))
 }
 
-/// Ensure the coordinator-private table tracking active land batches exists.
+fn land_batch_schema_present(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN (
+                   'land_batch_members',
+                   'land_batch_slices',
+                   'land_batches',
+                   'land_batch_entries',
+                   'land_batch_steps'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    Ok(count == 5)
+}
+
+/// Ensure the coordinator-private tables tracking active and historical land batches exist.
 pub fn ensure_land_batch_schema(connection: &Connection) -> Result<()> {
+    if land_batch_schema_present(connection)? {
+        return Ok(());
+    }
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS land_batch_members (
@@ -3624,9 +3852,215 @@ pub fn ensure_land_batch_schema(connection: &Connection) -> Result<()> {
                 leader_run_id TEXT PRIMARY KEY,
                 gating_head_sha TEXT NOT NULL,
                 slice_member_ids_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS land_batches (
+                batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                leader_run_id TEXT NOT NULL,
+                target_branch TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS land_batches_leader
+                ON land_batches(leader_run_id, batch_id);
+            CREATE TABLE IF NOT EXISTS land_batch_entries (
+                batch_id INTEGER NOT NULL REFERENCES land_batches(batch_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                member_run_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                publication_adapter TEXT,
+                publication_request TEXT,
+                requeued INTEGER NOT NULL DEFAULT 0,
+                final_status TEXT,
+                final_failure_reason TEXT,
+                PRIMARY KEY (batch_id, position),
+                UNIQUE (batch_id, member_run_id)
+            );
+            CREATE INDEX IF NOT EXISTS land_batch_entries_member
+                ON land_batch_entries(member_run_id, batch_id);
+            CREATE TABLE IF NOT EXISTS land_batch_steps (
+                batch_id INTEGER NOT NULL REFERENCES land_batches(batch_id) ON DELETE CASCADE,
+                step INTEGER NOT NULL,
+                member_run_ids_json TEXT NOT NULL,
+                gated_member_ids_json TEXT NOT NULL,
+                dropped_json TEXT NOT NULL DEFAULT '[]',
+                base_sha TEXT,
+                gating_head_sha TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                gate_reused_from TEXT,
+                gate_exit_status INTEGER,
+                outcome TEXT NOT NULL,
+                split_left_count INTEGER,
+                split_right_count INTEGER,
+                published_sha TEXT,
+                PRIMARY KEY (batch_id, step)
             );",
         )
         .map_err(map_database_error)
+}
+
+fn load_batch_view(connection: &Connection, batch_id: i64) -> Result<(String, Value)> {
+    let (leader_run_id, target_branch): (String, Option<String>) = connection
+        .query_row(
+            "SELECT leader_run_id, target_branch FROM land_batches WHERE batch_id = ?1",
+            params![batch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(map_database_error)?;
+    let mut member_stmt = connection
+        .prepare(
+            "SELECT e.position, e.member_run_id, e.branch, e.head_sha,
+                    e.publication_adapter, e.publication_request,
+                    e.requeued, e.final_status, e.final_failure_reason,
+                    r.status, r.failure_reason
+             FROM land_batch_entries e
+             LEFT JOIN runs r ON r.run_id = e.member_run_id
+             WHERE e.batch_id = ?1
+             ORDER BY e.position",
+        )
+        .map_err(map_database_error)?;
+    let mut member_rows = member_stmt.query(params![batch_id]).map_err(map_database_error)?;
+    let mut members = Vec::new();
+    while let Some(row) = member_rows.next().map_err(map_database_error)? {
+        let position: i64 = row.get(0).map_err(map_database_error)?;
+        let member_run_id: String = row.get(1).map_err(map_database_error)?;
+        let branch: String = row.get(2).map_err(map_database_error)?;
+        let head_sha: String = row.get(3).map_err(map_database_error)?;
+        let pub_adapter: Option<String> = row.get(4).map_err(map_database_error)?;
+        let pub_request_raw: Option<String> = row.get(5).map_err(map_database_error)?;
+        let requeued: i64 = row.get(6).map_err(map_database_error)?;
+        let final_status: Option<String> = row.get(7).map_err(map_database_error)?;
+        let final_failure: Option<String> = row.get(8).map_err(map_database_error)?;
+        let live_status: Option<String> = row.get(9).map_err(map_database_error)?;
+        let live_failure: Option<String> = row.get(10).map_err(map_database_error)?;
+        let pub_request: Value = match pub_request_raw {
+            Some(raw) => parse_json(raw, &member_run_id, "batch publication request")?,
+            None => Value::Null,
+        };
+        let publication = pub_adapter.map(|adapter| {
+            json!({
+                "adapter": adapter,
+                "request": pub_request,
+            })
+        });
+        let (status, failure_reason) = if requeued != 0 {
+            ("requeued".to_owned(), None)
+        } else if let Some(status) = final_status {
+            (status, final_failure)
+        } else {
+            (
+                live_status.unwrap_or_else(|| "unknown".to_owned()),
+                live_failure,
+            )
+        };
+        members.push(json!({
+            "position": position,
+            "run_id": member_run_id,
+            "branch": branch,
+            "head_sha": head_sha,
+            "publication": publication,
+            "status": status,
+            "failure_reason": failure_reason,
+        }));
+    }
+
+    let mut step_stmt = connection
+        .prepare(
+            "SELECT step, member_run_ids_json, gated_member_ids_json, dropped_json,
+                    base_sha, gating_head_sha, started_at, finished_at,
+                    gate_reused_from, gate_exit_status, outcome,
+                    split_left_count, split_right_count, published_sha
+             FROM land_batch_steps
+             WHERE batch_id = ?1
+             ORDER BY step",
+        )
+        .map_err(map_database_error)?;
+    let mut step_rows = step_stmt.query(params![batch_id]).map_err(map_database_error)?;
+    let mut steps = Vec::new();
+    while let Some(row) = step_rows.next().map_err(map_database_error)? {
+        let step: i64 = row.get(0).map_err(map_database_error)?;
+        let member_ids_raw: String = row.get(1).map_err(map_database_error)?;
+        let gated_ids_raw: String = row.get(2).map_err(map_database_error)?;
+        let dropped_raw: String = row.get(3).map_err(map_database_error)?;
+        let base_sha: Option<String> = row.get(4).map_err(map_database_error)?;
+        let gating_head_sha: Option<String> = row.get(5).map_err(map_database_error)?;
+        let started_at: String = row.get(6).map_err(map_database_error)?;
+        let finished_at: Option<String> = row.get(7).map_err(map_database_error)?;
+        let gate_reused_from: Option<String> = row.get(8).map_err(map_database_error)?;
+        let gate_exit_status: Option<i64> = row.get(9).map_err(map_database_error)?;
+        let outcome: String = row.get(10).map_err(map_database_error)?;
+        let split_left: Option<i64> = row.get(11).map_err(map_database_error)?;
+        let split_right: Option<i64> = row.get(12).map_err(map_database_error)?;
+        let published_sha: Option<String> = row.get(13).map_err(map_database_error)?;
+        let member_run_ids: Vec<String> =
+            parse_json(member_ids_raw, &leader_run_id, "batch step members")?;
+        let gated_member_run_ids: Vec<String> =
+            parse_json(gated_ids_raw, &leader_run_id, "batch step gated members")?;
+        let dropped: Vec<Value> =
+            parse_json(dropped_raw, &leader_run_id, "batch step dropped members")?;
+        let split = match (split_left, split_right) {
+            (Some(l), Some(r)) => json!([l, r]),
+            _ => Value::Null,
+        };
+        steps.push(json!({
+            "step": step,
+            "member_run_ids": member_run_ids,
+            "gated_member_run_ids": gated_member_run_ids,
+            "dropped": dropped,
+            "base_sha": base_sha,
+            "gating_head_sha": gating_head_sha,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "gate_reused_from": gate_reused_from,
+            "gate_exit_status": gate_exit_status,
+            "outcome": outcome,
+            "split": split,
+            "published_sha": published_sha,
+        }));
+    }
+
+    let base = json!({
+        "leader_run_id": leader_run_id,
+        "target_branch": target_branch,
+        "members": members,
+        "steps": steps,
+    });
+    Ok((leader_run_id, base))
+}
+
+fn batch_for_run_cached(
+    connection: &Connection,
+    run: &RunRecord,
+    cache: &mut BTreeMap<i64, (String, Value)>,
+) -> Result<Value> {
+    if run.kind != "land" {
+        return Ok(Value::Null);
+    }
+    let batch_id: Option<i64> = connection
+        .query_row(
+            "SELECT batch_id FROM land_batch_entries
+             WHERE member_run_id = ?1 AND requeued = 0
+             ORDER BY batch_id DESC LIMIT 1",
+            params![run.run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_database_error)?;
+    let Some(batch_id) = batch_id else {
+        return Ok(Value::Null);
+    };
+    if !cache.contains_key(&batch_id) {
+        let loaded = load_batch_view(connection, batch_id)?;
+        cache.insert(batch_id, loaded);
+    }
+    let (leader_run_id, base) = cache.get(&batch_id).unwrap();
+    let mut payload = base.clone();
+    payload["role"] = json!(if run.run_id == *leader_run_id {
+        "leader"
+    } else {
+        "follower"
+    });
+    Ok(payload)
 }
 
 fn batch_slice(connection: &Connection, run_id: &str) -> Result<Value> {
@@ -4055,6 +4489,286 @@ pub fn clear_batch_slice(paths: &Paths, request: &BatchStatusRequest) -> Result<
     Ok(json!({"leader_run_id": request.run_id}))
 }
 
+fn batch_step_outcome_valid(value: &str) -> bool {
+    matches!(
+        value,
+        "running"
+            | "published"
+            | "bisected"
+            | "gate-failed"
+            | "publish-failed"
+            | "merge-conflict"
+            | "merge-error"
+            | "stale-main"
+            | "head-changed"
+            | "pr-not-ready"
+            | "avoided-commit"
+            | "preflight-failed"
+            | "cancelled"
+            | "interrupted"
+    )
+}
+
+pub fn record_batch_step(paths: &Paths, request: &BatchStepRequest) -> Result<Value> {
+    let _owner = owner_info(paths)?;
+    let connection = open_protocol5(paths)?;
+    ensure_land_batch_schema(&connection)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_database_error)?;
+    let identity = &request.identity;
+    let payload = &request.payload;
+    load_verified_batch_leader(
+        &connection,
+        &identity.run_id,
+        identity.worker_pid,
+        &identity.worker_start_token,
+        &identity.checkout,
+        &identity.head_sha,
+        payload.outcome == "running",
+    )?;
+    if !batch_step_outcome_valid(&payload.outcome) {
+        return Err(AppError::new(
+            "broker-batch-step-invalid",
+            format!("invalid batch step outcome {:?}", payload.outcome),
+        ));
+    }
+    for sha in [
+        payload.base_sha.as_deref(),
+        payload.gating_head_sha.as_deref(),
+        payload.published_sha.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !commit_sha_valid(sha) {
+            return Err(AppError::new(
+                "broker-batch-step-invalid",
+                "batch step commit SHA must be 40 lowercase hexadecimal characters",
+            ));
+        }
+    }
+    if let Some(reused) = &payload.gate_reused_from
+        && !identifier_valid(reused)
+    {
+        return Err(AppError::new(
+            "broker-batch-step-invalid",
+            "batch step gate_reused_from has an invalid run identifier",
+        ));
+    }
+    if payload
+        .gate_exit_status
+        .is_some_and(|code| !(0..=255).contains(&code))
+    {
+        return Err(AppError::new(
+            "broker-batch-step-invalid",
+            "batch step gate_exit_status must be from 0 to 255",
+        ));
+    }
+    if let Some([left, right]) = payload.split
+        && (left == 0 || right == 0 || payload.outcome != "bisected")
+    {
+        return Err(AppError::new(
+            "broker-batch-step-invalid",
+            "batch step split counts require a bisected outcome and positive halves",
+        ));
+    }
+    if (payload.outcome == "published") != payload.published_sha.is_some() {
+        return Err(AppError::new(
+            "broker-batch-step-invalid",
+            "published batch steps must carry published_sha and non-published steps must omit it",
+        ));
+    }
+    let batch_id: i64 = connection
+        .query_row(
+            "SELECT batch_id FROM land_batches WHERE leader_run_id = ?1 ORDER BY batch_id DESC LIMIT 1",
+            params![identity.run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_database_error)?
+        .ok_or_else(|| {
+            AppError::new(
+                "broker-batch-step-invalid",
+                "leader has no recorded land batch",
+            )
+        })?;
+    let batch_members: BTreeSet<String> = {
+        let mut stmt = connection
+            .prepare("SELECT member_run_id FROM land_batch_entries WHERE batch_id = ?1")
+            .map_err(map_database_error)?;
+        stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))
+            .map_err(map_database_error)?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map_err(map_database_error)?
+    };
+    if let Some(dropped) = &payload.dropped {
+        for item in dropped {
+            if !batch_members.contains(&item.run_id)
+                || item.reason.trim().is_empty()
+                || item.reason.contains('\0')
+            {
+                return Err(AppError::new(
+                    "broker-batch-step-invalid",
+                    "dropped batch member must belong to the batch and carry a non-empty reason",
+                ));
+            }
+        }
+    }
+
+    let recorded_step = match payload.step {
+        None => {
+            let member_ids = payload.member_run_ids.as_ref().ok_or_else(|| {
+                AppError::new(
+                    "broker-batch-step-invalid",
+                    "starting a batch step requires member_run_ids",
+                )
+            })?;
+            if member_ids.is_empty() {
+                return Err(AppError::new(
+                    "broker-batch-step-invalid",
+                    "batch step member_run_ids cannot be empty",
+                ));
+            }
+            let mut seen_attempted = BTreeSet::new();
+            for id in member_ids {
+                if !batch_members.contains(id) || !seen_attempted.insert(id.clone()) {
+                    return Err(AppError::new(
+                        "broker-batch-step-invalid",
+                        "batch step member_run_ids must be distinct members of the batch",
+                    ));
+                }
+            }
+            let gated_ids = payload
+                .gated_member_run_ids
+                .clone()
+                .unwrap_or_else(|| member_ids.clone());
+            let mut seen_gated = BTreeSet::new();
+            for id in &gated_ids {
+                if !seen_attempted.contains(id) || !seen_gated.insert(id.clone()) {
+                    return Err(AppError::new(
+                        "broker-batch-step-invalid",
+                        "batch step gated_member_run_ids must be distinct members of member_run_ids",
+                    ));
+                }
+            }
+            let dropped_values: Vec<Value> = payload
+                .dropped
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(DroppedBatchMember::to_json_value)
+                .collect();
+            let next_step: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(step), 0) + 1 FROM land_batch_steps WHERE batch_id = ?1",
+                    params![batch_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_database_error)?;
+            let started_at = now(&connection)?;
+            let finished_at = (payload.outcome != "running").then(|| started_at.clone());
+            let (split_left, split_right) = match payload.split {
+                Some([l, r]) => (Some(l as i64), Some(r as i64)),
+                None => (None, None),
+            };
+            connection
+                .execute(
+                    "INSERT INTO land_batch_steps (
+                        batch_id, step, member_run_ids_json, gated_member_ids_json, dropped_json,
+                        base_sha, gating_head_sha, started_at, finished_at,
+                        gate_reused_from, gate_exit_status, outcome,
+                        split_left_count, split_right_count, published_sha
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        batch_id,
+                        next_step,
+                        serde_json::to_string(member_ids).unwrap(),
+                        serde_json::to_string(&gated_ids).unwrap(),
+                        serde_json::to_string(&dropped_values).unwrap(),
+                        payload.base_sha,
+                        payload.gating_head_sha,
+                        started_at,
+                        finished_at,
+                        payload.gate_reused_from,
+                        payload.gate_exit_status,
+                        payload.outcome,
+                        split_left,
+                        split_right,
+                        payload.published_sha,
+                    ],
+                )
+                .map_err(map_database_error)?;
+            next_step as u64
+        }
+        Some(step_num) => {
+            if step_num == 0 || payload.outcome == "running" {
+                return Err(AppError::new(
+                    "broker-batch-step-invalid",
+                    "updating an existing batch step requires a positive step and terminal outcome",
+                ));
+            }
+            let current_outcome: Option<String> = connection
+                .query_row(
+                    "SELECT outcome FROM land_batch_steps WHERE batch_id = ?1 AND step = ?2",
+                    params![batch_id, step_num as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if current_outcome.as_deref() != Some("running") {
+                return Err(AppError::new(
+                    "broker-batch-step-invalid",
+                    format!("batch step {step_num} is not currently running"),
+                ));
+            }
+            let finished_at = now(&connection)?;
+            let (split_left, split_right) = match payload.split {
+                Some([l, r]) => (Some(l as i64), Some(r as i64)),
+                None => (None, None),
+            };
+            let dropped_update = payload.dropped.as_ref().map(|items| {
+                let values: Vec<Value> = items.iter().map(DroppedBatchMember::to_json_value).collect();
+                serde_json::to_string(&values).unwrap()
+            });
+            connection
+                .execute(
+                    "UPDATE land_batch_steps
+                     SET finished_at = ?1,
+                         gate_reused_from = COALESCE(?2, gate_reused_from),
+                         gate_exit_status = COALESCE(?3, gate_exit_status),
+                         outcome = ?4,
+                         split_left_count = ?5,
+                         split_right_count = ?6,
+                         published_sha = ?7,
+                         dropped_json = COALESCE(?8, dropped_json)
+                     WHERE batch_id = ?9 AND step = ?10",
+                    params![
+                        finished_at,
+                        payload.gate_reused_from,
+                        payload.gate_exit_status,
+                        payload.outcome,
+                        split_left,
+                        split_right,
+                        payload.published_sha,
+                        dropped_update,
+                        batch_id,
+                        step_num as i64,
+                    ],
+                )
+                .map_err(map_database_error)?;
+            step_num
+        }
+    };
+    connection
+        .execute_batch("COMMIT")
+        .map_err(map_database_error)?;
+    Ok(json!({
+        "leader_run_id": identity.run_id,
+        "step": recorded_step,
+    }))
+}
+
 fn apply_land_phase_update(
     connection: &Connection,
     run: &RunRecord,
@@ -4145,6 +4859,14 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
             })?,
         None => owner.local_runtime.clone(),
     };
+    if let Some(target) = &request.target_branch
+        && (target.trim().is_empty() || target.contains('\0'))
+    {
+        return Err(AppError::new(
+            "broker-submission-invalid",
+            "batch target branch must be non-empty without NUL",
+        ));
+    }
     let context = BatchSelectionContext::from_live(&leader, &live, &target_runtime);
     let started_at = now(&connection)?;
     let leader_env_json: String = connection
@@ -4154,26 +4876,12 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
             |row| row.get(0),
         )
         .map_err(map_database_error)?;
-    connection
-        .execute(
-            "INSERT INTO land_batch_members
-             (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
-             VALUES (?1, ?2, 0, 1, ?3, ?4)
-             ON CONFLICT(member_run_id) DO UPDATE SET active = 1",
-            params![
-                leader.run_id,
-                leader.run_id,
-                leader.checkout.to_string_lossy().into_owned(),
-                leader_env_json,
-            ],
-        )
-        .map_err(map_database_error)?;
 
     let mut seen_branches = BTreeSet::new();
     seen_branches.insert(leader.branch.clone());
     let mut seen_requests = vec![leader.publication_request.clone()];
     let mut members = vec![member_descriptor(&leader, true)?];
-    let mut position: i64 = 1;
+    let mut eligible_candidates = Vec::new();
     let leader_checkout_str = leader.checkout.to_string_lossy().into_owned();
 
     for member_id in &request.member_run_ids {
@@ -4195,33 +4903,102 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(map_database_error)?;
-        connection
-            .execute(
-                "UPDATE runs
-                 SET status = 'running', phase = 'preflight', started_at = ?1,
-                     environment_json = '{}', checkout = ?2
-                 WHERE run_id = ?3 AND status = 'queued'",
-                params![started_at, leader_checkout_str, candidate.run_id],
-            )
-            .map_err(map_database_error)?;
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO land_batch_members
-                 (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
-                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-                params![
-                    leader.run_id,
-                    candidate.run_id,
-                    position,
-                    orig_checkout,
-                    orig_env,
-                ],
-            )
-            .map_err(map_database_error)?;
         seen_branches.insert(candidate.branch.clone());
         seen_requests.push(candidate.publication_request.clone());
         members.push(member_descriptor(candidate, false)?);
-        position += 1;
+        eligible_candidates.push((candidate, orig_checkout, orig_env));
+    }
+
+    if !eligible_candidates.is_empty() {
+        connection
+            .execute(
+                "INSERT INTO land_batch_members
+                 (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
+                 VALUES (?1, ?2, 0, 1, ?3, ?4)
+                 ON CONFLICT(member_run_id) DO UPDATE SET active = 1",
+                params![
+                    leader.run_id,
+                    leader.run_id,
+                    &leader_checkout_str,
+                    leader_env_json,
+                ],
+            )
+            .map_err(map_database_error)?;
+        connection
+            .execute(
+                "INSERT INTO land_batches (leader_run_id, target_branch, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![leader.run_id, request.target_branch, started_at],
+            )
+            .map_err(map_database_error)?;
+        let batch_id = connection.last_insert_rowid();
+        let insert_entry = |position: i64, run: &RunRecord| -> Result<()> {
+            let head_sha = run.head_sha.as_deref().ok_or_else(|| {
+                AppError::new(
+                    "broker-row-invalid",
+                    format!("land batch member {} has no head SHA", run.run_id),
+                )
+            })?;
+            let pub_req = run
+                .publication_request
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    AppError::new(
+                        "broker-row-invalid",
+                        format!("cannot encode batch publication request: {error}"),
+                    )
+                })?;
+            connection
+                .execute(
+                    "INSERT INTO land_batch_entries (
+                        batch_id, position, member_run_id, branch, head_sha,
+                        publication_adapter, publication_request
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        batch_id,
+                        position,
+                        run.run_id,
+                        run.branch,
+                        head_sha,
+                        run.publication_adapter,
+                        pub_req,
+                    ],
+                )
+                .map_err(map_database_error)?;
+            Ok(())
+        };
+        insert_entry(0, &leader)?;
+        for (idx, (candidate, orig_checkout, orig_env)) in
+            eligible_candidates.into_iter().enumerate()
+        {
+            let position = (idx + 1) as i64;
+            connection
+                .execute(
+                    "UPDATE runs
+                     SET status = 'running', phase = 'preflight', started_at = ?1,
+                         environment_json = '{}', checkout = ?2
+                     WHERE run_id = ?3 AND status = 'queued'",
+                    params![started_at, &leader_checkout_str, candidate.run_id],
+                )
+                .map_err(map_database_error)?;
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO land_batch_members
+                     (leader_run_id, member_run_id, position, active, original_checkout, original_environment_json)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                    params![
+                        leader.run_id,
+                        candidate.run_id,
+                        position,
+                        orig_checkout,
+                        orig_env,
+                    ],
+                )
+                .map_err(map_database_error)?;
+            insert_entry(position, candidate)?;
+        }
     }
     connection
         .execute_batch("COMMIT")
@@ -4354,9 +5131,11 @@ fn try_reuse_gate_for_run(
     paths: &Paths,
     connection: &Connection,
     run: &RunRecord,
+    allow_batch_gating: bool,
 ) -> Result<Value> {
     let max_age = land_gate_reuse_max_age(paths)?;
-    if run.kind != "land" || run.status != "running" || run.phase != "preflight" {
+    let phase_ok = run.phase == "preflight" || (allow_batch_gating && run.phase == "gating");
+    if run.kind != "land" || run.status != "running" || !phase_ok {
         return Err(AppError::new(
             "broker-gate-reuse-invalid",
             "only a running land still in preflight may reuse a gate",
@@ -4441,7 +5220,7 @@ pub fn reuse_batch_member_gate(paths: &Paths, request: &BatchMemberReuseRequest)
         true,
     )?;
     let member = verify_active_batch_member(&connection, &request.run_id, &request.member_run_id)?;
-    let outcome = try_reuse_gate_for_run(paths, &connection, &member)?;
+    let outcome = try_reuse_gate_for_run(paths, &connection, &member, true)?;
     connection
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
@@ -4529,6 +5308,18 @@ pub fn finish_batch_member(paths: &Paths, request: &BatchMemberFinishRequest) ->
         )
         .map_err(map_database_error)?;
     connection
+        .execute(
+            "UPDATE land_batch_entries
+             SET final_status = ?1, final_failure_reason = ?2
+             WHERE batch_id = (
+                 SELECT batch_id FROM land_batches
+                 WHERE leader_run_id = ?3
+                 ORDER BY batch_id DESC LIMIT 1
+             ) AND member_run_id = ?4",
+            params![member_status, failure_reason, request.run_id, member.run_id],
+        )
+        .map_err(map_database_error)?;
+    connection
         .execute_batch("COMMIT")
         .map_err(map_database_error)?;
     copy_leader_log_to_member(paths, &request.run_id, &member.run_id);
@@ -4545,6 +5336,42 @@ pub fn reconcile_batch_on_leader_exit(
     leader_failure_reason: Option<&str>,
 ) -> Result<Vec<String>> {
     ensure_land_batch_schema(connection)?;
+    let finished_at = now(connection)?;
+    let active_batch_id: Option<i64> = connection
+        .query_row(
+            "SELECT batch_id FROM land_batches
+             WHERE leader_run_id = ?1
+             ORDER BY batch_id DESC LIMIT 1",
+            params![leader.run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_database_error)?;
+    if let Some(batch_id) = active_batch_id {
+        connection
+            .execute(
+                "UPDATE land_batch_entries
+                 SET final_status = ?1, final_failure_reason = ?2
+                 WHERE batch_id = ?3 AND member_run_id = ?4",
+                params![leader_status, leader_failure_reason, batch_id, leader.run_id],
+            )
+            .map_err(map_database_error)?;
+        let aborted_step_outcome = if leader.cancel_requested || leader_status == "cancelled" {
+            "cancelled"
+        } else if leader_status == "interrupted" {
+            "interrupted"
+        } else {
+            leader_failure_reason.unwrap_or("merge-error")
+        };
+        connection
+            .execute(
+                "UPDATE land_batch_steps
+                 SET finished_at = ?1, outcome = ?2
+                 WHERE batch_id = ?3 AND outcome = 'running'",
+                params![finished_at, aborted_step_outcome, batch_id],
+            )
+            .map_err(map_database_error)?;
+    }
     connection
         .execute(
             "DELETE FROM land_batch_slices WHERE leader_run_id = ?1",
@@ -4582,7 +5409,6 @@ pub fn reconcile_batch_on_leader_exit(
     let mut finalized_for_log_copy = Vec::new();
     let leader_requeue =
         leader.cancel_requested || matches!(leader_status, "cancelled" | "interrupted");
-    let finished_at = now(connection)?;
     for (member_id, orig_checkout, orig_env) in entries {
         if member_id == leader.run_id {
             continue;
@@ -4597,6 +5423,17 @@ pub fn reconcile_batch_on_leader_exit(
                     params![member_id],
                 )
                 .map_err(map_database_error)?;
+            if let Some(batch_id) = active_batch_id {
+                connection
+                    .execute(
+                        "UPDATE land_batch_entries
+                         SET final_status = COALESCE(final_status, ?1),
+                             final_failure_reason = COALESCE(final_failure_reason, ?2)
+                         WHERE batch_id = ?3 AND member_run_id = ?4",
+                        params![member.status, member.failure_reason, batch_id, member_id],
+                    )
+                    .map_err(map_database_error)?;
+            }
             continue;
         }
         if leader_requeue && !member.cancel_requested {
@@ -4617,6 +5454,16 @@ pub fn reconcile_batch_on_leader_exit(
                     params![member_id],
                 )
                 .map_err(map_database_error)?;
+            if let Some(batch_id) = active_batch_id {
+                connection
+                    .execute(
+                        "UPDATE land_batch_entries
+                         SET requeued = 1, final_status = 'requeued', final_failure_reason = NULL
+                         WHERE batch_id = ?1 AND member_run_id = ?2",
+                        params![batch_id, member_id],
+                    )
+                    .map_err(map_database_error)?;
+            }
         } else {
             let (status, exit_status, failure_reason) = if member.cancel_requested {
                 ("cancelled", 130, None)
@@ -4642,6 +5489,16 @@ pub fn reconcile_batch_on_leader_exit(
                     params![member_id],
                 )
                 .map_err(map_database_error)?;
+            if let Some(batch_id) = active_batch_id {
+                connection
+                    .execute(
+                        "UPDATE land_batch_entries
+                         SET final_status = ?1, final_failure_reason = ?2
+                         WHERE batch_id = ?3 AND member_run_id = ?4",
+                        params![status, failure_reason, batch_id, member_id],
+                    )
+                    .map_err(map_database_error)?;
+            }
             finalized_for_log_copy.push(member_id);
         }
     }
