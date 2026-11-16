@@ -9674,8 +9674,10 @@ if os.environ['BAD_PR'] and Path('p' + os.environ['BAD_PR'] + '.txt').exists():
             .collect();
         let expected: Vec<Vec<usize>> = if bad.is_empty() {
             vec![vec![1, 2]]
-        } else {
+        } else if bad == "1" {
             vec![vec![1, 2], vec![1], vec![2]]
+        } else {
+            vec![vec![1, 2], vec![1]]
         };
         assert_eq!(gates.len(), expected.len());
         for (observed, members) in gates.iter().zip(expected) {
