@@ -21,9 +21,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 use store::{
     AdmissionRequest, BatchClaimRequest, BatchMemberFinishRequest, BatchMemberPhaseRequest,
-    BatchMemberReuseRequest, BatchSliceRequest, BatchStatusRequest, ChildLeaseOwnerRequest,
-    ChildLeaseRequest, LandResultRequest, PROTOCOL, Paths, PhaseRequest, ReuseRequest,
-    SnapshotFilter, SubmitRequest,
+    BatchMemberReuseRequest, BatchSliceRequest, BatchStatusRequest, BatchStepPayload,
+    BatchStepRequest, ChildLeaseOwnerRequest, ChildLeaseRequest, LandResultRequest, PROTOCOL,
+    Paths, PhaseRequest, ReuseRequest, SnapshotFilter, SubmitRequest,
 };
 use worker::WorkerFault;
 
@@ -810,6 +810,8 @@ struct BatchArgs {
     checkout: Option<PathBuf>,
     head_sha: Option<String>,
     members_json: Option<String>,
+    target_branch: Option<String>,
+    step_json: Option<String>,
     slice_head: Option<String>,
     member_run_id: Option<String>,
     phase: Option<String>,
@@ -855,6 +857,8 @@ fn parse_batch_args(arguments: &[String], allowed: &[&str]) -> Result<(Paths, Ba
             "--checkout" => parsed.checkout = Some(PathBuf::from(value)),
             "--head" => parsed.head_sha = Some(value),
             "--members-json" => parsed.members_json = Some(value),
+            "--target-branch" => parsed.target_branch = Some(value),
+            "--step-json" => parsed.step_json = Some(value),
             "--slice-head" => parsed.slice_head = Some(value),
             "--member-run-id" => parsed.member_run_id = Some(value),
             "--phase" => parsed.phase = Some(value),
@@ -906,7 +910,7 @@ fn require_batch_identity(args: &BatchArgs) -> Result<(String, u32, String, Path
 }
 
 fn parse_claim_batch(arguments: &[String]) -> Result<(Paths, BatchClaimRequest)> {
-    let (paths, args) = parse_batch_args(arguments, &["--members-json"])?;
+    let (paths, args) = parse_batch_args(arguments, &["--members-json", "--target-branch"])?;
     let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
         require_batch_identity(&args)?;
     let raw_members = args
@@ -923,6 +927,30 @@ fn parse_claim_batch(arguments: &[String]) -> Result<(Paths, BatchClaimRequest)>
             checkout,
             head_sha,
             member_run_ids,
+            target_branch: args.target_branch,
+        },
+    ))
+}
+
+fn parse_batch_step(arguments: &[String]) -> Result<(Paths, BatchStepRequest)> {
+    let (paths, args) = parse_batch_args(arguments, &["--step-json"])?;
+    let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
+        require_batch_identity(&args)?;
+    let raw_step = args
+        .step_json
+        .ok_or_else(|| AppError::usage("--step-json is required"))?;
+    let payload = BatchStepPayload::from_json_str(&raw_step)?;
+    Ok((
+        paths,
+        BatchStepRequest {
+            identity: BatchStatusRequest {
+                run_id,
+                worker_pid,
+                worker_start_token,
+                checkout,
+                head_sha,
+            },
+            payload,
         },
     ))
 }
@@ -1458,6 +1486,10 @@ fn run_command(arguments: &[String]) -> Result<()> {
         [command, rest @ ..] if command == "claim-batch" => {
             let (paths, request) = parse_claim_batch(rest)?;
             emit_json(&store::claim_batch(&paths, &request)?)
+        }
+        [command, rest @ ..] if command == "record-batch-step" => {
+            let (paths, request) = parse_batch_step(rest)?;
+            emit_json(&store::record_batch_step(&paths, &request)?)
         }
         [command, rest @ ..] if command == "set-batch-slice" => {
             let (paths, request) = parse_batch_slice(rest)?;

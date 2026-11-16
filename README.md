@@ -129,7 +129,7 @@ agc run  --label "unit tests"   --resource cpu=2 -- python -m pytest -q   # an o
 agc full --label "release gate" --resource cpu=4 -- ./scripts/test.sh      # a clean exact-head receipt
 agc land 123 --label "land PR 123" --resource cpu=4 -- ./scripts/test.sh   # gate and publish, one row
 agc list                                                                   # every job on the machine
-agc show check-0123456789ab                                                # one durable row, as JSON
+agc show check-0123456789ab                                                # one durable row (--json for JSON)
 agc log land-0123456789ab --follow                                         # one combined log
 agc cancel check-0123456789ab                                              # process-group cancellation
 agc tui                                                                    # live view across repositories

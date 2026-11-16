@@ -452,6 +452,34 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
     log_texts = {pr: str(client.log(run_ids[pr], offset=0, limit=65536)["text"]) for pr in (1, 2, 3)}
     assert all("one.txt" in text and "three.txt" in text for text in log_texts.values())
 
+    # Structured batch history is exposed on leader and all followers, and null on standalone PR #4.
+    main_final_sha = _git(remote, "rev-parse", "refs/heads/main")
+    assert results[4]["batch"] is None
+    for idx, pr in enumerate((1, 2, 3)):
+        batch = results[pr]["batch"]
+        assert batch is not None
+        assert batch["leader_run_id"] == run_ids[1]
+        assert batch["role"] == ("leader" if pr == 1 else "follower")
+        assert batch["target_branch"] == "main"
+        assert [m["run_id"] for m in batch["members"]] == [run_ids[1], run_ids[2], run_ids[3]]
+        assert [m["status"] for m in batch["members"]] == ["passed", "passed", "passed"]
+        assert batch["members"][idx]["position"] == idx
+        assert len(batch["steps"]) == 1
+        step = batch["steps"][0]
+        assert step["step"] == 1
+        assert step["member_run_ids"] == [run_ids[1], run_ids[2], run_ids[3]]
+        assert step["gated_member_run_ids"] == [run_ids[1], run_ids[2], run_ids[3]]
+        assert step["dropped"] == []
+        assert step["gating_head_sha"] == main_gate["head"]
+        assert step["gate_exit_status"] == 0
+        assert step["outcome"] == "published"
+        assert step["published_sha"] == main_final_sha
+
+    snap = client.snapshot()
+    snap_by_id = {row["run_id"]: row for row in snap["recent"]}
+    assert snap_by_id[run_ids[2]]["batch"] == results[2]["batch"]
+    assert snap_by_id[run_ids[4]]["batch"] is None
+
     # Remote refs/heads/main has all 3 PR files; refs/heads/release-1 stays isolated.
     main_tree = _git(remote, "ls-tree", "--name-only", "refs/heads/main").splitlines()
     rel_tree = _git(remote, "ls-tree", "--name-only", "refs/heads/release-1").splitlines()
@@ -522,6 +550,26 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
     assert (
         _git(remote, "show", "refs/heads/main:shared.txt") == "first"
     )
+    conflict_batch = conflict_row["batch"]
+    assert conflict_batch is not None
+    assert conflict_batch["role"] == "follower"
+    assert conflict_batch["members"][2]["status"] == "failed"
+    assert conflict_batch["members"][2]["failure_reason"] == "merge-error"
+    assert conflict_batch["steps"][0]["member_run_ids"] == [
+        run_ids[10],
+        run_ids[11],
+        run_ids[12],
+        run_ids[13],
+    ]
+    assert conflict_batch["steps"][0]["gated_member_run_ids"] == [
+        run_ids[10],
+        run_ids[11],
+        run_ids[13],
+    ]
+    assert conflict_batch["steps"][0]["dropped"] == [
+        {"run_id": run_ids[12], "reason": "merge-conflict"}
+    ]
+    assert conflict_batch["steps"][0]["outcome"] == "published"
 
 
 def test_land_batch_binary_bisects_and_isolates_order_dependent_failure(
@@ -592,6 +640,43 @@ if not ok:
     # Exact binary split sequence: [21,22,23,24] fail -> [21,22] pass & publish ->
     # [23,24] fail -> [23] fail -> [24] pass & publish = 5 gate invocations.
     assert [entry["ok"] for entry in gated_runs] == [False, True, False, False, True]
+
+    # Early-finalized follower #22 (finalized at Step 2) exposes ALL 5 steps of the batch
+    # in status, snapshot, agc --json show, and plain agc show!
+    final_rows = {pr: client.status(run_ids[pr]) for pr in (21, 22, 23, 24)}
+    expected_outcomes = ["bisected", "published", "bisected", "gate-failed", "published"]
+    for pr in (21, 22, 23, 24):
+        batch = final_rows[pr]["batch"]
+        assert batch is not None
+        assert batch["role"] == ("leader" if pr == 21 else "follower")
+        assert [s["outcome"] for s in batch["steps"]] == expected_outcomes
+        assert batch["steps"][0]["split"] == [2, 2]
+        assert batch["steps"][2]["split"] == [1, 1]
+        assert [m["status"] for m in batch["members"]] == [
+            "passed",
+            "passed",
+            "failed",
+            "passed",
+        ]
+    shown_plain = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agcoord",
+            "show",
+            run_ids[22],
+            "--state-dir",
+            str(client.paths.state_dir),
+        ],
+        capture_output=True,
+        text=True,
+        env=caller_environment(),
+        check=True,
+    )
+    assert "Batch & Bisect History:" in shown_plain.stdout
+    assert "gate failed (exit 5) -> bisected 4 into 2 + 2" in shown_plain.stdout
+    assert "gate failed (exit 5) -> bisected 2 into 1 + 1" in shown_plain.stdout
+    assert f"Step 5: [#24 ({run_ids[24]})]" in shown_plain.stdout
 
 
 def test_land_batch_rechecks_head_changed_and_stale_main_mid_batch(
@@ -731,3 +816,128 @@ while not Path(sys.argv[2]).exists():
     assert row42["failure_reason"] == "stale-main"
     assert row42["exit_status"] == 75
     assert _git(remote_b, "rev-parse", "refs/heads/main") == ext_main
+    assert row41["batch"]["steps"][0]["outcome"] == "stale-main"
+    assert row42["batch"]["steps"][0]["outcome"] == "stale-main"
+
+
+def test_land_batch_records_publish_failure_reuse_full_and_requeued_follower_rebatch(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    # Part 1: Publish failure records step outcome "publish-failed" and member status "failed".
+    remote, state_file, checkouts, pr_state = _setup_remote_and_worktrees(
+        tmp_path / "pub-fail",
+        [
+            {"pr": 51, "base": "main", "branch": "feat/p51", "files": {"p51.txt": "1\n"}},
+            {"pr": 52, "base": "main", "branch": "feat/p52", "files": {"p52.txt": "2\n"}},
+        ],
+    )
+    bin_dir = _install_stateful_gh(tmp_path / "bin-pf", remote, state_file, tmp_path / "gh-pf.jsonl")
+    # Corrupt graphql updateRefs by replacing fake gh's graphql branch with a rejection.
+    gh_script = bin_dir / "gh"
+    gh_script.write_text(
+        gh_script.read_text(encoding="utf-8").replace(
+            'elif args[:2] == ["api", "graphql"]:',
+            'elif args[:2] == ["api", "graphql"]:\n    print("atomic update rejected", file=sys.stderr)\n    raise SystemExit(1)',
+        ),
+        encoding="utf-8",
+    )
+    hold_id, hold_release = _submit_hold(client, tmp_path, checkouts[51], "pf")
+    env_pf = _env_with_gh(bin_dir)
+    r51 = client.submit_land(
+        "github", 51, ["true"], checkout=str(checkouts[51]),
+        resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_pf,
+    )
+    r52 = client.submit_land(
+        "github", 52, ["true"], checkout=str(checkouts[52]),
+        resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_pf,
+    )
+    hold_release.touch()
+    _wait_terminal(client, hold_id, "passed")
+    row51 = _wait_terminal(client, r51, "failed")
+    row52 = _wait_terminal(client, r52, "failed")
+    assert row51["failure_reason"] == "publish-failed"
+    assert row52["failure_reason"] == "publish-failed"
+    assert row51["batch"]["steps"][0]["outcome"] == "publish-failed"
+    assert row52["batch"]["steps"][0]["outcome"] == "publish-failed"
+
+    # Part 2: Leader cancellation mid-gate requeues follower, which then leads a new batch
+    # and reuses a passed `full` receipt after bisecting!
+    remote2, state_file2, checkouts2, _ = _setup_remote_and_worktrees(
+        tmp_path / "requeue-rebatch",
+        [
+            {"pr": 61, "base": "main", "branch": "feat/p61", "files": {"p61.txt": "1\n"}},
+            {"pr": 62, "base": "main", "branch": "feat/p62", "files": {"p62.txt": "2\n"}},
+            {"pr": 63, "base": "main", "branch": "feat/p63", "files": {"bad63.txt": "x\n"}},
+        ],
+    )
+    bin_dir2 = _install_stateful_gh(tmp_path / "bin-rq", remote2, state_file2, tmp_path / "gh-rq.jsonl")
+    gate_entered = tmp_path / "rq-entered"
+    gate_release = tmp_path / "rq-release"
+    gate_cmd = _python(
+        """
+import os, sys, time
+from pathlib import Path
+if os.environ.get("PAUSE_FIRST") == "1" and not Path(sys.argv[1]).exists():
+    Path(sys.argv[1]).touch()
+    while not Path(sys.argv[2]).exists():
+        time.sleep(0.02)
+if Path("bad63.txt").exists():
+    sys.exit(4)
+""",
+        gate_entered,
+        gate_release,
+    )
+    # First record a passed `full` receipt for PR #62 with identical gate command!
+    full62 = client.submit(
+        gate_cmd,
+        kind="full",
+        checkout=str(checkouts2[62]),
+        resources={"jobs": 1},
+        caller_pid=os.getpid(),
+        environment=_env_with_gh(bin_dir2),
+    )
+    _wait_terminal(client, full62, "passed")
+
+    hold_rq, release_rq = _submit_hold(client, tmp_path, checkouts2[61], "rq")
+    r61 = client.submit_land(
+        "github", 61, gate_cmd, checkout=str(checkouts2[61]),
+        resources={"jobs": 1}, caller_pid=os.getpid(),
+        environment=_env_with_gh(bin_dir2, {"PAUSE_FIRST": "1"}),
+    )
+    r62 = client.submit_land(
+        "github", 62, gate_cmd, checkout=str(checkouts2[62]),
+        resources={"jobs": 1}, caller_pid=os.getpid(),
+        reuse_full=True,
+        environment=_env_with_gh(bin_dir2),
+    )
+    release_rq.touch()
+    _wait_terminal(client, hold_rq, "passed")
+    wait_for(gate_entered.exists, "first batch gate did not start")
+
+    # Queue PR #63 before cancelling r61 so requeued r62 batches with r63!
+    r63 = client.submit_land(
+        "github", 63, gate_cmd, checkout=str(checkouts2[63]),
+        resources={"jobs": 1}, caller_pid=os.getpid(),
+        environment=_env_with_gh(bin_dir2),
+    )
+    client.cancel(r61)
+    gate_release.touch()
+
+    row61 = _wait_terminal(client, r61, "cancelled")
+    row62 = _wait_terminal(client, r62, "passed")
+    row63 = _wait_terminal(client, r63, "failed")
+
+    # Cancelled batch 1 retains r61 as cancelled and r62 as requeued.
+    assert [m["status"] for m in row61["batch"]["members"]] == ["cancelled", "requeued"]
+    assert row61["batch"]["steps"][0]["outcome"] == "cancelled"
+
+    # Requeued r62 led batch 2 ([r62, r63]), bisected, reused full62 on singleton [r62], and failed [r63]!
+    b2 = row62["batch"]
+    assert b2["leader_run_id"] == r62
+    assert b2["role"] == "leader"
+    assert row63["batch"]["leader_run_id"] == r62
+    assert row63["batch"]["role"] == "follower"
+    assert [s["outcome"] for s in b2["steps"]] == ["bisected", "published", "gate-failed"]
+    assert b2["steps"][1]["gate_reused_from"] == full62

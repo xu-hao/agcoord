@@ -9979,3 +9979,587 @@ fn local_userns_probe_availability_controls_local_userns_admission() {
     assert_eq!(done["pool"], Value::Null);
     assert!(broker.terminate().success());
 }
+
+#[test]
+fn land_batch_retains_history_across_bisect_follower_views_and_requeue() {
+    let temporary = TestDirectory::new("land-batch-history");
+    let state = temporary.path().join("state");
+    let wt1 = temporary.path().join("wt1");
+    let wt2 = temporary.path().join("wt2");
+    let wt3 = temporary.path().join("wt3");
+    let wt4 = temporary.path().join("wt4");
+    let wt5 = temporary.path().join("wt5");
+    for wt in [&wt1, &wt2, &wt3, &wt4, &wt5] {
+        fs::create_dir(wt).unwrap();
+    }
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+
+    let entered_hold = temporary.path().join("hold-entered");
+    let release_hold = temporary.path().join("hold-release");
+    let entered_1 = temporary.path().join("leader1-entered");
+    let release_1 = temporary.path().join("leader1-release");
+    let entered_4 = temporary.path().join("leader4-entered");
+    let release_4 = temporary.path().join("leader4-release");
+    let _releases = ReleaseFiles(vec![
+        release_hold.clone(),
+        release_1.clone(),
+        release_4.clone(),
+    ]);
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "hold-slot",
+            kind: "check",
+            repository: "repo-batch-history",
+            checkout: &wt1,
+            command: blocking_command(&entered_hold, &release_hold, None),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || entered_hold.exists());
+
+    let submit_custom_land = |run_id: &str, wt: &Path, branch: &str, pr: &str, cmd: Vec<String>| {
+        if !wt.join(".git").exists() {
+            for args in [
+                vec!["init", "-q", "-b", branch],
+                vec!["config", "user.name", "AGCoord test"],
+                vec!["config", "user.email", "test@example.invalid"],
+                vec!["commit", "-q", "--allow-empty", "-m", "initial"],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(wt)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let passthrough = wt.join(format!("agcoord-test-land-python-{run_id}"));
+        fs::write(
+            &passthrough,
+            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&passthrough, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut arguments = vec![
+            "submit".to_owned(),
+            "--state-dir".to_owned(),
+            state_argument(&state).to_owned(),
+            "--run-id".to_owned(),
+            run_id.to_owned(),
+            "--kind".to_owned(),
+            "land".to_owned(),
+            "--label".to_owned(),
+            run_id.to_owned(),
+            "--repository-id".to_owned(),
+            "repo-batch-history".to_owned(),
+            "--repository".to_owned(),
+            "repo-batch-history".to_owned(),
+            "--worktree-id".to_owned(),
+            format!("worktree-{run_id}"),
+            "--checkout".to_owned(),
+            wt.to_str().unwrap().to_owned(),
+            "--branch".to_owned(),
+            branch.to_owned(),
+            "--head".to_owned(),
+            head,
+            "--resource".to_owned(),
+            "jobs=1".to_owned(),
+            "--caller-pid".to_owned(),
+            std::process::id().to_string(),
+            "--publication-adapter".to_owned(),
+            "github".to_owned(),
+            "--publication-request-json".to_owned(),
+            pr.to_owned(),
+            "--env".to_owned(),
+            format!("_AGCOORD_LAND_PYTHON={}", passthrough.to_string_lossy()),
+            "--".to_owned(),
+        ];
+        arguments.extend(cmd);
+        let output = Command::new(BROKER).args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let shared_cmd = blocking_command(&entered_1, &release_1, None);
+    let standalone_cmd = touch_command(&temporary.path().join("standalone-3"));
+    submit_custom_land("land-1", &wt1, "feat/one", "201", shared_cmd.clone());
+    submit_custom_land("land-2", &wt2, "feat/two", "202", shared_cmd.clone());
+    submit_custom_land("land-3", &wt3, "feat/three", "203", standalone_cmd);
+    submit_custom_land("land-4", &wt4, "feat/four", "204", shared_cmd);
+
+    fs::write(&release_hold, b"").unwrap();
+    wait_for(Duration::from_secs(5), || entered_1.exists());
+
+    let leader_row = status(&state, "land-1");
+    assert!(leader_row["batch"].is_null());
+    let pid = leader_row["worker_pid"].as_u64().unwrap().to_string();
+    let db = rusqlite::Connection::open(state.join("queue.sqlite3")).unwrap();
+    let token: String = db
+        .query_row(
+            "SELECT worker_start_token FROM runs WHERE run_id = 'land-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let checkout_str = leader_row["checkout"].as_str().unwrap().to_owned();
+    let head_str = leader_row["head_sha"].as_str().unwrap().to_owned();
+    let identity = [
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "land-1",
+        "--worker-pid",
+        &pid,
+        "--worker-start-token",
+        &token,
+        "--checkout",
+        &checkout_str,
+        "--head",
+        &head_str,
+    ];
+
+    let claim = Command::new(BROKER)
+        .arg("claim-batch")
+        .args(identity)
+        .args([
+            "--target-branch",
+            "main",
+            "--members-json",
+            r#"["land-2","land-4"]"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        claim.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+
+    // Reject unauthenticated and malformed step records.
+    let mut bad_identity = identity;
+    bad_identity[7] = "wrong-token";
+    let unauth = Command::new(BROKER)
+        .arg("record-batch-step")
+        .args(bad_identity)
+        .args([
+            "--step-json",
+            r#"{"member_run_ids":["land-1"],"outcome":"running"}"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(!unauth.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unauth.stderr).unwrap()["code"],
+        "broker-land-identity-mismatch"
+    );
+    for invalid_step in [
+        r#"{"member_run_ids":["land-3"],"outcome":"running"}"#,
+        r#"{"member_run_ids":["land-1"],"outcome":"published"}"#,
+        r#"{"member_run_ids":["land-1"],"outcome":"bisected","split":[0,1]}"#,
+    ] {
+        let rejected = Command::new(BROKER)
+            .arg("record-batch-step")
+            .args(identity)
+            .args(["--step-json", invalid_step])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{invalid_step}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rejected.stderr).unwrap()["code"],
+            "broker-batch-step-invalid"
+        );
+    }
+
+    let base_sha = "0000000000000000000000000000000000000000";
+    let head_step1 = "1111111111111111111111111111111111111111";
+    let head_step2 = "2222222222222222222222222222222222222222";
+    let head_step3 = "3333333333333333333333333333333333333333";
+
+    // Step 1: combined batch starts running, then bisects 3 into 1 + 2.
+    let step1_start = Command::new(BROKER)
+        .arg("record-batch-step")
+        .args(identity)
+        .args([
+            "--step-json",
+            &json!({
+                "member_run_ids": ["land-1", "land-2", "land-4"],
+                "gated_member_run_ids": ["land-1", "land-2", "land-4"],
+                "base_sha": base_sha,
+                "gating_head_sha": head_step1,
+                "outcome": "running",
+            })
+            .to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(step1_start.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&step1_start.stdout).unwrap()["step"],
+        1
+    );
+    let live_follower = status(&state, "land-2");
+    assert_eq!(live_follower["batch"]["role"], "follower");
+    assert_eq!(live_follower["batch"]["leader_run_id"], "land-1");
+    assert_eq!(live_follower["batch"]["steps"][0]["outcome"], "running");
+
+    assert!(
+        Command::new(BROKER)
+            .arg("record-batch-step")
+            .args(identity)
+            .args([
+                "--step-json",
+                &json!({
+                    "step": 1,
+                    "gate_exit_status": 1,
+                    "outcome": "bisected",
+                    "split": [1, 2],
+                })
+                .to_string(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Step 2: singleton [land-2] fails gate and finalizes early as follower.
+    assert!(
+        Command::new(BROKER)
+            .arg("record-batch-step")
+            .args(identity)
+            .args([
+                "--step-json",
+                &json!({
+                    "member_run_ids": ["land-2"],
+                    "gated_member_run_ids": ["land-2"],
+                    "base_sha": base_sha,
+                    "gating_head_sha": head_step2,
+                    "outcome": "running",
+                })
+                .to_string(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .arg("record-batch-step")
+            .args(identity)
+            .args([
+                "--step-json",
+                &json!({
+                    "step": 2,
+                    "gate_exit_status": 5,
+                    "outcome": "gate-failed",
+                })
+                .to_string(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .arg("batch-phase")
+            .args(identity)
+            .args([
+                "--member-run-id",
+                "land-2",
+                "--phase",
+                "gating",
+                "--gate-exit-status",
+                "5",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .arg("batch-finish")
+            .args(identity)
+            .args([
+                "--member-run-id",
+                "land-2",
+                "--exit-status",
+                "5",
+                "--failure-reason",
+                "gate-failed",
+                "--gate-exit-status",
+                "5",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Step 3: [land-4] starts running, then leader land-1 is cancelled!
+    assert!(
+        Command::new(BROKER)
+            .arg("record-batch-step")
+            .args(identity)
+            .args([
+                "--step-json",
+                &json!({
+                    "member_run_ids": ["land-4"],
+                    "gated_member_run_ids": ["land-4"],
+                    "base_sha": base_sha,
+                    "gating_head_sha": head_step3,
+                    "outcome": "running",
+                })
+                .to_string(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .args([
+                "cancel",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-1"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Before releasing land-4's subsequent run, swap land-4's command file wait to release_4
+    // and queue land-5 so requeued land-4 can lead a brand-new batch without PK collisions!
+    let next_cmd = blocking_command(&entered_4, &release_4, None);
+    db.execute(
+        "UPDATE runs SET command_json = ?1 WHERE run_id = 'land-4'",
+        rusqlite::params![serde_json::to_string(&next_cmd).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    submit_custom_land("land-5", &wt5, "feat/five", "205", next_cmd);
+
+    fs::write(&release_1, b"").unwrap();
+    wait_status(&state, "land-1", "cancelled");
+    wait_status(&state, "land-3", "passed");
+    wait_for(Duration::from_secs(5), || entered_4.exists());
+
+    // Standalone land-3 has null batch.
+    assert!(status(&state, "land-3")["batch"].is_null());
+
+    // Both cancelled leader land-1 and early-finalized follower land-2 retain full 3-step history!
+    let b1 = status(&state, "land-1")["batch"].clone();
+    let b2 = status(&state, "land-2")["batch"].clone();
+    assert_eq!(b1["role"], "leader");
+    assert_eq!(b2["role"], "follower");
+    assert_eq!(b1["target_branch"], "main");
+    assert_eq!(b1["members"], b2["members"]);
+    assert_eq!(b1["steps"], b2["steps"]);
+    let statuses: Vec<&str> = b1["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, vec!["cancelled", "failed", "requeued"]);
+    let outcomes: Vec<&str> = b1["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, vec!["bisected", "gate-failed", "cancelled"]);
+    assert!(b1["steps"][2]["finished_at"].is_string());
+
+    // Requeued land-4 has batch == null before claiming a new batch, and can claim land-5 cleanly!
+    let row4 = status(&state, "land-4");
+    assert!(row4["batch"].is_null());
+    let pid4 = row4["worker_pid"].as_u64().unwrap().to_string();
+    let db = rusqlite::Connection::open(state.join("queue.sqlite3")).unwrap();
+    let token4: String = db
+        .query_row(
+            "SELECT worker_start_token FROM runs WHERE run_id = 'land-4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let checkout4 = row4["checkout"].as_str().unwrap().to_owned();
+    let head4 = row4["head_sha"].as_str().unwrap().to_owned();
+    let claim2 = Command::new(BROKER)
+        .args([
+            "claim-batch",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "land-4",
+            "--worker-pid",
+            &pid4,
+            "--worker-start-token",
+            &token4,
+            "--checkout",
+            &checkout4,
+            "--head",
+            &head4,
+            "--target-branch",
+            "main",
+            "--members-json",
+            r#"["land-5"]"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        claim2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim2.stderr)
+    );
+    let pub_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert!(
+        Command::new(BROKER)
+            .args([
+                "record-batch-step",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-4",
+                "--worker-pid",
+                &pid4,
+                "--worker-start-token",
+                &token4,
+                "--checkout",
+                &checkout4,
+                "--head",
+                &head4,
+                "--step-json",
+                &json!({
+                    "member_run_ids": ["land-4", "land-5"],
+                    "gated_member_run_ids": ["land-4", "land-5"],
+                    "base_sha": base_sha,
+                    "gating_head_sha": head_step3,
+                    "gate_exit_status": 0,
+                    "outcome": "published",
+                    "published_sha": pub_sha,
+                })
+                .to_string(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .args([
+                "batch-finish",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-4",
+                "--worker-pid",
+                &pid4,
+                "--worker-start-token",
+                &token4,
+                "--checkout",
+                &checkout4,
+                "--head",
+                &head4,
+                "--member-run-id",
+                "land-5",
+                "--exit-status",
+                "0",
+                "--gate-exit-status",
+                "0",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .args([
+                "phase",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-4",
+                "--worker-pid",
+                &pid4,
+                "--worker-start-token",
+                &token4,
+                "--checkout",
+                &checkout4,
+                "--head",
+                &head4,
+                "--phase",
+                "publishing",
+                "--gate-exit-status",
+                "0",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(BROKER)
+            .args([
+                "report",
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "land-4",
+                "--worker-pid",
+                &pid4,
+                "--worker-start-token",
+                &token4,
+                "--exit-status",
+                "0",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(&release_4, b"").unwrap();
+    wait_status(&state, "land-4", "passed");
+    wait_status(&state, "land-5", "passed");
+
+    let snap = snapshot(&state).unwrap();
+    let recent_by_id: std::collections::BTreeMap<&str, &Value> = snap["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| (row["run_id"].as_str().unwrap(), row))
+        .collect();
+    assert_eq!(recent_by_id["land-4"]["batch"]["leader_run_id"], "land-4");
+    assert_eq!(recent_by_id["land-4"]["batch"]["role"], "leader");
+    assert_eq!(recent_by_id["land-5"]["batch"]["leader_run_id"], "land-4");
+    assert_eq!(recent_by_id["land-5"]["batch"]["role"], "follower");
+    assert_eq!(
+        recent_by_id["land-5"]["batch"]["steps"][0]["published_sha"],
+        pub_sha
+    );
+    // Original batch 1 still shows land-4 as "requeued" even after land-4 passed in batch 2!
+    assert_eq!(
+        recent_by_id["land-1"]["batch"]["members"][2]["status"],
+        "requeued"
+    );
+    assert!(recent_by_id["land-3"]["batch"].is_null());
+
+    assert!(broker.terminate().success());
+}

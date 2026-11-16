@@ -28,6 +28,7 @@ from .queue import (
     CoordinatorUnreachable,
     EXIT_COORDINATOR_UNREACHABLE,
     follow,
+    format_batch_history,
     parse_name_selectors,
     parse_resource_claims,
     queue_paths,
@@ -142,6 +143,84 @@ def _table(rows: list[dict], *, color: bool = False) -> str:
             row_cells.append(text)
         lines.append("  ".join(row_cells))
     return "\n".join(lines)
+
+
+def _format_run_show(row: dict) -> str:
+    pool_val = row.get("pool")
+    if isinstance(pool_val, str) and pool_val:
+        pool = pool_val
+    elif row.get("started_at") is not None or row.get("status") == "running":
+        pool = "local"
+    else:
+        pool = "—"
+    status_line = str(row["status"])
+    if row.get("cancel_requested"):
+        status_line += " · cancellation requested"
+    resources = ", ".join(
+        f"{name}={units}" for name, units in row["resources"].items()
+    )
+    enforcement = resource_enforcement_summary(row["resource_receipt"])
+    blockers = ", ".join(row["blocked_by"]) or "—"
+    publication = row.get("publication")
+    if isinstance(publication, dict) and publication.get("adapter"):
+        req = publication.get("request")
+        pub_text = (
+            f"{publication['adapter']} #{req}"
+            if isinstance(req, int) and not isinstance(req, bool)
+            else f"{publication['adapter']} {req}"
+        )
+    else:
+        pub_text = "—"
+    lines = [
+        f"Run: {row['run_id']}",
+        f"Status: {status_line}",
+        f"Kind: {row['kind']} · Phase: {row['phase']} · Pool: {pool}",
+        f"Label: {row['label']}",
+        f"Agent: {row['agent']}",
+        f"Repository: {row['repository']} ({row['repository_id']})",
+        f"Worktree: {row['worktree_id']}",
+        f"Branch: {row['branch']}",
+        f"Head: {row.get('head_sha') or '—'}",
+        f"Gate receipt: {row.get('gate_run_id') or '—'}",
+        f"Publication: {pub_text}",
+        f"Resources: {resources} · Enforcement: {enforcement}",
+        f"Blocked by: {blockers}",
+    ]
+    if row.get("position") is not None:
+        lines.append(f"Position: {row['position']}")
+    gate_exit = (
+        row["gate_exit_status"] if row.get("gate_exit_status") is not None else "—"
+    )
+    exit_code = row["exit_status"] if row.get("exit_status") is not None else "—"
+    lines.extend(
+        [
+            f"Gate exit: {gate_exit} · Exit: {exit_code} · "
+            f"Failure reason: {row.get('failure_reason') or '—'}",
+            f"Checkout: {row['checkout']}",
+            f"Caller PID: {row['caller_pid']} · "
+            f"Worker PID: {row['worker_pid'] if row.get('worker_pid') is not None else '—'} · "
+            f"Log: {row['log_bytes']} bytes",
+            f"Created: {row['created_at']} · "
+            f"Started: {row.get('started_at') or '—'} · "
+            f"Finished: {row.get('finished_at') or '—'}",
+            f"Command: {shlex.join(row['command'])}",
+        ]
+    )
+    active_slice = row.get("batch_slice")
+    if isinstance(active_slice, dict):
+        slice_members = ", ".join(
+            str(m["run_id"])
+            for m in (active_slice.get("members") or ())
+            if isinstance(m, dict) and "run_id" in m
+        )
+        lines.append(
+            f"Active slice: {active_slice.get('gating_head_sha') or '—'} [{slice_members}]"
+        )
+    rendered = "\n".join(lines)
+    batch = row.get("batch")
+    if isinstance(batch, dict):
+        rendered += f"\n\n{format_batch_history(batch)}"
+    return rendered
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -709,7 +788,10 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             if os.environ.get(RUN_ID_ENV) == args.run_id
             else client.status(args.run_id)
         )
-        print(json.dumps(row, indent=2, sort_keys=True), file=out)
+        if emit:
+            emit(row)
+        else:
+            print(_format_run_show(row), file=out)
         return 0
     if args.command == "cancel":
         row = client.cancel(args.run_id)

@@ -129,6 +129,16 @@
       }
     },
     {
+      "id": "publication.batch-history-retention",
+      "domain": "publication",
+      "description": "Batched land attempts retain durable batch membership and ordered slice and bisection steps across leader and follower status and snapshot views, while requeued followers record their subsequent standalone or re-batched execution without collision.",
+      "tests": {
+        "rust_native": [
+          "scheduler::land_batch_retains_history_across_bisect_follower_views_and_requeue"
+        ]
+      }
+    },
+    {
       "id": "tui.real-snapshot-refresh",
       "domain": "tui",
       "description": "The real Textual application renders public queue identity and refreshes a live native snapshot.",

@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Persist structured land batch membership and chronological slice/bisect step history for leaders
+  and followers, render `agc show <id>` as readable plain text with `Batch & Bisect History:` when
+  batched (`agc --json show <id>` keeps the full JSON row), and surface compact batch status plus
+  live-updating modal history in `agc tui`. #353 — persist structured land batch and bisect history
+  and surface it in agc show and the TUI.
+
 ## 0.9.2 — 2026-11-15
 
 - Verify admission against the exact active batch slice head and expose its ordered members in

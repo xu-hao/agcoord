@@ -568,7 +568,7 @@ class _BatchRunner:
         self,
         t0_sha: str,
         members: list[_BatchMember],
-    ) -> tuple[list[tuple[_BatchMember, str]], str]:
+    ) -> tuple[list[tuple[_BatchMember, str]], str, list[dict[str, str]]]:
         for cmd in (
             ("update-ref", "--no-deref", "HEAD", t0_sha),
             ("reset", "--hard", t0_sha),
@@ -579,6 +579,7 @@ class _BatchRunner:
                 raise RuntimeError(res.stderr.strip() or f"git {' '.join(cmd)} failed")
         prev_tip = t0_sha
         merged: list[tuple[_BatchMember, str]] = []
+        dropped: list[dict[str, str]] = []
         for member in members:
             merge_res = _git_batch(
                 self.checkout,
@@ -603,6 +604,7 @@ class _BatchRunner:
                     file=self.err,
                     flush=True,
                 )
+                dropped.append({"run_id": member.run_id, "reason": "merge-conflict"})
                 self._finalize_member(member, EXIT_MERGE_ERROR, "merge-error", None)
                 continue
             tip_res = _git_batch(self.checkout, "rev-parse", "HEAD")
@@ -611,23 +613,70 @@ class _BatchRunner:
                 raise RuntimeError("cannot resolve batch merge tip or tree")
             prev_tip = tip_res.stdout.strip()
             merged.append((member, tree_res.stdout.strip()))
-        return merged, prev_tip
+        return merged, prev_tip, dropped
 
     def _publish_slice(
         self,
         target_branch: str,
         t0_sha: str,
         merged: list[tuple[_BatchMember, str]],
+        *,
+        step: int,
+        dropped: list[dict[str, str]],
     ) -> None:
         slice_members = [member for member, _tree in merged]
         remaining_after_cancel = self._poll_cancellations(slice_members)
         if self.leader_cancelled:
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=0,
+                outcome="cancelled",
+            )
             return
         if len(remaining_after_cancel) != len(slice_members):
+            remaining_ids = {member.run_id for member in remaining_after_cancel}
+            updated_dropped = [
+                *dropped,
+                *(
+                    {"run_id": member.run_id, "reason": "cancelled"}
+                    for member in slice_members
+                    if member.run_id not in remaining_ids
+                ),
+            ]
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=0,
+                dropped=updated_dropped,
+                outcome="cancelled",
+            )
             self.bisect_and_land(target_branch, remaining_after_cancel)
             return
 
-        current_t0, remote_heads = self._fetch_remote_refs(target_branch, slice_members)
+        try:
+            current_t0, remote_heads = self._fetch_remote_refs(
+                target_branch, slice_members
+            )
+        except Exception as exc:
+            print(
+                f"Land coordinator: REFUSED (merge-error) — {exc}",
+                file=self.err,
+                flush=True,
+            )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=0,
+                outcome="merge-error",
+            )
+            for member in slice_members:
+                self._finalize_member(member, EXIT_MERGE_ERROR, "merge-error", None)
+            return
+
         if current_t0 != t0_sha:
             print(
                 f"Land coordinator: REFUSED (stale-main) — target {target_branch} advanced from "
@@ -635,12 +684,20 @@ class _BatchRunner:
                 file=self.err,
                 flush=True,
             )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=0,
+                outcome="stale-main",
+            )
             for member in slice_members:
                 self._finalize_member(member, EXIT_STALE_MAIN, "stale-main", None)
             return
 
         clean_members: list[_BatchMember] = []
-        moved_or_bad = False
+        post_gate_dropped: list[dict[str, str]] = []
+        bad_failures: list[tuple[_BatchMember, int, str]] = []
         for member in slice_members:
             failure = self._validate_member(
                 member,
@@ -651,11 +708,25 @@ class _BatchRunner:
             )
             if failure is not None:
                 exit_code, reason = failure
-                self._finalize_member(member, exit_code, reason, None)
-                moved_or_bad = True
+                post_gate_dropped.append({"run_id": member.run_id, "reason": reason})
+                bad_failures.append((member, exit_code, reason))
             else:
                 clean_members.append(member)
-        if moved_or_bad:
+        if bad_failures:
+            reasons = {item["reason"] for item in post_gate_dropped}
+            step_outcome = (
+                next(iter(reasons)) if len(reasons) == 1 else "preflight-failed"
+            )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=0,
+                dropped=[*dropped, *post_gate_dropped],
+                outcome=step_outcome,
+            )
+            for member, exit_code, reason in bad_failures:
+                self._finalize_member(member, exit_code, reason, None)
             if clean_members:
                 self.bisect_and_land(target_branch, clean_members)
             return
@@ -699,10 +770,25 @@ class _BatchRunner:
                 file=self.err,
                 flush=True,
             )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=0,
+                outcome="publish-failed",
+            )
             for member in slice_members:
                 self._finalize_member(member, EXIT_PUBLISH_FAILED, "publish-failed", 0)
             return
 
+        self.client.record_batch_step(
+            self.leader_run_id,
+            worker_pid=self.worker_pid,
+            step=step,
+            gate_exit_status=0,
+            outcome="published",
+            published_sha=parent_sha,
+        )
         prs = ", ".join(f"#{member.pull_request}" for member in slice_members)
         print(
             f"Land coordinator: batch published {prs} onto {target_branch} at {parent_sha}",
@@ -715,8 +801,25 @@ class _BatchRunner:
     def bisect_and_land(self, target_branch: str, members: list[_BatchMember]) -> None:
         if not members:
             return
+        attempted_ids = [member.run_id for member in members]
         members = self._poll_cancellations(members)
-        if self.leader_cancelled or not members:
+        if self.leader_cancelled:
+            return
+        remaining_ids = {member.run_id for member in members}
+        dropped: list[dict[str, str]] = [
+            {"run_id": rid, "reason": "cancelled"}
+            for rid in attempted_ids
+            if rid not in remaining_ids
+        ]
+        if not members:
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=[],
+                dropped=dropped,
+                outcome="cancelled",
+            )
             return
 
         try:
@@ -727,11 +830,24 @@ class _BatchRunner:
                 file=self.err,
                 flush=True,
             )
+            dropped.extend(
+                {"run_id": member.run_id, "reason": "merge-error"}
+                for member in members
+            )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=[],
+                dropped=dropped,
+                outcome="merge-error",
+            )
             for member in members:
                 self._finalize_member(member, EXIT_MERGE_ERROR, "merge-error", None)
             return
 
         valid_members: list[_BatchMember] = []
+        preflight_failures: list[tuple[_BatchMember, int, str]] = []
         for member in members:
             failure = self._validate_member(
                 member,
@@ -742,16 +858,47 @@ class _BatchRunner:
             )
             if failure is not None:
                 exit_code, reason = failure
-                self._finalize_member(member, exit_code, reason, None)
+                dropped.append({"run_id": member.run_id, "reason": reason})
+                preflight_failures.append((member, exit_code, reason))
             else:
                 valid_members.append(member)
         if not valid_members:
+            reasons = {item["reason"] for item in dropped}
+            step_outcome = (
+                next(iter(reasons)) if len(reasons) == 1 else "preflight-failed"
+            )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=[],
+                dropped=dropped,
+                base_sha=t0_sha,
+                outcome=step_outcome,
+            )
+            for member, exit_code, reason in preflight_failures:
+                self._finalize_member(member, exit_code, reason, None)
             return
+        for member, exit_code, reason in preflight_failures:
+            self._finalize_member(member, exit_code, reason, None)
 
-        merged, combined_tip = self._sequential_merge_slice(t0_sha, valid_members)
+        merged, combined_tip, merge_dropped = self._sequential_merge_slice(
+            t0_sha, valid_members
+        )
+        dropped.extend(merge_dropped)
         if not merged:
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=[],
+                dropped=dropped,
+                base_sha=t0_sha,
+                outcome="merge-conflict",
+            )
             return
 
+        gated_ids = [member.run_id for member, _tree in merged]
         reused_source: str | None = None
         if len(merged) == 1 and merged[0][0].reuse_full and _is_git_ancestor(
             self.checkout, t0_sha, merged[0][0].expected_head_sha
@@ -778,6 +925,18 @@ class _BatchRunner:
                 file=self.out,
                 flush=True,
             )
+            step = self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=gated_ids,
+                dropped=dropped,
+                base_sha=t0_sha,
+                gating_head_sha=combined_tip,
+                gate_reused_from=reused_source,
+                gate_exit_status=0,
+                outcome="running",
+            )
             gate_status = 0
         else:
             for member, _tree in merged:
@@ -789,9 +948,19 @@ class _BatchRunner:
                 file=self.out,
                 flush=True,
             )
+            step = self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                member_run_ids=attempted_ids,
+                gated_member_run_ids=gated_ids,
+                dropped=dropped,
+                base_sha=t0_sha,
+                gating_head_sha=combined_tip,
+                outcome="running",
+            )
             self.client.set_batch_slice(
                 self.leader_run_id, gating_head_sha=combined_tip,
-                member_run_ids=[member.run_id for member, _tree in merged],
+                member_run_ids=gated_ids,
                 worker_pid=self.worker_pid,
             )
             try:
@@ -805,12 +974,44 @@ class _BatchRunner:
                 self.client.clear_batch_slice(self.leader_run_id, worker_pid=self.worker_pid)
 
         if gate_status == 0:
-            self._publish_slice(target_branch, t0_sha, merged)
+            self._publish_slice(
+                target_branch, t0_sha, merged, step=step, dropped=dropped
+            )
+            return
+
+        status_payload = self.client.batch_status(
+            self.leader_run_id,
+            worker_pid=self.worker_pid,
+        )
+        if status_payload.get("cancel_requested"):
+            self.leader_cancelled = True
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=gate_status,
+                outcome="cancelled",
+            )
             return
 
         clean_slice = [member for member, _tree in merged]
         if len(clean_slice) == 1:
             singleton = clean_slice[0]
+            singleton_cancelled = any(
+                str(entry["run_id"]) == singleton.run_id
+                and bool(entry.get("cancel_requested"))
+                for entry in status_payload["members"]
+            )
+            if singleton_cancelled:
+                self.client.record_batch_step(
+                    self.leader_run_id,
+                    worker_pid=self.worker_pid,
+                    step=step,
+                    gate_exit_status=gate_status,
+                    outcome="cancelled",
+                )
+                self._finalize_member(singleton, 130, "cancelled", None)
+                return
             self._advance_phase(singleton, "gating", gate_status)
             print(
                 f"Land coordinator: gate failed for PR #{singleton.pull_request} "
@@ -818,12 +1019,27 @@ class _BatchRunner:
                 file=self.err,
                 flush=True,
             )
+            self.client.record_batch_step(
+                self.leader_run_id,
+                worker_pid=self.worker_pid,
+                step=step,
+                gate_exit_status=gate_status,
+                outcome="gate-failed",
+            )
             self._finalize_member(singleton, gate_status, "gate-failed", gate_status)
             return
 
         mid = len(clean_slice) // 2
         left = clean_slice[:mid]
         right = clean_slice[mid:]
+        self.client.record_batch_step(
+            self.leader_run_id,
+            worker_pid=self.worker_pid,
+            step=step,
+            gate_exit_status=gate_status,
+            outcome="bisected",
+            split=(len(left), len(right)),
+        )
         print(
             f"Land coordinator: batch gate failed (exit {gate_status}); bisecting "
             f"{len(clean_slice)} PR(s) into {len(left)} + {len(right)}",
@@ -919,6 +1135,7 @@ def _execute_batch_if_applicable(
         args.run_id,
         member_run_ids=selected_ids,
         worker_pid=os.getpid(),
+        target_branch=target_branch,
     )
     if len(claimed) <= 1:
         return None

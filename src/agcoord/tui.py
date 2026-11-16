@@ -12,7 +12,12 @@ from typing import Callable
 
 from rich.text import Text
 
-from .queue import CoordinatorError, CoordinatorClient, TERMINAL_STATUSES
+from .queue import (
+    CoordinatorError,
+    CoordinatorClient,
+    TERMINAL_STATUSES,
+    format_batch_history,
+)
 from .resources import resource_enforcement_summary
 from . import frame
 
@@ -215,6 +220,38 @@ def _overflow_pools_summary(snapshot: dict) -> str:
     return " · ".join(parts)
 
 
+def _compact_batch_detail(row: dict) -> tuple[str, str]:
+    batch = row.get("batch")
+    if not isinstance(batch, dict):
+        return "", ""
+    members = [m for m in (batch.get("members") or ()) if isinstance(m, dict)]
+    steps = [s for s in (batch.get("steps") or ()) if isinstance(s, dict)]
+    size = len(members)
+    pos = next(
+        (
+            int(m.get("position", 0)) + 1
+            for m in members
+            if m.get("run_id") == row.get("run_id")
+        ),
+        1,
+    )
+    n_steps = len(steps)
+    slice_word = "slice" if n_steps == 1 else "slices"
+    bisected = any(s.get("outcome") == "bisected" for s in steps)
+    bisect_part = ", bisected" if bisected else ""
+    phase_suffix = f" · batch {pos}/{size} ({n_steps} {slice_word}{bisect_part})"
+    leader_id = str(batch.get("leader_run_id") or "—")
+    role = batch.get("role") or (
+        "leader" if leader_id == row.get("run_id") else "follower"
+    )
+    branch_suffix = (
+        " · batch: leader"
+        if role == "leader"
+        else f" · batch: follower of {leader_id}"
+    )
+    return phase_suffix, branch_suffix
+
+
 def _detail(row: dict | None) -> str:
     if row is None:
         return "no coordinated runs"
@@ -245,13 +282,15 @@ def _detail(row: dict | None) -> str:
         if publication
         else ""
     )
+    batch_phase_suffix, batch_branch_suffix = _compact_batch_detail(row)
     return (
         f"{row['run_id']} · {row['kind']} · {row['repository']}{target}\n"
         f"phase: {row['phase']} · pool: {pool} · gate exit: "
-        f"{row['gate_exit_status'] if row['gate_exit_status'] is not None else '—'}\n"
+        f"{row['gate_exit_status'] if row['gate_exit_status'] is not None else '—'}"
+        f"{batch_phase_suffix}\n"
         f"agent: {row['agent']} · resources: {resources} · enforcement: "
         f"{enforcement} · blocked: {blockers}\n"
-        f"branch: {row['branch']}\n"
+        f"branch: {row['branch']}{batch_branch_suffix}\n"
         f"checkout: {row['checkout']}\n"
         f"{process}{result}{failure}{cancel}{publication_cancel} · log {row['log_bytes']} bytes\n"
         f"created: {row['created_at']}\n"
@@ -260,9 +299,9 @@ def _detail(row: dict | None) -> str:
     )
 
 
-def _modal_detail(row: dict) -> str:
+def _modal_detail(row: dict, *, now: datetime | None = None) -> str:
     command = shlex.join(row["command"])
-    return (
+    base = (
         f"Status: {row['status']}\n"
         f"Kind: {row['kind']}\n"
         f"Phase: {row['phase']}\n"
@@ -292,6 +331,10 @@ def _modal_detail(row: dict) -> str:
         f"Exit: {row['exit_status'] if row['exit_status'] is not None else '—'}\n"
         f"Command: {command}"
     )
+    batch = row.get("batch")
+    if isinstance(batch, dict):
+        return f"{base}\n\n{format_batch_history(batch, now=now)}"
+    return base
 
 
 def build_app(
@@ -308,11 +351,19 @@ def build_app(
     class Show(ModalScreen[None]):
         BINDINGS = [Binding("escape,enter,q", "close", "close")]
 
-        def __init__(self, title: str, body: str, *, wide: bool = False) -> None:
+        def __init__(
+            self,
+            title: str,
+            body: str,
+            *,
+            wide: bool = False,
+            detail_run_id: str | None = None,
+        ) -> None:
             super().__init__()
             self.title_text = title
             self.body_text = body
             self.wide = wide
+            self.detail_run_id = detail_run_id
 
         def compose(self) -> ComposeResult:
             with Vertical(id="show", classes="wide" if self.wide else ""):
@@ -325,6 +376,13 @@ def build_app(
             if self.wide:
                 self.query_one("#show", Vertical).styles.height = "94%"
                 self.query_one("#show-scroll", VerticalScroll).styles.height = "1fr"
+
+        def update_body(self, body: str) -> None:
+            if body == self.body_text:
+                return
+            self.body_text = body
+            if self.is_mounted:
+                self.query_one("#show-body", Static).update(body)
 
         def action_close(self) -> None:
             self.dismiss(None)
@@ -941,6 +999,26 @@ def build_app(
                 rule = f"── {row['label']} · {row['run_id']}"
             self.query_one("#gate-rule", Static).update(rule)
             self.query_one("#gate-detail", Static).update(_detail(row))
+            if isinstance(self.screen, Show) and self.screen.detail_run_id is not None:
+                target_id = self.screen.detail_run_id
+                modal_row = self._rows.get(target_id)
+                if modal_row is None and self._snapshot is not None:
+                    modal_row = next(
+                        (
+                            candidate
+                            for group in ("active", "queued", "recent")
+                            for candidate in self._snapshot.get(group, ())
+                            if candidate.get("run_id") == target_id
+                        ),
+                        None,
+                    )
+                if modal_row is not None:
+                    now = (
+                        _moment(self._snapshot["captured_at"])
+                        if self._snapshot is not None
+                        else None
+                    )
+                    self.screen.update_body(_modal_detail(modal_row, now=now))
 
         def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
             if self.is_running:
@@ -956,7 +1034,19 @@ def build_app(
         def action_detail(self) -> None:
             row = self._selected()
             if row is not None:
-                self.push_screen(Show(row["label"], _modal_detail(row), wide=True))
+                now = (
+                    _moment(self._snapshot["captured_at"])
+                    if self._snapshot is not None
+                    else None
+                )
+                self.push_screen(
+                    Show(
+                        row["label"],
+                        _modal_detail(row, now=now),
+                        wide=True,
+                        detail_run_id=str(row["run_id"]),
+                    )
+                )
 
         def action_keys(self) -> None:
             lines = []

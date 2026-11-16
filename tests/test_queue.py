@@ -57,6 +57,7 @@ ROW_KEYS = {
     "pool",
     "gate_run_id",
     "publication",
+    "batch",
     "batch_slice",
     "failure_reason",
     "phase",
