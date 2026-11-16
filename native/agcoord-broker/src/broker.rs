@@ -90,6 +90,9 @@ fn land_request_options(run: &RunRecord) -> Result<Vec<String>> {
     if parsed.reuse_full {
         options.push("--reuse-full".to_owned());
     }
+    if !parsed.deductive_bisect {
+        options.push("--no-deductive-bisect".to_owned());
+    }
     for sha in parsed.avoid {
         options.extend(["--avoid".to_owned(), sha]);
     }
@@ -167,8 +170,11 @@ impl Broker {
         ]);
         command.extend(land_request_options(run)?);
         let target_runtime = pool.map_or_else(|| self.local_runtime.clone(), Pool::runtime);
-        let candidates = select_land_batch_candidates(connection, run, &target_runtime)?;
+        let (max_batch_size, candidates) =
+            select_land_batch_candidates(&self.paths, connection, run, &target_runtime)?;
         if !candidates.is_empty() {
+            command.push("--batch-max-size".to_owned());
+            command.push(max_batch_size.to_string());
             command.push("--batch-candidates-json".to_owned());
             command.push(serde_json::to_string(&candidates).map_err(|error| {
                 AppError::new(

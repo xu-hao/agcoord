@@ -531,19 +531,20 @@ def test_show_renders_batch_and_bisect_history_in_plain_text_and_json(
             {
                 "step": 3,
                 "member_run_ids": ["land-follower"],
-                "gated_member_run_ids": ["land-follower"],
+                "gated_member_run_ids": [],
                 "dropped": [],
                 "base_sha": "c" * 40,
                 "gating_head_sha": "d" * 40,
                 "started_at": "2026-08-30T12:00:23+00:00",
-                "finished_at": "2026-08-30T12:00:29+00:00",
+                "finished_at": "2026-08-30T12:00:23+00:00",
                 "gate_reused_from": None,
-                "gate_exit_status": 5,
-                "outcome": "gate-failed",
+                "gate_exit_status": None,
+                "outcome": "deduced-gate-failed",
                 "split": None,
                 "published_sha": None,
             },
         ],
+        "max_batch_size": 4,
     }
 
     class BatchClient:
@@ -572,13 +573,16 @@ def test_show_renders_batch_and_bisect_history_in_plain_text_and_json(
     rendered = plain.getvalue()
     assert "Run: land-follower" in rendered
     assert "Batch & Bisect History:" in rendered
-    assert "Leader: land-leader · Role: follower · Target: main · Bisected: yes" in rendered
+    assert (
+        "Leader: land-leader · Role: follower · Target: main · Bisected: yes · Max batch (B): 4"
+        in rendered
+    )
     assert "[0] land-leader (leader) · feat/p1 · github #101 · passed" in rendered
     assert "[1] land-follower (follower) · feat/p2 · github #102 · failed (gate-failed)" in rendered
     assert "gate failed (exit 1) -> bisected 2 into 1 + 1" in rendered
     assert "reused full-receipt-1" in rendered
     assert f"published -> {'c' * 40}" in rendered
-    assert "gate failed (exit 5)" in rendered
+    assert "gate skipped (deduced) · deduced gate-failed" in rendered
 
     as_json = StringIO()
     assert cli.run(_args("--json", "show", "land-follower"), out=as_json) == 0
@@ -1020,8 +1024,26 @@ def test_land_dispatches_gate_and_publication_as_one_followed_request(
     assert metadata["resources"] == {"network": 1}
     assert metadata["synchronize_target"] is synchronize_target
     assert metadata["reuse_full"] is reuse_full
+    assert metadata["deductive_bisect"] is True
     assert fake_client["follow"][-1][1] == "land-new"
     assert "land-new" in output.getvalue()
+
+    assert (
+        cli.run(
+            _args(
+                "land",
+                "123",
+                "--no-deductive-bisect",
+                "--checkout",
+                str(checkout),
+                "--",
+                "true",
+            ),
+            out=StringIO(),
+        )
+        == 7
+    )
+    assert fake_client["landed"][-1][3]["deductive_bisect"] is False
 
 
 def test_tui_constructs_the_client_lazily(fake_client, monkeypatch):

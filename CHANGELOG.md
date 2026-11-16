@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Bound batched `agc land` runs to adaptive power-of-two sizes ($B = 2^k$, configurable via
+  `land_max_batch_size` and falling back to $B = 1$ above ~38% recent repository failure rate),
+  skip deductively known-failing right-hand slices (`deduced-bisected`, `deduced-gate-failed`) with
+  `--no-deductive-bisect` opt-out, and surface `B` and deduced outcomes in `agc show` and `agc tui`.
+  #354 — bound land batch size to adaptive powers of two and skip deductively known-failing slices
+  during bisection.
+
 - Persist structured land batch membership and chronological slice/bisect step history for leaders
   and followers, render `agc show <id>` as readable plain text with `Batch & Bisect History:` when
   batched (`agc --json show <id>` keeps the full JSON row), and surface compact batch status plus

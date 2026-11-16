@@ -22,6 +22,10 @@ pub const SCHEMA_FINGERPRINT: &str = "agcoord-spool-v5";
 pub const MAINTENANCE_REFUSAL: &str = "agcoord-maintenance-draining";
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const LAND_GATE_REUSE_MAX_AGE: Duration = Duration::from_secs(3600);
+const DEFAULT_LAND_MAX_BATCH_SIZE: u64 = 8;
+const MAX_LAND_MAX_BATCH_SIZE: u64 = 1024;
+const LAND_BATCH_HISTORY_WINDOW: usize = 16;
+const LAND_BATCH_COLD_START_MIN_RUNS: usize = 4;
 const STOP_GRACE: Duration = Duration::from_secs(600);
 const RECENT_LIMIT: usize = 50;
 
@@ -298,6 +302,7 @@ pub struct BatchClaimRequest {
     pub head_sha: String,
     pub member_run_ids: Vec<String>,
     pub target_branch: Option<String>,
+    pub max_batch_size: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -683,6 +688,7 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
         "cgroup_io",
         "database_timeout",
         "land_gate_reuse_max_age",
+        "land_max_batch_size",
         "stop_grace",
         "native_broker",
         "overflow_pools",
@@ -818,6 +824,17 @@ fn database_timeout(paths: &Paths) -> Result<Duration> {
             "land_gate_reuse_max_age must be a finite number of seconds from 0 to 2147483.647",
         ));
     }
+    if let Some(value) = object.get("land_max_batch_size")
+        && value
+            .as_u64()
+            .filter(|limit| (1..=MAX_LAND_MAX_BATCH_SIZE).contains(limit))
+            .is_none()
+    {
+        return Err(AppError::new(
+            "broker-config-invalid",
+            "land_max_batch_size must be an integer from 1 to 1024",
+        ));
+    }
     if let Some(value) = object.get("stop_grace")
         && value
             .as_f64()
@@ -913,6 +930,93 @@ fn land_gate_reuse_max_age(paths: &Paths) -> Result<Duration> {
             )
         })?;
     Ok(Duration::from_secs_f64(seconds))
+}
+
+pub fn largest_power_of_two_le(value: u64) -> u64 {
+    if value <= 1 {
+        1
+    } else {
+        1_u64 << (63 - value.leading_zeros())
+    }
+}
+
+pub fn configured_land_max_batch_size(paths: &Paths) -> Result<u64> {
+    let path = paths.state_dir.join("config.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_LAND_MAX_BATCH_SIZE);
+        }
+        Err(error) => {
+            return Err(AppError::new(
+                "broker-config-invalid",
+                format!("cannot read broker configuration: {error}"),
+            ));
+        }
+    };
+    let document: Value = serde_json::from_str(&text).map_err(|_| {
+        AppError::new(
+            "broker-config-invalid",
+            "broker configuration is not valid JSON",
+        )
+    })?;
+    let Some(value) = document.get("land_max_batch_size") else {
+        return Ok(DEFAULT_LAND_MAX_BATCH_SIZE);
+    };
+    value
+        .as_u64()
+        .filter(|limit| (1..=MAX_LAND_MAX_BATCH_SIZE).contains(limit))
+        .ok_or_else(|| {
+            AppError::new(
+                "broker-config-invalid",
+                "land_max_batch_size must be an integer from 1 to 1024",
+            )
+        })
+}
+
+pub fn compute_adaptive_land_batch_size(
+    paths: &Paths,
+    connection: &Connection,
+    repository_id: &str,
+) -> Result<u64> {
+    let cap_b = largest_power_of_two_le(configured_land_max_batch_size(paths)?);
+    if cap_b <= 1 {
+        return Ok(1);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT status FROM runs
+             WHERE kind = 'land'
+               AND repository_id = ?1
+               AND status IN ('passed', 'failed')
+             ORDER BY sequence DESC
+             LIMIT ?2",
+        )
+        .map_err(map_database_error)?;
+    let statuses: Vec<String> = statement
+        .query_map(
+            params![repository_id, LAND_BATCH_HISTORY_WINDOW as i64],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_database_error)?;
+    let raw_b = if statuses.len() < LAND_BATCH_COLD_START_MIN_RUNS {
+        4
+    } else {
+        let failed = statuses.iter().filter(|s| s.as_str() == "failed").count();
+        let p_hat = failed as f64 / statuses.len() as f64;
+        if p_hat < 0.11 {
+            cap_b.max(8)
+        } else if p_hat < 0.21 {
+            4
+        } else if p_hat < 0.38 {
+            2
+        } else {
+            1
+        }
+    };
+    Ok(raw_b.min(cap_b).max(1))
 }
 
 pub fn now(connection: &Connection) -> Result<String> {
@@ -3214,6 +3318,16 @@ pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Res
         }
         if request
             .environment
+            .get("_AGCOORD_LAND_DEDUCTIVE_BISECT")
+            .is_some_and(|value| !matches!(value.as_str(), "0" | "1"))
+        {
+            return Err(AppError::new(
+                "broker-submission-invalid",
+                "land deductive-bisect setting must be 0 or 1",
+            ));
+        }
+        if request
+            .environment
             .get("_AGCOORD_LAND_AVOID")
             .is_some_and(|value| !value.split(',').all(commit_sha_valid))
         {
@@ -3830,7 +3944,17 @@ fn land_batch_schema_present(connection: &Connection) -> Result<bool> {
             |row| row.get(0),
         )
         .map_err(map_database_error)?;
-    Ok(count == 5)
+    if count != 5 {
+        return Ok(false);
+    }
+    let has_max_size: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('land_batches') WHERE name = 'max_batch_size'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    Ok(has_max_size == 1)
 }
 
 /// Ensure the coordinator-private tables tracking active and historical land batches exist.
@@ -3857,6 +3981,7 @@ pub fn ensure_land_batch_schema(connection: &Connection) -> Result<()> {
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 leader_run_id TEXT NOT NULL,
                 target_branch TEXT,
+                max_batch_size INTEGER,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS land_batches_leader
@@ -3896,17 +4021,32 @@ pub fn ensure_land_batch_schema(connection: &Connection) -> Result<()> {
                 PRIMARY KEY (batch_id, step)
             );",
         )
-        .map_err(map_database_error)
+        .map_err(map_database_error)?;
+    let has_max_size: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('land_batches') WHERE name = 'max_batch_size'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    if has_max_size == 0 {
+        connection
+            .execute_batch("ALTER TABLE land_batches ADD COLUMN max_batch_size INTEGER;")
+            .map_err(map_database_error)?;
+    }
+    Ok(())
 }
 
 fn load_batch_view(connection: &Connection, batch_id: i64) -> Result<(String, Value)> {
-    let (leader_run_id, target_branch): (String, Option<String>) = connection
-        .query_row(
-            "SELECT leader_run_id, target_branch FROM land_batches WHERE batch_id = ?1",
-            params![batch_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(map_database_error)?;
+    let (leader_run_id, target_branch, max_batch_size): (String, Option<String>, Option<i64>) =
+        connection
+            .query_row(
+                "SELECT leader_run_id, target_branch, max_batch_size
+                 FROM land_batches WHERE batch_id = ?1",
+                params![batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(map_database_error)?;
     let mut member_stmt = connection
         .prepare(
             "SELECT e.position, e.member_run_id, e.branch, e.head_sha,
@@ -4022,6 +4162,7 @@ fn load_batch_view(connection: &Connection, batch_id: i64) -> Result<(String, Va
     let base = json!({
         "leader_run_id": leader_run_id,
         "target_branch": target_branch,
+        "max_batch_size": max_batch_size,
         "members": members,
         "steps": steps,
     });
@@ -4162,6 +4303,7 @@ fn publication_exit_reason(exit_status: i64) -> &'static str {
 pub struct ParsedLandOptions {
     pub target_sync: bool,
     pub reuse_full: bool,
+    pub deductive_bisect: bool,
     pub avoid: Vec<String>,
 }
 
@@ -4192,6 +4334,19 @@ pub fn parse_land_options(environment: &BTreeMap<String, String>) -> Result<Pars
             ));
         }
     };
+    let deductive_bisect = match environment
+        .get("_AGCOORD_LAND_DEDUCTIVE_BISECT")
+        .map(String::as_str)
+    {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(_) => {
+            return Err(AppError::new(
+                "broker-row-invalid",
+                "land run has an invalid deductive-bisect setting",
+            ));
+        }
+    };
     let mut avoid = Vec::new();
     if let Some(avoided) = environment.get("_AGCOORD_LAND_AVOID") {
         for sha in avoided.split(',') {
@@ -4207,6 +4362,7 @@ pub fn parse_land_options(environment: &BTreeMap<String, String>) -> Result<Pars
     Ok(ParsedLandOptions {
         target_sync,
         reuse_full,
+        deductive_bisect,
         avoid,
     })
 }
@@ -4344,18 +4500,25 @@ fn member_descriptor(run: &RunRecord, is_leader: bool) -> Result<Value> {
         "environment_options": {
             "target_sync": options.target_sync,
             "reuse_full": options.reuse_full,
+            "deductive_bisect": options.deductive_bisect,
             "avoid": options.avoid,
         },
     }))
 }
 
 pub fn select_land_batch_candidates(
+    paths: &Paths,
     connection: &Connection,
     leader: &RunRecord,
     target_runtime: &crate::overflow::Runtime,
-) -> Result<Vec<Value>> {
+) -> Result<(u64, Vec<Value>)> {
     if leader.kind != "land" {
-        return Ok(Vec::new());
+        return Ok((1, Vec::new()));
+    }
+    let max_batch_size =
+        compute_adaptive_land_batch_size(paths, connection, &leader.repository_id)?;
+    if max_batch_size <= 1 {
+        return Ok((1, Vec::new()));
     }
     let live = load_live_runs(connection)?;
     let context = BatchSelectionContext::from_live(leader, &live, target_runtime);
@@ -4370,7 +4533,7 @@ pub fn select_land_batch_candidates(
             selected.push(member_descriptor(candidate, false)?);
         }
     }
-    Ok(selected)
+    Ok((max_batch_size, selected))
 }
 
 fn load_verified_batch_leader(
@@ -4495,7 +4658,9 @@ fn batch_step_outcome_valid(value: &str) -> bool {
         "running"
             | "published"
             | "bisected"
+            | "deduced-bisected"
             | "gate-failed"
+            | "deduced-gate-failed"
             | "publish-failed"
             | "merge-conflict"
             | "merge-error"
@@ -4566,7 +4731,9 @@ pub fn record_batch_step(paths: &Paths, request: &BatchStepRequest) -> Result<Va
         ));
     }
     if let Some([left, right]) = payload.split
-        && (left == 0 || right == 0 || payload.outcome != "bisected")
+        && (left == 0
+            || right == 0
+            || !matches!(payload.outcome.as_str(), "bisected" | "deduced-bisected"))
     {
         return Err(AppError::new(
             "broker-batch-step-invalid",
@@ -4867,6 +5034,20 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
             "batch target branch must be non-empty without NUL",
         ));
     }
+    let adaptive_max =
+        compute_adaptive_land_batch_size(paths, &connection, &leader.repository_id)?;
+    let effective_max_batch_size = match request.max_batch_size {
+        Some(explicit) => {
+            if !(1..=MAX_LAND_MAX_BATCH_SIZE).contains(&explicit) || !explicit.is_power_of_two() {
+                return Err(AppError::new(
+                    "broker-submission-invalid",
+                    "batch max_batch_size must be a power of two from 1 to 1024",
+                ));
+            }
+            explicit.min(adaptive_max)
+        }
+        None => adaptive_max,
+    };
     let context = BatchSelectionContext::from_live(&leader, &live, &target_runtime);
     let started_at = now(&connection)?;
     let leader_env_json: String = connection
@@ -4883,8 +5064,12 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
     let mut members = vec![member_descriptor(&leader, true)?];
     let mut eligible_candidates = Vec::new();
     let leader_checkout_str = leader.checkout.to_string_lossy().into_owned();
+    let max_followers = effective_max_batch_size.saturating_sub(1) as usize;
 
     for member_id in &request.member_run_ids {
+        if eligible_candidates.len() >= max_followers {
+            break;
+        }
         let Some(candidate) = context
             .repo_queued
             .iter()
@@ -4926,9 +5111,14 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
             .map_err(map_database_error)?;
         connection
             .execute(
-                "INSERT INTO land_batches (leader_run_id, target_branch, created_at)
-                 VALUES (?1, ?2, ?3)",
-                params![leader.run_id, request.target_branch, started_at],
+                "INSERT INTO land_batches (leader_run_id, target_branch, max_batch_size, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    leader.run_id,
+                    request.target_branch,
+                    effective_max_batch_size as i64,
+                    started_at,
+                ],
             )
             .map_err(map_database_error)?;
         let batch_id = connection.last_insert_rowid();

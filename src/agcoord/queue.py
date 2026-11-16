@@ -81,6 +81,7 @@ LOCAL_RUNTIME = "local"
 USERNS_CAPABILITY = "userns"
 LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
 LAND_REUSE_ENV = "_AGCOORD_LAND_REUSE_FULL"
+LAND_DEDUCTIVE_BISECT_ENV = "_AGCOORD_LAND_DEDUCTIVE_BISECT"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
 RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
@@ -389,16 +390,23 @@ def format_batch_history(
     leader_run_id = str(batch.get("leader_run_id") or "—")
     role = str(batch.get("role") or "member")
     target_branch = batch.get("target_branch") or "—"
+    max_batch_size = batch.get("max_batch_size")
     members = list(batch.get("members") or ())
     steps = list(batch.get("steps") or ())
     bisected = any(
-        isinstance(step, Mapping) and step.get("outcome") == "bisected"
+        isinstance(step, Mapping)
+        and step.get("outcome") in {"bisected", "deduced-bisected"}
         for step in steps
+    )
+    max_b_suffix = (
+        f" · Max batch (B): {max_batch_size}"
+        if isinstance(max_batch_size, int) and not isinstance(max_batch_size, bool)
+        else ""
     )
     lines = [
         "Batch & Bisect History:",
         f"  Leader: {leader_run_id} · Role: {role} · Target: {target_branch} · "
-        f"Bisected: {'yes' if bisected else 'no'}",
+        f"Bisected: {'yes' if bisected else 'no'}{max_b_suffix}",
         f"  Members ({len(members)}):",
     ]
     member_labels: dict[str, str] = {}
@@ -462,19 +470,24 @@ def format_batch_history(
             gate_text = f"reused {reused}"
         elif exit_code is not None:
             gate_text = f"gate exit {exit_code}"
+        elif outcome in {"deduced-gate-failed", "deduced-bisected"}:
+            gate_text = "gate skipped (deduced)"
         elif outcome == "running":
             gate_text = "gate running"
         else:
             gate_text = "gate not run"
         split = step.get("split")
         if (
-            outcome == "bisected"
+            outcome in {"bisected", "deduced-bisected"}
             and isinstance(split, Sequence)
             and not isinstance(split, (str, bytes))
             and len(split) == 2
         ):
             left_count, right_count = int(split[0]), int(split[1])
-            prefix = f"gate failed (exit {exit_code}) -> " if exit_code is not None else ""
+            if outcome == "deduced-bisected":
+                prefix = "deduced failing slice -> "
+            else:
+                prefix = f"gate failed (exit {exit_code}) -> " if exit_code is not None else ""
             outcome_text = (
                 f"{prefix}bisected {left_count + right_count} into "
                 f"{left_count} + {right_count}"
@@ -486,6 +499,8 @@ def format_batch_history(
             )
         elif outcome == "gate-failed" and exit_code is not None:
             outcome_text = f"gate failed (exit {exit_code})"
+        elif outcome == "deduced-gate-failed":
+            outcome_text = "deduced gate-failed"
         else:
             outcome_text = outcome
         lines.append(
@@ -1973,6 +1988,7 @@ class CoordinatorClient:
         synchronize_target: bool = True,
         avoid_commits: Sequence[str] = (),
         reuse_full: bool = False,
+        deductive_bisect: bool = True,
         overflow: bool | None = None,
         require_capabilities: Sequence[str] | None = None,
         runtimes: Sequence[str] | None = None,
@@ -1990,6 +2006,8 @@ class CoordinatorClient:
             raise CoordinatorError("synchronize_target must be boolean")
         if not isinstance(reuse_full, bool):
             raise CoordinatorError("reuse_full must be boolean")
+        if not isinstance(deductive_bisect, bool):
+            raise CoordinatorError("deductive_bisect must be boolean")
         selected_avoid = _validate_avoid_commits(avoid_commits)
         selected_capabilities = parse_name_selectors(
             require_capabilities,
@@ -2025,6 +2043,7 @@ class CoordinatorClient:
             synchronize_target=synchronize_target,
             avoid_commits=selected_avoid,
             reuse_full=reuse_full,
+            deductive_bisect=deductive_bisect,
             owner=owner,
             overflow=overflow,
             require_capabilities=selected_capabilities,
@@ -2044,6 +2063,7 @@ class CoordinatorClient:
         synchronize_target: bool,
         avoid_commits: Sequence[str],
         reuse_full: bool,
+        deductive_bisect: bool = True,
         owner: Mapping[str, Any],
         overflow: bool | None = None,
         require_capabilities: Sequence[str] = (),
@@ -2077,6 +2097,12 @@ class CoordinatorClient:
             )
         if reuse_full:
             selected_environment[LAND_REUSE_ENV] = "1"
+        if LAND_DEDUCTIVE_BISECT_ENV in selected_environment:
+            raise CoordinatorError(
+                f"gate environment uses the reserved {LAND_DEDUCTIVE_BISECT_ENV} name"
+            )
+        if not deductive_bisect:
+            selected_environment[LAND_DEDUCTIVE_BISECT_ENV] = "0"
         if "_AGCOORD_LAND_PYTHON" in selected_environment:
             raise CoordinatorError(
                 "gate environment uses the reserved _AGCOORD_LAND_PYTHON name"
@@ -2641,11 +2667,14 @@ class CoordinatorClient:
         member_run_ids: Sequence[str],
         worker_pid: int,
         target_branch: str | None = None,
+        max_batch_size: int | None = None,
     ) -> list[dict[str, object]]:
         arguments = self._admitted_leader_arguments(leader_run_id, worker_pid=worker_pid)
         arguments.extend(("--members-json", json.dumps(list(member_run_ids))))
         if target_branch is not None:
             arguments.extend(("--target-branch", target_branch))
+        if max_batch_size is not None:
+            arguments.extend(("--max-batch-size", str(int(max_batch_size))))
         result = self._native_callback_invoke("claim-batch", arguments)
         if (
             not isinstance(result, dict)

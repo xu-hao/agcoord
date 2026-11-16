@@ -811,6 +811,7 @@ struct BatchArgs {
     head_sha: Option<String>,
     members_json: Option<String>,
     target_branch: Option<String>,
+    max_batch_size: Option<u64>,
     step_json: Option<String>,
     slice_head: Option<String>,
     member_run_id: Option<String>,
@@ -858,6 +859,17 @@ fn parse_batch_args(arguments: &[String], allowed: &[&str]) -> Result<(Paths, Ba
             "--head" => parsed.head_sha = Some(value),
             "--members-json" => parsed.members_json = Some(value),
             "--target-branch" => parsed.target_branch = Some(value),
+            "--max-batch-size" => {
+                parsed.max_batch_size = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|limit| *limit > 0)
+                        .ok_or_else(|| {
+                            AppError::usage("--max-batch-size must be a positive integer")
+                        })?,
+                );
+            }
             "--step-json" => parsed.step_json = Some(value),
             "--slice-head" => parsed.slice_head = Some(value),
             "--member-run-id" => parsed.member_run_id = Some(value),
@@ -910,7 +922,10 @@ fn require_batch_identity(args: &BatchArgs) -> Result<(String, u32, String, Path
 }
 
 fn parse_claim_batch(arguments: &[String]) -> Result<(Paths, BatchClaimRequest)> {
-    let (paths, args) = parse_batch_args(arguments, &["--members-json", "--target-branch"])?;
+    let (paths, args) = parse_batch_args(
+        arguments,
+        &["--members-json", "--target-branch", "--max-batch-size"],
+    )?;
     let (run_id, worker_pid, worker_start_token, checkout, head_sha) =
         require_batch_identity(&args)?;
     let raw_members = args
@@ -928,6 +943,7 @@ fn parse_claim_batch(arguments: &[String]) -> Result<(Paths, BatchClaimRequest)>
             head_sha,
             member_run_ids,
             target_branch: args.target_branch,
+            max_batch_size: args.max_batch_size,
         },
     ))
 }

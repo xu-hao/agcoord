@@ -237,17 +237,25 @@ def _compact_batch_detail(row: dict) -> tuple[str, str]:
     )
     n_steps = len(steps)
     slice_word = "slice" if n_steps == 1 else "slices"
-    bisected = any(s.get("outcome") == "bisected" for s in steps)
+    bisected = any(
+        s.get("outcome") in {"bisected", "deduced-bisected"} for s in steps
+    )
     bisect_part = ", bisected" if bisected else ""
     phase_suffix = f" · batch {pos}/{size} ({n_steps} {slice_word}{bisect_part})"
     leader_id = str(batch.get("leader_run_id") or "—")
     role = batch.get("role") or (
         "leader" if leader_id == row.get("run_id") else "follower"
     )
+    max_b = batch.get("max_batch_size")
+    b_part = (
+        f" (B={max_b})"
+        if isinstance(max_b, int) and not isinstance(max_b, bool)
+        else ""
+    )
     branch_suffix = (
-        " · batch: leader"
+        f" · batch: leader{b_part}"
         if role == "leader"
-        else f" · batch: follower of {leader_id}"
+        else f" · batch: follower of {leader_id}{b_part}"
     )
     return phase_suffix, branch_suffix
 
