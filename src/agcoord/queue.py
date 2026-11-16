@@ -82,6 +82,7 @@ USERNS_CAPABILITY = "userns"
 LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
 LAND_REUSE_ENV = "_AGCOORD_LAND_REUSE_FULL"
 LAND_DEDUCTIVE_BISECT_ENV = "_AGCOORD_LAND_DEDUCTIVE_BISECT"
+BATCH_ATTRIBUTION_FILE_ENV = "AGCOORD_BATCH_ATTRIBUTION_FILE"
 RUN_KINDS = frozenset({"check", "full", "merge", "land"})
 RUN_PHASES = frozenset({
     "queued", "running", "preflight", "gating", "publishing", "complete",
@@ -395,7 +396,8 @@ def format_batch_history(
     steps = list(batch.get("steps") or ())
     bisected = any(
         isinstance(step, Mapping)
-        and step.get("outcome") in {"bisected", "deduced-bisected"}
+        and step.get("outcome")
+        in {"bisected", "deduced-bisected", "attributed-gate-failed"}
         for step in steps
     )
     max_b_suffix = (
@@ -501,6 +503,18 @@ def format_batch_history(
             outcome_text = f"gate failed (exit {exit_code})"
         elif outcome == "deduced-gate-failed":
             outcome_text = "deduced gate-failed"
+        elif outcome == "attributed-gate-failed":
+            attributed_items = step.get("attributed") or ()
+            evicted_parts = [
+                f"{member_labels.get(str(item['run_id']), str(item['run_id']))} "
+                f"[{', '.join(str(u) for u in (item.get('units') or ()))}]"
+                for item in attributed_items
+                if isinstance(item, Mapping) and "run_id" in item
+            ]
+            if evicted_parts:
+                outcome_text = f"attributed-gate-failed -> evicted {'; '.join(evicted_parts)}"
+            else:
+                outcome_text = "attributed-gate-failed"
         else:
             outcome_text = outcome
         lines.append(
@@ -2694,6 +2708,7 @@ class CoordinatorClient:
         member_run_ids: Sequence[str] | None = None,
         gated_member_run_ids: Sequence[str] | None = None,
         dropped: Sequence[Mapping[str, str]] | None = None,
+        attributed: Sequence[Mapping[str, Any]] | None = None,
         base_sha: str | None = None,
         gating_head_sha: str | None = None,
         gate_reused_from: str | None = None,
@@ -2713,6 +2728,14 @@ class CoordinatorClient:
             payload["dropped"] = [
                 {"run_id": str(item["run_id"]), "reason": str(item["reason"])}
                 for item in dropped
+            ]
+        if attributed is not None:
+            payload["attributed"] = [
+                {
+                    "run_id": str(item["run_id"]),
+                    "units": [str(u) for u in (item.get("units") or ())],
+                }
+                for item in attributed
             ]
         if base_sha is not None:
             payload["base_sha"] = _validate_head_sha(base_sha, required=True)

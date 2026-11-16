@@ -1177,3 +1177,285 @@ if bad:
     row90 = _wait_terminal(client, r90, "passed")
     assert row89["batch"] is None
     assert row90["batch"] is None
+
+
+def test_land_batch_failure_attribution_evicts_culprits_and_falls_back_safely(
+    coordinator,
+    tmp_path: Path,
+):
+    from io import StringIO
+    from agcoord.land import (
+        ATTRIBUTION_FORMAT,
+        BATCH_ATTRIBUTION_FILE_ENV,
+        _load_failure_attribution,
+    )
+
+    _broker, client = coordinator
+
+    # 1. Receipt validator refuses missing, empty, malformed, traversal, absolute, and symlinked receipts/paths.
+    fake_checkout = tmp_path / "validator-checkout"
+    (fake_checkout / "src").mkdir(parents=True)
+    (fake_checkout / "src" / "real.py").write_text("x = 1\n", encoding="utf-8")
+    (fake_checkout / "src" / "link.py").symlink_to(fake_checkout / "src" / "real.py")
+
+    err_buf = StringIO()
+    missing_path = tmp_path / "missing-attr.json"
+    assert _load_failure_attribution(missing_path, checkout=fake_checkout, err=err_buf) is None
+
+    empty_path = tmp_path / "empty-attr.json"
+    empty_path.write_text("", encoding="utf-8")
+    assert _load_failure_attribution(empty_path, checkout=fake_checkout, err=err_buf) is None
+
+    symlink_receipt = tmp_path / "symlink-attr.json"
+    real_receipt = tmp_path / "real-attr.json"
+    real_receipt.write_text(
+        json.dumps(
+            {
+                "format": ATTRIBUTION_FORMAT,
+                "failures": [{"unit": "tests/test_x.py", "causal_paths": ["src/real.py"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    symlink_receipt.symlink_to(real_receipt)
+    assert _load_failure_attribution(symlink_receipt, checkout=fake_checkout, err=err_buf) is None
+    assert _load_failure_attribution(real_receipt, checkout=fake_checkout, err=err_buf) == [
+        ("tests/test_x.py", ("src/real.py",))
+    ]
+
+    for bad_payload in (
+        "{not json",
+        json.dumps({"format": "wrong-v1", "failures": [{"unit": "u", "causal_paths": ["src/real.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "extra": 1, "failures": [{"unit": "u", "causal_paths": ["src/real.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "", "causal_paths": ["src/real.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "u", "causal_paths": ["../escape.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "u", "causal_paths": ["./src/real.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "u", "causal_paths": ["/abs/path.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "u", "causal_paths": ["src/trailing/"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "u", "causal_paths": ["src\\win.py"]}]}),
+        json.dumps({"format": ATTRIBUTION_FORMAT, "failures": [{"unit": "u", "causal_paths": ["src/link.py"]}]}),
+    ):
+        bad_file = tmp_path / "bad-attr.json"
+        bad_file.write_text(bad_payload, encoding="utf-8")
+        assert _load_failure_attribution(bad_file, checkout=fake_checkout, err=err_buf) is None
+
+    # 2. Disjoint 2-PR failure cases: (fail, pass), (pass, fail), and (fail, fail) ALL finish in 2 gate runs!
+    def run_attributed_pair(name: str, bad_prs: tuple[int, ...]) -> tuple[list[dict], dict[int, dict]]:
+        case_dir = tmp_path / name
+        remote, state_file, checkouts, _ = _setup_remote_and_worktrees(
+            case_dir,
+            [
+                {
+                    "pr": 1,
+                    "base": "main",
+                    "branch": "feat/billing",
+                    "files": {"src/billing/invoice.py": "bad\n" if 1 in bad_prs else "ok\n"},
+                },
+                {
+                    "pr": 2,
+                    "base": "main",
+                    "branch": "feat/auth",
+                    "files": {"src/auth/token.py": "bad\n" if 2 in bad_prs else "ok\n"},
+                },
+            ],
+        )
+        bin_dir = _install_stateful_gh(case_dir / "bin", remote, state_file, case_dir / "gh.jsonl")
+        gate_log = case_dir / "gates.jsonl"
+        gate_cmd = _python(
+            """
+import json, os, sys
+from pathlib import Path
+
+cwd = Path.cwd().resolve()
+attr_env = os.environ.get("AGCOORD_BATCH_ATTRIBUTION_FILE")
+failures = []
+for unit, rel_file, causal in (
+    ("tests/test_billing.py", "src/billing/invoice.py", ["src/billing"]),
+    ("tests/test_auth.py", "src/auth/token.py", ["src/auth/token.py"]),
+):
+    p = cwd / rel_file
+    if p.exists() and p.read_text(encoding="utf-8").strip() == "bad":
+        failures.append({"unit": unit, "causal_paths": causal})
+
+with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
+    s.write(json.dumps({"attr_env": attr_env, "cwd": str(cwd), "failures": [f["unit"] for f in failures]}) + "\\n")
+
+if failures:
+    if attr_env:
+        Path(attr_env).write_text(
+            json.dumps({"format": "agcoord-failure-attribution-v1", "failures": failures}),
+            encoding="utf-8",
+        )
+    sys.exit(5)
+""",
+        )
+        hold_id, release = _submit_hold(client, case_dir, checkouts[1], name)
+        env = _env_with_gh(bin_dir, {"BATCH_GATE_LOG": str(gate_log)})
+        ids = {
+            pr: client.submit_land(
+                "github", pr, gate_cmd, checkout=str(checkouts[pr]),
+                resources={"jobs": 1}, caller_pid=os.getpid(), environment=env,
+            )
+            for pr in (1, 2)
+        }
+        release.touch()
+        _wait_terminal(client, hold_id, "passed")
+        rows = {
+            pr: _wait_terminal(client, ids[pr], "failed" if pr in bad_prs else "passed")
+            for pr in (1, 2)
+        }
+        records = [json.loads(line) for line in gate_log.read_text(encoding="utf-8").splitlines()]
+        return records, rows
+
+    for label, bad_set in (
+        ("attr-fail-pass", (1,)),
+        ("attr-pass-fail", (2,)),
+        ("attr-fail-fail", (1, 2)),
+    ):
+        records, rows = run_attributed_pair(label, bad_set)
+        assert len(records) == 2, (label, records)
+        first_attr_path = Path(records[0]["attr_env"])
+        assert not first_attr_path.is_relative_to(Path(records[0]["cwd"]))
+        assert not first_attr_path.exists()
+        assert records[1]["attr_env"] is None
+        assert rows[1]["batch"]["steps"][0]["outcome"] == "attributed-gate-failed"
+        evicted_pr = bad_set[0]
+        expected_unit = (
+            "tests/test_billing.py" if evicted_pr == 1 else "tests/test_auth.py"
+        )
+        assert rows[1]["batch"]["steps"][0]["attributed"] == [
+            {"run_id": rows[evicted_pr]["run_id"], "units": [expected_unit]}
+        ]
+        if label == "attr-fail-pass":
+            shown = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "agcoord",
+                    "show",
+                    rows[1]["run_id"],
+                    "--state-dir",
+                    str(client.paths.state_dir),
+                ],
+                capture_output=True,
+                text=True,
+                env=caller_environment(),
+                check=True,
+            )
+            assert "attributed-gate-failed -> evicted #1" in shown.stdout
+            assert "tests/test_billing.py" in shown.stdout
+
+    # 3. Multi-culprit eviction in one run (4 PRs, 2 culprits evicted simultaneously -> 2 gate runs total!).
+    multi_dir = tmp_path / "attr-multi"
+    remote_m, state_file_m, checkouts_m, _ = _setup_remote_and_worktrees(
+        multi_dir,
+        [
+            {"pr": 1, "base": "main", "branch": "feat/m1", "files": {"pkg/a/mod.py": "bad\n"}},
+            {"pr": 2, "base": "main", "branch": "feat/m2", "files": {"pkg/b/mod.py": "ok\n"}},
+            {"pr": 3, "base": "main", "branch": "feat/m3", "files": {"pkg/c/mod.py": "bad\n"}},
+            {"pr": 4, "base": "main", "branch": "feat/m4", "files": {"pkg/d/mod.py": "ok\n"}},
+        ],
+    )
+    bin_m = _install_stateful_gh(multi_dir / "bin", remote_m, state_file_m, multi_dir / "gh.jsonl")
+    multi_log = multi_dir / "gates.jsonl"
+    multi_gate = _python(
+        """
+import json, os, sys
+from pathlib import Path
+
+failures = []
+for name in ("a", "b", "c", "d"):
+    p = Path(f"pkg/{name}/mod.py")
+    if p.exists() and p.read_text(encoding="utf-8").strip() == "bad":
+        failures.append({"unit": f"tests/test_{name}.py", "causal_paths": [f"pkg/{name}"]})
+with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
+    s.write(json.dumps({"failures": [f["unit"] for f in failures]}) + "\\n")
+if failures:
+    attr = os.environ.get("AGCOORD_BATCH_ATTRIBUTION_FILE")
+    if attr:
+        Path(attr).write_text(
+            json.dumps({"format": "agcoord-failure-attribution-v1", "failures": failures}),
+            encoding="utf-8",
+        )
+    sys.exit(4)
+""",
+    )
+    hold_m, release_m = _submit_hold(client, multi_dir, checkouts_m[1], "multi")
+    env_m = _env_with_gh(bin_m, {"BATCH_GATE_LOG": str(multi_log)})
+    ids_m = {
+        pr: client.submit_land(
+            "github", pr, multi_gate, checkout=str(checkouts_m[pr]),
+            resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_m,
+        )
+        for pr in (1, 2, 3, 4)
+    }
+    release_m.touch()
+    _wait_terminal(client, hold_m, "passed")
+    rows_m = {
+        pr: _wait_terminal(client, ids_m[pr], "failed" if pr in {1, 3} else "passed")
+        for pr in (1, 2, 3, 4)
+    }
+    assert len(multi_log.read_text(encoding="utf-8").splitlines()) == 2
+    assert [s["outcome"] for s in rows_m[2]["batch"]["steps"]] == [
+        "attributed-gate-failed",
+        "published",
+    ]
+    assert rows_m[2]["batch"]["steps"][0]["attributed"] == [
+        {"run_id": ids_m[1], "units": ["tests/test_a.py"]},
+        {"run_id": ids_m[3], "units": ["tests/test_c.py"]},
+    ]
+
+    # 4. Shared-directory ambiguous receipt (both PRs touch src/shared/*) + malformed receipt fallback:
+    # zero false evictions, falls back cleanly to standard bisection (3 gate runs for (fail, pass)).
+    ambig_dir = tmp_path / "attr-ambig"
+    remote_a, state_file_a, checkouts_a, _ = _setup_remote_and_worktrees(
+        ambig_dir,
+        [
+            {"pr": 1, "base": "main", "branch": "feat/s1", "files": {"src/shared/one.py": "bad\n"}},
+            {"pr": 2, "base": "main", "branch": "feat/s2", "files": {"src/shared/two.py": "ok\n"}},
+        ],
+    )
+    bin_a = _install_stateful_gh(ambig_dir / "bin", remote_a, state_file_a, ambig_dir / "gh.jsonl")
+    ambig_log = ambig_dir / "gates.jsonl"
+    ambig_gate = _python(
+        """
+import json, os, sys
+from pathlib import Path
+
+bad = Path("src/shared/one.py").exists()
+with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
+    s.write(json.dumps({"bad": bad}) + "\\n")
+if bad:
+    attr = os.environ.get("AGCOORD_BATCH_ATTRIBUTION_FILE")
+    if attr:
+        Path(attr).write_text(
+            json.dumps({
+                "format": "agcoord-failure-attribution-v1",
+                "failures": [{"unit": "tests/test_shared.py", "causal_paths": ["src/shared"]}],
+            }),
+            encoding="utf-8",
+        )
+    sys.exit(6)
+""",
+    )
+    hold_a, release_a = _submit_hold(client, ambig_dir, checkouts_a[1], "ambig")
+    env_a = _env_with_gh(bin_a, {"BATCH_GATE_LOG": str(ambig_log)})
+    ra1 = client.submit_land(
+        "github", 1, ambig_gate, checkout=str(checkouts_a[1]),
+        resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_a,
+    )
+    ra2 = client.submit_land(
+        "github", 2, ambig_gate, checkout=str(checkouts_a[2]),
+        resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_a,
+    )
+    release_a.touch()
+    _wait_terminal(client, hold_a, "passed")
+    row_a1 = _wait_terminal(client, ra1, "failed")
+    row_a2 = _wait_terminal(client, ra2, "passed")
+    assert len(ambig_log.read_text(encoding="utf-8").splitlines()) == 3
+    assert [s["outcome"] for s in row_a2["batch"]["steps"]] == [
+        "bisected",
+        "gate-failed",
+        "published",
+    ]
+    assert row_a1["failure_reason"] == "gate-failed"

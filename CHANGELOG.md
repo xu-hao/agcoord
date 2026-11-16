@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Pass `AGCOORD_BATCH_ATTRIBUTION_FILE` to multi-PR batch gates, validate optional
+  `agcoord-failure-attribution-v1` causal failure receipts, evict uniquely blamed batch members
+  immediately before binary bisection (`attributed-gate-failed`), and surface attributed culprits
+  and blaming units in `agc show` and `agc tui`. #355 — evict uniquely blamed batch members via
+  optional gate failure-attribution receipts before binary bisection.
+
 - Bound batched `agc land` runs to adaptive power-of-two sizes ($B = 2^k$, configurable via
   `land_max_batch_size` and falling back to $B = 1$ above ~38% recent repository failure rate),
   skip deductively known-failing right-hand slices (`deduced-bisected`, `deduced-gate-failed`) with

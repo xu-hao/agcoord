@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+import tempfile
 from typing import Callable, Mapping, Sequence, TextIO
 
 from .merge import (
@@ -343,6 +346,227 @@ def _largest_power_of_two_lt(value: int) -> int:
     if value <= 2:
         return 1
     return _largest_power_of_two_le(value - 1)
+
+
+BATCH_ATTRIBUTION_FILE_ENV = "AGCOORD_BATCH_ATTRIBUTION_FILE"
+ATTRIBUTION_FORMAT = "agcoord-failure-attribution-v1"
+MAX_ATTRIBUTION_BYTES = 4 * 1024 * 1024
+MAX_ATTRIBUTION_FAILURES = 10_000
+
+
+def _validate_canonical_repo_path(value: object, *, checkout: Path) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\0" in value
+        or "\\" in value
+        or value.startswith("/")
+        or value.endswith("/")
+    ):
+        return None
+    segments = value.split("/")
+    if any(not seg or seg in {".", ".."} for seg in segments):
+        return None
+    current = checkout
+    for seg in segments:
+        current = current / seg
+        try:
+            st = os.lstat(current)
+        except OSError:
+            break
+        if stat.S_ISLNK(st.st_mode):
+            return None
+    return value
+
+
+def _load_failure_attribution(
+    path: Path,
+    *,
+    checkout: Path,
+    err: TextIO,
+) -> list[tuple[str, tuple[str, ...]]] | None:
+    if os.path.islink(path.parent):
+        print(
+            "Land coordinator: ignoring failure attribution receipt inside symlinked parent",
+            file=err,
+            flush=True,
+        )
+        return None
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(
+            f"Land coordinator: ignoring unreadable failure attribution receipt: {exc}",
+            file=err,
+            flush=True,
+        )
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        print(
+            "Land coordinator: ignoring non-regular or symlinked failure attribution receipt",
+            file=err,
+            flush=True,
+        )
+        return None
+    if st.st_size == 0:
+        return None
+    if st.st_size > MAX_ATTRIBUTION_BYTES:
+        print(
+            f"Land coordinator: ignoring oversized failure attribution receipt ({st.st_size} bytes)",
+            file=err,
+            flush=True,
+        )
+        return None
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            print(
+                f"Land coordinator: ignoring failure attribution receipt ({exc})",
+                file=err,
+                flush=True,
+            )
+        return None
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_ATTRIBUTION_BYTES:
+                print(
+                    "Land coordinator: ignoring oversized failure attribution receipt",
+                    file=err,
+                    flush=True,
+                )
+                return None
+            chunks.append(chunk)
+        raw_bytes = b"".join(chunks)
+    finally:
+        os.close(fd)
+
+    if not raw_bytes:
+        return None
+    try:
+        document = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(
+            f"Land coordinator: ignoring malformed failure attribution receipt: {exc}",
+            file=err,
+            flush=True,
+        )
+        return None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"format", "failures"}
+        or document.get("format") != ATTRIBUTION_FORMAT
+    ):
+        print(
+            "Land coordinator: ignoring failure attribution receipt with invalid envelope",
+            file=err,
+            flush=True,
+        )
+        return None
+    raw_failures = document.get("failures")
+    if (
+        not isinstance(raw_failures, list)
+        or not raw_failures
+        or len(raw_failures) > MAX_ATTRIBUTION_FAILURES
+    ):
+        return None
+
+    parsed: list[tuple[str, tuple[str, ...]]] = []
+    for entry in raw_failures:
+        if not isinstance(entry, dict) or set(entry) != {"unit", "causal_paths"}:
+            print(
+                "Land coordinator: ignoring failure attribution receipt with invalid failure entry",
+                file=err,
+                flush=True,
+            )
+            return None
+        unit = entry.get("unit")
+        causal_raw = entry.get("causal_paths")
+        if (
+            not isinstance(unit, str)
+            or not unit.strip()
+            or "\0" in unit
+            or "\n" in unit
+            or "\r" in unit
+            or not isinstance(causal_raw, list)
+        ):
+            print(
+                "Land coordinator: ignoring failure attribution receipt with invalid unit or causal_paths",
+                file=err,
+                flush=True,
+            )
+            return None
+        validated_paths: list[str] = []
+        for raw_p in causal_raw:
+            canonical = _validate_canonical_repo_path(raw_p, checkout=checkout)
+            if canonical is None:
+                print(
+                    f"Land coordinator: ignoring failure attribution receipt with non-canonical path {raw_p!r}",
+                    file=err,
+                    flush=True,
+                )
+                return None
+            if canonical not in validated_paths:
+                validated_paths.append(canonical)
+        parsed.append((unit.strip(), tuple(validated_paths)))
+    return parsed
+
+
+def _member_changed_paths(checkout: Path, base_sha: str, head_sha: str) -> tuple[str, ...]:
+    res = _git_batch(checkout, "diff", "--name-only", "-z", f"{base_sha}...{head_sha}")
+    if res.returncode != 0:
+        return ()
+    return tuple(item for item in res.stdout.split("\0") if item)
+
+
+def _attribute_batch_failures(
+    checkout: Path,
+    t0_sha: str,
+    merged: list[tuple[_BatchMember, str]],
+    failures: list[tuple[str, tuple[str, ...]]],
+) -> list[tuple[_BatchMember, list[str]]]:
+    changed_by_run = {
+        member.run_id: _member_changed_paths(checkout, t0_sha, member.expected_head_sha)
+        for member, _tree in merged
+    }
+    blamed_units: dict[str, list[str]] = {}
+    for unit, causal_paths in failures:
+        if not causal_paths:
+            continue
+        matching = [
+            member
+            for member, _tree in merged
+            if any(
+                ch == cp or ch.startswith(f"{cp}/")
+                for ch in changed_by_run[member.run_id]
+                for cp in causal_paths
+            )
+        ]
+        if len(matching) == 1:
+            culprit = matching[0]
+            units_for_culprit = blamed_units.setdefault(culprit.run_id, [])
+            if unit not in units_for_culprit:
+                units_for_culprit.append(unit)
+    culprits = [
+        (member, blamed_units[member.run_id])
+        for member, _tree in merged
+        if member.run_id in blamed_units
+    ]
+    if not culprits:
+        return []
+    if len(culprits) >= len(merged):
+        culprits = culprits[:-1]
+    return culprits
 
 
 @dataclass
@@ -1007,6 +1231,7 @@ class _BatchRunner:
                 )
 
         if reused_source is not None:
+            parsed_attribution = None
             singleton = merged[0][0]
             singleton.phase = "gating"
             singleton.gate_exit_status = 0
@@ -1053,14 +1278,44 @@ class _BatchRunner:
                 member_run_ids=gated_ids,
                 worker_pid=self.worker_pid,
             )
+            parsed_attribution: list[tuple[str, tuple[str, ...]]] | None = None
+            base_gate_env = {
+                k: v
+                for k, v in self.environment.items()
+                if k != BATCH_ATTRIBUTION_FILE_ENV
+            }
+            attr_tmpdir = (
+                tempfile.TemporaryDirectory(prefix="agcoord-batch-attr-")
+                if len(merged) >= 2
+                else None
+            )
             try:
+                gate_env = dict(base_gate_env)
+                attr_path: Path | None = None
+                if attr_tmpdir is not None:
+                    attr_path = Path(attr_tmpdir.name) / "attribution.json"
+                    fd = os.open(
+                        attr_path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                    os.close(fd)
+                    gate_env[BATCH_ATTRIBUTION_FILE_ENV] = str(attr_path)
                 gate_status = _run_gate(
                     self.gate_command,
                     checkout=self.checkout,
-                    environment=self.environment,
+                    environment=gate_env,
                     out=self.out,
                 )
+                if gate_status != 0 and attr_path is not None:
+                    parsed_attribution = _load_failure_attribution(
+                        attr_path,
+                        checkout=self.checkout,
+                        err=self.err,
+                    )
             finally:
+                if attr_tmpdir is not None:
+                    attr_tmpdir.cleanup()
                 self.client.clear_batch_slice(self.leader_run_id, worker_pid=self.worker_pid)
 
         if gate_status == 0:
@@ -1117,6 +1372,56 @@ class _BatchRunner:
             )
             self._finalize_member(singleton, gate_status, "gate-failed", gate_status)
             return False
+
+        cancelled_member_ids = {
+            str(entry["run_id"])
+            for entry in status_payload["members"]
+            if entry.get("cancel_requested")
+        }
+        if parsed_attribution is not None and len(clean_slice) >= 2:
+            evicted = _attribute_batch_failures(
+                self.checkout,
+                t0_sha,
+                merged,
+                parsed_attribution,
+            )
+            evicted = [
+                (member, units)
+                for member, units in evicted
+                if member.run_id not in cancelled_member_ids
+            ]
+            if evicted:
+                evicted_ids = {member.run_id for member, _units in evicted}
+                remaining_slice = [
+                    member
+                    for member in clean_slice
+                    if member.run_id not in evicted_ids
+                ]
+                self.client.record_batch_step(
+                    self.leader_run_id,
+                    worker_pid=self.worker_pid,
+                    step=step,
+                    gate_exit_status=gate_status,
+                    outcome="attributed-gate-failed",
+                    attributed=[
+                        {"run_id": member.run_id, "units": units}
+                        for member, units in evicted
+                    ],
+                )
+                for culprit, units in evicted:
+                    self._advance_phase(culprit, "gating", gate_status)
+                    print(
+                        f"Land coordinator: attributed gate failure (exit {gate_status}) to "
+                        f"PR #{culprit.pull_request} via {', '.join(units)}; evicting without solo gate",
+                        file=self.err,
+                        flush=True,
+                    )
+                    self._finalize_member(
+                        culprit, gate_status, "gate-failed", gate_status
+                    )
+                if remaining_slice:
+                    self.bisect_and_land(target_branch, remaining_slice)
+                return False
 
         mid = _largest_power_of_two_lt(len(clean_slice))
         left = clean_slice[:mid]

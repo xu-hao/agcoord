@@ -238,7 +238,9 @@ def _compact_batch_detail(row: dict) -> tuple[str, str]:
     n_steps = len(steps)
     slice_word = "slice" if n_steps == 1 else "slices"
     bisected = any(
-        s.get("outcome") in {"bisected", "deduced-bisected"} for s in steps
+        s.get("outcome")
+        in {"bisected", "deduced-bisected", "attributed-gate-failed"}
+        for s in steps
     )
     bisect_part = ", bisected" if bisected else ""
     phase_suffix = f" · batch {pos}/{size} ({n_steps} {slice_word}{bisect_part})"

@@ -1555,6 +1555,33 @@ $\le \min(Q, B)$ (leaving trailing requests queued for the next batch):
    preflight invalidation, merge conflict, or external target move changes the tree and invalidates
    `known_bad`, running an explicit gate instead. Pass `--no-deductive-bisect` on `agc land` when a
    flaky non-deterministic gate requires an explicit singleton failure log on every rejected PR.
+4. **Causal failure-attribution eviction (`AGCOORD_BATCH_ATTRIBUTION_FILE`):** Before invoking the
+   gate for any multi-PR batch slice (`k >= 2`), the leader creates an owned empty temporary file
+   outside the checkout and sets `AGCOORD_BATCH_ATTRIBUTION_FILE=<path>` in the gate environment
+   (cleaned up after each gate). Dependency-aware test runners may write an optional JSON receipt
+   (`<= 4 MiB`, regular non-symlink file):
+
+   ```json
+   {
+     "format": "agcoord-failure-attribution-v1",
+     "failures": [
+       {
+         "unit": "tests/test_billing.py",
+         "causal_paths": ["src/billing/invoice.py", "tests/test_billing.py"]
+       }
+     ]
+   }
+   ```
+
+   Each `causal_paths` entry must be a canonical repository-relative POSIX file or directory path
+   (no leading/trailing `/`, `.`/`..`, backslashes, or symlinks; a directory `"src/billing"` matches
+   any changed path below `src/billing/`). On non-zero gate exit, `LandCoordinator` intersects each
+   failure's `causal_paths` with every slice member's `git diff --name-only <T_0>...<head>`. When
+   one or more members form a strict subset uniquely blamed by individual failing units (`|M_f| == 1`),
+   those culprits are finalized immediately as `gate-failed` (recording `attributed-gate-failed` and
+   `attributed` `[{run_id, units}]` in batch history) without solo confirmation gates, and the
+   remaining unblamed members proceed in a fresh slice (`known_bad=False`). Missing, malformed,
+   zero-match, or multi-member-match receipts fall back safely to deductive binary splitting.
 
 While a batch slice's gate runs, the leader's `admitted_run_status` and `agc --json show`
 include `batch_slice`: its exact `gating_head_sha` and an ordered `members` array containing
@@ -1573,11 +1600,12 @@ if a requeued follower is later claimed into a new batch, `batch` reflects that 
 A populated `batch` object records `leader_run_id`, `role`, `target_branch`, `max_batch_size`,
 `created_at`, ordered `members` (`position`, `run_id`, `branch`, `head_sha`, `publication`,
 `status`, `failure_reason`), and chronological `steps` (`step`, `base_sha`, `gating_head_sha`,
-`member_run_ids`, `gated_member_run_ids`, `dropped`, `gate_reused_from`, `gate_exit_status`,
-`outcome`, `split`, `published_sha`, `started_at`, `finished_at`) across clean multi-PR gates,
-recursive and deductive binary-split bisections (`bisected`, `deduced-bisected`,
-`deduced-gate-failed`), merge-conflict drops, `--reuse-full` substitutions, stale-target or
-changed-head handbacks, publication failures, and cancellations.
+`member_run_ids`, `gated_member_run_ids`, `dropped`, `attributed`, `gate_reused_from`,
+`gate_exit_status`, `outcome`, `split`, `published_sha`, `started_at`, `finished_at`) across clean
+multi-PR gates, causal failure-attribution culprit evictions (`attributed-gate-failed`), recursive
+and deductive binary-split bisections (`bisected`, `deduced-bisected`, `deduced-gate-failed`),
+merge-conflict drops, `--reuse-full` substitutions, stale-target or changed-head handbacks,
+publication failures, and cancellations.
 
 ### Reusing a full receipt as the land gate
 

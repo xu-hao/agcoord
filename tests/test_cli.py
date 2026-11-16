@@ -533,13 +533,19 @@ def test_show_renders_batch_and_bisect_history_in_plain_text_and_json(
                 "member_run_ids": ["land-follower"],
                 "gated_member_run_ids": [],
                 "dropped": [],
+                "attributed": [
+                    {
+                        "run_id": "land-follower",
+                        "units": ["tests/test_billing.py"],
+                    }
+                ],
                 "base_sha": "c" * 40,
                 "gating_head_sha": "d" * 40,
                 "started_at": "2026-08-30T12:00:23+00:00",
-                "finished_at": "2026-08-30T12:00:23+00:00",
+                "finished_at": "2026-08-30T12:00:24+00:00",
                 "gate_reused_from": None,
-                "gate_exit_status": None,
-                "outcome": "deduced-gate-failed",
+                "gate_exit_status": 5,
+                "outcome": "attributed-gate-failed",
                 "split": None,
                 "published_sha": None,
             },
@@ -582,7 +588,10 @@ def test_show_renders_batch_and_bisect_history_in_plain_text_and_json(
     assert "gate failed (exit 1) -> bisected 2 into 1 + 1" in rendered
     assert "reused full-receipt-1" in rendered
     assert f"published -> {'c' * 40}" in rendered
-    assert "gate skipped (deduced) · deduced gate-failed" in rendered
+    assert (
+        "attributed-gate-failed -> evicted #102 (land-follower) [tests/test_billing.py]"
+        in rendered
+    )
 
     as_json = StringIO()
     assert cli.run(_args("--json", "show", "land-follower"), out=as_json) == 0
