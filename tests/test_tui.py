@@ -1475,15 +1475,22 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
             {
                 **step1_running,
                 "finished_at": "2026-08-30T12:00:22+00:00",
-                "gate_exit_status": 1,
-                "outcome": "bisected",
-                "split": [1, 1],
+                "gate_exit_status": 5,
+                "outcome": "attributed-gate-failed",
+                "attributed": [
+                    {
+                        "run_id": "land-follow02",
+                        "units": ["tests/test_billing.py"],
+                    }
+                ],
+                "split": None,
             },
             {
                 "step": 2,
                 "member_run_ids": ["land-leader01"],
                 "gated_member_run_ids": ["land-leader01"],
                 "dropped": [],
+                "attributed": [],
                 "base_sha": "0" * 40,
                 "gating_head_sha": "b" * 40,
                 "started_at": "2026-08-30T12:00:23+00:00",
@@ -1499,6 +1506,7 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
                 "member_run_ids": ["land-follow02"],
                 "gated_member_run_ids": [],
                 "dropped": [],
+                "attributed": [],
                 "base_sha": "c" * 40,
                 "gating_head_sha": "d" * 40,
                 "started_at": "2026-08-30T12:00:29+00:00",
@@ -1553,7 +1561,10 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
         await _settled(pilot)
         modal_done = _screen_text(app)
         assert "Bisected: yes · Max batch (B): 4" in modal_done
-        assert "gate failed (exit 1) -> bisected 2 into 1 + 1" in modal_done
+        assert (
+            "attributed-gate-failed -> evicted #22 (land-follow02) [tests/test_billing.py]"
+            in modal_done
+        )
         assert f"published -> {'c' * 40}" in modal_done
         assert "gate skipped (deduced) · deduced gate-failed" in modal_done
 
