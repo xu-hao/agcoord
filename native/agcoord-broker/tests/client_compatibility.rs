@@ -301,7 +301,10 @@ fn python_public_commands_keep_the_protocol_five_json_contract() {
     ]);
     assert_success(&shown_plain, "native plain show");
     let plain_text = String::from_utf8_lossy(&shown_plain.stdout);
-    assert!(plain_text.contains(&format!("Run: {run_id}")), "{plain_text}");
+    assert!(
+        plain_text.contains(&format!("Run: {run_id}")),
+        "{plain_text}"
+    );
     assert!(plain_text.contains("Status: passed"), "{plain_text}");
 
     let log = python_cli(&[
