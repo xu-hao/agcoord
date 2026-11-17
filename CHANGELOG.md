@@ -5,6 +5,8 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.9.3 — 2026-11-17
+
 - Pass `AGCOORD_BATCH_ATTRIBUTION_FILE` to multi-PR batch gates, validate optional
   `agcoord-failure-attribution-v1` causal failure receipts, evict uniquely blamed batch members
   immediately before binary bisection (`attributed-gate-failed`), and surface attributed culprits
