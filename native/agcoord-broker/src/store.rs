@@ -441,9 +441,7 @@ impl BatchStepPayload {
                             "--step-json field dropped must contain objects",
                         ));
                     };
-                    if obj.len() != 2
-                        || !obj.contains_key("run_id")
-                        || !obj.contains_key("reason")
+                    if obj.len() != 2 || !obj.contains_key("run_id") || !obj.contains_key("reason")
                     {
                         return Err(AppError::usage(
                             "--step-json dropped items must have exact keys run_id and reason",
@@ -469,7 +467,7 @@ impl BatchStepPayload {
             _ => {
                 return Err(AppError::usage(
                     "--step-json field dropped must be an array or null",
-                ))
+                ));
             }
         };
         let gate_exit_status = match object.get("gate_exit_status") {
@@ -497,7 +495,7 @@ impl BatchStepPayload {
             _ => {
                 return Err(AppError::usage(
                     "--step-json field split must be a 2-element u64 array or null",
-                ))
+                ));
             }
         };
         let attributed = match object.get("attributed") {
@@ -510,10 +508,7 @@ impl BatchStepPayload {
                             "--step-json field attributed must contain objects",
                         ));
                     };
-                    if obj.len() != 2
-                        || !obj.contains_key("run_id")
-                        || !obj.contains_key("units")
-                    {
+                    if obj.len() != 2 || !obj.contains_key("run_id") || !obj.contains_key("units") {
                         return Err(AppError::usage(
                             "--step-json attributed items must have exact keys run_id and units",
                         ));
@@ -547,7 +542,7 @@ impl BatchStepPayload {
             _ => {
                 return Err(AppError::usage(
                     "--step-json field attributed must be an array or null",
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -4149,7 +4144,9 @@ fn load_batch_view(connection: &Connection, batch_id: i64) -> Result<(String, Va
              ORDER BY e.position",
         )
         .map_err(map_database_error)?;
-    let mut member_rows = member_stmt.query(params![batch_id]).map_err(map_database_error)?;
+    let mut member_rows = member_stmt
+        .query(params![batch_id])
+        .map_err(map_database_error)?;
     let mut members = Vec::new();
     while let Some(row) = member_rows.next().map_err(map_database_error)? {
         let position: i64 = row.get(0).map_err(map_database_error)?;
@@ -4205,7 +4202,9 @@ fn load_batch_view(connection: &Connection, batch_id: i64) -> Result<(String, Va
              ORDER BY step",
         )
         .map_err(map_database_error)?;
-    let mut step_rows = step_stmt.query(params![batch_id]).map_err(map_database_error)?;
+    let mut step_rows = step_stmt
+        .query(params![batch_id])
+        .map_err(map_database_error)?;
     let mut steps = Vec::new();
     while let Some(row) = step_rows.next().map_err(map_database_error)? {
         let step: i64 = row.get(0).map_err(map_database_error)?;
@@ -4229,8 +4228,11 @@ fn load_batch_view(connection: &Connection, batch_id: i64) -> Result<(String, Va
             parse_json(gated_ids_raw, &leader_run_id, "batch step gated members")?;
         let dropped: Vec<Value> =
             parse_json(dropped_raw, &leader_run_id, "batch step dropped members")?;
-        let attributed: Vec<Value> =
-            parse_json(attributed_raw, &leader_run_id, "batch step attributed failures")?;
+        let attributed: Vec<Value> = parse_json(
+            attributed_raw,
+            &leader_run_id,
+            "batch step attributed failures",
+        )?;
         let split = match (split_left, split_right) {
             (Some(l), Some(r)) => json!([l, r]),
             _ => Value::Null,
@@ -4284,11 +4286,12 @@ fn batch_for_run_cached(
     let Some(batch_id) = batch_id else {
         return Ok(Value::Null);
     };
-    if !cache.contains_key(&batch_id) {
-        let loaded = load_batch_view(connection, batch_id)?;
-        cache.insert(batch_id, loaded);
-    }
-    let (leader_run_id, base) = cache.get(&batch_id).unwrap();
+    let (leader_run_id, base) = match cache.entry(batch_id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(load_batch_view(connection, batch_id)?)
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+    };
     let mut payload = base.clone();
     payload["role"] = json!(if run.run_id == *leader_run_id {
         "leader"
@@ -4878,10 +4881,7 @@ pub fn record_batch_step(paths: &Paths, request: &BatchStepRequest) -> Result<Va
         }
     }
     if payload.outcome == "attributed-gate-failed"
-        && payload
-            .attributed
-            .as_ref()
-            .is_none_or(Vec::is_empty)
+        && payload.attributed.as_ref().is_none_or(Vec::is_empty)
     {
         return Err(AppError::new(
             "broker-batch-step-invalid",
@@ -5027,7 +5027,10 @@ pub fn record_batch_step(paths: &Paths, request: &BatchStepRequest) -> Result<Va
                 None => (None, None),
             };
             let dropped_update = payload.dropped.as_ref().map(|items| {
-                let values: Vec<Value> = items.iter().map(DroppedBatchMember::to_json_value).collect();
+                let values: Vec<Value> = items
+                    .iter()
+                    .map(DroppedBatchMember::to_json_value)
+                    .collect();
                 serde_json::to_string(&values).unwrap()
             });
             let attributed_update = payload.attributed.as_ref().map(|items| {
@@ -5175,8 +5178,7 @@ pub fn claim_batch(paths: &Paths, request: &BatchClaimRequest) -> Result<Value> 
             "batch target branch must be non-empty without NUL",
         ));
     }
-    let adaptive_max =
-        compute_adaptive_land_batch_size(paths, &connection, &leader.repository_id)?;
+    let adaptive_max = compute_adaptive_land_batch_size(paths, &connection, &leader.repository_id)?;
     let effective_max_batch_size = match request.max_batch_size {
         Some(explicit) => {
             if !(1..=MAX_LAND_MAX_BATCH_SIZE).contains(&explicit) || !explicit.is_power_of_two() {
@@ -5684,7 +5686,12 @@ pub fn reconcile_batch_on_leader_exit(
                 "UPDATE land_batch_entries
                  SET final_status = ?1, final_failure_reason = ?2
                  WHERE batch_id = ?3 AND member_run_id = ?4",
-                params![leader_status, leader_failure_reason, batch_id, leader.run_id],
+                params![
+                    leader_status,
+                    leader_failure_reason,
+                    batch_id,
+                    leader.run_id
+                ],
             )
             .map_err(map_database_error)?;
         let aborted_step_outcome = if leader.cancel_requested || leader_status == "cancelled" {
