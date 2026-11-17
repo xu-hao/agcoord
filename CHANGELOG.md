@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.9.4 — 2026-11-17
+
+- Fix `rustfmt` and `clippy::map-entry` CI checks in `agcoord-broker` and publish the coupled
+  AGCoord `0.9.4` PyPI distribution and native `x86_64-unknown-linux-musl` host bundle on GitHub
+  Releases, superseding the unpublished `v0.9.3` tag. #362 — fix rustfmt and clippy checks in
+  agcoord-broker.
+
 ## 0.9.3 — 2026-11-17
 
 - Pass `AGCOORD_BATCH_ATTRIBUTION_FILE` to multi-PR batch gates, validate optional
