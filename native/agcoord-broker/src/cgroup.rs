@@ -290,6 +290,10 @@ fn process_table() -> BTreeMap<u32, (u32, String)> {
     selected
 }
 
+/// A file a test creates in a fixture leaf to keep it populated, as a process that no kill
+/// can end would, until the test removes it.
+const FIXTURE_HELD: &str = ".agcoord-fixture-held";
+
 #[derive(Debug)]
 struct FixtureSystem {
     root: PathBuf,
@@ -298,6 +302,10 @@ struct FixtureSystem {
 }
 
 impl FixtureSystem {
+    fn held(path: &Path) -> bool {
+        path.join(FIXTURE_HELD).exists()
+    }
+
     fn new(root: &Path) -> CgroupResult<Self> {
         let controllers = ["cpu", "io", "memory", "pids"]
             .into_iter()
@@ -495,7 +503,7 @@ impl FixtureSystem {
         let deadline = Instant::now() + EMPTY_TIMEOUT;
         loop {
             let members = self.members(path)?;
-            if members.is_empty() {
+            if members.is_empty() && !Self::held(path) {
                 return Ok(());
             }
             for pid in members {
@@ -513,7 +521,7 @@ impl FixtureSystem {
     }
 
     fn remove_group(&self, path: &Path) -> CgroupResult<()> {
-        if !self.members(path)?.is_empty() {
+        if !self.members(path)?.is_empty() || Self::held(path) {
             return Err(CgroupError::new("leaf-populated"));
         }
         for entry in fs::read_dir(path).map_err(|_| CgroupError::new("cleanup-failed"))? {
@@ -706,7 +714,7 @@ impl CgroupSystem {
 
     fn populated(&self, path: &Path) -> CgroupResult<bool> {
         if let Self::Fixture(system) = self {
-            return Ok(!system.members(path)?.is_empty());
+            return Ok(!system.members(path)?.is_empty() || FixtureSystem::held(path));
         }
         let events = self.read_raw(path, "cgroup.events")?;
         events

@@ -9479,53 +9479,9 @@ fn a_victim_whose_leaf_is_not_reclaimed_ends_interrupted_with_its_receipt() {
     assert!(broker.terminate().success());
 }
 
-/// A running kernel thread with no children, which this test process cannot signal.  As a
-/// member of a fixture leaf it keeps that leaf populated through any kill.
-fn unkillable_childless_process() -> (u32, String) {
-    let table: Vec<(u32, u32, String)> = fs::read_dir("/proc")
-        .unwrap()
-        .filter_map(|entry| {
-            let pid = entry.ok()?.file_name().to_str()?.parse::<u32>().ok()?;
-            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            let fields: Vec<_> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
-            Some((
-                pid,
-                fields.get(1)?.parse().ok()?,
-                fields.first()?.to_string(),
-            ))
-        })
-        .collect();
-    table
-        .iter()
-        .filter(|(pid, parent, state)| {
-            *parent == 2
-                && !matches!(state.as_str(), "Z" | "X")
-                && !table.iter().any(|(_, other_parent, _)| other_parent == pid)
-                // SAFETY: signal 0 only checks whether this process may signal `pid`.
-                && unsafe { libc::kill(*pid as i32, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-        })
-        .map(|(pid, _, _)| (*pid, process_start_token(u64::from(*pid))))
-        .next()
-        .expect("this host exposes no childless kernel thread to keep a fixture leaf populated")
-}
-
-/// The fixture's membership record of one leaf: process ID to start token.
-fn leaf_members(leaf: &Path) -> Option<serde_json::Map<String, Value>> {
-    let text = fs::read_to_string(leaf.join(".agcoord-members.json")).ok()?;
-    serde_json::from_str::<Value>(&text)
-        .ok()?
-        .as_object()
-        .cloned()
-}
-
-/// Replace a leaf's membership record in one rename, so the broker never reads it half
-/// written.
-fn write_leaf_members(leaf: &Path, members: &serde_json::Map<String, Value>) {
-    let staged = leaf.join(".agcoord-test-members.json");
-    fs::write(&staged, serde_json::to_vec(members).unwrap()).unwrap();
-    fs::rename(&staged, leaf.join(".agcoord-members.json")).unwrap();
-}
+/// A file that keeps a fixture leaf populated, as a process that no kill can end would,
+/// until the test removes it.
+const FIXTURE_HELD: &str = ".agcoord-fixture-held";
 
 #[test]
 fn a_victim_whose_leaf_empties_after_its_cancel_gave_up_is_requeued() {
@@ -9576,23 +9532,10 @@ fn a_victim_whose_leaf_empties_after_its_cancel_gave_up_is_requeued() {
     wait_for(Duration::from_secs(10), || {
         attempts_started(&path("victim-starts")) == 1
     });
-    // The victim's leaf also lists a process that no kill can end, so the leaf stays
-    // populated after the victim's own processes are gone.
+    // The victim's leaf stays populated after its own processes are gone, as if it held a
+    // process that no kill can end.
     let leaf = only_cgroup_leaf(&root);
-    let (pid, token) = unkillable_childless_process();
-    let key = pid.to_string();
-    let listed = |leaf: &Path| leaf_members(leaf).is_some_and(|members| members.contains_key(&key));
-    wait_for(Duration::from_secs(10), || {
-        if !listed(&leaf) {
-            if let Some(mut members) = leaf_members(&leaf) {
-                members.insert(key.clone(), Value::String(token.clone()));
-                write_leaf_members(&leaf, &members);
-            }
-            return false;
-        }
-        thread::sleep(Duration::from_millis(200));
-        listed(&leaf)
-    });
+    fs::write(leaf.join(FIXTURE_HELD), "").unwrap();
 
     // The starving check preempts the victim.  The cancel kills the victim's processes but
     // gives up waiting for the leaf to empty.
@@ -9608,16 +9551,7 @@ fn a_victim_whose_leaf_empties_after_its_cancel_gave_up_is_requeued() {
             })
     });
     // Then the leaf empties, while the broker still waits for it to finish the attempt.
-    wait_for(Duration::from_secs(10), || {
-        if listed(&leaf) {
-            let mut members = leaf_members(&leaf).unwrap();
-            members.remove(&key);
-            write_leaf_members(&leaf, &members);
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
-        !listed(&leaf)
-    });
+    fs::remove_file(leaf.join(FIXTURE_HELD)).unwrap();
 
     // The attempt ended clean, so the victim is requeued like any other; the cancel that
     // gave up is recorded as an incident.
@@ -9668,7 +9602,13 @@ fn a_later_row_that_would_take_what_the_starving_row_needs_waits_while_victims_s
         let checkout = temporary.path().join("checkout");
         fs::create_dir(&checkout).unwrap();
         write_broker_config(&state, json!({"preempt_after": 0}));
-        let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4), ("memory", 8)]);
+        // The broker pauses right after it requests the preemption, so the later row is
+        // submitted while the victim certainly still holds its claim.
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 8), ("cpu", 4), ("memory", 8)],
+            &["--stop-after", "preemption-request"],
+        );
         let path = |name: &str| temporary.path().join(name);
         let _releases = ReleaseFiles(vec![
             path("holder-release"),
@@ -9711,10 +9651,10 @@ fn a_later_row_that_would_take_what_the_starving_row_needs_waits_while_victims_s
             attempts_started(&path("victim-starts")) == 1
         });
         fs::write(path("holder-release"), "release").unwrap();
-        wait_status(&state, "check-holder", "passed");
-        wait_for(Duration::from_secs(10), || {
-            status(&state, "check-victim")["cancel_requested"] == true
+        wait_for(Duration::from_secs(20), || {
+            process_state(u64::from(broker.pid())).as_deref() == Some("T")
         });
+        assert_eq!(status(&state, "check-victim")["cancel_requested"], true);
 
         // While the victim stops, a later row that claims no CPU but memory the starving
         // check will need waits: admitting it would leave the starving check unable to fit
@@ -9735,6 +9675,7 @@ fn a_later_row_that_would_take_what_the_starving_row_needs_waits_while_victims_s
             json!(["preemption:check-starving"]),
             "later kind {later}"
         );
+        signal_process(broker.pid(), "-CONT");
 
         // The victim is stopped once, and the starving check starts with the memory free.
         wait_for(Duration::from_secs(10), || {
@@ -9743,6 +9684,7 @@ fn a_later_row_that_would_take_what_the_starving_row_needs_waits_while_victims_s
         let requeued = status(&state, "check-victim");
         assert_eq!(requeued["status"], "queued");
         assert_eq!(requeued["attempts"], 2);
+        // The later row never ran beside the starving check's victim or before that check.
         let waiting = status(&state, "later-memory");
         assert_eq!(waiting["status"], "queued", "later kind {later}");
         assert_eq!(waiting["blocked_by"], json!(["resource:memory"]));
@@ -9812,11 +9754,14 @@ fn a_victim_that_ends_before_its_stop_is_delivered_keeps_only_a_passing_verdict(
             verdict_command(&path("victim-starts"), &path("victim-release"), exit),
             &[("cpu", 2)],
         );
-        let admitted = wait_status(&state, "check-victim", "running");
-        let worker_pid = u64::try_from(admitted["worker_pid"].as_i64().unwrap()).unwrap();
-        wait_for(Duration::from_secs(10), || {
+        // The worker's identity is committed after the row starts running, so wait for it.
+        wait_for(Duration::from_secs(20), || {
             attempts_started(&path("victim-starts")) == 1
+                && status(&state, "check-victim")["worker_pid"].is_number()
         });
+        let worker_pid = status(&state, "check-victim")["worker_pid"]
+            .as_u64()
+            .unwrap();
 
         // The holder leaves, the starving check asks the victim to stop, and the owner
         // pauses.
@@ -9886,7 +9831,7 @@ fn a_requeued_check_waits_preempt_after_again_before_it_preempts() {
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
-    let preempt_after = 4.0;
+    let preempt_after = 6.0;
     write_broker_config(&state, json!({"preempt_after": preempt_after}));
     let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4), ("gpu", 4)]);
     let path = |name: &str| temporary.path().join(name);
