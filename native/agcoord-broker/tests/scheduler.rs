@@ -9147,6 +9147,119 @@ fn a_replacement_owner_completes_a_requested_preemption() {
 }
 
 #[test]
+fn a_preempted_check_under_a_cgroup_binding_is_reclaimed_and_prepared_again() {
+    let temporary = TestDirectory::new("preempt-cgroup");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    write_broker_config(
+        &state,
+        json!({
+            "bindings": {
+                "cgroup_slot": {
+                    "backend": "cgroup-v2",
+                    "kind": "generic",
+                    "mode": "required",
+                    "unit": "admission-unit",
+                }
+            },
+            "cgroup_root": root,
+        }),
+    );
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 8), ("cpu", 4), ("cgroup_slot", 8)],
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let path = |name: &str| temporary.path().join(name);
+    let _releases = ReleaseFiles(vec![
+        path("holder-release"),
+        path("starving-release"),
+        path("victim-release"),
+    ]);
+    // Every row claims the bound resource, so each runs in its own coordinator-owned leaf.
+    submit_check(
+        &state,
+        &checkout,
+        "check-holder",
+        "repo-a",
+        attempt_command(&path("holder-starts"), &path("holder-release")),
+        &[("cpu", 2), ("cgroup_slot", 1)],
+    );
+    wait_status(&state, "check-holder", "running");
+    submit_check(
+        &state,
+        &checkout,
+        "check-starving",
+        "repo-a",
+        attempt_command(&path("starving-starts"), &path("starving-release")),
+        &[("cpu", 4), ("cgroup_slot", 1)],
+    );
+    submit_check(
+        &state,
+        &checkout,
+        "check-victim",
+        "repo-b",
+        attempt_command(&path("victim-starts"), &path("victim-release")),
+        &[("cpu", 2), ("cgroup_slot", 1)],
+    );
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("victim-starts")) == 1
+    });
+    assert_ne!(
+        status(&state, "check-victim")["resource_receipt"]["events"],
+        json!([]),
+        "the first attempt runs under the enforced binding"
+    );
+
+    // The holder leaves and the starving check preempts.  The victim's leaf is killed and
+    // removed like a cancelled job's, and the row waits again with a fresh receipt.
+    fs::write(path("holder-release"), "release").unwrap();
+    wait_status(&state, "check-holder", "passed");
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("starving-starts")) == 1
+    });
+    let requeued = status(&state, "check-victim");
+    assert_eq!(requeued["status"], "queued");
+    assert_eq!(requeued["attempts"], 2);
+    assert_eq!(requeued["preempted_by"], "check-starving");
+    assert_eq!(
+        requeued["resource_receipt"],
+        json!({
+            "requested": {"cgroup_slot": 1, "cpu": 2, "jobs": 1},
+            "applied": {},
+            "peak": {},
+            "events": [],
+        })
+    );
+
+    // Its next attempt is prepared and enforced again from nothing, and its receipt
+    // describes that attempt alone.
+    fs::write(path("starving-release"), "release").unwrap();
+    wait_status(&state, "check-starving", "passed");
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("victim-starts")) == 2
+    });
+    fs::write(path("victim-release"), "release").unwrap();
+    let finished = wait_status(&state, "check-victim", "passed");
+    assert_eq!(finished["attempts"], 2);
+    let codes: Vec<_> = finished["resource_receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"cleaned"), "{codes:?}");
+    assert!(!codes.contains(&"cancelled"), "{codes:?}");
+    // No leaf of either attempt is left behind.
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    assert!(broker.terminate().success());
+}
+
+#[test]
 fn an_eligible_row_overflows_to_a_pool_after_its_wait_threshold() {
     let temporary = TestDirectory::new("overflow-placement");
     let state = temporary.path().join("state");

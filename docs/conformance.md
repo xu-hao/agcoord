@@ -26,8 +26,9 @@ that minimally cover its shortage once it has waited `preempt_after`, or at once
 land, and they are requeued at their original sequence. Lands, fulls, merges, opted-out checks,
 and checks already preempted twice are never stopped; a repository-blocked or overflow-only row
 preempts nothing; an overflow pool with room is used first; a caller's cancellation wins; a
-victim that does not stop keeps its claim while its preemption is abandoned; and a replacement
-owner completes a requested preemption.
+victim that does not stop keeps its claim while its preemption is abandoned; a replacement
+owner completes a requested preemption; and a victim under an enforced binding is reclaimed and
+prepared again for its next attempt.
 
 Repository coverage also proves reusable coordinator-owned exact-head gate trees, stable
 logical worktree identity, same-branch serialization, warm artifact retention, and setup
