@@ -59,13 +59,25 @@ cannot make the selected broker abandon startup. A lock held through that bounde
 still a live-owner conflict and returns `broker-already-owned`; the retry never permits two
 owners or weakens the exclusive lock.
 
-### Why the durable spool remains the client protocol
+### Why the durable spool remains the client protocol, and the optional owner socket
 
 Restricted agent sessions may refuse local socket creation, while SQLite transactions in a
 user-owned directory already support concurrent terminals, crash-safe submission, and offline
-inspection. Protocol 5 therefore remains a filesystem protocol rather than adding a required
-Unix socket. The database file and state directory are mode `0600` and `0700` respectively and
-must be owned by the broker account.
+inspection. Protocol 5 therefore remains the durable filesystem protocol, while a live broker also
+binds an owner-only `AF_UNIX` `SOCK_SEQPACKET` listener at `broker.sock` (mode `0600`) inside the
+private `0700` state directory:
+
+- Every socket request carries a 4-byte big-endian length prefix and JSON envelope with `"wire": 1`,
+  `"command"`, and `"arguments"` whose `--state-dir` must match the listening broker's directory.
+- The broker verifies `SO_PEERCRED` owner UID match (`broker-socket-unauthorized` otherwise),
+  replaces stale socket inodes while refusing non-socket obstructions (`broker-socket-failed`),
+  dispatches the same command handlers as CLI invocations with exact refusal parity, and wakes the
+  scheduler loop immediately from `poll` on incoming connections.
+- When `broker.sock` is present in the state directory, Python clients try the socket first
+  (keeping `identity --json` keys unchanged for `0.9.x` worker-environment compatibility) and fall
+  back to subprocess invocation when the socket is absent, unreachable, or reports
+  `broker-wire-unsupported`. The database file and state directory are mode `0600` and `0700`
+  respectively and must be owned by the broker account.
 
 The state directory is not a boundary between mutually hostile processes with the same UID.
 Any same-UID process that can write the spool is inside the coordinator trust domain. The native

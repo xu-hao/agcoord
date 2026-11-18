@@ -512,6 +512,18 @@
           "host_recovery::malformed_original_drain_cannot_be_read_or_reused_as_a_recovery_guard"
         ]
       }
+    },
+    {
+      "id": "ipc.owner-unix-socket",
+      "domain": "protocol",
+      "description": "A live broker serves its command set over an owner-only SOCK_SEQPACKET Unix socket with CLI refusal parity, recovers stale socket inodes, refuses obstructions, and wakes the scheduler immediately on socket submissions.",
+      "tests": {
+        "rust_native": [
+          "scheduler::socket_serves_commands_with_refusal_parity_and_owner_only_permissions",
+          "scheduler::socket_recovers_stale_socket_and_refuses_obstruction",
+          "scheduler::socket_submit_wakes_scheduler_and_completes_run"
+        ]
+      }
     }
   ],
   "intentional_differences": [
