@@ -19,9 +19,15 @@ unrelated process kill, or unverified enforcement claim.
 Resource coverage proves the zero-scratch default at the worker boundary — the broker removes
 caller temporary-directory variables and creates no managed run scratch path unless a provider is
 declared — and that a worker under a declared scratch policy still verifies its admission.
-It also proves machine-wide front-row reservations across row kinds, backfilling into spare
-unreserved capacity, exclusion of repository-blocked and oversized overflow-only rows from
-reservation, and overflow placement of reservation-blocked work after the pool threshold.
+It also proves first-fit admission in submission order across repositories and row kinds,
+with no capacity reserved for a waiting row, and the bounded preemption that keeps such a row
+from starving. The oldest row that lacks only local capacity stops the youngest later checks
+that minimally cover its shortage once it has waited `preempt_after`, or at once when it is a
+land, and they are requeued at their original sequence. Lands, fulls, merges, opted-out checks,
+and checks already preempted twice are never stopped; a repository-blocked or overflow-only row
+preempts nothing; an overflow pool with room is used first; a caller's cancellation wins; a
+victim that does not stop keeps its claim while its preemption is abandoned; and a replacement
+owner completes a requested preemption.
 
 Repository coverage also proves reusable coordinator-owned exact-head gate trees, stable
 logical worktree identity, same-branch serialization, warm artifact retention, and setup

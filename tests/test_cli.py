@@ -664,6 +664,77 @@ def test_run_allows_overflow_only_when_the_submitter_asks(fake_client, tmp_path:
     assert fake_client["submitted"][-1][1]["overflow"] is True
 
 
+def test_no_preempt_is_a_check_option_that_reaches_the_client(fake_client, tmp_path: Path):
+    cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=StringIO())
+    assert fake_client["submitted"][-1][1]["preempt"] is True
+
+    cli.run(
+        _args("run", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
+        out=StringIO(),
+    )
+    assert fake_client["submitted"][-1][1]["preempt"] is False
+
+    # A full gate or a land is never preempted, so neither command offers the option.
+    cli.run(_args("full", "--checkout", str(tmp_path), "--", "true"), out=StringIO())
+    assert fake_client["submitted"][-1][1]["preempt"] is True
+    for command in (
+        ("full", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
+        ("land", "7", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
+    ):
+        with pytest.raises(SystemExit) as refused:
+            _args(*command)
+        assert refused.value.code == 2
+
+
+def test_show_reports_attempts_and_the_preempting_run(fake_client, monkeypatch):
+    rows = {
+        "check-first-attempt": _row("check-first-attempt", "running", "check", "untouched"),
+        "check-requeued": {
+            **_row("check-requeued", "queued", "check", "preempted"),
+            "attempts": 2,
+            "preempted_by": "land-older",
+        },
+        "check-stopping": {
+            **_row("check-stopping", "running", "check", "being preempted"),
+            "cancel_requested": True,
+            "failure_reason": "preempted",
+            "attempts": 1,
+            "preempted_by": "land-older",
+        },
+        "check-cancelling": {
+            **_row("check-cancelling", "running", "check", "being cancelled"),
+            "cancel_requested": True,
+            "attempts": 2,
+            "preempted_by": "land-older",
+        },
+    }
+    client_type = cli.CoordinatorClient
+    monkeypatch.setattr(client_type, "status", lambda _self, run_id: rows[run_id])
+
+    def shown(run_id: str) -> str:
+        output = StringIO()
+        assert cli.run(_args("show", run_id), out=output) == 0
+        return output.getvalue()
+
+    untouched = shown("check-first-attempt")
+    assert "Status: running\n" in untouched
+    assert "Attempts: 1 · Preempted by: —" in untouched
+
+    requeued = shown("check-requeued")
+    assert "Status: queued\n" in requeued
+    assert "Attempts: 2 · Preempted by: land-older" in requeued
+
+    # A stop that a preemption requested is not presented as a cancellation.
+    stopping = shown("check-stopping")
+    assert "Status: running · preemption requested by land-older\n" in stopping
+    assert "cancellation requested" not in stopping
+
+    # A caller's cancellation of a check that was preempted earlier still is one.
+    cancelling = shown("check-cancelling")
+    assert "Status: running · cancellation requested\n" in cancelling
+    assert "Attempts: 2 · Preempted by: land-older" in cancelling
+
+
 @pytest.mark.parametrize("kind", ["run", "full"])
 def test_inline_script_file_becomes_portable_shell_command(fake_client, tmp_path, kind):
     script = tmp_path / "check.sh"
@@ -1606,6 +1677,69 @@ def test_follow_backs_off_while_queued_and_streams_promptly_once_admitted(
     )
     assert [seconds for status, seconds in sleeps if status == "running"] == pytest.approx([0.1, 0.1])
     assert logged == ["running", "running", "passed"]
+
+
+def test_follow_prints_a_preemption_notice_and_returns_the_final_attempt(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from agcoord import queue as queue_module
+
+    notice = (
+        "AGCoord: preempted by check-older at 2026-08-30T12:00:02.000Z, attempt 1; "
+        "requeued at its original position as attempt 2\n"
+    )
+    transcript = "first attempt\n" + notice + "second attempt\n"
+    # What the log holds at each status poll: the stopped attempt's output is still
+    # growing when the row is first seen queued again.
+    polls = [
+        ("running", len("first att")),
+        ("queued", len("first attempt\n" + notice)),
+        ("queued", len("first attempt\n" + notice)),
+        ("running", len(transcript)),
+        ("failed", len(transcript)),
+    ]
+    state = {"poll": 0}
+
+    class PreemptedClient:
+        def __init__(self, **_options):
+            pass
+
+        def submit(self, _command, **_metadata):
+            return "check-preempted"
+
+        def status(self, run_id):
+            state["poll"] += 1
+            status, _visible = polls[state["poll"] - 1]
+            row = _row(run_id, status, "check", "preempted")
+            if status == "failed":
+                row["exit_status"] = 7
+            return row
+
+        def log(self, run_id, *, offset=0):
+            _status, visible = polls[state["poll"] - 1]
+            return {
+                "run_id": run_id,
+                "offset": offset,
+                "next_offset": visible,
+                "text": transcript[offset:visible],
+                "eof": True,
+            }
+
+    monkeypatch.setattr(cli, "CoordinatorClient", PreemptedClient)
+    monkeypatch.setattr(queue_module.time, "sleep", lambda _seconds: None)
+
+    output = StringIO()
+    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=output) == 7
+    assert output.getvalue() == (
+        "AGCoord: accepted check-preempted\n"
+        "Gate queue: check-preempted running as pid 5100 in /worktrees/example\n"
+        "first attempt\n"
+        + notice
+        + "Gate queue: check-preempted waiting at position 1 for branch feature/example\n"
+        "Gate queue: check-preempted running as pid 5100 in /worktrees/example\n"
+        "second attempt\n"
+    )
 
 
 def test_json_wait_backs_off_to_one_second_polls_until_the_final_row(

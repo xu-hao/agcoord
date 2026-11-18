@@ -75,6 +75,7 @@ CHILD_LEASE_POLL_SECONDS = 0.05
 CHILD_LEASE_MAX_BYPASSES = 1
 LAND_TARGET_SYNC_ENV = "_AGCOORD_LAND_TARGET_SYNC"
 OVERFLOW_ENV = "_AGCOORD_OVERFLOW"
+NO_PREEMPT_ENV = "_AGCOORD_NO_PREEMPT"
 CAPABILITIES_ENV = "_AGCOORD_CAPABILITIES"
 RUNTIMES_ENV = "_AGCOORD_RUNTIMES"
 LOCAL_RUNTIME = "local"
@@ -1688,8 +1689,16 @@ class CoordinatorClient:
         overflow: bool | None = None,
         require_capabilities: Sequence[str] | None = None,
         runtimes: Sequence[str] | None = None,
+        preempt: bool = True,
     ) -> str:
+        """Submit a check or a full gate and return its run ID.
+
+        ``preempt=False`` opts a check out of preemption: the broker then never stops it
+        to let an older starving row start. A full gate is never preempted either way.
+        """
         selected_command = _validate_command(command)
+        if not isinstance(preempt, bool):
+            raise CoordinatorError("preempt must be boolean")
         if kind not in RUN_KINDS:
             raise CoordinatorError(
                 "kind must be exactly 'check', 'full', 'merge', or 'land'"
@@ -1732,6 +1741,7 @@ class CoordinatorClient:
             overflow=overflow,
             require_capabilities=selected_capabilities,
             runtimes=selected_runtimes,
+            preempt=preempt,
         )
 
     def _prepare_submission(
@@ -1792,6 +1802,7 @@ class CoordinatorClient:
         overflow: bool | None = None,
         require_capabilities: Sequence[str] = (),
         runtimes: Sequence[str] = (),
+        preempt: bool = True,
     ) -> str:
         environment, effective_overflow = _placement_environment(
             prepared.environment,
@@ -1801,6 +1812,10 @@ class CoordinatorClient:
             require_capabilities=require_capabilities,
             runtimes=runtimes,
         )
+        if NO_PREEMPT_ENV in environment:
+            raise CoordinatorError(f"gate environment uses the reserved {NO_PREEMPT_ENV} name")
+        if kind == "check" and not preempt:
+            environment[NO_PREEMPT_ENV] = "1"
         run_id = f"{kind}-{uuid4().hex[:12]}"
         arguments = self._native_submission_arguments(
             run_id=run_id,
@@ -3142,7 +3157,8 @@ def follow(
     Returns the job's exit status, 70 when a terminal row carries none, 130 when the
     caller interrupted the stream and cancellation was requested, and 75 when this client
     lost contact with the coordinator after acceptance; in that last case the job continues
-    and no verdict is claimed.
+    and no verdict is claimed. A check that is preempted and requeued keeps being followed,
+    so the status returned is that of its final attempt.
     """
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
@@ -3156,6 +3172,19 @@ def follow(
             status = row["status"]
             if status != previous_status:
                 interval = FOLLOW_POLL_SECONDS
+                if status == "queued" and previous_status == "running":
+                    # A preempted job returns to the queue. The rest of its stopped
+                    # attempt's output and the preemption notice are printed before the
+                    # caller is told that it waits again.
+                    while True:
+                        page = _following_call(
+                            lambda: client.log(run_id, offset=offset), run_id, retry
+                        )
+                        if page["text"]:
+                            print(page["text"], end="", file=out, flush=True)
+                        offset = page["next_offset"]
+                        if page["eof"]:
+                            break
                 if status == "queued":
                     print(
                         f"Gate queue: {run_id} waiting at position {row['position']} "

@@ -26,8 +26,9 @@ Exact rules: [machine state and ownership](coordinator.md#machine-state-and-owne
 
 ## Jobs: check, full, and land
 
-A job is one command, run once, from one checkout, with one stable ID, one durable row, and
-one combined log. There are three kinds.
+A job is one command from one checkout, with one stable ID, one durable row, and one combined
+log. It runs once, except that a check may be preempted and started again. There are three
+kinds.
 
 | Kind | You give it | It promises | Barrier? |
 | --- | --- | --- | --- |
@@ -68,6 +69,15 @@ A job *claims* resources with `--resource name=units`, and every job implicitly 
 the machine hands out. Admission is arithmetic: a job starts when, for every name it claims,
 the units already held plus its own fit under the capacity. A name with no capacity is refused
 at submission, and so is a claim larger than the capacity, because neither could ever run.
+
+Jobs are admitted *first fit* in submission order: whatever fits starts, and nothing is held
+back for a job that does not fit yet. So that such a job cannot wait forever behind later,
+smaller ones, the oldest job that lacks only capacity may *preempt* later checks once it has
+waited `preempt_after`, and a land may do so at once. The youngest of those checks are stopped
+like cancelled jobs and requeued at their original place, and their callers keep waiting for
+the final attempt. A full, a land, a check submitted with `--no-preempt`, and a check that was
+already preempted twice are never stopped.
+Exact rules: [first-fit admission and bounded preemption](coordinator.md#first-fit-admission-and-bounded-preemption).
 
 An *overflow pool* is extra capacity somewhere else: another machine you own, or one a cloud
 provider creates for a single run. A job submitted with `--overflow` that has waited longer than
@@ -122,8 +132,8 @@ Exact rules: [durable job shape](coordinator.md#durable-job-shape).
 
 ```text
                          queued ──────────────► cancelled
-                           │
-                           ▼
+                           │  ▲
+                           ▼  │  a preempted check waits again
                         running ─────► passed | failed | cancelled | interrupted
 
   a land's phases inside "running":
@@ -139,7 +149,9 @@ exactly one of four terminal states. `passed` and `failed` carry the command's v
 row becomes terminal. `interrupted` means the coordinator claims no verdict: the worker vanished
 before it could report (`worker-result-lost`), or a stopping broker ended the job after its
 stop grace (`broker-stopped`). A graceful broker stop first lets running jobs finish. Terminal rows are immutable
-history until `agc clear` removes them while the queue is idle.
+history until `agc clear` removes them while the queue is idle. A check that is preempted is
+not terminal: it returns to `queued` at its original place, and `attempts` on its row says
+which attempt it is on.
 
 A `land` moves through named phases inside `running`. *Preflight* checks the pull request,
 the head, and the target, and merges an advanced target into the branch with an exact lease.

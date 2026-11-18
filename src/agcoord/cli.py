@@ -154,8 +154,14 @@ def _format_run_show(row: dict) -> str:
     else:
         pool = "—"
     status_line = str(row["status"])
+    preempted_by = row.get("preempted_by")
     if row.get("cancel_requested"):
-        status_line += " · cancellation requested"
+        # A running check that a preemption is stopping is requeued, not cancelled.
+        status_line += (
+            f" · preemption requested by {preempted_by or '—'}"
+            if row["status"] == "running" and row.get("failure_reason") == "preempted"
+            else " · cancellation requested"
+        )
     resources = ", ".join(
         f"{name}={units}" for name, units in row["resources"].items()
     )
@@ -188,6 +194,9 @@ def _format_run_show(row: dict) -> str:
     ]
     if row.get("position") is not None:
         lines.append(f"Position: {row['position']}")
+    lines.append(
+        f"Attempts: {row.get('attempts', 1)} · Preempted by: {preempted_by or '—'}"
+    )
     gate_exit = (
         row["gate_exit_status"] if row.get("gate_exit_status") is not None else "—"
     )
@@ -427,6 +436,16 @@ def build_parser() -> argparse.ArgumentParser:
             help="repeatable machine resource claim",
         )
         overflow_options(command)
+        if name == "run":
+            command.add_argument(
+                "--no-preempt",
+                dest="preempt",
+                action="store_false",
+                help=(
+                    "never stop this check to let an older starving job start "
+                    "(by default it may be stopped and requeued, at most twice)"
+                ),
+            )
         command.add_argument(
             "--script",
             metavar="FILE",
@@ -879,6 +898,7 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
             overflow=args.overflow,
             require_capabilities=selected_capabilities,
             runtimes=selected_runtimes,
+            preempt=getattr(args, "preempt", True),
         )
 
     if emit:

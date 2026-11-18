@@ -115,6 +115,13 @@ def test_native_broker_configuration_is_strict_and_defaults_to_host_package():
         with pytest.raises(BrokerConfigError, match="stop_grace"):
             parse_broker_config(json.dumps({"stop_grace": invalid}))
 
+    assert parse_broker_config(json.dumps({})).preempt_after is None
+    assert parse_broker_config(json.dumps({"preempt_after": 0})).preempt_after == 0
+    assert parse_broker_config(json.dumps({"preempt_after": 300})).preempt_after == 300
+    for invalid in (-1, "300", True, float("inf")):
+        with pytest.raises(BrokerConfigError, match="preempt_after"):
+            parse_broker_config(json.dumps({"preempt_after": invalid}))
+
     assert parse_broker_config(json.dumps({})).land_max_batch_size is None
     assert parse_broker_config(json.dumps({"land_max_batch_size": 1})).land_max_batch_size == 1
     assert parse_broker_config(json.dumps({"land_max_batch_size": 8})).land_max_batch_size == 8

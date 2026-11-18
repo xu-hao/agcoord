@@ -5,6 +5,7 @@ mod gate_tree;
 mod host;
 mod overflow;
 mod platform;
+mod preempt;
 mod project_quota;
 mod recovery;
 mod resources;
@@ -457,6 +458,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                         | "worker-release"
                         | "terminal-commit"
                         | "worker-cleanup"
+                        | "preemption-request"
                 ) {
                     return Err(AppError::usage("unknown broker crash point"));
                 }
