@@ -1238,6 +1238,8 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
 
 
 def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: Path):
+    # The large check may preempt at once rather than after the five-minute default.
+    _preempt_at_once(tmp_path / "state")
     running = RunningCoordinator(
         tmp_path / "state",
         capacities={"jobs": 4, "cpu": 3},
@@ -1345,6 +1347,8 @@ def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: P
 
 def test_a_preempted_check_caller_keeps_waiting_and_gets_the_final_attempt(tmp_path: Path):
     state = tmp_path / "state"
+    # The starving check may preempt at once rather than after the five-minute default.
+    _preempt_at_once(state)
     running = RunningCoordinator(state, capacities={"jobs": 4, "cpu": 4})
     client = running.start()
     repository = _repository(tmp_path / "repository")
@@ -1451,6 +1455,8 @@ while True:
 def test_a_check_submitted_without_preemption_is_never_stopped_for_a_starving_row(
     tmp_path: Path,
 ):
+    # The starving check may preempt at once, so only the opt-out keeps the later check.
+    _preempt_at_once(tmp_path / "state")
     running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 4, "cpu": 4})
     client = running.start()
     repository = _repository(tmp_path / "repository")
@@ -3318,6 +3324,12 @@ def test_land_without_the_opt_in_never_consults_a_full_receipt(
 
     assert _executions(ledger) == ["shared", "shared"]
     assert row["gate_run_id"] is None
+
+
+def _preempt_at_once(state_dir: Path) -> None:
+    """Configure a coordinator, before it starts, so a starving row preempts at once."""
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state_dir / "config.json").write_text(json.dumps({"preempt_after": 0}), encoding="utf-8")
 
 
 def _reuse_coordinator(state_dir: Path, max_age: float) -> RunningCoordinator:

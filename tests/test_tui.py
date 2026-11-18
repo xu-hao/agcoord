@@ -304,6 +304,9 @@ async def test_a_preempted_check_is_visible_in_public_views(tmp_path: Path, surf
         check=True,
     )
     state = tmp_path / "state"
+    # The starving check may preempt at once rather than after the five-minute default.
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state / "config.json").write_text(json.dumps({"preempt_after": 0}), encoding="utf-8")
     running = RunningCoordinator(state, capacities={"jobs": 24, "cpu": 4})
     client = running.start()
     releases = {name: tmp_path / f"{name}-release" for name in ("holder", "starving", "later")}
