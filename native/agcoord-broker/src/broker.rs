@@ -2616,7 +2616,7 @@ impl Broker {
             environment.remove(name);
         }
         if let Some(tmpfs) = &worker_setup.tmpfs {
-            let target = tmpfs.target.to_string_lossy().into_owned();
+            let target = tmpfs.tmpdir().to_string_lossy().into_owned();
             environment.insert("TMPDIR".to_owned(), target.clone());
             environment.insert("TMP".to_owned(), target.clone());
             environment.insert("TEMP".to_owned(), target);

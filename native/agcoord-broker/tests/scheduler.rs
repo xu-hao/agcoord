@@ -5197,6 +5197,97 @@ fn cgroup_fixture_provisions_private_tmpfs_and_retains_usage_receipt() {
 }
 
 #[test]
+fn cgroup_tmpfs_scratch_path_supports_unix_domain_sockets() {
+    let temporary = TestDirectory::new("cgroup-tmpfs-socket");
+    let state = temporary
+        .path()
+        .join("home/example-user/.local/state/agcoord");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    let report = temporary.path().join("observed.json");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&json!({
+            "bindings": {
+                "ram": {"backend":"cgroup-v2", "kind":"memory", "mode":"required", "unit":"bytes"},
+                "scratch": {"backend":"cgroup-v2", "kind":"tmpfs", "mode":"required", "unit":"bytes"},
+                "scratch_inodes": {"backend":"cgroup-v2", "kind":"inodes", "mode":"required", "unit":"inodes"}
+            },
+            "cgroup_root": root,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capacities = [
+        ("jobs", 1),
+        ("ram", 256 * 1024 * 1024),
+        ("scratch", 64 * 1024 * 1024),
+        ("scratch_inodes", 256),
+    ];
+    let requested = [
+        ("ram", 64 * 1024 * 1024),
+        ("scratch", 16 * 1024 * 1024),
+        ("scratch_inodes", 128),
+    ];
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &capacities,
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let script = r#"
+import json, os, pathlib, socket, sys
+tmpdir = pathlib.Path(os.environ['TMPDIR'])
+assert os.environ['TMPDIR'] == os.environ['TMP'] == os.environ['TEMP']
+sock_path = tmpdir / 'plugin1234567890123456'
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    sock.bind(str(sock_path))
+finally:
+    sock.close()
+(tmpdir / 'payload').write_bytes(b'x' * 8192)
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    'tmpdir': str(tmpdir),
+    'resolved': str(tmpdir.resolve()),
+    'socket': str(sock_path),
+}), encoding='ascii')
+"#;
+    let submission = Submission {
+        run_id: "cgroup-tmpfs-unix-socket",
+        kind: "check",
+        repository: "repo-a",
+        checkout: &checkout,
+        command: vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            report.to_string_lossy().into_owned(),
+        ],
+        gate_run_id: None,
+    };
+    assert!(
+        submit_with_resources(&state, &submission, &requested)
+            .status
+            .success()
+    );
+    let passed = wait_status(&state, submission.run_id, "passed");
+    assert!(
+        passed["resource_receipt"]["peak"]["scratch"]
+            .as_u64()
+            .unwrap()
+            >= 8192
+    );
+    let observed: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let tmpdir = PathBuf::from(observed["tmpdir"].as_str().unwrap());
+    let resolved = PathBuf::from(observed["resolved"].as_str().unwrap());
+    assert!(fs::symlink_metadata(&tmpdir).is_err());
+    assert!(!resolved.exists());
+    assert!(broker.terminate().success());
+}
+
+#[test]
 fn cgroup_tmpfs_mount_failure_obeys_required_or_no_scratch_mode() {
     let temporary = TestDirectory::new("cgroup-tmpfs-worker-failure");
     let checkout = temporary.path().join("checkout");
@@ -5425,7 +5516,7 @@ from pathlib import Path
 import sys
 import time
 
-target = Path(os.environ['TMPDIR'])
+target = Path(os.environ['TMPDIR']).resolve()
 mount = None
 for line in Path('/proc/self/mountinfo').read_text(encoding='ascii').splitlines():
     left, separator, right = line.partition(' - ')
@@ -7759,7 +7850,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-target = Path(os.environ['TMPDIR'])
+target = Path(os.environ['TMPDIR']).resolve()
 options = None
 for line in Path('/proc/self/mountinfo').read_text(encoding='ascii').splitlines():
     left, separator, right = line.partition(' - ')

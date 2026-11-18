@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 const CPU_PERIOD_USEC: u64 = 100_000;
 const EMPTY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DIRECT_TMPDIR_BYTES: usize = 48;
+const SCRATCH_ALIAS_ATTEMPTS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct CgroupError {
@@ -133,6 +135,7 @@ struct TmpfsPolicy {
 #[derive(Clone, Debug)]
 pub struct TmpfsSetup {
     pub target: PathBuf,
+    pub alias: Option<PathBuf>,
     pub size: u64,
     pub inodes: u64,
     pub report: PathBuf,
@@ -140,6 +143,13 @@ pub struct TmpfsSetup {
     pub emulate: bool,
     /// The binding's operator-set `exec` (#177): mount without `noexec`.
     pub exec: bool,
+}
+
+impl TmpfsSetup {
+    /// Returns the shortest AGCoord-owned path that reaches the scratch directory.
+    pub fn tmpdir(&self) -> &Path {
+        self.alias.as_deref().unwrap_or(&self.target)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1695,6 +1705,13 @@ impl CgroupBackend {
         ))
     }
 
+    fn tmpfs_alias_path(&self, run_id: &str) -> PathBuf {
+        self.metadata_dir.join(format!(
+            "tmpfs-alias-{}.json",
+            sha256_prefix(run_id.as_bytes(), 16)
+        ))
+    }
+
     fn tmpfs_target_path(&self, run_id: &str, handle: &Value) -> CgroupResult<PathBuf> {
         let token = handle
             .get("token")
@@ -2660,6 +2677,7 @@ impl CgroupBackend {
             Err(error) => return Err(error),
             Ok(_) => return Err(CgroupError::new("root-not-reused")),
         }
+        self.cleanup_all_tmpfs_aliases();
         let abandoned = self
             .metadata_dir
             .with_file_name(format!("cgroup-v2-reused-{}", random_hex(16)?));
@@ -2673,6 +2691,119 @@ impl CgroupBackend {
         // scratch permissions must not put the broker back into a startup loop.
         let _ = fs::remove_dir_all(abandoned);
         Ok(())
+    }
+
+    fn short_alias_directory(target: &Path) -> Option<PathBuf> {
+        let euid = unsafe { libc::geteuid() };
+        let runtime_dir = PathBuf::from(format!("/run/user/{euid}"));
+        if let Ok(details) = fs::symlink_metadata(&runtime_dir)
+            && !details.file_type().is_symlink()
+            && details.file_type().is_dir()
+            && details.uid() == euid
+            && details.mode() & 0o077 == 0
+            && runtime_dir.as_os_str().len() + "/agc-00000000".len() <= MAX_DIRECT_TMPDIR_BYTES
+            && runtime_dir.as_os_str().len() + "/agc-00000000".len() < target.as_os_str().len()
+        {
+            return Some(runtime_dir);
+        }
+        let temp_dir = PathBuf::from("/tmp");
+        if let Ok(details) = fs::symlink_metadata(&temp_dir)
+            && !details.file_type().is_symlink()
+            && details.file_type().is_dir()
+            && temp_dir.as_os_str().len() + "/agc-00000000".len() < target.as_os_str().len()
+        {
+            return Some(temp_dir);
+        }
+        None
+    }
+
+    fn create_tmpfs_alias(&self, run_id: &str, target: &Path) -> CgroupResult<Option<PathBuf>> {
+        if target.as_os_str().len() <= MAX_DIRECT_TMPDIR_BYTES {
+            return Ok(None);
+        }
+        let Some(base) = Self::short_alias_directory(target) else {
+            return Ok(None);
+        };
+        let record_path = self.tmpfs_alias_path(run_id);
+        let euid = unsafe { libc::geteuid() };
+        for _ in 0..SCRATCH_ALIAS_ATTEMPTS {
+            let alias = base.join(format!("agc-{}", random_hex(4)?));
+            if alias.as_os_str().len() >= target.as_os_str().len() {
+                return Ok(None);
+            }
+            let record = json!({
+                "alias": alias,
+                "target": target,
+            });
+            self.write_json(&record_path, &record)?;
+            match std::os::unix::fs::symlink(target, &alias) {
+                Ok(()) => {
+                    let valid = fs::symlink_metadata(&alias).is_ok_and(|details| {
+                        details.file_type().is_symlink()
+                            && details.uid() == euid
+                            && fs::read_link(&alias).ok().as_deref() == Some(target)
+                    });
+                    if valid {
+                        return Ok(Some(alias));
+                    }
+                    let _ = fs::remove_file(&alias);
+                    let _ = fs::remove_file(&record_path);
+                    return Err(CgroupError::new("tmpfs-target-invalid"));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&record_path);
+                    continue;
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&record_path);
+                    return Err(CgroupError::new("tmpfs-target-unavailable"));
+                }
+            }
+        }
+        Err(CgroupError::new("tmpfs-target-collision"))
+    }
+
+    fn remove_alias_record(record_path: &Path, expected_target: Option<&Path>) -> CgroupResult<()> {
+        let Ok(raw) = fs::read(record_path) else {
+            return Ok(());
+        };
+        if let Ok(record) = serde_json::from_slice::<Value>(&raw)
+            && let (Some(alias_str), Some(target_str)) = (
+                record.get("alias").and_then(Value::as_str),
+                record.get("target").and_then(Value::as_str),
+            )
+            && expected_target.is_none_or(|expected| Path::new(target_str) == expected)
+        {
+            let alias = Path::new(alias_str);
+            let target = Path::new(target_str);
+            if let Ok(details) = fs::symlink_metadata(alias) {
+                if !details.file_type().is_symlink()
+                    || details.uid() != unsafe { libc::geteuid() }
+                    || fs::read_link(alias).ok().as_deref() != Some(target)
+                {
+                    return Err(CgroupError::new("tmpfs-target-invalid"));
+                }
+                fs::remove_file(alias).map_err(|_| CgroupError::new("tmpfs-cleanup-failed"))?;
+            }
+        }
+        match fs::remove_file(record_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(CgroupError::new("tmpfs-cleanup-failed")),
+        }
+    }
+
+    fn cleanup_all_tmpfs_aliases(&self) {
+        let Ok(entries) = fs::read_dir(&self.metadata_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            if text.starts_with("tmpfs-alias-") && text.ends_with(".json") {
+                let _ = Self::remove_alias_record(&entry.path(), None);
+            }
+        }
     }
 
     pub fn tmpfs_setup(
@@ -2711,12 +2842,20 @@ impl CgroupBackend {
             let _ = fs::remove_dir(&target);
             return Err(CgroupError::new("tmpfs-target-invalid"));
         }
+        let alias = match self.create_tmpfs_alias(&request.run_id, &target) {
+            Ok(alias) => alias,
+            Err(error) => {
+                let _ = fs::remove_dir(&target);
+                return Err(error);
+            }
+        };
         let token = handle
             .get("token")
             .and_then(Value::as_str)
             .ok_or_else(|| CgroupError::new("handle-invalid"))?;
         Ok(Some(TmpfsSetup {
             target,
+            alias,
             size: policy.size,
             inodes: policy.inodes,
             report: self.tmpfs_report_path(&request.run_id),
@@ -3281,6 +3420,10 @@ impl CgroupBackend {
         let resources = Self::controller_resources(request)?;
         if Self::tmpfs_policy(request, &resources)?.is_some() {
             let target = self.tmpfs_target_path(&request.run_id, handle)?;
+            let alias_record = self.tmpfs_alias_path(&request.run_id);
+            if alias_record.exists() {
+                Self::remove_alias_record(&alias_record, Some(&target))?;
+            }
             if target.exists() {
                 let details = fs::symlink_metadata(&target)
                     .map_err(|_| CgroupError::new("tmpfs-target-invalid"))?;
@@ -3310,8 +3453,13 @@ impl CgroupBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{BTreeSet, CgroupMount, cgroup_bind_source};
+    use super::{BTreeSet, CgroupBackend, CgroupMount, cgroup_bind_source};
+    use crate::resources::{Binding, ResourceConfiguration};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn busy_cgroup_mount_fallback_selects_only_the_attached_leaf() {
@@ -3326,5 +3474,83 @@ mod tests {
             PathBuf::from("/sys/fs/cgroup/runner.scope/agcoord-leaf"),
         );
         assert!(cgroup_bind_source(&mount, Path::new("/system.slice/unrelated.service")).is_err());
+    }
+
+    #[test]
+    fn abandon_reused_root_cleans_recorded_tmpfs_aliases() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "agcoord-cgroup-alias-{}-{nonce}",
+            std::process::id()
+        ));
+        let state = temp.join("home/example-developer/.local/state/agcoord");
+        let root = temp.join("root");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir(&root).unwrap();
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            "ram".to_owned(),
+            Binding {
+                backend: Some("cgroup-v2".to_owned()),
+                kind: "memory".to_owned(),
+                mode: "required".to_owned(),
+                unit: "bytes".to_owned(),
+                exec: false,
+            },
+        );
+        bindings.insert(
+            "scratch".to_owned(),
+            Binding {
+                backend: Some("cgroup-v2".to_owned()),
+                kind: "tmpfs".to_owned(),
+                mode: "required".to_owned(),
+                unit: "bytes".to_owned(),
+                exec: false,
+            },
+        );
+        bindings.insert(
+            "scratch_inodes".to_owned(),
+            Binding {
+                backend: Some("cgroup-v2".to_owned()),
+                kind: "inodes".to_owned(),
+                mode: "required".to_owned(),
+                unit: "inodes".to_owned(),
+                exec: false,
+            },
+        );
+        let config = ResourceConfiguration {
+            capacities: BTreeMap::from([("jobs".to_owned(), 1)]),
+            bindings,
+            cgroup_root: Some(root.clone()),
+            cgroup_io_paths: Vec::new(),
+        };
+        let backend = CgroupBackend::new(&config, &state, Some(&root)).unwrap();
+        let target = state.join("cgroup-v2/scratch-0123456789abcdef-0123456789ab");
+        fs::create_dir_all(&target).unwrap();
+        let alias = backend
+            .create_tmpfs_alias("run-alias-cleanup", &target)
+            .unwrap()
+            .expect("long state root must allocate short alias");
+        assert!(alias.as_os_str().len() <= 48);
+        assert!(fs::symlink_metadata(&alias).is_ok());
+
+        let owner_record = json!({
+            "version": 1,
+            "root": root,
+            "root_device": 0,
+            "root_inode": 0,
+            "owner": backend.owner_name,
+            "owner_device": 0,
+            "owner_inode": 0,
+        });
+        backend
+            .write_json(&backend.owner_record_path(), &owner_record)
+            .unwrap();
+        backend.abandon_reused_root().unwrap();
+        assert!(fs::symlink_metadata(&alias).is_err());
+        let _ = fs::remove_dir_all(&temp);
     }
 }
