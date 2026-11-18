@@ -292,7 +292,7 @@ def _widget_text(widget: Static) -> str:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["list", "show", "tui"])
-async def test_front_row_reservation_is_visible_in_public_views(tmp_path: Path, surface: str):
+async def test_a_preempted_check_is_visible_in_public_views(tmp_path: Path, surface: str):
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
     subprocess.run(
@@ -304,34 +304,42 @@ async def test_front_row_reservation_is_visible_in_public_views(tmp_path: Path, 
         check=True,
     )
     state = tmp_path / "state"
-    gib = 1024**3
-    running = RunningCoordinator(state, capacities={"jobs": 24, "cpu": 24, "tmpfs": 16 * gib})
+    # The starving check may preempt at once rather than after the five-minute default.
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state / "config.json").write_text(json.dumps({"preempt_after": 0}), encoding="utf-8")
+    running = RunningCoordinator(state, capacities={"jobs": 24, "cpu": 4})
     client = running.start()
-    release = tmp_path / "release"
+    releases = {name: tmp_path / f"{name}-release" for name in ("holder", "starving", "later")}
 
-    def submit(label: str, cpu: int, tmpfs: int, *, kind: str = "check") -> str:
-        entered = tmp_path / label
+    def submit(label: str, cpu: int) -> str:
         return client.submit(
             [
                 sys.executable, "-c",
                 "import pathlib,sys,time\npathlib.Path(sys.argv[1]).touch()\n"
                 "while not pathlib.Path(sys.argv[2]).exists():\n    time.sleep(0.02)\n",
-                str(entered), str(release),
+                str(tmp_path / label), str(releases[label]),
             ],
             checkout=str(checkout),
-            kind=kind,
             label=label,
-            resources={"cpu": cpu, "tmpfs": tmpfs},
+            resources={"cpu": cpu},
             caller_pid=os.getpid(),
             environment=caller_environment(),
         )
 
     try:
-        submit("active", 10, 6 * gib)
-        wait_for((tmp_path / "active").exists, "the active check never started")
-        front_id = submit("front", 16, 12 * gib, kind="full")
-        later_id = submit("later", 2, 2 * gib)
-        reasons = [f"reservation:{front_id}:cpu", f"reservation:{front_id}:tmpfs"]
+        # The starving check lacks CPUs the holder keeps, and a later check takes the rest.
+        submit("holder", 2)
+        wait_for((tmp_path / "holder").exists, "the holder never started")
+        starving_id = submit("starving", 4)
+        later_id = submit("later", 2)
+        wait_for((tmp_path / "later").exists, "the later check never started")
+        # Once the holder leaves, the starving check preempts the later one.
+        releases["holder"].touch()
+        wait_for((tmp_path / "starving").exists, "the starving check never preempted")
+        wait_for(
+            lambda: client.status(later_id)["status"] == "queued",
+            "the preempted check was not requeued",
+        )
         if surface in {"list", "show"}:
             arguments = (
                 ["list", "--json"]
@@ -348,30 +356,33 @@ async def test_front_row_reservation_is_visible_in_public_views(tmp_path: Path, 
                     row for group in ("active", "queued", "recent")
                     for row in record[group] if row["run_id"] == later_id
                 )
-            assert record["blocked_by"] == reasons
             assert record["status"] == "queued"
+            assert record["attempts"] == 2
+            assert record["preempted_by"] == starving_id
+            assert record["blocked_by"] == ["resource:cpu"]
             if surface == "show":
                 plain = subprocess.run(
                     [sys.executable, "-m", "agcoord", "show", later_id, "--state-dir", str(state)],
                     capture_output=True, text=True, env=caller_environment(), check=True,
                 )
-                for reason in reasons:
-                    assert reason in plain.stdout
+                assert f"Attempts: 2 · Preempted by: {starving_id}" in plain.stdout
         else:
             app = build_app(lambda: client, refresh_interval=60)
             async with app.run_test(size=(100, 30)) as pilot:
                 await _settled(pilot)
-                await pilot.press("down", "down")
+                await pilot.press("down")
                 await pilot.pause()
                 selected = _widget_text(app.query_one("#gate-detail", Static))
-                for reason in reasons:
-                    assert reason in selected
+                assert later_id in selected
+                assert f"attempt 2 (preempted by {starving_id})" in selected
                 await pilot.press("enter")
                 await pilot.pause()
-                for reason in reasons:
-                    assert reason in _screen_text(app)
+                screen = _screen_text(app)
+                assert "Attempts: 2" in screen
+                assert f"Preempted by: {starving_id}" in screen
     finally:
-        release.touch()
+        for release in releases.values():
+            release.touch()
         running.stop()
 
 

@@ -192,8 +192,8 @@ its ordinary admitted profile.
 
 One JSON file, `config.json` in the state directory, configures the broker that owns that
 directory. It holds at most `capacities`, `bindings`, `cgroup_root`, `cgroup_io`,
-`database_timeout`, `land_gate_reuse_max_age`, `land_max_batch_size`, `stop_grace`, `native_broker`, and
-`overflow_pools`; invalid JSON, a top-level
+`database_timeout`, `land_gate_reuse_max_age`, `land_max_batch_size`, `stop_grace`,
+`preempt_after`, `native_broker`, and `overflow_pools`; invalid JSON, a top-level
 value that is not an object,
 an unknown key, a section that is not an object, or an empty `cgroup_root` is refused when the
 client or broker loads its configuration. When present, `cgroup_io` contains exactly one
@@ -205,7 +205,12 @@ every reuse on that host even when a caller asks for one. `land_max_batch_size` 
 `1` to `1024`, defaults to `8`, and bounds the adaptive power-of-two batch size ceiling (`1`
 disables batch claiming so queued lands execute one at a time). `stop_grace` is a finite number of
 seconds from `0` to `2147483.647`, defaults to `600`, and bounds how long a gracefully stopping
-broker lets running jobs finish before it interrupts them; `0` interrupts them at once. An
+broker lets running jobs finish before it interrupts them; `0` interrupts them at once.
+`preempt_after` is a finite number of seconds from `0` to `2147483.647` and is how long the
+oldest queued job that lacks only local capacity waits, counted from when it last entered the
+queue, before it may [preempt later checks](#first-fit-admission-and-preemption); it defaults
+to the largest `wait_threshold` among the configured overflow pools, but never less than `300`,
+including on a host without a pool. A `land` does not wait for it. An
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
 defaults capacity to `jobs=2`.
 
@@ -279,39 +284,127 @@ fit is rejected rather than left queued forever, unless it allowed overflow and 
 [overflow pool](#overflow-pools) offers it. Scheduling does not infer resource use from
 labels or commands.
 
-Admission greedily packs the complete declared resource vectors rather than assigning fixed
-per-job shares. On each pass the scheduler takes each repository lane's first queued job whose
-blockers are empty, rotates fairly among repositories, admits one, and repeats until no lane has
-an admissible job. A blocked lane job—waiting for a land, for its worktree, or for capacity—lets
-later admissible lane work pass it; only lands keep submission order among themselves and behind
-earlier same-worktree work. Thus an eight-CPU host can overlap requests for six
+### First-fit admission and preemption
+
+Admission is first fit. On each pass the scheduler walks the queue in submission order, across
+all repositories and row kinds, and starts every queued job whose blockers are empty: its
+repository lane and worktree allow it, this machine offers the runtime and capabilities it
+needs, and each resource it claims fits beside the claims that are already running. A blocked
+job—waiting for a land, for its worktree, or for capacity—never holds back a later job that
+fits; only lands keep submission order among themselves and behind earlier same-worktree work.
+No capacity is reserved for a waiting job. Thus an eight-CPU host can overlap requests for six
 and two CPUs, or four requests for two CPUs, without a preselected “two jobs at four CPUs each”
-partition. `jobs` remains an independent concurrency ceiling and does not replace CPU, memory,
-temporary-storage, or disk claims.
+partition, and a job that is short of one resource leaves the others in use by later jobs.
+`jobs` remains an independent concurrency ceiling and does not replace CPU, memory,
+temporary-storage, or disk claims. A queued job reports what blocks it in `blocked_by`:
+`repository:*` and `gate-tree:*` for its lane, `runtime:local` or `capability:<name>` for an
+exclusion from this machine, and `resource:<name>` for each claimed resource that is short.
+These blockers appear in `agc list --json`, `agc show`, and the TUI's selection and detail
+views.
 
-Backfilling reserves local capacity for one **front row** across all repositories and row
-kinds (`check`, `full`, `land`, and retained `merge`). The front row is the oldest queued row
-by submission sequence whose raw blockers are nonempty and contain only `resource:<name>`
-shortages, and whose complete claim could fit on this machine when idle. Raw blockers include
-the repository barrier, FIFO, and worktree exclusions plus shortages against running local
-allocations; they exclude reservations. A row with any `repository:*` blocker reserves nothing.
-An oversized claim accepted only because an overflow pool offers it also reserves nothing
-locally, so it cannot hold this machine's capacity forever.
+First fit keeps the machine busy, but by itself it lets one job wait indefinitely: a job that
+needs a large share of one resource stays short while later, smaller jobs keep fitting.
+Preemption shortens that wait when the later work is checks, which can be stopped and run
+again. It does not bound the wait; see [the starvation gap](#the-starvation-gap) below.
 
-While a front row exists, every later row may backfill locally only when, for each resource it
-claims, its units plus running local allocations plus the front row's units fit the configured
-capacity. The reservation covers the front row's complete claim, including resources that are
-not currently short. A later row that already lacks capacity reports `resource:<name>`; one
-that fits now but would consume reserved capacity reports
-`reservation:<front_run_id>:<resource>`. These blockers appear in `agc list --json`, `agc show`,
-and the TUI's selection and detail views. Work using spare unreserved units or resources absent
-from the front claim can continue. This is estimate-free EASY backfilling: admission does not
-assume that a later job will finish before the front row can start. The reservation is
-recomputed from live work and ends when the front row starts or leaves the queue.
-When finishing workers release enough capacity for the reserved row to run, it is admitted
-before ordinary lane rotation resumes, so another repository cannot take those newly freed
-units in the same scheduling pass. Its current repository and resource blockers must still
-be empty before it starts.
+- **The starving job.** Only one queued job may preempt at a time: the oldest job, by
+  submission sequence across all repositories, that is blocked by `resource:*` shortages alone
+  and whose complete claim fits this machine when idle. A job that also waits on its repository
+  could not start even with the capacity, and a claim accepted only because an overflow pool
+  offers it can never run here, so neither preempts anything.
+- **When.** The starving job may preempt once it has been queued for `preempt_after` seconds,
+  fractions included, counted from when it last entered the queue: its submission, or the moment a preemption
+  returned it to the queue. A check that was just requeued therefore waits the whole
+  `preempt_after` again before it may stop other checks in its turn. A `land` does not wait: it
+  holds up every later landing in its repository, which costs far more than restarting checks,
+  so it may preempt as soon as it is the starving job.
+- **Overflow first.** In every pass the broker first admits everything that fits here, then
+  places jobs in [overflow pools](#overflow-pools), and only then preempts. A starving job that
+  a pool can take now is placed there instead. Because `preempt_after` defaults to the largest
+  pool `wait_threshold`, every pool has by default had its chance before a job preempts.
+- **Victims.** Victims are running `check` jobs on this machine that were submitted after the
+  starving job. They are taken latest submission first (among equal submissions, latest start
+  first) until their claims cover every shortage; a victim whose claim is not needed after all
+  is then spared, earliest submission first, so the set is minimal. The work that is restarted
+  thus belongs to the jobs that arrived last. When no set of victims would let the starving job
+  fit, nothing is preempted and it keeps waiting. A `land`, a `full`, and a retained `merge` are never victims, because they hold
+  barriers or produce reusable receipts. Neither is a job placed in an overflow pool, a check
+  submitted with `--no-preempt`, or a check that was already preempted twice, which bounds how
+  often one job is restarted.
+- **Stopping and requeueing.** A victim is stopped exactly like a cancelled job: its process
+  group or cgroup is signalled, it keeps its claim until every descendant is gone, and its
+  scratch and enforcement state are reclaimed. While it is being stopped the row stays
+  `running` with `cancel_requested` set and `failure_reason` `preempted`. Instead of becoming
+  terminal it then returns to `queued` with its original sequence, creation time, and submitted
+  environment, a fresh resource receipt, and `attempts` raised by one; `preempted_by` names the
+  job it was stopped for. Its log receives the line
+  `AGCoord: preempted by <run> at <time>, attempt <n>; requeued at its original position as attempt <n+1>`,
+  and the next attempt appends to the same log. The client that submitted the check keeps
+  waiting and receives the final attempt's status. A caller's own `agc cancel` during the stop
+  wins: the job ends `cancelled`.
+- **A victim that passes first.** A victim whose command passes on its own before the broker
+  has delivered any stop to it keeps that verdict: the requested stop is withdrawn, the row ends
+  `passed`, and it is not run again. A victim that fails in that window is requeued like any
+  other, because the requested stop may have caused the failure: its
+  [child CPU leases](#child-cpu-leases-for-parallel-tools) are cancelled as soon as the stop is
+  requested.
+- **A victim that is not reclaimed.** A victim is requeued only when everything its attempt
+  held was reclaimed cleanly, judged by the final state of each enforced resource: the outcome
+  of the last cancel, finish, or cleanup step its backend recorded for it. A cancel that gave up
+  waiting for a cgroup to empty, followed by a clean finish and cleanup, counts as clean; the
+  victim is requeued and its log, and the broker's diagnostics, receive
+  `AGCoord: incident: the cancel of <victim> for the preemption requested by <run> failed (<backend> <resource>: <code>); the attempt was reclaimed cleanly afterwards, so <victim> is requeued`.
+  If that last step failed instead, for example because a cgroup leaf is still populated when it
+  is to be removed, the row ends `interrupted` with exit status 125 and `failure_reason`
+  `preemption-reclaim-failed`, its resource receipt keeps the failed events, and its log receives
+  `AGCoord: preempted by <run> at <time>, attempt <n>; not requeued, because the resources of that attempt were not reclaimed cleanly (preemption-reclaim-failed)`.
+  Like a cancelled job whose cleanup fails, the row releases its claim at that transition,
+  although the host may still hold what was not reclaimed; the receipt says what that is.
+- **What waits while victims stop.** From the moment a preemption is requested until its
+  victims are gone, a job submitted after the starving job is not admitted here if admitting it
+  would leave the starving job unable to fit once the victims are gone: for some resource both
+  claim, the units held now, the stopping victims included, plus both claims exceed the
+  capacity. Such a job reports `preemption:<starving_run_id>` in `blocked_by`, so the capacity
+  being released reaches the starving job. A later job that claims nothing the starving job
+  claims, or that fits beside it, and every older job is admitted as usual, and a waiting job
+  may still be placed in an overflow pool.
+- **A victim that does not stop.** If a victim is still present five seconds after the owning
+  broker first delivered its stop (its first signal, or the kill of its cgroup), the broker
+  abandons that preemption. The five seconds run from that delivery, not from the request, so a
+  replacement broker that completes a request its predecessor made gives the victim the whole
+  bound. Later jobs stop waiting behind the abandoned preemption, and the victim keeps its claim
+  until its processes are really gone, so nothing is admitted into its claim while any of them
+  still runs. The broker records
+  `AGCoord: incident: <victim> was still running 5 seconds after it was told to stop for the preemption requested by <run>; …`
+  in the victim's log and in its own diagnostics. The victim is still requeued once it
+  disappears, and the starving job may preempt other checks meanwhile.
+
+A requested preemption is durable. A replacement broker adopts the live victim, stops it,
+requeues it, and only then admits the starving job. So that a preempted check can restart
+unchanged, the broker keeps the submitted environment of a running check that may still be
+preempted in the owner-only spool until that attempt ends. It keeps none for a job that is
+never a victim, and a starting broker discards any environment or requested stop it finds kept
+for a row that is not running.
+
+A check that is safe to run twice is not necessarily safe to restart after it was killed. A
+victim's attempt is ended by `SIGTERM`, then `SIGKILL` after two seconds, or by the kill of its
+cgroup, so it can leave behind state that a clean finish would have removed, such as a stale
+`.git/index.lock`, and its next attempt starts in that state. Submit a check that is not safe
+in either sense with `--no-preempt`.
+
+#### The starvation gap
+
+Preemption never stops a `land`, a `full`, a `merge`, a check submitted with `--no-preempt`, or
+a check that was already preempted twice, and admission holds nothing back for a waiting job.
+A job whose shortage can be covered only by such work may therefore wait indefinitely, for as
+long as such work keeps starting. For example, on a host with four CPUs, a check that claims all
+four waits for as long as two-CPU `full` jobs from other repositories keep overlapping one
+another, because one of them always holds two CPUs and none of them is ever stopped. AGCoord
+accepts this gap rather than idling capacity for a job that cannot start yet; such a job starts
+once that work stops arriving, or earlier in an [overflow pool](#overflow-pools) when its
+submitter allowed overflow.
+
+### Resource bindings and enforcement
 
 Capacity and enforcement are separate contracts. An unbound name is always a generic
 `admission-unit`, even when it is spelled `cpu`, `memory`, or `disk`: AGCoord schedules it but
@@ -451,9 +544,9 @@ never overflows.
 This machine is always preferred when `local` is an allowed runtime and holds every required
 capability. In each scheduling pass the broker first admits everything that fits locally. Rows
 excluded from `local` by `--runtime` or `--require-capability` report `runtime:local` and/or
-`capability:<name>` in `blocked_by` and never reserve front-row local capacity. Next, the broker
+`capability:<name>` in `blocked_by` and never preempt local work. Next, the broker
 takes the earliest queued job that allowed overflow, is blocked only by `resource:*`,
-`reservation:*`, `runtime:local`, and/or `capability:*` reasons, and has been queued for at
+`preemption:*`, `runtime:local`, and/or `capability:*` reasons, and has been queued for at
 least a matching pool's `wait_threshold`, and places it in the first configured pool that is
 allowed by `--runtime`, holds every required capability, and has room for its complete claim and
 enough budget. Lane and barrier rules are unchanged: a placed job
@@ -462,10 +555,12 @@ its worktree never overflows around it. For an eligible job, a claim larger than
 capacity or requiring a capability `local` lacks is accepted at submission when one allowed pool
 satisfies both the complete resource claim and every required capability together, and reaches
 that pool by the same rule. With `--no-overflow`, claims and capabilities must fit `local`.
-A later row held back by the front row's reservation may overflow after that threshold:
-placement consumes the pool's capacity rather than local capacity, so it does not delay the
-local front row. Pool allocations are excluded from local shortages and reservations, while
-their repository and worktree exclusions still apply.
+A job that waits behind an in-flight
+[preemption](#first-fit-admission-and-preemption) may overflow after that threshold:
+placement consumes the pool's capacity rather than local capacity, so it does not delay the job
+the preemption serves. A starving job preempts local checks only when no pool can take it. Pool
+allocations are excluded from local shortages, and a job placed in a pool is never a preemption
+victim, while its repository and worktree exclusions still apply.
 
 A placed job's row moves to `running` with its `pool` set. Its worker on this machine is
 `EXECUTOR... -- COMMAND...`, started in the executed checkout (the gate tree for
@@ -1208,8 +1303,10 @@ credential, network, or general security sandboxes.
 
 Fairness applies across lanes and capacity: a compatible check can overlap work in another
 repository or in another worktree of its own, but it cannot leapfrog an earlier land in its own
-worktree, and lane rotation keeps one repository from monopolizing admission. Backfilling
-uses only capacity left unreserved by a resource-blocked front row.
+worktree. Capacity is handed out in submission order to whatever fits, and
+[preemption](#first-fit-admission-and-preemption) lets an older job stop later checks that
+hold what it lacks. Nothing bounds how long a job waits behind later work that is never
+preempted; see [the starvation gap](#the-starvation-gap).
 
 ## Durable job shape
 
@@ -1239,6 +1336,7 @@ Each row contains exactly:
 run_id · sequence · status · kind · label · agent
 repository_id · repository · worktree_id · checkout · branch · head_sha
 barrier · resources · resource_contract · resource_receipt · blocked_by · pool
+attempts · preempted_by
 gate_run_id · publication · failure_reason · phase · gate_exit_status
 caller_pid · command · created_at · started_at · finished_at
 exit_status · worker_pid · cancel_requested · log_bytes · position
@@ -1258,11 +1356,14 @@ event fields. A backend sample may also return stable, sanitized observations su
 controller-limit event; the broker validates the resource and code, records each observation
 once, and never exposes a raw controller file or exception. Backend handles and host paths remain
 private spool state and never enter the public row;
-`blocked_by` identifies repository predecessors, resource shortages, front-row reservations,
-and local runtime or capability exclusions (`runtime:local`, `capability:<name>`)
-currently preventing admission. `pool` is the
+`blocked_by` identifies repository predecessors, resource shortages, an in-flight preemption
+(`preemption:<run_id>`), and local runtime or capability exclusions (`runtime:local`,
+`capability:<name>`) currently preventing admission. `pool` is the
 name of the overflow pool the job was placed in, or null for a job that ran or will run on this
-machine. Repository and
+machine. `attempts` is the number of the row's current or next attempt: `1` until a
+[preemption](#first-fit-admission-and-preemption) requeues the row, and one more after
+each. `preempted_by` is the run ID of the job that most recently preempted the row, including
+one whose stop is still in progress, or null. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
 operators. `agent` is the explicit `--agent` value, then `AGCOORD_AGENT`, or the stable value
 `unnamed` when neither is set; `caller_pid` remains the exact submitting process diagnostic and
@@ -1272,7 +1373,8 @@ position is one-based; active and terminal rows use null.
 
 The durable status state machine is
 `queued -> running -> passed|failed|cancelled|interrupted`, with direct
-`queued -> cancelled` allowed. `phase` is always present. Checks, full gates, and retained
+`queued -> cancelled` allowed; a preempted check also returns from `running` to `queued` for
+its next attempt. `phase` is always present. Checks, full gates, and retained
 merge jobs use `queued -> running -> complete` and keep `gate_exit_status` null. A land job
 uses `queued -> preflight -> gating -> publishing -> complete`; its gate status remains null
 until the gate finishes and is then the actual shell status. Terminal rows are immutable
@@ -1316,9 +1418,18 @@ authorization.
 resource it requires. Capacities—not the fact that the job is named “full”—decide whether
 other work can overlap it.
 
+A check may be [preempted](#first-fit-admission-and-preemption): stopped and requeued
+so that an older job that has waited long enough can start. The submitting client keeps waiting
+and reports the final attempt. Pass `--no-preempt` to `agc run`, or `preempt=False` to
+`CoordinatorClient.submit`, for a check that must not be restarted, such as one that is not safe
+to run twice; it is then never stopped for another job. A `full` and a `land` are never
+preempted, so they take no such option.
+
 The coordinator snapshots the submitting client's execution environment for its worker, but
 does not expose it through rows, CLI output, or the TUI, and clears it when the job starts or
-is cancelled while queued. A reserved admission marker prevents a coordinated worker from
+is cancelled while queued. The one exception is a running check that may still be preempted:
+its environment stays in the owner-only spool until that attempt ends, so that the check can
+be restarted unchanged. A reserved admission marker prevents a coordinated worker from
 submitting another coordinated job and deadlocking behind itself.
 
 ### Admission context for repository wrappers
@@ -1741,7 +1852,8 @@ agc cancel <run-id>
 
 The non-JSON `list` table summarizes each row as `admission-only`, `applied`, `partial`,
 `unapplied`, or `failed`, and `agc show <run-id>` prints a readable summary of one durable row
-(including chronological `Batch & Bisect History:` when the row participated in a land batch).
+(including its `Attempts` and the job that last preempted it, and chronological
+`Batch & Bisect History:` when the row participated in a land batch).
 `list --json` and `show --json` (or `agc --json show`) retain the complete binding, capability,
 receipt, and batch fields as JSON so automation can distinguish scheduling, actual application,
 and measurement.
@@ -1751,10 +1863,14 @@ matching runs across the durable spool rather than limiting matches to the globa
 
 Queued work is cancellable. Running checks and full gates, plus land preflight and gating,
 receive process-group cancellation and become terminal only after every descendant is gone.
-Publishing land jobs refuse cancellation as described above. Unknown IDs and terminal jobs
+Cancelling a check that a preemption is already stopping ends it `cancelled` instead of
+requeued. Publishing land jobs refuse cancellation as described above. Unknown IDs and terminal jobs
 produce named errors rather than silently changing another row.
 
-A submitting client streams the job it accepted. The stream ends with the job's own exit
+A submitting client streams the job it accepted. A preempted check is followed across its
+attempts: the client prints the rest of the stopped attempt's output and the preemption line,
+reports that the job waits again, and continues with the next attempt. The stream ends with
+the job's own exit
 status, with 70 when a terminal row carries none, with 130 when the caller interrupted it and
 cancellation was requested, and with 75 when the client lost contact with the coordinator
 after acceptance. In that last case the client first retries a transient error for five
@@ -1790,8 +1906,9 @@ shortcut that deletes coordinator state.
 version. It shows active, queued, and recent terminal jobs across repositories; kind, lane/repository identity, pool,
 declared resources, status, phase, label, timing, head, publication, gate exit, and failure details
 remain inspectable without truncating the durable values. Persistent selection detail includes
-the pool, enforcement summary, and compact batch position, slice/bisect summary, and leader/follower
-role when batched; the modal detail (`Enter`) includes the pool, exact resource contract,
+the pool, enforcement summary, a preempted job's attempt and preemptor, and compact batch
+position, slice/bisect summary, and leader/follower
+role when batched; the modal detail (`Enter`) includes the pool, attempts, exact resource contract,
 sanitized receipt events, and live-updating chronological **Batch & Bisect History** across active
 and completed batched lands; and the status bar summarizes configured overflow pools' active
 allocations and used/limit daily CPU-hour budgets (with estimated used/limit cost when

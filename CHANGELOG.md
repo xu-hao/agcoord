@@ -5,6 +5,22 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Replace front-row reservations with first-fit admission and check preemption. Queued jobs
+  now start in submission order, across repositories, whenever their whole claim fits; no
+  capacity is held for a waiting job and the `reservation:*` blocker is gone. The oldest job
+  that lacks only local capacity may stop the latest-submitted checks that cover its shortage
+  once it has been queued for the new `preempt_after` setting since it last entered the queue
+  (default: the largest overflow `wait_threshold`, never less than 300 seconds; a `land` does
+  not wait). A stopped check is requeued at its original position, its caller keeps waiting
+  for the final attempt, its log marks the preemption, and rows gain `attempts` and
+  `preempted_by`; a check that passes before its stop reaches it keeps its verdict, and one
+  whose resources are not reclaimed cleanly ends `interrupted` as `preemption-reclaim-failed`
+  instead of running again. Lands, fulls, merges, checks submitted with the new
+  `agc run --no-preempt`, and checks already preempted twice are never stopped, and an overflow
+  pool with room is still used first. Nothing bounds the wait of a job whose shortage only such
+  work holds. #368 — replace front-row reservations with first-fit admission and
+  preemption of check rows.
+
 - Add a private result-cache bucket, `PROJECT_ID-result-cache`, to the GCP overflow Terraform
   module, readable and writable only by the job service account and the `submitters`, whose
   objects expire after `result_cache_retention_days` (default 30), and output its URL as

@@ -6,15 +6,15 @@ use crate::platform::{
     worker_identity_conflicts,
 };
 use crate::store::{
-    Paths, RunRecord, blocked_by, configured_stop_grace, connect, copy_leader_log_to_member,
-    front_row, initialize_native, load_live_runs, load_live_scheduler_state, load_run, load_runs,
-    local_allocations, maintain_child_cpu_leases, maintenance_record, map_database_error,
-    mark_maintenance_drained, now, overflow_candidate, parse_land_options,
-    publication_failure_reason, reconcile_batch_on_leader_exit, select_land_batch_candidates,
-    validate_child_cpu_leases,
+    LiveSchedulerState, Paths, RunRecord, configured_preempt_after, configured_stop_grace, connect,
+    copy_leader_log_to_member, initialize_native, load_live_runs, load_live_scheduler_state,
+    load_run, load_runs, local_allocations, local_blockers, maintain_child_cpu_leases,
+    maintenance_record, map_database_error, mark_maintenance_drained, now, overflow_candidate,
+    parse_land_options, publication_failure_reason, reconcile_batch_on_leader_exit,
+    select_land_batch_candidates, starving_row, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
-use crate::{cgroup, overflow, project_quota, resources};
+use crate::{cgroup, overflow, preempt, project_quota, resources};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -41,6 +41,7 @@ pub struct ServeOptions {
     pub idle_timeout: Option<Duration>,
     pub host_preflight: Option<host::PreflightOptions>,
     pub crash_after: Option<String>,
+    pub stop_after: Option<String>,
     pub worker_fault: Option<WorkerFault>,
     pub cgroup_fixture: Option<PathBuf>,
     pub project_quota_fixture: Option<PathBuf>,
@@ -54,6 +55,7 @@ pub struct Broker {
     idle_timeout: Option<Duration>,
     managed_host: bool,
     crash_after: Option<String>,
+    stop_after: Option<String>,
     worker_fault: Option<WorkerFault>,
     resource_capabilities: Value,
     cgroup_backend: Option<cgroup::CgroupBackend>,
@@ -68,13 +70,23 @@ pub struct Broker {
     overflow_pools: Vec<Pool>,
     children: HashMap<String, NativeWorker>,
     pending_setups: HashMap<String, (PendingWorker, WorkerSetup)>,
+    /// When this owner first delivered each requested stop that is still in progress.
     cancellation_started: HashMap<String, Instant>,
     group_drain_started: HashMap<String, Instant>,
-    last_repository: Option<String>,
     stopped: Arc<AtomicBool>,
     stop_signals: usize,
     stop_grace: Duration,
+    /// How long the oldest starving row waits, from when it last entered the queue, before
+    /// it may preempt later checks.
+    preempt_after: Duration,
     idle_since: Option<Instant>,
+}
+
+/// A preemption the scheduler decided on in one pass: the starving row and the running
+/// checks that must stop for it.
+struct PreemptionPlan {
+    starving: RunRecord,
+    victims: Vec<RunRecord>,
 }
 
 /// The documented reason for one failed publication run: a red gate keeps its shell status
@@ -325,6 +337,7 @@ impl Broker {
         connection
             .execute_batch("COMMIT")
             .map_err(map_database_error)?;
+        preempt::recover(&connection)?;
         validate_child_cpu_leases(&connection)?;
         maintain_child_cpu_leases(&connection)?;
         if cgroup_backend.is_none()
@@ -457,6 +470,7 @@ impl Broker {
             started_at,
         ))?;
         let stop_grace = configured_stop_grace(&paths)?;
+        let preempt_after = configured_preempt_after(&paths, &overflow_pools)?;
         Ok(Self {
             paths,
             capacities,
@@ -464,6 +478,7 @@ impl Broker {
             idle_timeout: options.idle_timeout,
             managed_host,
             crash_after: options.crash_after,
+            stop_after: options.stop_after,
             worker_fault: options.worker_fault,
             resource_capabilities,
             cgroup_backend,
@@ -475,10 +490,10 @@ impl Broker {
             pending_setups: HashMap::new(),
             cancellation_started: HashMap::new(),
             group_drain_started: HashMap::new(),
-            last_repository: None,
             stopped,
             stop_signals: 0,
             stop_grace,
+            preempt_after,
             idle_since: None,
         })
     }
@@ -486,6 +501,17 @@ impl Broker {
     fn crash(&self, point: &str) {
         if self.crash_after.as_deref() == Some(point) {
             std::process::exit(86);
+        }
+    }
+
+    /// Stop this process at a point a debug build was asked to stop at, until it is
+    /// continued.  A test uses the pause to act between two steps of one owner.
+    fn stop_at(&self, point: &str) {
+        if self.stop_after.as_deref() == Some(point) {
+            // SAFETY: raise only delivers a signal to the calling process.
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+            }
         }
     }
 
@@ -624,28 +650,19 @@ impl Broker {
     fn pump_once(&mut self) -> Result<()> {
         let connection = connect(&self.paths)?;
         maintain_child_cpu_leases(&connection)?;
-        let snapshot_state = load_live_scheduler_state(&connection)?;
-        let active = snapshot_state.active;
-        let queued = snapshot_state.queued;
-        let placed = snapshot_state.placed;
-        let batch_followers = snapshot_state.batch_followers;
-        let batch_owners = snapshot_state.batch_owners;
-        self.validate_active(&active, &placed, &batch_followers, &batch_owners)?;
-        // Remember the reservation before observation releases completed workers' claims.
-        // Once it fits, the front's raw shortages disappear; lane rotation must not let
-        // another repository take those newly freed units before the front starts.
-        let reserved_front = front_row(
-            &active,
-            &queued,
-            &self.local_runtime,
-            &local_allocations(&active, &placed, &batch_followers),
-        )
-        .map(|run| run.run_id.clone());
-        for run in &active {
-            if batch_followers.contains_key(&run.run_id) {
+        let state = load_live_scheduler_state(&connection)?;
+        self.validate_active(
+            &state.active,
+            &state.placed,
+            &state.batch_followers,
+            &state.batch_owners,
+        )?;
+        for run in &state.active {
+            if state.batch_followers.contains_key(&run.run_id) {
                 continue;
             }
-            if let Some(pool) = placed
+            if let Some(pool) = state
+                .placed
                 .get(&run.run_id)
                 .and_then(|name| self.overflow_pools.iter().find(|pool| pool.name == *name))
             {
@@ -658,61 +675,188 @@ impl Broker {
 
         loop {
             let connection = connect(&self.paths)?;
-            let snapshot_state = load_live_scheduler_state(&connection)?;
-            let active = snapshot_state.active;
-            let queued = snapshot_state.queued;
-            let placed = snapshot_state.placed;
-            let batch_followers = snapshot_state.batch_followers;
-            let batch_owners = snapshot_state.batch_owners;
-            self.validate_active(&active, &placed, &batch_followers, &batch_owners)?;
-            // This machine is always preferred: a pool is considered only when nothing
-            // more can be admitted locally in this pass.
-            let (next, pool) = match self.next_admissible(
-                &active,
-                &queued,
-                &placed,
-                &batch_followers,
-                reserved_front.as_deref(),
-            ) {
-                Some(next) => (next, None),
-                None => {
-                    match self.next_overflow(
-                        &connection,
-                        &active,
-                        &queued,
-                        &placed,
-                        &batch_followers,
-                    )? {
-                        Some((next, pool)) => (next, Some(pool)),
-                        None => return Ok(()),
-                    }
-                }
+            let state = load_live_scheduler_state(&connection)?;
+            self.validate_active(
+                &state.active,
+                &state.placed,
+                &state.batch_followers,
+                &state.batch_owners,
+            )?;
+            if self.abandon_overdue_preemptions(&connection, &state.preemption)? {
+                // The abandoned preemption no longer holds later rows; plan from that state.
+                continue;
+            }
+            let used = local_allocations(&state.active, &state.placed, &state.batch_followers);
+            // A preemption this pass decides on holds later rows from this moment, before
+            // its stops are requested: admitting a row that takes what the starving row
+            // lacks would only add that row to the victims.
+            let plan = match &state.hold {
+                Some(_) => None,
+                None => self.preemption_plan(&connection, &state, &used)?,
+            };
+            let hold = state
+                .hold
+                .clone()
+                .or_else(|| plan.as_ref().map(|plan| preempt::Hold::of(&plan.starving)));
+            // This machine is always preferred, then a pool: a row preempts only when
+            // nothing more can be admitted or placed in this pass.
+            let selected = match self.next_admissible(&state, &used, hold.as_ref()) {
+                Some(next) => Some((next, None)),
+                None => self
+                    .next_overflow(&connection, &state, &used, hold.as_ref())?
+                    .map(|(next, pool)| (next, Some(pool))),
             };
             drop(connection);
+            let Some((next, pool)) = selected else {
+                let Some(plan) = plan else {
+                    return Ok(());
+                };
+                if self.request_preemption(&plan)? {
+                    continue;
+                }
+                return Ok(());
+            };
             self.start_worker(&next, pool.as_ref())?;
-            self.last_repository = Some(next.repository_id);
         }
+    }
+
+    /// Decide whether the oldest starving row may preempt now, and which checks stop for it.
+    ///
+    /// Only the oldest queued row that fits this machine when idle and lacks nothing but
+    /// local capacity is considered.  A land may preempt at once, because it holds up every
+    /// later landing in its repository; any other row must first have waited
+    /// `preempt_after` since it last entered the queue, so a check that was just requeued
+    /// does not stop another one in its turn.  Victims are running local checks submitted
+    /// after that row whose environment is still retained, so that they can be requeued.
+    fn preemption_plan(
+        &self,
+        connection: &Connection,
+        state: &LiveSchedulerState,
+        used: &BTreeMap<String, u64>,
+    ) -> Result<Option<PreemptionPlan>> {
+        let Some(starving) = starving_row(&state.active, &state.queued, &self.local_runtime, used)
+        else {
+            return Ok(None);
+        };
+        if starving.kind != "land"
+            && overflow::waited(connection, state.preemption.queued_since(starving))?
+                < self.preempt_after.as_secs_f64()
+        {
+            return Ok(None);
+        }
+        let candidates: Vec<&RunRecord> = state
+            .active
+            .iter()
+            .filter(|run| {
+                run.kind == "check"
+                    && run.sequence > starving.sequence
+                    && !run.cancel_requested
+                    && run.worker_pid.is_some()
+                    && !state.placed.contains_key(&run.run_id)
+                    && state.preemption.preemptible.contains(&run.run_id)
+            })
+            .collect();
+        Ok(
+            preempt::plan(starving, used, &self.local_runtime.capacities, &candidates).map(
+                |victims| PreemptionPlan {
+                    starving: starving.clone(),
+                    victims: victims.into_iter().cloned().collect(),
+                },
+            ),
+        )
+    }
+
+    /// Durably ask every planned victim to stop.  The ordinary cancellation path then ends
+    /// each one as a complete process group, and its terminal transition requeues it.
+    fn request_preemption(&self, plan: &PreemptionPlan) -> Result<bool> {
+        let requested = preempt::request(&connect(&self.paths)?, &plan.starving, &plan.victims)?;
+        if requested {
+            self.crash("preemption-request");
+            self.stop_at("preemption-request");
+        }
+        Ok(requested)
+    }
+
+    /// Stop waiting for victims that outlive the stop bound, and say whether any did.
+    ///
+    /// The bound runs from the first stop this owner delivered to the victim, not from the
+    /// request: an owner that took over, or one whose pass stalled, has not yet given the
+    /// victim its chance to stop.  An overdue victim keeps its claim until its processes are
+    /// really gone, so nothing is admitted into its claim while any of them runs.  Later rows stop
+    /// waiting behind the preemption, and the event is recorded as an incident in the
+    /// victim's log and the broker's diagnostics.
+    fn abandon_overdue_preemptions(
+        &self,
+        connection: &Connection,
+        preemption: &preempt::Live,
+    ) -> Result<bool> {
+        let mut abandoned = false;
+        for stop in &preemption.stops {
+            let overdue = self
+                .cancellation_started
+                .get(&stop.run_id)
+                .is_some_and(|delivered| delivered.elapsed() >= preempt::STOP_BOUND);
+            if stop.abandoned || !overdue || !preempt::abandon(connection, &stop.run_id)? {
+                continue;
+            }
+            abandoned = true;
+            let incident = format!(
+                "AGCoord: incident: {victim} was still running {bound} seconds after it was \
+                 told to stop for the preemption requested by {preemptor}; that preemption \
+                 is abandoned and {victim} keeps its claim until it is gone",
+                victim = stop.run_id,
+                bound = preempt::STOP_BOUND.as_secs(),
+                preemptor = stop.preemptor,
+            );
+            eprintln!("{incident}");
+            self.append_run_log(&stop.run_id, &incident);
+        }
+        Ok(abandoned)
+    }
+
+    /// Append one coordinator line to a run's log, starting on a line of its own.
+    fn append_run_log(&self, run_id: &str, line: &str) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let Ok(mut log) = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .mode(0o600)
+            .open(self.paths.logs.join(format!("{run_id}.log")))
+        else {
+            return;
+        };
+        let mut last = [0_u8; 1];
+        let unterminated = log.seek(SeekFrom::End(-1)).is_ok()
+            && log.read_exact(&mut last).is_ok()
+            && last[0] != b'\n';
+        // One append, so the line is never interleaved with output of a worker still alive.
+        let text = if unterminated {
+            format!("\n{line}\n")
+        } else {
+            format!("{line}\n")
+        };
+        let _ = log.write_all(text.as_bytes());
     }
 
     /// Choose the earliest queued row that may leave this machine, with the first
     /// configured pool that can take it now.
     ///
     /// A row qualifies only when its submitter allowed overflow, nothing but this machine's
-    /// capacity or front-row reservation blocks it and it has waited at least the pool's
+    /// capacity or an in-flight preemption blocks it and it has waited at least the pool's
     /// threshold. The pool must have room for the claim and, when it has a budget, enough
     /// of today's allowance left for the claim's worst case.
     fn next_overflow(
         &self,
         connection: &Connection,
-        active: &[RunRecord],
-        queued: &[RunRecord],
-        placed: &BTreeMap<String, String>,
-        batch_followers: &BTreeMap<String, String>,
+        state: &LiveSchedulerState,
+        used: &BTreeMap<String, u64>,
+        hold: Option<&preempt::Hold>,
     ) -> Result<Option<(RunRecord, Pool)>> {
         if self.overflow_pools.is_empty() {
             return Ok(None);
         }
-        for run in queued {
+        for run in &state.queued {
             if !overflow_candidate(&run.kind, &run.environment) {
                 continue;
             }
@@ -721,18 +865,18 @@ impl Broker {
             else {
                 continue;
             };
-            let blockers = blocked_by(
+            let blockers = local_blockers(
                 run,
-                active,
-                queued,
+                &state.active,
+                &state.queued,
                 &self.local_runtime,
-                placed,
-                batch_followers,
+                used,
+                hold,
             );
             if blockers.is_empty()
                 || blockers.iter().any(|blocker| {
                     !blocker.starts_with("resource:")
-                        && !blocker.starts_with("reservation:")
+                        && !blocker.starts_with("preemption:")
                         && !blocker.starts_with("runtime:")
                         && !blocker.starts_with("capability:")
                 })
@@ -753,8 +897,9 @@ impl Broker {
                 if waited < pool.wait_threshold {
                     continue;
                 }
-                let used = overflow::pool_allocations(active, placed, &pool.name);
-                if pool.fits(&run.resources, &used)
+                let pool_used =
+                    overflow::pool_allocations(&state.active, &state.placed, &pool.name);
+                if pool.fits(&run.resources, &pool_used)
                     && overflow::budget_allows(connection, pool, &run.resources)?
                 {
                     return Ok(Some((run.clone(), pool.clone())));
@@ -785,66 +930,43 @@ impl Broker {
         Ok(())
     }
 
-    /// Choose one repository lane's first admissible job in round-robin order.
+    /// Choose the first queued row, in submission order across repositories, that can start
+    /// on this machine now.
     ///
-    /// Within a lane, a queued job that is blocked by a barrier, by its worktree, or by
-    /// capacity lets later admissible lane work pass it; the blockers themselves keep
-    /// barriers in submission order. A reserved front that became runnable when workers
-    /// finished is admitted before rotation can consume the capacity it waited for.
+    /// Admission is first fit: a row blocked by a barrier, by its worktree, or by capacity
+    /// never holds back a later row that fits, and the blockers themselves keep barriers in
+    /// submission order.
     fn next_admissible(
         &self,
-        active: &[RunRecord],
-        queued: &[RunRecord],
-        placed: &BTreeMap<String, String>,
-        batch_followers: &BTreeMap<String, String>,
-        reserved_front: Option<&str>,
+        state: &LiveSchedulerState,
+        used: &BTreeMap<String, u64>,
+        hold: Option<&preempt::Hold>,
     ) -> Option<RunRecord> {
-        if let Some(run) = queued.iter().find(|run| {
-            reserved_front == Some(run.run_id.as_str())
-                && blocked_by(
+        state
+            .queued
+            .iter()
+            .find(|run| {
+                local_blockers(
                     run,
-                    active,
-                    queued,
+                    &state.active,
+                    &state.queued,
                     &self.local_runtime,
-                    placed,
-                    batch_followers,
+                    used,
+                    hold,
                 )
                 .is_empty()
-        }) {
-            return Some(run.clone());
-        }
-        let mut heads = Vec::new();
-        let mut seen = BTreeSet::new();
-        for run in queued {
-            if seen.contains(&run.repository_id) {
-                continue;
-            }
-            if blocked_by(
-                run,
-                active,
-                queued,
-                &self.local_runtime,
-                placed,
-                batch_followers,
-            )
-            .is_empty()
-            {
-                seen.insert(run.repository_id.clone());
-                heads.push(run.clone());
-            }
-        }
-        if let Some(last) = &self.last_repository {
-            let (after, before): (Vec<_>, Vec<_>) =
-                heads.into_iter().partition(|run| run.repository_id > *last);
-            heads = after.into_iter().chain(before).collect();
-        }
-        heads.into_iter().next()
+            })
+            .cloned()
     }
 
     fn observe(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
         if let Some((pending, setup)) = self.pending_setups.remove(&run.run_id) {
             if run.cancel_requested {
+                // Aborting the setup signals the worker, so this owner has delivered a stop.
                 let child = pending.abort();
+                self.cancellation_started
+                    .entry(run.run_id.clone())
+                    .or_insert_with(Instant::now);
                 self.children.insert(run.run_id.clone(), child);
             } else if pending.setup_ready() {
                 return self.complete_worker_setup(connection, run, pending, setup);
@@ -861,14 +983,15 @@ impl Broker {
             self.capture_resource_usage(connection, &refreshed)?;
         }
         if self.children.contains_key(&run.run_id) {
+            let withdrawn;
+            let run = if self.ended_before_its_preemption(connection, run)? {
+                withdrawn = load_run(connection, &run.run_id)?;
+                &withdrawn
+            } else {
+                run
+            };
             if run.cancel_requested {
-                if resource_managed {
-                    let refreshed = load_run(connection, &run.run_id)?;
-                    let _ = self.cancel_resources(connection, &refreshed)?;
-                }
-                if !cgroup_managed {
-                    Self::signal_cancel(&mut self.cancellation_started, run)?;
-                }
+                self.deliver_stop(connection, run)?;
             }
             let child = self.children.get_mut(&run.run_id).unwrap();
             let Some(exit) = child.try_wait().map_err(|error| {
@@ -945,13 +1068,7 @@ impl Broker {
                 return Ok(());
             }
             if run.cancel_requested {
-                if resource_managed {
-                    let refreshed = load_run(connection, &run.run_id)?;
-                    let _ = self.cancel_resources(connection, &refreshed)?;
-                }
-                if !cgroup_managed {
-                    Self::signal_cancel(&mut self.cancellation_started, run)?;
-                }
+                self.deliver_stop(connection, run)?;
             }
             return Ok(());
         }
@@ -983,6 +1100,55 @@ impl Broker {
         self.finish_run(connection, &run, status, exit_status, failure_reason)?;
         self.cancellation_started.remove(&run.run_id);
         self.group_drain_started.remove(&run.run_id);
+        Ok(())
+    }
+
+    /// Whether a preemption's victim passed on its own before this owner delivered any stop
+    /// to it.  Such a check is not run again: the requested stop is withdrawn, and the
+    /// caller finishes the row with its verdict.  A failure is not kept, because the
+    /// preemption itself may have caused it: the check's child CPU leases are cancelled as
+    /// soon as the stop is requested.  That row is requeued like any other victim.
+    fn ended_before_its_preemption(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+    ) -> Result<bool> {
+        if !run.cancel_requested
+            || run.failure_reason.as_deref() != Some(preempt::PREEMPTED)
+            || self.cancellation_started.contains_key(&run.run_id)
+        {
+            return Ok(false);
+        }
+        let Some(child) = self.children.get_mut(&run.run_id) else {
+            return Ok(false);
+        };
+        let ended = child.try_wait().map_err(|error| {
+            AppError::new(
+                "broker-worker-observation-failed",
+                format!("cannot observe worker {}: {error}", run.run_id),
+            )
+        })?;
+        if ended != Some(0) {
+            return Ok(false);
+        }
+        preempt::withdraw(connection, &run.run_id)?;
+        Ok(true)
+    }
+
+    /// Deliver a requested stop to a worker that may still be alive, and note when this
+    /// owner first did.  An enforced cgroup is killed as a whole; any other worker's
+    /// process group is signalled, first to terminate and after the grace period to die.
+    fn deliver_stop(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
+        self.cancellation_started
+            .entry(run.run_id.clone())
+            .or_insert_with(Instant::now);
+        if !run.resource_state.is_empty() {
+            let refreshed = load_run(connection, &run.run_id)?;
+            let _ = self.cancel_resources(connection, &refreshed)?;
+        }
+        if !run.resource_state.contains_key(resources::CGROUP_BACKEND) {
+            Self::signal_cancel(&mut self.cancellation_started, run)?;
+        }
         Ok(())
     }
 
@@ -1056,7 +1222,51 @@ impl Broker {
                 format!("run {} changed while its worker was observed", run.run_id),
             ));
         }
-        let (status, exit_status, failure_reason) = if current.cancel_requested {
+        let stop = preempt::pending_stop(connection, &current)?;
+        // A victim returns to the queue only when the attempt that was stopped left nothing
+        // behind.  One whose cgroup or quota could not be reclaimed ends here instead, and
+        // keeps the receipt that says so.
+        let unreclaimed = stop.is_some() && preempt::reclaim_failed(&current.resource_receipt);
+        if let Some(stop) = stop.as_ref().filter(|_| !unreclaimed) {
+            // The victim's process group is gone and its resources are reclaimed, exactly
+            // as for a cancellation; only the outcome differs.  It waits again at its
+            // original sequence, and its caller keeps waiting for the final attempt.
+            preempt::requeue(connection, &current, stop)?;
+            connection
+                .execute_batch("COMMIT")
+                .map_err(map_database_error)?;
+            // Written once the requeue is durable, so no pass that is repeated after a
+            // failed commit writes the line twice.  A cancel that stopped waiting before the
+            // attempt's group emptied did not leave anything behind, but it is an incident.
+            let failed_cancels = preempt::failed_cancels(&current.resource_receipt);
+            if !failed_cancels.is_empty() {
+                let incident = format!(
+                    "AGCoord: incident: the cancel of {victim} for the preemption requested \
+                     by {preemptor} failed ({failed}); the attempt was reclaimed cleanly \
+                     afterwards, so {victim} is requeued",
+                    victim = run.run_id,
+                    preemptor = stop.preemptor,
+                    failed = failed_cancels.join(", "),
+                );
+                eprintln!("{incident}");
+                self.append_run_log(&run.run_id, &incident);
+            }
+            self.append_run_log(
+                &run.run_id,
+                &format!(
+                    "AGCoord: preempted by {} at {}, attempt {}; requeued at its original \
+                     position as attempt {}",
+                    stop.preemptor,
+                    stop.requested_at,
+                    stop.attempt,
+                    stop.attempt + 1,
+                ),
+            );
+            return Ok(());
+        }
+        let (status, exit_status, failure_reason) = if unreclaimed {
+            ("interrupted", 125, Some(preempt::RECLAIM_FAILED))
+        } else if current.cancel_requested {
             Self::requested_stop_outcome(&current)
         } else {
             (status, exit_status, failure_reason)
@@ -1075,6 +1285,7 @@ impl Broker {
                 ],
             )
             .map_err(map_database_error)?;
+        preempt::release(connection, &run.run_id)?;
         overflow::settle(connection, &current)?;
         let finalized_followers = reconcile_batch_on_leader_exit(
             &self.paths,
@@ -1087,6 +1298,19 @@ impl Broker {
         connection
             .execute_batch("COMMIT")
             .map_err(map_database_error)?;
+        if let Some(stop) = stop.filter(|_| unreclaimed) {
+            self.append_run_log(
+                &run.run_id,
+                &format!(
+                    "AGCoord: preempted by {} at {}, attempt {}; not requeued, because the \
+                     resources of that attempt were not reclaimed cleanly ({})",
+                    stop.preemptor,
+                    stop.requested_at,
+                    stop.attempt,
+                    preempt::RECLAIM_FAILED,
+                ),
+            );
+        }
         for member_id in finalized_followers {
             copy_leader_log_to_member(&self.paths, &run.run_id, &member_id);
         }
@@ -2240,6 +2464,10 @@ impl Broker {
         if let Some(pool) = pool {
             // The placement and its budget reservation commit with the admission.
             overflow::place(&connection, &current, pool)?;
+        } else {
+            // A local check that may still be preempted keeps its submitted environment,
+            // which the row itself drops once its worker exists, so it can be requeued.
+            preempt::retain(&connection, &current)?;
         }
         connection
             .execute_batch("COMMIT")

@@ -863,16 +863,22 @@ pub fn budget_allows(
     Ok(used.saturating_add(pool.reservation(resources)) <= budget.cpu_seconds)
 }
 
-/// Whole seconds a row has waited since it was submitted.
-pub fn waited_seconds(connection: &Connection, created_at: &str) -> Result<u64> {
+/// Seconds, with their fraction, a row has waited since the stored instant `since`: its
+/// submission, or the moment it last entered the queue.
+pub fn waited(connection: &Connection, since: &str) -> Result<f64> {
     let waited: Option<f64> = connection
         .query_row(
             "SELECT (julianday('now') - julianday(?1)) * 86400.0",
-            params![created_at],
+            params![since],
             |row| row.get(0),
         )
         .map_err(map_database_error)?;
-    Ok(waited.unwrap_or(0.0).max(0.0) as u64)
+    Ok(waited.unwrap_or(0.0).max(0.0))
+}
+
+/// Whole seconds a row has waited since `since`.
+pub fn waited_seconds(connection: &Connection, since: &str) -> Result<u64> {
+    Ok(waited(connection, since)? as u64)
 }
 
 /// Record a placement and its worst-case reservation.  The caller holds the admission

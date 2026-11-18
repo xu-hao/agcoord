@@ -273,6 +273,13 @@ def _detail(row: dict | None) -> str:
         result = f" · exit {row['exit_status']}"
     cancel = " · cancellation requested" if row["cancel_requested"] else ""
     failure = f" · {row['failure_reason']}" if row["failure_reason"] else ""
+    attempts = row.get("attempts") or 1
+    preempted_by = row.get("preempted_by")
+    preemption = (
+        f" · attempt {attempts}" + (f" (preempted by {preempted_by})" if preempted_by else "")
+        if attempts > 1 or preempted_by
+        else ""
+    )
     publication_cancel = (
         " · cancellable only while queued"
         if row["status"] == "running"
@@ -302,7 +309,7 @@ def _detail(row: dict | None) -> str:
         f"{enforcement} · blocked: {blockers}\n"
         f"branch: {row['branch']}{batch_branch_suffix}\n"
         f"checkout: {row['checkout']}\n"
-        f"{process}{result}{failure}{cancel}{publication_cancel} · log {row['log_bytes']} bytes\n"
+        f"{process}{result}{failure}{cancel}{publication_cancel}{preemption} · log {row['log_bytes']} bytes\n"
         f"created: {row['created_at']}\n"
         f"started: {row['started_at'] or '—'}\n"
         f"finished: {row['finished_at'] or '—'}"
@@ -332,6 +339,8 @@ def _modal_detail(row: dict, *, now: datetime | None = None) -> str:
         f"Gate receipt: {row['gate_run_id'] or '—'}\n"
         f"Publication: {json.dumps(row['publication'], sort_keys=True) if row['publication'] else '—'}\n"
         f"Failure reason: {row['failure_reason'] or '—'}\n"
+        f"Attempts: {row.get('attempts') or 1}\n"
+        f"Preempted by: {row.get('preempted_by') or '—'}\n"
         f"Checkout: {row['checkout']}\n"
         f"Caller PID: {row['caller_pid']}\n"
         f"Worker PID: {row['worker_pid'] if row['worker_pid'] is not None else '—'}\n"

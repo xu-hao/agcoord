@@ -141,7 +141,10 @@ forever. Without a binding, a name is admission accounting only. With a binding 
 `config.json`, the broker applies and measures it, and every run reports what was requested,
 applied, and observed. Scratch is opt-in: a job that declares neither a tmpfs nor a
 project-quota policy receives no temporary directory from AGCoord, and inherited `TMPDIR`,
-`TMP`, and `TEMP` values are removed. The
+`TMP`, and `TEMP` values are removed. Jobs start first fit in submission order, and an older
+job that lacks only capacity may
+[preempt](docs/coordinator.md#first-fit-admission-and-preemption) later checks, which
+are requeued while their callers keep waiting; `agc run --no-preempt` opts a check out. The
 [resource contract](docs/coordinator.md#repository-lanes-and-resources) covers bindings,
 [delegated cgroups](docs/coordinator.md#delegated-cgroup-v2-lifecycle),
 [child CPU leases](docs/coordinator.md#child-cpu-leases-for-parallel-tools) for tools that

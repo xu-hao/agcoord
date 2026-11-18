@@ -33,6 +33,7 @@ _CONFIG_KEYS = frozenset(
         "land_gate_reuse_max_age",
         "land_max_batch_size",
         "stop_grace",
+        "preempt_after",
         "native_broker",
         "overflow_pools",
     }
@@ -67,6 +68,7 @@ class BrokerConfig:
     overflow_pools: tuple[Mapping[str, Any], ...] = ()
     capabilities: tuple[str, ...] = ()
     land_max_batch_size: int | None = None
+    preempt_after: float | None = None
 
 
 def config_path(state_dir: str | os.PathLike[str]) -> Path:
@@ -128,6 +130,7 @@ def parse_broker_config(
     land_gate_reuse_max_age = _land_gate_reuse_max_age(document, source=source)
     land_max_batch_size = _land_max_batch_size(document, source=source)
     stop_grace = _stop_grace(document, source=source)
+    preempt_after = _preempt_after(document, source=source)
     native_broker = _native_broker_section(document, source=source)
     overflow_pools = _overflow_pools_section(document, source=source)
     cgroup_root = document.get("cgroup_root")
@@ -149,6 +152,7 @@ def parse_broker_config(
         overflow_pools=overflow_pools,
         capabilities=capabilities,
         land_max_batch_size=land_max_batch_size,
+        preempt_after=preempt_after,
     )
 
 
@@ -344,6 +348,15 @@ def _stop_grace(
 ) -> float | None:
     """How long a stopping broker lets running work finish; zero interrupts it at once."""
     return _nonnegative_seconds(document, "stop_grace", source=source)
+
+
+def _preempt_after(
+    document: Mapping[str, Any],
+    *,
+    source: str | os.PathLike[str],
+) -> float | None:
+    """How long the oldest starving row waits, since it last entered the queue, to preempt."""
+    return _nonnegative_seconds(document, "preempt_after", source=source)
 
 
 def _nonnegative_seconds(

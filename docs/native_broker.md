@@ -216,13 +216,25 @@ callback boundary.
 ### Implemented scheduler and state boundary
 
 The native executable implements the protocol-5 owner lock, SQLite spool initialization,
-submission validation, admission, repository barriers, queue-order-preserving round-robin
-selection, generic capacity accounting, cancellation, land-phase authority, land gate-reuse
+submission validation, first-fit admission in submission order, preemption of
+checks, repository barriers, generic capacity accounting, cancellation, land-phase authority,
+land gate-reuse
 authority, history reads,
 worker observation, child leases, durable drain/status/resume, and protocol-4-to-5 migration
 and rollback. The Python client, TUI, and pytest-xdist adapter use these native commands while
 retaining their public JSON and environment contracts; migration and rollback are broker-internal
 and are no longer exposed as client commands.
+
+[Preemption](coordinator.md#first-fit-admission-and-preemption) keeps its
+state in the coordinator-private `run_preemptions` table, so the `runs` columns keep their
+protocol-5 shape: a row's attempt count and last preemptor, when a requeued row last entered
+the queue, a requested stop that has not completed, and the submitted environment of a running
+check that may still be preempted. The stop request commits in one transaction for every
+victim, and each victim's requeue, or its terminal transition when it is not requeued, commits
+in the transaction that would otherwise make it terminal. That transition drops the kept
+environment and any stop in flight, a row that was never preempted leaves no record once it
+ends, and a starting broker drops a kept environment or stop it finds for a row that is not
+running.
 
 `serve` validates the complete schema and every stored run before changing activity metadata,
 puts new and migrated databases in WAL mode, and uses `database_timeout` and
@@ -331,7 +343,8 @@ Clients continue to use short SQLite transactions rather than mutating live proc
   for `full`/`land`, the forked launcher prepares the coordinator-owned gate tree and the
   broker commits its executed `checkout` before final release;
 - cancellation sets the durable cancellation request, except that a queued row may be made
-  terminal atomically;
+  terminal atomically; cancelling a check that a preemption is stopping also clears that stop
+  in the same transaction, so the check ends cancelled instead of requeued;
 - child lease acquisition inserts a waiting lease tied to the admitted run, PID and start token;
 - lease release or cancellation updates only the authenticated lease request;
 - an admitted land adapter reports phase and result only when run ID, kind, current durable

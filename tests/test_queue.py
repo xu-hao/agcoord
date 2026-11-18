@@ -55,6 +55,8 @@ ROW_KEYS = {
     "resource_receipt",
     "blocked_by",
     "pool",
+    "attempts",
+    "preempted_by",
     "gate_run_id",
     "publication",
     "batch",
@@ -1236,6 +1238,8 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
 
 
 def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: Path):
+    # The large check may preempt at once rather than after the five-minute default.
+    _preempt_at_once(tmp_path / "state")
     running = RunningCoordinator(
         tmp_path / "state",
         capacities={"jobs": 4, "cpu": 3},
@@ -1297,30 +1301,39 @@ def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: P
             second,
             resources={"cpu": 1},
         )
-        # The front request reserves capacity across repository lanes.
+        # Admission is first fit: the small check packs into the CPU the large one cannot
+        # use, and the other repository's check then waits for capacity as the large one does.
+        wait_for(entered_small.exists, "the small check did not pack into free capacity")
         assert client.status(large_id)["status"] == "queued"
         assert client.status(large_id)["blocked_by"] == ["resource:cpu"]
-        for run_id in (small_id, other_id):
-            assert client.status(run_id)["status"] == "queued"
-            assert client.status(run_id)["blocked_by"] == [f"reservation:{large_id}:cpu"]
-        assert not entered_small.exists()
+        assert client.status(other_id)["status"] == "queued"
+        assert client.status(other_id)["blocked_by"] == ["resource:cpu"]
         assert not entered_other.exists()
         assert not entered_large.exists()
-        assert client.snapshot()["allocations"] == {"jobs": 2, "cpu": 2}
+        assert client.snapshot()["allocations"] == {"jobs": 3, "cpu": 3}
 
+        # Once the first check leaves, the oldest waiting check lacks one CPU.  It preempts
+        # the later small check, which waits again at its place ahead of the newer row.
         release_first.touch()
         _row(client, first_id, "passed")
-        wait_for(entered_large.exists, "the front request did not use the freed capacity")
+        wait_for(entered_large.exists, "the large check did not preempt later work")
+        requeued = _row(client, small_id, "queued")
+        assert requeued["attempts"] == 2
+        assert requeued["preempted_by"] == large_id
+        assert requeued["position"] == 1
+        assert client.status(other_id)["position"] == 2
         assert not entered_other.exists()
 
+        # The CPU the full gate frees goes to the requeued check first.
         release_full.touch()
         _row(client, full_id, "passed")
+        assert _row(client, small_id, "running")["attempts"] == 2
+        assert client.status(other_id)["status"] == "queued"
         release_large.touch()
-        wait_for(entered_small.exists, "later lane work never started")
         wait_for(entered_other.exists, "cross-repository work never started")
         release_small.touch()
         release_other.touch()
-        _row(client, small_id, "passed")
+        assert _row(client, small_id, "passed")["preempted_by"] == large_id
         assert _row(client, large_id, "passed")["repository_id"] == client.status(full_id)[
             "repository_id"
         ]
@@ -1329,6 +1342,188 @@ def test_full_is_not_a_lane_barrier_and_lane_work_packs_by_resources(tmp_path: P
     finally:
         for path in releases:
             path.touch()
+        running.stop()
+
+
+def test_a_preempted_check_caller_keeps_waiting_and_gets_the_final_attempt(tmp_path: Path):
+    state = tmp_path / "state"
+    # The starving check may preempt at once rather than after the five-minute default.
+    _preempt_at_once(state)
+    running = RunningCoordinator(state, capacities={"jobs": 4, "cpu": 4})
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    holder_entered = tmp_path / "holder-entered"
+    holder_release = tmp_path / "holder-release"
+    starving_entered = tmp_path / "starving-entered"
+    starving_release = tmp_path / "starving-release"
+    victim_starts = tmp_path / "victim-starts"
+    victim_source = """
+import pathlib
+import sys
+import time
+
+starts = pathlib.Path(sys.argv[1])
+with starts.open("a", encoding="utf-8") as stream:
+    stream.write("started\\n")
+if len(starts.read_text(encoding="utf-8").splitlines()) > 1:
+    print("second attempt", flush=True)
+    raise SystemExit(7)
+print("first attempt", flush=True)
+while True:
+    time.sleep(0.01)
+"""
+    caller: subprocess.Popen[str] | None = None
+
+    def victim_attempts() -> int:
+        try:
+            return len(victim_starts.read_text(encoding="utf-8").splitlines())
+        except FileNotFoundError:
+            return 0
+
+    try:
+        holder_id = _submit(
+            client,
+            _blocking_command(holder_entered, holder_release, "holder"),
+            repository,
+            resources={"cpu": 2},
+        )
+        wait_for(holder_entered.exists, "the holder did not start")
+        starving_id = _submit(
+            client,
+            _blocking_command(starving_entered, starving_release, "starving"),
+            repository,
+            resources={"cpu": 4},
+        )
+        assert client.status(starving_id)["blocked_by"] == ["resource:cpu"]
+        # The later check is an ordinary `agc run` whose caller waits for its verdict.
+        caller = subprocess.Popen(
+            [
+                sys.executable, "-m", "agcoord", "--state-dir", str(state), "run",
+                "--checkout", str(repository), "--label", "later check",
+                "--resource", "cpu=2", "--",
+                sys.executable, "-u", "-c", victim_source, str(victim_starts),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=caller_environment(),
+        )
+        wait_for(lambda: victim_attempts() == 1, "the later check did not start")
+        victim_id = next(
+            row["run_id"]
+            for row in client.snapshot()["active"]
+            if row["label"] == "later check"
+        )
+
+        # The holder leaves, so the starving check preempts the later one.
+        holder_release.touch()
+        _row(client, holder_id, "passed")
+        wait_for(starving_entered.exists, "the starving check did not preempt later work")
+        requeued = _row(client, victim_id, "queued")
+        assert requeued["attempts"] == 2
+        assert requeued["preempted_by"] == starving_id
+        assert caller.poll() is None, "the caller stopped waiting for its preempted check"
+
+        starving_release.touch()
+        _row(client, starving_id, "passed")
+        stdout, stderr = caller.communicate(timeout=30)
+        # The caller receives the final attempt's exit status, and one stream that marks
+        # the preemption between the two attempts.
+        assert caller.returncode == 7, stderr
+        final = client.status(victim_id)
+        assert final["status"] == "failed"
+        assert final["exit_status"] == 7
+        assert final["attempts"] == 2
+        assert victim_attempts() == 2
+        notice = f"AGCoord: preempted by {starving_id} at "
+        assert notice in stdout, stdout
+        assert ", attempt 1; requeued at its original position as attempt 2\n" in stdout
+        assert (
+            stdout.index("first attempt\n")
+            < stdout.index(notice)
+            < stdout.index("second attempt\n")
+        ), stdout
+    finally:
+        for path in (holder_release, starving_release):
+            path.touch()
+        if caller is not None and caller.poll() is None:
+            caller.kill()
+            caller.communicate()
+        running.stop()
+
+
+def test_a_check_submitted_without_preemption_is_never_stopped_for_a_starving_row(
+    tmp_path: Path,
+):
+    # The starving check may preempt at once, so only the opt-out keeps the later check.
+    _preempt_at_once(tmp_path / "state")
+    running = RunningCoordinator(tmp_path / "state", capacities={"jobs": 4, "cpu": 4})
+    client = running.start()
+    repository = _repository(tmp_path / "repository")
+    paths = {
+        name: (tmp_path / f"{name}-entered", tmp_path / f"{name}-release")
+        for name in ("holder", "starving", "later")
+    }
+
+    try:
+        reserved = dict(caller_environment(), _AGCOORD_NO_PREEMPT="1")
+        with pytest.raises(CoordinatorError, match="reserved _AGCOORD_NO_PREEMPT name"):
+            client.submit(
+                _python("None"),
+                checkout=str(repository),
+                environment=reserved,
+            )
+        with pytest.raises(CoordinatorError, match="preempt must be boolean"):
+            client.submit(
+                _python("None"),
+                checkout=str(repository),
+                environment=caller_environment(),
+                preempt=None,  # type: ignore[arg-type]
+            )
+        assert client.snapshot()["queued"] == []
+
+        holder_id = _submit(
+            client,
+            _blocking_command(*paths["holder"], "holder"),
+            repository,
+            resources={"cpu": 2},
+        )
+        wait_for(paths["holder"][0].exists, "the holder did not start")
+        starving_id = _submit(
+            client,
+            _blocking_command(*paths["starving"], "starving"),
+            repository,
+            resources={"cpu": 4},
+        )
+        later_id = client.submit(
+            _blocking_command(*paths["later"], "later"),
+            checkout=str(repository),
+            resources={"cpu": 2},
+            caller_pid=os.getpid(),
+            environment=caller_environment(),
+            preempt=False,
+        )
+        wait_for(paths["later"][0].exists, "the later check did not start")
+
+        # Stopping the later check would let the starving one start, but it opted out.
+        paths["holder"][1].touch()
+        _row(client, holder_id, "passed")
+        time.sleep(0.75)
+        later = client.status(later_id)
+        assert later["status"] == "running"
+        assert later["cancel_requested"] is False
+        assert later["attempts"] == 1
+        assert client.status(starving_id)["status"] == "queued"
+        assert not paths["starving"][0].exists()
+
+        paths["later"][1].touch()
+        assert _row(client, later_id, "passed")["attempts"] == 1
+        wait_for(paths["starving"][0].exists, "the starving check never started")
+        paths["starving"][1].touch()
+        _row(client, starving_id, "passed")
+    finally:
+        for _entered, release in paths.values():
+            release.touch()
         running.stop()
 
 
@@ -3129,6 +3324,12 @@ def test_land_without_the_opt_in_never_consults_a_full_receipt(
 
     assert _executions(ledger) == ["shared", "shared"]
     assert row["gate_run_id"] is None
+
+
+def _preempt_at_once(state_dir: Path) -> None:
+    """Configure a coordinator, before it starts, so a starving row preempts at once."""
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state_dir / "config.json").write_text(json.dumps({"preempt_after": 0}), encoding="utf-8")
 
 
 def _reuse_coordinator(state_dir: Path, max_age: float) -> RunningCoordinator:

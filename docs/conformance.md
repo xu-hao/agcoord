@@ -19,9 +19,23 @@ unrelated process kill, or unverified enforcement claim.
 Resource coverage proves the zero-scratch default at the worker boundary — the broker removes
 caller temporary-directory variables and creates no managed run scratch path unless a provider is
 declared — and that a worker under a declared scratch policy still verifies its admission.
-It also proves machine-wide front-row reservations across row kinds, backfilling into spare
-unreserved capacity, exclusion of repository-blocked and oversized overflow-only rows from
-reservation, and overflow placement of reservation-blocked work after the pool threshold.
+It also proves first-fit admission in submission order across repositories and row kinds,
+with no capacity reserved for a waiting row, and the preemption of later checks for such a row.
+The oldest row that lacks only local capacity stops the latest-submitted checks that minimally
+cover its shortage once it has been queued for `preempt_after` since it last entered the queue,
+or at once when it is a land, and they are requeued at their original sequence. Lands, fulls,
+merges, opted-out checks, and checks already preempted twice are never stopped, so a row whose
+shortage only they hold keeps waiting with nothing reserved for it; a repository-blocked or
+overflow-only row preempts nothing; an overflow pool with room is used first; while victims
+stop, a later row waits exactly when admitting it would leave the starving row unable to fit,
+whatever its kind; a caller's cancellation wins; a victim that passes before any stop reaches
+it keeps its verdict, and one that fails in that window is requeued; a victim whose cancel gave
+up but whose group emptied before it was removed is requeued with an incident, while one whose
+resources are not reclaimed cleanly ends interrupted with its receipt instead of being
+requeued; a victim that does not stop keeps its claim while its preemption is abandoned; a
+replacement owner completes a requested preemption with the whole stop bound; a starting owner
+keeps no submitted environment or stop for a row that is not running; and a victim under an
+enforced binding is reclaimed and prepared again for its next attempt.
 
 Repository coverage also proves reusable coordinator-owned exact-head gate trees, stable
 logical worktree identity, same-branch serialization, warm artifact retention, and setup
