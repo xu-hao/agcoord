@@ -27,3 +27,8 @@ output "runner_service_account" {
   description = "Email of the service account job machines run as."
   value       = google_service_account.runner.email
 }
+
+output "result_cache_url" {
+  description = "URL of the private result-cache bucket that the runner and the submitters may read and write."
+  value       = "gs://${google_storage_bucket.result_cache.name}"
+}

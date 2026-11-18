@@ -100,8 +100,10 @@ unmounts only its test-owned filesystem.
 
 The Terraform module below `packaging/terraform/` has opt-in static checks. With `terraform`
 installed, set `AGCOORD_TEST_TERRAFORM=1` and run `tests/test_terraform_gcp_overflow.py` to check
-its formatting and validate it against the provider schema; the provider is downloaded into a
-temporary copy. These checks never contact a cloud API. A snap-installed `terraform` refuses to
+its formatting, validate it against the provider schema, and run `terraform test` against a mock
+provider (Terraform 1.7 or later) to check the result-cache bucket's privacy, retention, and
+writers; the provider is downloaded into a temporary copy. These checks never contact a cloud
+API. A snap-installed `terraform` refuses to
 start inside an admitted job on an enforced host, so run this one file directly rather than
 through `agc run` there. Applying the module, or running a job on real cloud infrastructure, is
 an operator action or a benchmark, never part of a test suite.

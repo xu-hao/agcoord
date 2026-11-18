@@ -10,6 +10,7 @@ locals {
     "iam.googleapis.com",
     "logging.googleapis.com",
     "run.googleapis.com",
+    "storage.googleapis.com",
   ])
 
   # The package names executors push under.  The cleanup policies below depend on them.
@@ -84,8 +85,9 @@ resource "google_artifact_registry_repository" "images" {
   depends_on = [google_project_service.enabled]
 }
 
-# The identity of a job machine.  It can report to Batch, write logs, and read this one
-# repository; it holds no forge credentials and cannot change the project.
+# The identity of a job machine.  It can report to Batch, write logs, read this one
+# repository, and use the result cache; it holds no forge credentials and cannot change the
+# project.
 resource "google_service_account" "runner" {
   project      = google_project.overflow.project_id
   account_id   = "agcoord-overflow-runner"
@@ -139,4 +141,41 @@ resource "google_service_account_iam_member" "submitter_runs_as_runner" {
   service_account_id = google_service_account.runner.name
   role               = "roles/iam.serviceAccountUser"
   member             = each.value
+}
+
+# A private bucket that jobs and submitters share as a result cache, so a check's cache
+# survives the job machine that produced it.  Anyone who can write it can make a later job
+# reuse a result it never computed, so only the runner and the submitters may write it.
+resource "google_storage_bucket" "result_cache" {
+  project                     = google_project.overflow.project_id
+  name                        = "${google_project.overflow.project_id}-result-cache"
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  lifecycle_rule {
+    condition {
+      age = var.result_cache_retention_days
+    }
+
+    action {
+      type = "Delete"
+    }
+  }
+
+  depends_on = [google_project_service.enabled]
+}
+
+resource "google_storage_bucket_iam_member" "runner_uses_result_cache" {
+  bucket = google_storage_bucket.result_cache.name
+  role   = "roles/storage.objectAdmin"
+  member = google_service_account.runner.member
+}
+
+resource "google_storage_bucket_iam_member" "submitter_uses_result_cache" {
+  for_each = var.submitters
+
+  bucket = google_storage_bucket.result_cache.name
+  role   = "roles/storage.objectAdmin"
+  member = each.value
 }
