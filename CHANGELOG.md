@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Bound worker-identity commit contention retries in the native broker, retry transient busy
+  transactions cleanly without leaking started workers, reconcile aborted post-admission runs
+  immediately as `interrupted` (`worker-result-lost`), and keep `--idle-timeout` responsive under
+  contention or stop signals. #234 — prevent busy worker-identity commits from stranding a
+  running row without a worker.
+
 - Shorten long `cgroup-v2` `tmpfs` `TMPDIR`/`TMP`/`TEMP` paths through a broker-owned short symlink
   alias (preferring `/run/user/<uid>` when owner-only, else `/tmp`) when the direct scratch path
   exceeds 48 bytes, keeping the physical mount, quotas, and terminal/recovery cleanup unchanged so
