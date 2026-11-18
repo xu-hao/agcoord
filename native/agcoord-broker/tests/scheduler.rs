@@ -9870,13 +9870,13 @@ fn a_starting_owner_drops_kept_environments_and_stops_of_rows_that_are_not_runni
     assert_eq!(record("check-preempted"), preempted_record);
     assert_eq!(record("check-plain"), None);
     assert_eq!(record("check-forgotten"), None);
-    assert!(retained_environments(&state).is_empty());
     assert_eq!(status(&state, "check-preempted")["attempts"], 2);
     assert_eq!(
         status(&state, "check-preempted")["preempted_by"],
         "check-elsewhere"
     );
-    // The queued row runs normally under the new owner, and nothing of it is kept after.
+    // The queued row, which the new owner may admit at once, runs normally, and once it has
+    // ended nothing of any submission is kept.
     wait_status(&state, "check-queued", "passed");
     assert!(retained_environments(&state).is_empty());
     drop(database);
