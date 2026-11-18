@@ -9479,19 +9479,68 @@ fn a_victim_whose_leaf_is_not_reclaimed_ends_interrupted_with_its_receipt() {
     assert!(broker.terminate().success());
 }
 
+/// A running kernel thread with no children, which this test process cannot signal.  As a
+/// member of a fixture leaf it keeps that leaf populated through any kill.
+fn unkillable_childless_process() -> (u32, String) {
+    let table: Vec<(u32, u32, String)> = fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| {
+            let pid = entry.ok()?.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let fields: Vec<_> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+            Some((
+                pid,
+                fields.get(1)?.parse().ok()?,
+                fields.first()?.to_string(),
+            ))
+        })
+        .collect();
+    table
+        .iter()
+        .filter(|(pid, parent, state)| {
+            *parent == 2
+                && !matches!(state.as_str(), "Z" | "X")
+                && !table.iter().any(|(_, other_parent, _)| other_parent == pid)
+                // SAFETY: signal 0 only checks whether this process may signal `pid`.
+                && unsafe { libc::kill(*pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        })
+        .map(|(pid, _, _)| (*pid, process_start_token(u64::from(*pid))))
+        .next()
+        .expect("this host exposes no childless kernel thread to keep a fixture leaf populated")
+}
+
+/// The fixture's membership record of one leaf: process ID to start token.
+fn leaf_members(leaf: &Path) -> Option<serde_json::Map<String, Value>> {
+    let text = fs::read_to_string(leaf.join(".agcoord-members.json")).ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+/// Replace a leaf's membership record in one rename, so the broker never reads it half
+/// written.
+fn write_leaf_members(leaf: &Path, members: &serde_json::Map<String, Value>) {
+    let staged = leaf.join(".agcoord-test-members.json");
+    fs::write(&staged, serde_json::to_vec(members).unwrap()).unwrap();
+    fs::rename(&staged, leaf.join(".agcoord-members.json")).unwrap();
+}
+
 #[test]
-fn a_victim_that_ends_before_its_stop_is_delivered_keeps_its_verdict() {
-    let temporary = TestDirectory::new("preempt-ended-first");
+fn a_victim_whose_leaf_empties_after_its_cancel_gave_up_is_requeued() {
+    let temporary = TestDirectory::new("preempt-late-empty");
     let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
     let checkout = temporary.path().join("checkout");
-    fs::create_dir(&checkout).unwrap();
-    write_broker_config(&state, json!({"preempt_after": 0}));
-    // The broker stops itself right after it durably requests a preemption, before it
-    // delivers anything to the victim.
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    write_broker_config(&state, cgroup_slot_config(&root));
     let mut broker = RunningBroker::start_with_options(
         &state,
-        &[("jobs", 8), ("cpu", 4)],
-        &["--stop-after", "preemption-request"],
+        &[("jobs", 8), ("cpu", 4), ("cgroup_slot", 8)],
+        &["--cgroup-fixture", root.to_str().unwrap()],
     );
     let path = |name: &str| temporary.path().join(name);
     let _releases = ReleaseFiles(vec![
@@ -9521,49 +9570,314 @@ fn a_victim_that_ends_before_its_stop_is_delivered_keeps_its_verdict() {
         &checkout,
         "check-victim",
         "repo-b",
-        verdict_command(&path("victim-starts"), &path("victim-release"), 3),
-        &[("cpu", 2)],
+        attempt_command(&path("victim-starts"), &path("victim-release")),
+        &[("cpu", 2), ("cgroup_slot", 1)],
     );
-    let admitted = wait_status(&state, "check-victim", "running");
-    let worker_pid = u64::try_from(admitted["worker_pid"].as_i64().unwrap()).unwrap();
     wait_for(Duration::from_secs(10), || {
         attempts_started(&path("victim-starts")) == 1
     });
+    // The victim's leaf also lists a process that no kill can end, so the leaf stays
+    // populated after the victim's own processes are gone.
+    let leaf = only_cgroup_leaf(&root);
+    let (pid, token) = unkillable_childless_process();
+    let key = pid.to_string();
+    let listed = |leaf: &Path| leaf_members(leaf).is_some_and(|members| members.contains_key(&key));
+    wait_for(Duration::from_secs(10), || {
+        if !listed(&leaf) {
+            if let Some(mut members) = leaf_members(&leaf) {
+                members.insert(key.clone(), Value::String(token.clone()));
+                write_leaf_members(&leaf, &members);
+            }
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+        listed(&leaf)
+    });
 
-    // The holder leaves, the starving check asks the victim to stop, and the owner pauses.
+    // The starving check preempts the victim.  The cancel kills the victim's processes but
+    // gives up waiting for the leaf to empty.
     fs::write(path("holder-release"), "release").unwrap();
-    wait_for(Duration::from_secs(10), || {
-        process_state(u64::from(broker.pid())).as_deref() == Some("T")
+    wait_status(&state, "check-holder", "passed");
+    wait_for(Duration::from_secs(20), || {
+        status(&state, "check-victim")["resource_receipt"]["events"]
+            .as_array()
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["stage"] == "cancel" && event["status"] == "failed")
+            })
     });
-    let requested = status(&state, "check-victim");
-    assert_eq!(requested["status"], "running");
-    assert_eq!(requested["failure_reason"], "preempted");
-    assert_eq!(requested["preempted_by"], "check-starving");
-
-    // Meanwhile the victim finishes on its own with a verdict of its own.
-    fs::write(path("victim-release"), "release").unwrap();
+    // Then the leaf empties, while the broker still waits for it to finish the attempt.
     wait_for(Duration::from_secs(10), || {
-        process_state(worker_pid).is_none_or(|state| state == "Z")
+        if listed(&leaf) {
+            let mut members = leaf_members(&leaf).unwrap();
+            members.remove(&key);
+            write_leaf_members(&leaf, &members);
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+        !listed(&leaf)
     });
-    signal_process(broker.pid(), "-CONT");
 
-    // Nothing was stopped, so nothing is run again: the verdict stands.
-    let finished = wait_status(&state, "check-victim", "failed");
-    assert_eq!(finished["exit_status"], 3);
-    assert_eq!(finished["failure_reason"], Value::Null);
-    assert_eq!(finished["cancel_requested"], false);
-    assert_eq!(finished["attempts"], 1);
-    assert_eq!(finished["preempted_by"], Value::Null);
-    assert!(!run_log(&state, "check-victim").contains("preempted by"));
-    // The capacity it held reaches the starving check.
-    wait_for(Duration::from_secs(10), || {
+    // The attempt ended clean, so the victim is requeued like any other; the cancel that
+    // gave up is recorded as an incident.
+    wait_for(Duration::from_secs(15), || {
         attempts_started(&path("starving-starts")) == 1
     });
+    let requeued = status(&state, "check-victim");
+    assert_eq!(requeued["status"], "queued");
+    assert_eq!(requeued["attempts"], 2);
+    assert_eq!(requeued["preempted_by"], "check-starving");
+    assert_eq!(requeued["resource_receipt"]["events"], json!([]));
+    let log = run_log(&state, "check-victim");
+    assert!(
+        log.contains(
+            "AGCoord: incident: the cancel of check-victim for the preemption requested by \
+             check-starving failed (cgroup-v2 cgroup_slot: leaf-populated); the attempt was \
+             reclaimed cleanly afterwards, so check-victim is requeued"
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains("AGCoord: preempted by check-starving at "),
+        "{log}"
+    );
+    assert!(!leaf.exists());
+
     fs::write(path("starving-release"), "release").unwrap();
     wait_status(&state, "check-starving", "passed");
-    assert_eq!(attempts_started(&path("victim-starts")), 1);
-    assert!(retained_environments(&state).is_empty());
-    assert!(broker.terminate().success());
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("victim-starts")) == 2
+    });
+    fs::write(path("victim-release"), "release").unwrap();
+    assert_eq!(wait_status(&state, "check-victim", "passed")["attempts"], 2);
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    let (exit, stderr) = broker.terminate_with_stderr();
+    assert!(exit.success(), "{stderr}");
+    assert!(
+        stderr.contains("AGCoord: incident: the cancel of check-victim"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_later_row_that_would_take_what_the_starving_row_needs_waits_while_victims_stop() {
+    for later in ["full", "check"] {
+        let temporary = TestDirectory::new(&format!("preempt-hold-{later}"));
+        let state = temporary.path().join("state");
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        write_broker_config(&state, json!({"preempt_after": 0}));
+        let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4), ("memory", 8)]);
+        let path = |name: &str| temporary.path().join(name);
+        let _releases = ReleaseFiles(vec![
+            path("holder-release"),
+            path("starving-release"),
+            path("victim-release"),
+            path("later-release"),
+        ]);
+        submit_check(
+            &state,
+            &checkout,
+            "check-holder",
+            "repo-a",
+            attempt_command(&path("holder-starts"), &path("holder-release")),
+            &[("cpu", 2)],
+        );
+        wait_status(&state, "check-holder", "running");
+        // The starving check needs memory too, but only CPUs are short.
+        submit_check(
+            &state,
+            &checkout,
+            "check-starving",
+            "repo-a",
+            attempt_command(&path("starving-starts"), &path("starving-release")),
+            &[("cpu", 4), ("memory", 4)],
+        );
+        assert_eq!(
+            status(&state, "check-starving")["blocked_by"],
+            json!(["resource:cpu"])
+        );
+        // The victim survives SIGTERM for the cancellation grace, so it is slow to stop.
+        submit_check(
+            &state,
+            &checkout,
+            "check-victim",
+            "repo-b",
+            stubborn_attempt_command(&path("victim-starts"), &path("victim-release"), 0),
+            &[("cpu", 2)],
+        );
+        wait_for(Duration::from_secs(10), || {
+            attempts_started(&path("victim-starts")) == 1
+        });
+        fs::write(path("holder-release"), "release").unwrap();
+        wait_status(&state, "check-holder", "passed");
+        wait_for(Duration::from_secs(10), || {
+            status(&state, "check-victim")["cancel_requested"] == true
+        });
+
+        // While the victim stops, a later row that claims no CPU but memory the starving
+        // check will need waits: admitting it would leave the starving check unable to fit
+        // once the victim is gone.
+        let submission = Submission {
+            run_id: "later-memory",
+            kind: later,
+            repository: "repo-c",
+            checkout: &checkout,
+            command: attempt_command(&path("later-starts"), &path("later-release")),
+            gate_run_id: None,
+        };
+        submit_ok_in_worktree(&state, &submission, &[("memory", 6)], None);
+        let held = status(&state, "later-memory");
+        assert_eq!(held["status"], "queued", "later kind {later}");
+        assert_eq!(
+            held["blocked_by"],
+            json!(["preemption:check-starving"]),
+            "later kind {later}"
+        );
+
+        // The victim is stopped once, and the starving check starts with the memory free.
+        wait_for(Duration::from_secs(10), || {
+            attempts_started(&path("starving-starts")) == 1
+        });
+        let requeued = status(&state, "check-victim");
+        assert_eq!(requeued["status"], "queued");
+        assert_eq!(requeued["attempts"], 2);
+        let waiting = status(&state, "later-memory");
+        assert_eq!(waiting["status"], "queued", "later kind {later}");
+        assert_eq!(waiting["blocked_by"], json!(["resource:memory"]));
+        assert_eq!(waiting["cancel_requested"], false);
+        assert_eq!(attempts_started(&path("later-starts")), 0);
+
+        // Both start once the starving check ends; nothing was stopped twice.
+        fs::write(path("starving-release"), "release").unwrap();
+        wait_status(&state, "check-starving", "passed");
+        assert_eq!(wait_status(&state, "check-victim", "passed")["attempts"], 2);
+        wait_for(Duration::from_secs(10), || {
+            attempts_started(&path("later-starts")) == 1
+        });
+        fs::write(path("later-release"), "release").unwrap();
+        let finished = wait_status(&state, "later-memory", "passed");
+        assert_eq!(finished["attempts"], 1, "later kind {later}");
+        assert_eq!(finished["preempted_by"], Value::Null);
+        assert_eq!(attempts_started(&path("victim-starts")), 2);
+        assert_eq!(attempts_started(&path("starving-starts")), 1);
+        assert!(broker.terminate().success());
+    }
+}
+
+#[test]
+fn a_victim_that_ends_before_its_stop_is_delivered_keeps_only_a_passing_verdict() {
+    for exit in [0_u8, 3] {
+        let temporary = TestDirectory::new(&format!("preempt-ended-first-{exit}"));
+        let state = temporary.path().join("state");
+        let checkout = temporary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        write_broker_config(&state, json!({"preempt_after": 0}));
+        // The broker stops itself right after it durably requests a preemption, before it
+        // delivers anything to the victim.
+        let mut broker = RunningBroker::start_with_options(
+            &state,
+            &[("jobs", 8), ("cpu", 4)],
+            &["--stop-after", "preemption-request"],
+        );
+        let path = |name: &str| temporary.path().join(name);
+        let _releases = ReleaseFiles(vec![
+            path("holder-release"),
+            path("starving-release"),
+            path("victim-release"),
+        ]);
+        submit_check(
+            &state,
+            &checkout,
+            "check-holder",
+            "repo-a",
+            attempt_command(&path("holder-starts"), &path("holder-release")),
+            &[("cpu", 2)],
+        );
+        wait_status(&state, "check-holder", "running");
+        submit_check(
+            &state,
+            &checkout,
+            "check-starving",
+            "repo-a",
+            attempt_command(&path("starving-starts"), &path("starving-release")),
+            &[("cpu", 4)],
+        );
+        submit_check(
+            &state,
+            &checkout,
+            "check-victim",
+            "repo-b",
+            verdict_command(&path("victim-starts"), &path("victim-release"), exit),
+            &[("cpu", 2)],
+        );
+        let admitted = wait_status(&state, "check-victim", "running");
+        let worker_pid = u64::try_from(admitted["worker_pid"].as_i64().unwrap()).unwrap();
+        wait_for(Duration::from_secs(10), || {
+            attempts_started(&path("victim-starts")) == 1
+        });
+
+        // The holder leaves, the starving check asks the victim to stop, and the owner
+        // pauses.
+        fs::write(path("holder-release"), "release").unwrap();
+        wait_for(Duration::from_secs(10), || {
+            process_state(u64::from(broker.pid())).as_deref() == Some("T")
+        });
+        let requested = status(&state, "check-victim");
+        assert_eq!(requested["status"], "running");
+        assert_eq!(requested["failure_reason"], "preempted");
+        assert_eq!(requested["preempted_by"], "check-starving");
+
+        // Meanwhile the victim finishes on its own.
+        fs::write(path("victim-release"), "release").unwrap();
+        wait_for(Duration::from_secs(10), || {
+            process_state(worker_pid).is_none_or(|state| state == "Z")
+        });
+        signal_process(broker.pid(), "-CONT");
+
+        if exit == 0 {
+            // It passed before anything was stopped, so it is not run again.
+            let finished = wait_status(&state, "check-victim", "passed");
+            assert_eq!(finished["exit_status"], 0);
+            assert_eq!(finished["failure_reason"], Value::Null);
+            assert_eq!(finished["cancel_requested"], false);
+            assert_eq!(finished["attempts"], 1);
+            assert_eq!(finished["preempted_by"], Value::Null);
+            assert!(!run_log(&state, "check-victim").contains("preempted by"));
+        } else {
+            // A failure may have been caused by the requested stop itself, so it is not
+            // kept: the check is requeued like any other victim.
+            wait_for(Duration::from_secs(10), || {
+                attempts_started(&path("starving-starts")) == 1
+            });
+            let requeued = status(&state, "check-victim");
+            assert_eq!(requeued["status"], "queued");
+            assert_eq!(requeued["attempts"], 2);
+            assert_eq!(requeued["preempted_by"], "check-starving");
+            assert!(
+                run_log(&state, "check-victim")
+                    .contains("AGCoord: preempted by check-starving at ")
+            );
+        }
+        // The capacity it held reaches the starving check.
+        wait_for(Duration::from_secs(10), || {
+            attempts_started(&path("starving-starts")) == 1
+        });
+        fs::write(path("starving-release"), "release").unwrap();
+        wait_status(&state, "check-starving", "passed");
+        if exit != 0 {
+            let finished = wait_status(&state, "check-victim", "failed");
+            assert_eq!(finished["exit_status"], i64::from(exit));
+            assert_eq!(finished["attempts"], 2);
+        }
+        assert_eq!(
+            attempts_started(&path("victim-starts")),
+            if exit == 0 { 1 } else { 2 }
+        );
+        assert!(retained_environments(&state).is_empty());
+        assert!(broker.terminate().success());
+    }
 }
 
 #[test]

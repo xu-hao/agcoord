@@ -2305,9 +2305,9 @@ pub fn blocked_by(
 ///
 /// Admission is first fit: a row is blocked by its repository, by a runtime or capability
 /// this machine lacks, or by a shortage of a resource it claims.  While a preemption is
-/// stopping its victims, a row submitted after the row it serves also waits if it claims a
-/// resource that row still lacks, so the capacity the victims release reaches that row
-/// instead of a later one.
+/// stopping its victims, a row submitted after the row it serves also waits if admitting it
+/// would leave that row unable to fit once the victims are gone, so the capacity they release
+/// reaches that row instead of a later one.
 pub fn local_blockers(
     run: &RunRecord,
     active: &[RunRecord],

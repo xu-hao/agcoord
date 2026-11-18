@@ -13,7 +13,7 @@ versioning; dates use ISO 8601.
   (default: the largest overflow `wait_threshold`, never less than 300 seconds; a `land` does
   not wait). A stopped check is requeued at its original position, its caller keeps waiting
   for the final attempt, its log marks the preemption, and rows gain `attempts` and
-  `preempted_by`; a check that finishes before its stop reaches it keeps its verdict, and one
+  `preempted_by`; a check that passes before its stop reaches it keeps its verdict, and one
   whose resources are not reclaimed cleanly ends `interrupted` as `preemption-reclaim-failed`
   instead of running again. Lands, fulls, merges, checks submitted with the new
   `agc run --no-preempt`, and checks already preempted twice are never stopped, and an overflow

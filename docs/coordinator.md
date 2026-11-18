@@ -313,7 +313,7 @@ again. It does not bound the wait; see [the starvation gap](#the-starvation-gap)
   could not start even with the capacity, and a claim accepted only because an overflow pool
   offers it can never run here, so neither preempts anything.
 - **When.** The starving job may preempt once it has been queued for `preempt_after` seconds,
-  counted from when it last entered the queue: its submission, or the moment a preemption
+  fractions included, counted from when it last entered the queue: its submission, or the moment a preemption
   returned it to the queue. A check that was just requeued therefore waits the whole
   `preempt_after` again before it may stop other checks in its turn. A `land` does not wait: it
   holds up every later landing in its repository, which costs far more than restarting checks,
@@ -342,28 +342,39 @@ again. It does not bound the wait; see [the starvation gap](#the-starvation-gap)
   and the next attempt appends to the same log. The client that submitted the check keeps
   waiting and receives the final attempt's status. A caller's own `agc cancel` during the stop
   wins: the job ends `cancelled`.
-- **A victim that finishes first.** A victim whose command ends on its own before the broker
-  has delivered any stop to it keeps its verdict: the requested stop is withdrawn, the row ends
-  `passed` or `failed` like any other check, and it is not run again.
+- **A victim that passes first.** A victim whose command passes on its own before the broker
+  has delivered any stop to it keeps that verdict: the requested stop is withdrawn, the row ends
+  `passed`, and it is not run again. A victim that fails in that window is requeued like any
+  other, because the requested stop may have caused the failure: its
+  [child CPU leases](#child-cpu-leases-for-parallel-tools) are cancelled as soon as the stop is
+  requested.
 - **A victim that is not reclaimed.** A victim is requeued only when everything its attempt
-  held was reclaimed cleanly. If a resource backend fails to stop, measure, or remove what the
-  attempt held, for example a cgroup leaf that is still populated, the row ends `interrupted`
-  with exit status 125 and `failure_reason` `preemption-reclaim-failed`, its resource receipt
-  keeps the failed events, and its log receives
+  held was reclaimed cleanly, judged by the final state of each enforced resource: the outcome
+  of the last cancel, finish, or cleanup step its backend recorded for it. A cancel that gave up
+  waiting for a cgroup to empty, followed by a clean finish and cleanup, counts as clean; the
+  victim is requeued and its log, and the broker's diagnostics, receive
+  `AGCoord: incident: the cancel of <victim> for the preemption requested by <run> failed (<backend> <resource>: <code>); the attempt was reclaimed cleanly afterwards, so <victim> is requeued`.
+  If that last step failed instead, for example because a cgroup leaf is still populated when it
+  is to be removed, the row ends `interrupted` with exit status 125 and `failure_reason`
+  `preemption-reclaim-failed`, its resource receipt keeps the failed events, and its log receives
   `AGCoord: preempted by <run> at <time>, attempt <n>; not requeued, because the resources of that attempt were not reclaimed cleanly (preemption-reclaim-failed)`.
+  Like a cancelled job whose cleanup fails, the row releases its claim at that transition,
+  although the host may still hold what was not reclaimed; the receipt says what that is.
 - **What waits while victims stop.** From the moment a preemption is requested until its
-  victims are gone, a job submitted after the starving job that claims a resource the starving
-  job still lacks is not admitted here and reports `preemption:<starving_run_id>` in
-  `blocked_by`, so the capacity being released reaches the starving job. A later job that claims
-  none of those resources, and every older job, is admitted as usual, and a waiting job may
-  still be placed in an overflow pool.
+  victims are gone, a job submitted after the starving job is not admitted here if admitting it
+  would leave the starving job unable to fit once the victims are gone: for some resource both
+  claim, the units held now, the stopping victims included, plus both claims exceed the
+  capacity. Such a job reports `preemption:<starving_run_id>` in `blocked_by`, so the capacity
+  being released reaches the starving job. A later job that claims nothing the starving job
+  claims, or that fits beside it, and every older job is admitted as usual, and a waiting job
+  may still be placed in an overflow pool.
 - **A victim that does not stop.** If a victim is still present five seconds after the owning
   broker first delivered its stop (its first signal, or the kill of its cgroup), the broker
   abandons that preemption. The five seconds run from that delivery, not from the request, so a
   replacement broker that completes a request its predecessor made gives the victim the whole
   bound. Later jobs stop waiting behind the abandoned preemption, and the victim keeps its claim
-  until it is really gone, so nothing is ever admitted into capacity it still holds. The broker
-  records
+  until its processes are really gone, so nothing is admitted into its claim while any of them
+  still runs. The broker records
   `AGCoord: incident: <victim> was still running 5 seconds after it was told to stop for the preemption requested by <run>; …`
   in the victim's log and in its own diagnostics. The victim is still requeued once it
   disappears, and the starving job may preempt other checks meanwhile.

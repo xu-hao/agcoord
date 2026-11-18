@@ -13,7 +13,7 @@
 //! This module owns the durable record of those attempts.  A row has a record only while it
 //! is a running check that may still be preempted, or after it was preempted at least once.
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::overflow::Pool;
 use crate::resources::initial_receipt;
 use crate::store::{RunRecord, load_run, map_database_error, now};
@@ -113,8 +113,10 @@ impl Live {
 /// What a preemption keeps later rows from taking while its victims stop.
 ///
 /// The capacity the victims release is meant for the starving row.  A row submitted after it
-/// that claims a resource the starving row still lacks would take that capacity first, so
-/// such a row waits; every other row is admitted as usual.
+/// waits if admitting it would leave the starving row unable to fit once the victims are
+/// gone: for some resource both claim, what is held now (the stopping victims included) plus
+/// both claims exceeds the capacity.  A row that claims nothing the starving row claims, or
+/// that fits beside it, is admitted as usual.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Hold {
     pub run_id: String,
@@ -133,6 +135,7 @@ impl Hold {
     }
 
     /// Whether `run` waits behind the starving row, given what this machine holds now.
+    /// `used` still counts the victims that are stopping.
     pub fn holds(
         &self,
         run: &RunRecord,
@@ -140,9 +143,19 @@ impl Hold {
         capacities: &BTreeMap<String, u64>,
     ) -> bool {
         run.sequence > self.sequence
-            && shortage(&self.resources, used, capacities)
-                .keys()
-                .any(|name| run.resources.get(*name).is_some_and(|units| *units > 0))
+            && self.resources.iter().any(|(name, starving)| {
+                let Some(later) = run.resources.get(name).filter(|units| **units > 0) else {
+                    return false;
+                };
+                *starving > 0
+                    && used
+                        .get(name)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*starving)
+                        .saturating_add(*later)
+                        > capacities.get(name).copied().unwrap_or(0)
+            })
     }
 }
 
@@ -156,23 +169,44 @@ pub struct PendingStop {
     environment: String,
 }
 
-fn schema_present(connection: &Connection) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_preemptions'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|found| found.is_some())
-        .map_err(map_database_error)
-}
+/// The columns `SCHEMA` creates, in order.
+const COLUMNS: [&str; 8] = [
+    "run_id",
+    "attempts",
+    "preempted_by",
+    "queued_at",
+    "stopping_for",
+    "stop_requested_at",
+    "abandoned",
+    "environment_json",
+];
 
+/// Create the table, or confirm that the one this spool holds has exactly its columns.  A
+/// spool written by another development build of this table is refused rather than read.
 pub fn ensure_schema(connection: &Connection) -> Result<()> {
-    if schema_present(connection)? {
-        return Ok(());
+    let mut statement = connection
+        .prepare("PRAGMA table_info(run_preemptions)")
+        .map_err(map_database_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(map_database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_database_error)?;
+    if columns.is_empty() {
+        return connection.execute_batch(SCHEMA).map_err(map_database_error);
     }
-    connection.execute_batch(SCHEMA).map_err(map_database_error)
+    if columns != COLUMNS {
+        return Err(AppError::new(
+            "broker-schema-invalid",
+            format!(
+                "coordinator table run_preemptions has columns {} instead of {}; this spool \
+                 was written by a different development build of the broker",
+                columns.join(", "),
+                COLUMNS.join(", "),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Bring the records an earlier owner left behind in line with the rows.
@@ -546,21 +580,59 @@ pub fn pending_stop(connection: &Connection, run: &RunRecord) -> Result<Option<P
     })
 }
 
-/// Whether stopping an attempt left enforcement state behind: a backend failed to cancel,
-/// finish, or clean up what the attempt held.
-pub fn reclaim_failed(receipt: &Value) -> bool {
+/// The cancel, finish, and cleanup events of a receipt, in the order they were recorded.
+fn reclaim_events(receipt: &Value) -> impl Iterator<Item = &Value> {
     receipt
         .get("events")
         .and_then(Value::as_array)
-        .is_some_and(|events| {
-            events.iter().any(|event| {
-                event.get("status").and_then(Value::as_str) == Some("failed")
-                    && matches!(
-                        event.get("stage").and_then(Value::as_str),
-                        Some("cancel" | "finish" | "cleanup")
-                    )
-            })
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            matches!(
+                event.get("stage").and_then(Value::as_str),
+                Some("cancel" | "finish" | "cleanup")
+            )
         })
+}
+
+fn event_field<'a>(event: &'a Value, name: &str) -> &'a str {
+    event.get(name).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Whether stopping an attempt left enforcement state behind.  What counts is the final
+/// state of each resource a backend enforced: the outcome of its last cancel, finish, or
+/// cleanup step.  A cancel that failed but was followed by a clean finish and cleanup, as
+/// when a group empties only after the cancel stopped waiting, left nothing behind.
+pub fn reclaim_failed(receipt: &Value) -> bool {
+    let mut last: BTreeMap<(&str, &str), bool> = BTreeMap::new();
+    for event in reclaim_events(receipt) {
+        last.insert(
+            (
+                event_field(event, "backend"),
+                event_field(event, "resource"),
+            ),
+            event_field(event, "status") == "failed",
+        );
+    }
+    last.values().any(|failed| *failed)
+}
+
+/// The cancel steps of a receipt that failed, as `backend resource: code`, for an attempt
+/// that was reclaimed cleanly all the same.
+pub fn failed_cancels(receipt: &Value) -> Vec<String> {
+    reclaim_events(receipt)
+        .filter(|event| {
+            event_field(event, "stage") == "cancel" && event_field(event, "status") == "failed"
+        })
+        .map(|event| {
+            format!(
+                "{} {}: {}",
+                event_field(event, "backend"),
+                event_field(event, "resource"),
+                event_field(event, "code"),
+            )
+        })
+        .collect()
 }
 
 /// Return a stopped victim to the queue at its original sequence, on its next attempt.
@@ -663,10 +735,11 @@ pub fn forget_cleared(connection: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hold, default_after, plan, reclaim_failed};
+    use super::{Hold, default_after, ensure_schema, failed_cancels, plan, reclaim_failed};
     use crate::overflow::Pool;
     use crate::resources::initial_receipt;
     use crate::store::RunRecord;
+    use rusqlite::Connection;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
@@ -841,21 +914,28 @@ mod tests {
     }
 
     #[test]
-    fn a_preemption_holds_only_later_rows_that_claim_what_the_starving_row_lacks() {
-        let starving = run("starving", 2, 0, &[("cpu", 4), ("memory", 8)]);
+    fn a_preemption_holds_later_rows_that_would_leave_the_starving_row_unable_to_fit() {
+        let starving = run("starving", 2, 0, &[("cpu", 4), ("memory", 8), ("jobs", 1)]);
         let hold = Hold::of(&starving);
-        let capacities = claim(&[("cpu", 4), ("memory", 16), ("jobs", 4)]);
+        let capacities = claim(&[("cpu", 4), ("memory", 24), ("jobs", 8), ("gpu", 1)]);
         // The victims still hold every CPU; memory has room for the starving row.
         let used = claim(&[("cpu", 4), ("memory", 8), ("jobs", 2)]);
-        let earlier = run("earlier", 1, 0, &[("cpu", 1)]);
+        let earlier = run("earlier", 1, 0, &[("cpu", 1), ("jobs", 1)]);
         let compute = run("compute", 3, 0, &[("cpu", 1), ("jobs", 1)]);
-        let memory_only = run("memory-only", 4, 0, &[("memory", 4), ("jobs", 1)]);
+        // Memory the starving row is not short of yet, but would be once this row ran.
+        let wide_memory = run("wide-memory", 4, 0, &[("memory", 12), ("jobs", 1)]);
+        // Memory that still leaves room for the starving row.
+        let small_memory = run("small-memory", 5, 0, &[("memory", 8), ("jobs", 1)]);
+        // A resource the starving row does not claim.
+        let gpu_only = run("gpu-only", 6, 0, &[("gpu", 1), ("jobs", 1)]);
         assert!(!hold.holds(&earlier, &used, &capacities));
         assert!(hold.holds(&compute, &used, &capacities));
-        assert!(!hold.holds(&memory_only, &used, &capacities));
-        // Once the victims are gone the starving row lacks nothing, and nothing is held.
-        let released = claim(&[("cpu", 0), ("memory", 8), ("jobs", 2)]);
-        assert!(!hold.holds(&compute, &released, &capacities));
+        assert!(hold.holds(&wide_memory, &used, &capacities));
+        assert!(!hold.holds(&small_memory, &used, &capacities));
+        assert!(!hold.holds(&gpu_only, &used, &capacities));
+        // The jobs ceiling counts like any other resource both claim.
+        let crowded = claim(&[("cpu", 4), ("memory", 8), ("jobs", 7)]);
+        assert!(hold.holds(&gpu_only, &crowded, &capacities));
     }
 
     #[test]
@@ -872,31 +952,69 @@ mod tests {
     }
 
     #[test]
-    fn only_a_failed_cancel_finish_or_cleanup_is_an_unclean_reclaim() {
-        let event = |stage: &str, status: &str| {
+    fn a_reclaim_is_judged_by_the_last_step_for_each_enforced_resource() {
+        let event = |resource: &str, stage: &str, status: &str| {
             json!({
                 "at": "2026-01-01T00:00:00.000Z",
                 "backend": "cgroup-v2",
-                "resource": "cpu",
+                "resource": resource,
                 "stage": stage,
                 "status": status,
-                "code": "leaf-populated",
+                "code": if status == "failed" { "leaf-populated" } else { "recorded" },
             })
         };
         let receipt = |events: Vec<serde_json::Value>| json!({"requested": {"cpu": 1}, "applied": {}, "peak": {}, "events": events});
         assert!(!reclaim_failed(&receipt(vec![])));
-        assert!(!reclaim_failed(&receipt(vec![
-            event("prepare", "applied"),
-            event("usage", "failed"),
-            event("cancel", "recorded"),
-            event("finish", "recorded"),
-            event("cleanup", "recorded"),
-        ])));
+        let clean = receipt(vec![
+            event("cpu", "prepare", "applied"),
+            event("cpu", "usage", "failed"),
+            event("cpu", "cancel", "recorded"),
+            event("cpu", "finish", "recorded"),
+            event("cpu", "cleanup", "recorded"),
+        ]);
+        assert!(!reclaim_failed(&clean));
+        assert!(failed_cancels(&clean).is_empty());
+        // The cancel stopped waiting before the group emptied, but it emptied before the
+        // finish, and the group was removed: nothing was left behind.
+        let late = receipt(vec![
+            event("cpu", "cancel", "failed"),
+            event("cpu", "finish", "recorded"),
+            event("cpu", "cleanup", "recorded"),
+        ]);
+        assert!(!reclaim_failed(&late));
+        assert_eq!(failed_cancels(&late), vec!["cgroup-v2 cpu: leaf-populated"]);
+        // A last step that failed leaves state behind, for any one resource.
         for stage in ["cancel", "finish", "cleanup"] {
             assert!(reclaim_failed(&receipt(vec![
-                event("prepare", "applied"),
-                event(stage, "failed"),
+                event("cpu", "prepare", "applied"),
+                event("cpu", stage, "failed"),
             ])));
         }
+        assert!(reclaim_failed(&receipt(vec![
+            event("cpu", "cancel", "recorded"),
+            event("memory", "cancel", "recorded"),
+            event("cpu", "cleanup", "recorded"),
+            event("memory", "cleanup", "failed"),
+        ])));
+    }
+
+    #[test]
+    fn a_table_of_another_shape_is_refused_rather_than_read() {
+        let fresh = Connection::open_in_memory().unwrap();
+        ensure_schema(&fresh).unwrap();
+        ensure_schema(&fresh).unwrap();
+        let stale = Connection::open_in_memory().unwrap();
+        stale
+            .execute_batch(
+                "CREATE TABLE run_preemptions (
+                    run_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 1,
+                    preempted_by TEXT, stopping_for TEXT, stop_requested_at TEXT,
+                    abandoned INTEGER NOT NULL DEFAULT 0, environment_json TEXT
+                );",
+            )
+            .unwrap();
+        let error = ensure_schema(&stale).unwrap_err();
+        assert_eq!(error.code, "broker-schema-invalid");
+        assert!(error.message.contains("queued_at"), "{}", error.message);
     }
 }

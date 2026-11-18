@@ -738,12 +738,11 @@ impl Broker {
         else {
             return Ok(None);
         };
-        if starving.kind != "land" {
-            let waited =
-                overflow::waited_seconds(connection, state.preemption.queued_since(starving))?;
-            if Duration::from_secs(waited) < self.preempt_after {
-                return Ok(None);
-            }
+        if starving.kind != "land"
+            && overflow::waited(connection, state.preemption.queued_since(starving))?
+                < self.preempt_after.as_secs_f64()
+        {
+            return Ok(None);
         }
         let candidates: Vec<&RunRecord> = state
             .active
@@ -782,8 +781,8 @@ impl Broker {
     ///
     /// The bound runs from the first stop this owner delivered to the victim, not from the
     /// request: an owner that took over, or one whose pass stalled, has not yet given the
-    /// victim its chance to stop.  An overdue victim keeps its claim until it is really
-    /// gone, so nothing is ever admitted into capacity it still holds.  Later rows stop
+    /// victim its chance to stop.  An overdue victim keeps its claim until its processes are
+    /// really gone, so nothing is admitted into its claim while any of them runs.  Later rows stop
     /// waiting behind the preemption, and the event is recorded as an incident in the
     /// victim's log and the broker's diagnostics.
     fn abandon_overdue_preemptions(
@@ -1104,9 +1103,11 @@ impl Broker {
         Ok(())
     }
 
-    /// Whether a preemption's victim ended on its own before this owner delivered any stop
-    /// to it.  Such a check is not stopped and run again: the requested stop is withdrawn,
-    /// and the caller finishes the row with the verdict its command produced.
+    /// Whether a preemption's victim passed on its own before this owner delivered any stop
+    /// to it.  Such a check is not run again: the requested stop is withdrawn, and the
+    /// caller finishes the row with its verdict.  A failure is not kept, because the
+    /// preemption itself may have caused it: the check's child CPU leases are cancelled as
+    /// soon as the stop is requested.  That row is requeued like any other victim.
     fn ended_before_its_preemption(
         &mut self,
         connection: &Connection,
@@ -1127,7 +1128,7 @@ impl Broker {
                 format!("cannot observe worker {}: {error}", run.run_id),
             )
         })?;
-        if ended.is_none() {
+        if ended != Some(0) {
             return Ok(false);
         }
         preempt::withdraw(connection, &run.run_id)?;
@@ -1235,7 +1236,21 @@ impl Broker {
                 .execute_batch("COMMIT")
                 .map_err(map_database_error)?;
             // Written once the requeue is durable, so no pass that is repeated after a
-            // failed commit writes the line twice.
+            // failed commit writes the line twice.  A cancel that stopped waiting before the
+            // attempt's group emptied did not leave anything behind, but it is an incident.
+            let failed_cancels = preempt::failed_cancels(&current.resource_receipt);
+            if !failed_cancels.is_empty() {
+                let incident = format!(
+                    "AGCoord: incident: the cancel of {victim} for the preemption requested \
+                     by {preemptor} failed ({failed}); the attempt was reclaimed cleanly \
+                     afterwards, so {victim} is requeued",
+                    victim = run.run_id,
+                    preemptor = stop.preemptor,
+                    failed = failed_cancels.join(", "),
+                );
+                eprintln!("{incident}");
+                self.append_run_log(&run.run_id, &incident);
+            }
             self.append_run_log(
                 &run.run_id,
                 &format!(

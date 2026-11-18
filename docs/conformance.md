@@ -27,8 +27,10 @@ or at once when it is a land, and they are requeued at their original sequence. 
 merges, opted-out checks, and checks already preempted twice are never stopped, so a row whose
 shortage only they hold keeps waiting with nothing reserved for it; a repository-blocked or
 overflow-only row preempts nothing; an overflow pool with room is used first; while victims
-stop, only later rows that claim what the starving row lacks wait; a caller's cancellation
-wins; a victim that finishes before any stop reaches it keeps its verdict; a victim whose
+stop, a later row waits exactly when admitting it would leave the starving row unable to fit,
+whatever its kind; a caller's cancellation wins; a victim that passes before any stop reaches
+it keeps its verdict, and one that fails in that window is requeued; a victim whose cancel gave
+up but whose group emptied before it was removed is requeued with an incident, while one whose
 resources are not reclaimed cleanly ends interrupted with its receipt instead of being
 requeued; a victim that does not stop keeps its claim while its preemption is abandoned; a
 replacement owner completes a requested preemption with the whole stop bound; a starting owner
