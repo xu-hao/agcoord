@@ -84,8 +84,8 @@ def test_the_command_runs_once_as_one_cloud_run_job_sized_to_the_claim(cloud: Cl
             {
                 # The job runs exactly the image that was built for it.
                 "image": JOB_IMAGE_DIGEST,
-                "command": ["python"],
-                "args": ["-m", "pytest", "-q"],
+                "command": ["/bin/sh"],
+                "args": ["-c", 'umask 0077 && exec "$@"', "agcoord", "python", "-m", "pytest", "-q"],
                 "resources": {"limits": {"cpu": "4", "memory": "3072Mi"}},
             }
         ],

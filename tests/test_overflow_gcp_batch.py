@@ -67,9 +67,12 @@ def test_the_command_runs_as_one_batch_job_sized_to_the_claim(cloud: Cloud):
             "container": {
                 # The machine pulls exactly the image that was built for this job.
                 "imageUri": JOB_IMAGE_DIGEST,
-                "entrypoint": "python",
-                "commands": ["-m", "pytest", "-q"],
-                "options": f"--cpus=4 --memory={MEMORY} --memory-swap={MEMORY}",
+                "entrypoint": "/bin/sh",
+                "commands": ["-c", 'umask 0077 && exec "$@"', "agcoord", "python", "-m", "pytest", "-q"],
+                "options": (
+                    "--security-opt=no-new-privileges "
+                    f"--cpus=4 --memory={MEMORY} --memory-swap={MEMORY}"
+                ),
             }
         }
     ]
@@ -230,9 +233,9 @@ def test_claims_without_enforcement_still_size_the_machine(cloud: Cloud):
 
     assert completed.returncode == 0, completed.stderr
     task = cloud.job()["taskGroups"][0]["taskSpec"]
-    # Nothing is enforced inside the container, as on this machine, but the job still
-    # gets a machine of the size it claimed.
-    assert "options" not in task["runnables"][0]["container"]
+    # Container security options still apply even when resource limits are admission-only,
+    # and the job still gets a machine of the size it claimed.
+    assert task["runnables"][0]["container"]["options"] == "--security-opt=no-new-privileges"
     assert task["computeResource"] == {"cpuMilli": 4000, "memoryMib": 3072}
 
 

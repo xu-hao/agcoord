@@ -6,8 +6,10 @@ import pytest
 
 from agcoord.overflow_image import (
     ContainerLimits,
+    container_command,
     container_environment,
     container_limits,
+    container_security_options,
     placement,
 )
 from agcoord.resources import resource_contract
@@ -71,3 +73,17 @@ def test_scratch_environment_needs_no_explicit_forwarding(scratch):
     assert environment == (
         {"TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp"} if scratch else {}
     )
+
+
+def test_container_security_options_enable_no_new_privileges():
+    assert container_security_options() == ["--security-opt=no-new-privileges"]
+
+
+def test_container_command_enforces_umask_and_preserves_arguments():
+    import os
+    import subprocess
+    import sys
+
+    wrapped = container_command([sys.executable, "-c", "import os, sys; print(f'{os.umask(0o022):04o}', sys.argv[1:])", "a b", "c"])
+    completed = subprocess.run(wrapped, capture_output=True, text=True, check=True)
+    assert completed.stdout.strip() == "0077 ['a b', 'c']"
