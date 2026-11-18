@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Add a private result-cache bucket, `PROJECT_ID-result-cache`, to the GCP overflow Terraform
+  module, readable and writable only by the job service account and the `submitters`, whose
+  objects expire after `result_cache_retention_days` (default 30), and output its URL as
+  `result_cache_url`, so a repository's result cache can outlive the overflow job machine. #366 —
+  optional private result-cache bucket in the GCP overflow Terraform module.
+
 ## 0.9.4 — 2026-11-17
 
 - Fix `rustfmt` and `clippy::map-entry` CI checks in `agcoord-broker` and publish the coupled

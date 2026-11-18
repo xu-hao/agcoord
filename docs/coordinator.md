@@ -592,18 +592,22 @@ and an identity for the job machines. The Terraform module in
 `packaging/terraform/gcp-overflow/` provides them as infrastructure as code. It manages:
 
 - the project and its billing link, with deletion prevented;
-- the Artifact Registry, Batch, Cloud Run, Compute Engine, Cloud Logging, and IAM APIs;
+- the Artifact Registry, Batch, Cloud Run, Compute Engine, Cloud Logging, Cloud Storage, and IAM
+  APIs;
 - one Docker repository in Artifact Registry, whose cleanup policies delete images under the
   `run` package after `job_image_retention_days` (default 2) and under the `toolchain` package
   after `toolchain_image_retention_days` (default 30). An executor deletes a job's image itself
   when the job ends; the policies are the backstop for an executor that was killed first;
-- a service account for job machines that may only report to Batch, write logs, and read that
-  repository. It holds no forge credentials;
+- a private result-cache bucket, `PROJECT_ID-result-cache` in the module's region, described
+  under [GCP result cache](#gcp-result-cache) below;
+- a service account for job machines that may only report to Batch, write logs, read that
+  repository, and read and write the result cache. It holds no forge credentials;
 - for each member of the optional `submitters` set, the grants to push images, start jobs as that
-  service account, and read job output. A project owner needs none of them.
+  service account, read job output, and read and write the result cache. A project owner needs
+  none of them.
 
 Nothing the module creates runs or bills by itself; machines exist only while an executor runs
-a job, and stored images cost by size. The module has no provider configuration, so call it from
+a job, and stored images and cached results cost by size. The module has no provider configuration, so call it from
 a small root of your own, kept outside any repository:
 
 ```hcl
@@ -624,7 +628,8 @@ output "overflow" {
 `project_id` and `billing_account` are required. `region` defaults to `us-central1`,
 `repository_id` to `agcoord-overflow`, and `org_id` or `folder_id` place the project when an
 organization requires it. The outputs are the facts an executor needs: `project_id`, `region`,
-`registry` (the image path prefix), `runner_service_account`, and the two package names.
+`registry` (the image path prefix), `runner_service_account`, and the two package names, plus
+`result_cache_url`, the `gs://` URL of the result-cache bucket.
 
 Terraform state and variable files name your project and billing account. They are operator
 state, like the broker's `config.json`: keep them in that root, never in a repository. The
@@ -632,6 +637,44 @@ provider reads application default credentials, or a short-lived token from
 `GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token)"`. To adopt a project that already
 exists, `terraform import` it, and any repository or enabled API it already has, before the
 first apply.
+
+#### GCP result cache
+
+A job machine exists only for one run, so a cache a check writes inside it, such as a
+content-addressed test-result or build cache, is lost with the machine, and the next job computes
+everything again. The module's result-cache bucket gives such a cache a place that outlives the
+machine and that the submitting workstations share with the jobs they place.
+
+The bucket is private: uniform bucket-level access is on, so no object carries its own access
+list, and public access prevention is enforced, so no grant can make it public. Only the job
+service account and the members of `submitters` are granted `roles/storage.objectAdmin` on it;
+project owners reach it through their project role. Objects are deleted
+`result_cache_retention_days` (default 30) days after they were written; a job that misses an
+expired entry computes the result again. Using the bucket is optional: a repository that does
+not point its cache at it leaves it empty, and an empty bucket costs nothing.
+
+Anyone who can write the bucket can cause cached results to be reused, so a writer can make a
+later check report a result it never computed. Only trusted runners and submitters get write
+access: grant `submitters` only to operators whose own checks you would accept, and do not grant
+the bucket to anyone else. A repository's cache should key its entries by everything that
+determines the result, so an entry is reused only for the same inputs, but that key does not
+protect against a writer who stores a false entry under a correct key.
+
+AGCoord itself never reads or writes the bucket; the repository's own cache tool does. To point
+a repository's cache at it:
+
+1. Give the repository's cache tool the bucket as its remote location, read from an environment
+   variable the repository chooses, so the project's URL stays operator state rather than a
+   committed value. A Batch or Cloud Run job reaches Cloud Storage as the job service account
+   through its machine's own credentials; a submitting workstation uses its own `gcloud` or
+   application default credentials.
+2. Set that variable to the `result_cache_url` output in the environment that submits the job,
+   for example `CHECK_CACHE_URL=gs://my-overflow-project-result-cache`.
+3. Add `--env CHECK_CACHE_URL` to each Google Cloud pool's `executor`, so the variable reaches the
+   job's container; by default the container receives none of the submitter's environment.
+
+A job that runs locally reads and writes the same bucket with the submitter's credentials, so
+local and overflow runs share one cache.
 
 #### GCP Batch executor
 

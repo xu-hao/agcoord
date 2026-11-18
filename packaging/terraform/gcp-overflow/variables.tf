@@ -60,6 +60,17 @@ variable "toolchain_image_retention_days" {
   }
 }
 
+variable "result_cache_retention_days" {
+  description = "Days after which an object in the result-cache bucket is deleted. A job that misses the cache computes the result again."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.result_cache_retention_days >= 1
+    error_message = "result_cache_retention_days must be at least 1."
+  }
+}
+
 variable "submitters" {
   description = "IAM members, such as user:alice@example.com, allowed to run overflow jobs without being project owners."
   type        = set(string)
