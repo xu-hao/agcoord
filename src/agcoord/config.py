@@ -355,7 +355,7 @@ def _preempt_after(
     *,
     source: str | os.PathLike[str],
 ) -> float | None:
-    """How long the oldest starving row waits before it may preempt later checks."""
+    """How long the oldest starving row waits, since it last entered the queue, to preempt."""
     return _nonnegative_seconds(document, "preempt_after", source=source)
 
 

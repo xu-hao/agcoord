@@ -863,12 +863,13 @@ pub fn budget_allows(
     Ok(used.saturating_add(pool.reservation(resources)) <= budget.cpu_seconds)
 }
 
-/// Whole seconds a row has waited since it was submitted.
-pub fn waited_seconds(connection: &Connection, created_at: &str) -> Result<u64> {
+/// Whole seconds a row has waited since the stored instant `since`: its submission, or the
+/// moment it last entered the queue.
+pub fn waited_seconds(connection: &Connection, since: &str) -> Result<u64> {
     let waited: Option<f64> = connection
         .query_row(
             "SELECT (julianday('now') - julianday(?1)) * 86400.0",
-            params![created_at],
+            params![since],
             |row| row.get(0),
         )
         .map_err(map_database_error)?;

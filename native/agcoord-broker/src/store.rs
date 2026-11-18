@@ -971,17 +971,12 @@ pub fn configured_stop_grace(paths: &Paths) -> Result<Duration> {
     Ok(Duration::from_secs_f64(seconds))
 }
 
-/// How long the oldest queued row that lacks only local capacity waits before it may preempt
-/// later checks.  The default is the longest overflow `wait_threshold`, so every pool has had
-/// its chance to take the row first; without a pool it is zero.
+/// How long the oldest queued row that lacks only local capacity waits, counted from when
+/// it last entered the queue, before it may preempt later checks.  The default is the
+/// longest overflow `wait_threshold`, so every pool has had its chance to take the row
+/// first, and never less than five minutes.
 pub fn configured_preempt_after(paths: &Paths, pools: &[Pool]) -> Result<Duration> {
-    let default = Duration::from_secs(
-        pools
-            .iter()
-            .map(|pool| pool.wait_threshold)
-            .max()
-            .unwrap_or(0),
-    );
+    let default = crate::preempt::default_after(pools);
     let path = paths.state_dir.join("config.json");
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -2178,7 +2173,7 @@ pub struct LiveSchedulerState {
     pub batch_followers: BTreeMap<String, String>,
     pub batch_owners: BTreeMap<String, String>,
     pub preemption: crate::preempt::Live,
-    /// The queued row whose requested preemption is still stopping its victims.
+    /// What the preemption that is still stopping its victims holds back.
     pub hold: Option<crate::preempt::Hold>,
 }
 
@@ -2207,7 +2202,7 @@ pub fn load_live_scheduler_state(connection: &Connection) -> Result<LiveSchedule
         let batch_followers = active_batch_followers(connection)?;
         let batch_owners = active_batch_owners(connection)?;
         let preemption = crate::preempt::live(connection)?;
-        let hold = crate::preempt::hold(&preemption, &queued);
+        let hold = preemption.hold(&queued);
         Ok(LiveSchedulerState {
             active,
             queued,
@@ -2309,9 +2304,10 @@ pub fn blocked_by(
 /// `blocked_by` against local allocations the caller already summed.
 ///
 /// Admission is first fit: a row is blocked by its repository, by a runtime or capability
-/// this machine lacks, or by a shortage of a resource it claims.  While a preemption is in
-/// flight, every row submitted after the row it serves also waits, so the capacity the
-/// victims release reaches that row instead of a later one.
+/// this machine lacks, or by a shortage of a resource it claims.  While a preemption is
+/// stopping its victims, a row submitted after the row it serves also waits if it claims a
+/// resource that row still lacks, so the capacity the victims release reaches that row
+/// instead of a later one.
 pub fn local_blockers(
     run: &RunRecord,
     active: &[RunRecord],
@@ -2323,7 +2319,7 @@ pub fn local_blockers(
     let mut reasons = row_blockers(run, active, queued, local_runtime, used);
     if run.status == "queued"
         && let Some(hold) = hold
-        && run.sequence > hold.sequence
+        && hold.holds(run, used, &local_runtime.capacities)
     {
         reasons.push(format!("preemption:{}", hold.run_id));
     }
@@ -2331,7 +2327,7 @@ pub fn local_blockers(
 }
 
 /// The oldest queued row that fits this machine when idle and lacks only local capacity:
-/// the one row the starvation guard may preempt for.
+/// the one row that may preempt later checks.
 pub fn starving_row<'a>(
     active: &[RunRecord],
     queued: &'a [RunRecord],
@@ -2621,8 +2617,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     };
     let live_placed = crate::overflow::live_placements(&connection)?;
     let batch_followers = active_batch_followers(&connection)?;
-    let attempts = crate::preempt::attempts(&connection)?;
-    let hold = crate::preempt::hold(&crate::preempt::live(&connection)?, &all_queued);
+    let hold = crate::preempt::live(&connection)?.hold(&all_queued);
     let mut selected_allocations = BTreeMap::new();
     let used = local_allocations(&all_active, &live_placed, &batch_followers);
     for name in capacities.keys() {
@@ -2630,6 +2625,14 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     }
     let limit = filter.limit.unwrap_or(RECENT_LIMIT);
     let recent_runs: Vec<_> = terminal.iter().take(limit).collect();
+    // Only the rows this snapshot reports are looked up, not every record history retains.
+    let attempts = crate::preempt::attempts(
+        &connection,
+        active
+            .iter()
+            .chain(&queued)
+            .chain(recent_runs.iter().copied()),
+    )?;
     let mut batch_cache: BTreeMap<i64, (String, Value)> = BTreeMap::new();
     let mut active_public = Vec::with_capacity(active.len());
     for run in &active {
@@ -2755,7 +2758,7 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
     let placed = crate::overflow::all_placements(&connection)?;
     let batch_followers = active_batch_followers(&connection)?;
     let attempts = crate::preempt::attempts_of(&connection, &run.run_id)?;
-    let hold = crate::preempt::hold(&crate::preempt::live(&connection)?, &queued);
+    let hold = crate::preempt::live(&connection)?.hold(&queued);
     let mut batch_cache = BTreeMap::new();
     let batch = batch_for_run_cached(&connection, &run, &mut batch_cache)?;
     let mut result = public_run(

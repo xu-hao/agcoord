@@ -36,7 +36,8 @@ Never run agc from inside an admitted job. A stale-main or head-changed refusal 
 update the branch, push, and submit a new land request.
 A check can be preempted: stopped and requeued so that an older job can start, at most
 twice. agc run keeps waiting and reports the final attempt, so never resubmit a check
-that is still queued or running. Pass --no-preempt to a check that is not safe to run twice.
+that is still queued or running. Pass --no-preempt to a check that is not safe to run twice
+or to restart after being killed (for example, one that can leave a stale .git/index.lock).
 ```
 
 The long form suits a repository with tickets, several agents, and an enforced host:
@@ -91,7 +92,8 @@ push, and submit a new land request. AGCoord never rebases or rewrites your comm
 A check can be preempted: stopped and requeued so that an older job can start, at most
 twice. `agc run` keeps waiting and reports the final attempt, so never resubmit a check
 that is still queued or running. Pass `--no-preempt` to a check that is not safe to run
-twice.
+twice or to restart after being killed (for example, one that can leave a stale
+`.git/index.lock`); these are separate properties.
 Set `AGCOORD_AGENT` to your session name so the queue shows who submitted what.
 ```
 
@@ -188,7 +190,8 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | A refusal with code `broker-draining` | Maintenance is closing the queue. | Wait; `agc list`, `show`, and `log` still work. |
 | `Gate queue: <id> waiting at position N for branch …` | Queued, not refused. | Wait; `blocked_by` in `agc --json show <id>` names the jobs ahead. |
 | `AGCoord: preempted by <run> at <time>, attempt 1; requeued at its original position as attempt 2`, then `Gate queue: <id> waiting …` again | The check was stopped so that an older job that had waited long enough could start. It waits again at its original place, and the same `agc run` exits with the final attempt's status. | Wait, and do not resubmit: the row is still live. Pass `--no-preempt` to a check that must not be restarted. |
-| `blocked_by` contains `preemption:<run>` | Checks are being stopped to free capacity for that older job; later jobs wait until they are gone, normally a few seconds. | Wait. |
+| `blocked_by` contains `preemption:<run>` | Checks are being stopped to free capacity for that older job; a later job that claims what it lacks waits until they are gone, normally a few seconds. | Wait. |
+| status `interrupted`, reason `preemption-reclaim-failed` | The check was preempted, but what its attempt held could not be reclaimed cleanly, so it was not run again. | Read `agc show <id>` and the log, then submit it again. |
 | `Gate queue: lost contact with the coordinator while following <id>: …`, exit status 75 | This client's stream ended; the job continues on the broker. | Read the verdict with `agc show <id>`; keep watching with `agc log <id> --follow`. Do not report 75 as a failed gate. |
 | `error: overflow needs a valid .agcoord/overflow.json in the checkout: …` | The declaration is invalid, or `--overflow` requires a missing declaration; no row was queued. | Fix the indicated configuration or use `--no-overflow` to run locally. |
 | `failure_reason: overflow-executor-failed` | The executor could not obtain a verdict; the row is interrupted and a land publishes nothing. | Read the log, resolve the executor or connection problem, and resubmit. |

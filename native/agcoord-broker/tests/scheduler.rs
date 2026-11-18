@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -17,6 +17,8 @@ const MIB: u64 = 1024 * 1024;
 const QUEUE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Busy timeout of one lock attempt, shorter than a frozen broker would hold the lock.
 const QUEUE_LOCK_ATTEMPT: Duration = Duration::from_millis(100);
+/// How long a preempted check may outlive its stop before the preemption is abandoned.
+const STOP_BOUND: Duration = Duration::from_secs(5);
 
 struct TestDirectory(PathBuf);
 
@@ -136,6 +138,10 @@ impl RunningBroker {
         self.child
             .as_mut()
             .is_some_and(|child| child.try_wait().unwrap().is_none())
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
     }
 
     fn signal_terminate(&mut self) {
@@ -1110,6 +1116,8 @@ fn rows_that_fit_start_while_an_older_row_of_any_kind_is_short() {
         let state = temporary.path().join("state");
         let checkout = temporary.path().join("checkout");
         fs::create_dir(&checkout).unwrap();
+        // The older row may preempt at once, so only what it would gain decides below.
+        write_broker_config(&state, json!({"preempt_after": 0}));
         let gib = 1024 * MIB;
         let mut broker = RunningBroker::start(
             &state,
@@ -1244,6 +1252,7 @@ fn a_repository_blocked_row_preempts_nothing() {
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
+    write_broker_config(&state, json!({"preempt_after": 0}));
     let mut broker = RunningBroker::start(&state, &[("jobs", 24), ("cpu", 24)]);
     let path = |name: &str| temporary.path().join(name);
     let _releases = ReleaseFiles(vec![path("land-release"), path("later-release")]);
@@ -7962,6 +7971,63 @@ fn write_broker_config(state: &Path, document: Value) {
     .unwrap();
 }
 
+/// A configuration under which a waiting row may preempt at once and every row that claims
+/// `cgroup_slot` runs in its own leaf of the fixture cgroup tree at `root`.
+fn cgroup_slot_config(root: &Path) -> Value {
+    json!({
+        "preempt_after": 0,
+        "bindings": {
+            "cgroup_slot": {
+                "backend": "cgroup-v2",
+                "kind": "generic",
+                "mode": "required",
+                "unit": "admission-unit",
+            }
+        },
+        "cgroup_root": root,
+    })
+}
+
+/// The only leaf below a fixture cgroup root.
+fn only_cgroup_leaf(root: &Path) -> PathBuf {
+    let children = |directory: &Path, prefix: &str| -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(prefix)
+            })
+            .collect()
+    };
+    let owners = children(root, "agcoord-u");
+    assert_eq!(owners.len(), 1, "{owners:?}");
+    let leaves = children(&owners[0], "run-");
+    assert_eq!(leaves.len(), 1, "{leaves:?}");
+    leaves[0].clone()
+}
+
+/// The rows whose submitted environment the coordinator currently keeps so that it can
+/// requeue them.
+fn retained_environments(state: &Path) -> Vec<String> {
+    let database = Connection::open(state.join("queue.sqlite3")).unwrap();
+    let mut statement = database
+        .prepare(
+            "SELECT run_id FROM run_preemptions WHERE environment_json IS NOT NULL
+             ORDER BY run_id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 /// A check that appends one line to `starts` on every attempt and then holds its claim until
 /// `release` exists, for up to a minute.
 fn attempt_command(starts: &Path, release: &Path) -> Vec<String> {
@@ -7988,6 +8054,21 @@ fn stubborn_attempt_command(starts: &Path, release: &Path, later_exit: u8) -> Ve
         starts.to_str().unwrap().to_owned(),
         release.to_str().unwrap().to_owned(),
         later_exit.to_string(),
+    ]
+}
+
+/// Like `attempt_command`, but the command ends with `exit` once it is released, so its
+/// verdict is its own.
+fn verdict_command(starts: &Path, release: &Path, exit: u8) -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "printf 'started\\n' >>\"$1\"; i=0; while [ ! -e \"$2\" ] && [ \"$i\" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done; exit \"$3\""
+            .to_owned(),
+        "agcoord-test".to_owned(),
+        starts.to_str().unwrap().to_owned(),
+        release.to_str().unwrap().to_owned(),
+        exit.to_string(),
     ]
 }
 
@@ -8055,13 +8136,13 @@ fn first_preemption_requested_at(state: &Path, victim: &str, preemptor: &str) ->
 }
 
 #[test]
-fn a_starving_row_preempts_the_youngest_later_check_after_preempt_after() {
-    let temporary = TestDirectory::new("preempt-youngest");
+fn a_starving_row_preempts_the_latest_submitted_check_after_preempt_after() {
+    let temporary = TestDirectory::new("preempt-latest");
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
     write_broker_config(&state, json!({"preempt_after": 3}));
-    let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 8)]);
+    let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 8), ("gpu", 1)]);
     let path = |name: &str| temporary.path().join(name);
     let _releases = ReleaseFiles(vec![
         path("holder-release"),
@@ -8138,11 +8219,28 @@ fn a_starving_row_preempts_the_youngest_later_check_after_preempt_after() {
     let held = status(&state, "check-latecomer");
     assert_eq!(held["status"], "queued");
     assert_eq!(held["blocked_by"], json!(["preemption:check-starving"]));
+    // A later row that claims nothing the starving row lacks is admitted as usual.
+    submit_check(
+        &state,
+        &checkout,
+        "check-unrelated",
+        "repo-b",
+        touch_command(&path("unrelated")),
+        &[("gpu", 1)],
+    );
+    wait_status(&state, "check-unrelated", "passed");
 
     // The victim returns to the queue at its original sequence and the starving row starts.
     wait_for(Duration::from_secs(10), || {
         attempts_started(&path("starving-starts")) == 1
     });
+    // The unrelated row started while the victim was still stopping.
+    let unrelated_started = status(&state, "check-unrelated")["started_at"].clone();
+    let starving_started = status(&state, "check-starving")["started_at"].clone();
+    assert!(
+        unrelated_started.as_str().unwrap() < starving_started.as_str().unwrap(),
+        "{unrelated_started} {starving_started}"
+    );
     let requeued = status(&state, "check-younger");
     assert_eq!(requeued["status"], "queued");
     assert_eq!(requeued["attempts"], 2);
@@ -8157,7 +8255,7 @@ fn a_starving_row_preempts_the_youngest_later_check_after_preempt_after() {
     // It keeps its place ahead of the row submitted after it.
     assert_eq!(requeued["position"], 1);
     assert_eq!(status(&state, "check-latecomer")["position"], 2);
-    // Only the youngest later check was stopped: the older one alone was not needed.
+    // Only the latest-submitted check was stopped: the earlier one alone was not needed.
     let spared = status(&state, "check-older");
     assert_eq!(spared["status"], "running");
     assert_eq!(spared["cancel_requested"], false);
@@ -8183,25 +8281,33 @@ fn a_starving_row_preempts_the_youngest_later_check_after_preempt_after() {
     assert_eq!(attempts_started(&path("starving-starts")), 1);
     assert_eq!(
         snapshot(&state).unwrap()["allocations"],
-        json!({"cpu": 0, "jobs": 0})
+        json!({"cpu": 0, "gpu": 0, "jobs": 0})
     );
+    // Nothing of any submission is kept once its row has ended.
+    assert!(retained_environments(&state).is_empty());
     assert!(broker.terminate().success());
 }
 
 #[test]
 fn a_starving_land_preempts_at_once_while_other_kinds_wait_preempt_after() {
-    for (kind, preempts_at_once) in [
-        ("land", true),
-        ("check", false),
-        ("full", false),
-        ("merge", false),
+    for (kind, configured, preempts_at_once) in [
+        ("land", Some(3600), true),
+        ("check", Some(3600), false),
+        ("full", Some(3600), false),
+        ("merge", Some(3600), false),
+        // Left unconfigured on a machine without a pool, the wait is five minutes for
+        // every kind but a land.
+        ("land", None, true),
+        ("check", None, false),
     ] {
         let temporary = TestDirectory::new(&format!("preempt-immediacy-{kind}"));
         let state = temporary.path().join("state");
         let checkout = temporary.path().join("checkout");
         fs::create_dir(&checkout).unwrap();
-        // No row of another kind can have waited this long by the end of the test.
-        write_broker_config(&state, json!({"preempt_after": 3600}));
+        if let Some(seconds) = configured {
+            // No row of another kind can have waited this long by the end of the test.
+            write_broker_config(&state, json!({"preempt_after": seconds}));
+        }
         let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
         let path = |name: &str| temporary.path().join(name);
         let _releases = ReleaseFiles(vec![
@@ -8309,6 +8415,9 @@ fn lands_fulls_merges_and_opted_out_checks_are_never_preempted() {
         let state = temporary.path().join("state");
         let checkout = temporary.path().join("checkout");
         fs::create_dir(&checkout).unwrap();
+        // The starving check may preempt at once, so only the later row's exemption keeps
+        // that row running.
+        write_broker_config(&state, json!({"preempt_after": 0}));
         let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
         let path = |name: &str| temporary.path().join(name);
         let _releases = ReleaseFiles(vec![
@@ -8368,6 +8477,13 @@ fn lands_fulls_merges_and_opted_out_checks_are_never_preempted() {
         wait_for(Duration::from_secs(10), || {
             attempts_started(&path("exempt-starts")) == 1
         });
+        // A running check keeps its submission so that it can be requeued; a row that is
+        // never preempted keeps none.
+        assert_eq!(
+            retained_environments(&state),
+            vec!["check-holder".to_owned()],
+            "later kind {later}"
+        );
 
         // The holder leaves: stopping the later row alone would let the starving check start
         // at once, but that row is never a victim, so the starving check keeps waiting.
@@ -8445,6 +8561,7 @@ fn a_check_preempted_twice_is_never_preempted_again() {
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
+    write_broker_config(&state, json!({"preempt_after": 0}));
     let mut broker = RunningBroker::start(
         &state,
         &[("jobs", 16), ("cpu", 4), ("gpu", 1), ("license", 1)],
@@ -8507,9 +8624,11 @@ fn a_check_preempted_twice_is_never_preempted_again() {
     assert_eq!(once["attempts"], 2);
     assert_eq!(once["preempted_by"], "first");
 
-    // The victim runs again while the second row still waits for the GPU as well.
+    // The victim runs again while the second row still waits for the GPU as well.  It can
+    // be requeued once more, so its submitted environment is kept again.
     release("first");
     wait_for(Duration::from_secs(10), || started("victim") == 2);
+    assert!(retained_environments(&state).contains(&"victim".to_owned()));
     assert_eq!(
         status(&state, "second")["blocked_by"],
         json!(["resource:cpu", "resource:gpu"])
@@ -8529,6 +8648,8 @@ fn a_check_preempted_twice_is_never_preempted_again() {
     // check that was preempted twice is never stopped again, so the third row waits.
     release("second");
     wait_for(Duration::from_secs(10), || started("victim") == 3);
+    // It will not return to the queue again, so nothing of its submission is kept.
+    assert!(!retained_environments(&state).contains(&"victim".to_owned()));
     release("hold-license");
     wait_status(&state, "hold-license", "passed");
     assert_eq!(
@@ -8564,16 +8685,19 @@ fn a_starving_row_overflows_when_a_pool_has_room_and_preempts_only_when_none_doe
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
     let executor = write_overflow_executor(temporary.path());
-    // The pool runs one job at a time.  `preempt_after` is not configured, so it is the
-    // pool's wait threshold: a row may preempt no sooner than it could have overflowed.
-    write_overflow_config(
+    // The pool runs one job at a time.  `preempt_after` equals the pool's wait threshold, so
+    // a row may preempt no sooner than it could have overflowed.
+    write_broker_config(
         &state,
         json!({
-            "name": "elsewhere",
-            "capacities": {"jobs": 1, "cpu": 4},
-            "executor": [executor],
-            "wait_threshold": 2,
-            "max_runtime": 60,
+            "preempt_after": 2,
+            "overflow_pools": [{
+                "name": "elsewhere",
+                "capacities": {"jobs": 1, "cpu": 4},
+                "executor": [executor],
+                "wait_threshold": 2,
+                "max_runtime": 60,
+            }],
         }),
     );
     let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
@@ -8660,8 +8784,7 @@ fn a_starving_row_overflows_when_a_pool_has_room_and_preempts_only_when_none_doe
     assert_eq!(requeued["attempts"], 2);
     assert_eq!(requeued["preempted_by"], "check-second");
     assert_eq!(attempts_started(&path("first-starts")), 1);
-    // It could not preempt sooner than `preempt_after`, which defaults to the pool's wait
-    // threshold.
+    // It could not preempt sooner than `preempt_after`.
     let requested_at = first_preemption_requested_at(&state, "check-later", "check-second");
     let waited = seconds_between(second["created_at"].as_str().unwrap(), &requested_at);
     assert!(waited > 1.99, "preempted after only {waited}s");
@@ -8881,6 +9004,7 @@ fn a_victim_that_does_not_stop_keeps_its_claim_and_its_preemption_is_abandoned()
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
+    write_broker_config(&state, json!({"preempt_after": 0}));
     let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
     let path = |name: &str| temporary.path().join(name);
     let _releases = ReleaseFiles(vec![
@@ -8943,8 +9067,8 @@ fn a_victim_that_does_not_stop_keeps_its_claim_and_its_preemption_is_abandoned()
     // After the stop bound the preemption is abandoned and recorded as an incident.
     wait_for(Duration::from_secs(15), || {
         run_log(&state, "check-stuck").contains(
-            "AGCoord: incident: check-stuck did not stop within 5 seconds of the preemption \
-             requested by check-starving",
+            "AGCoord: incident: check-stuck was still running 5 seconds after it was told to \
+             stop for the preemption requested by check-starving",
         )
     });
     // The later row no longer waits behind the abandoned preemption.
@@ -8982,7 +9106,7 @@ fn a_victim_that_does_not_stop_keeps_its_claim_and_its_preemption_is_abandoned()
     let (exit, stderr) = broker.terminate_with_stderr();
     assert!(exit.success(), "{stderr}");
     assert!(
-        stderr.contains("AGCoord: incident: check-stuck did not stop within 5 seconds"),
+        stderr.contains("AGCoord: incident: check-stuck was still running 5 seconds after"),
         "{stderr}"
     );
 }
@@ -8993,6 +9117,7 @@ fn a_caller_cancellation_wins_over_a_preemption_that_is_still_stopping_the_row()
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
+    write_broker_config(&state, json!({"preempt_after": 0}));
     let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
     let path = |name: &str| temporary.path().join(name);
     let _releases = ReleaseFiles(vec![
@@ -9068,6 +9193,7 @@ fn a_replacement_owner_completes_a_requested_preemption() {
     let state = temporary.path().join("state");
     let checkout = temporary.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
+    write_broker_config(&state, json!({"preempt_after": 0}));
     let capacities = [("jobs", 8), ("cpu", 4)];
     let mut crashing =
         start_crashing_broker_with_capacities(&state, &capacities, "preemption-request");
@@ -9123,8 +9249,11 @@ fn a_replacement_owner_completes_a_requested_preemption() {
     assert_eq!(reason.as_deref(), Some("preempted"));
     assert!(process_state(u64::try_from(worker_pid).unwrap()).is_some());
 
-    // A replacement adopts the live victim, stops it, requeues it, and only then starts
-    // the starving check: no command runs twice at once and nothing is lost.
+    // A replacement starts only after the stop bound has passed since the request.  It
+    // adopts the live victim, stops it, requeues it, and only then starts the starving
+    // check: no command runs twice at once and nothing is lost.  The bound runs from the
+    // stop the replacement delivers, so the preemption is not abandoned on the way.
+    thread::sleep(STOP_BOUND + Duration::from_millis(500));
     let mut replacement = RunningBroker::start(&state, &capacities);
     wait_for(Duration::from_secs(10), || {
         attempts_started(&path("starving-starts")) == 1
@@ -9133,7 +9262,12 @@ fn a_replacement_owner_completes_a_requested_preemption() {
     assert_eq!(requeued["status"], "queued");
     assert_eq!(requeued["attempts"], 2);
     assert_eq!(requeued["preempted_by"], "check-starving");
-    assert!(run_log(&state, "check-victim").contains("AGCoord: preempted by check-starving at "));
+    let log = run_log(&state, "check-victim");
+    assert!(
+        log.contains("AGCoord: preempted by check-starving at "),
+        "{log}"
+    );
+    assert!(!log.contains("incident"), "{log}");
     fs::write(path("starving-release"), "release").unwrap();
     wait_status(&state, "check-starving", "passed");
     wait_for(Duration::from_secs(10), || {
@@ -9143,7 +9277,9 @@ fn a_replacement_owner_completes_a_requested_preemption() {
     let finished = wait_status(&state, "check-victim", "passed");
     assert_eq!(finished["attempts"], 2);
     assert_eq!(attempts_started(&path("starving-starts")), 1);
-    assert!(replacement.terminate().success());
+    let (exit, stderr) = replacement.terminate_with_stderr();
+    assert!(exit.success(), "{stderr}");
+    assert!(!stderr.contains("incident"), "{stderr}");
 }
 
 #[test]
@@ -9155,20 +9291,7 @@ fn a_preempted_check_under_a_cgroup_binding_is_reclaimed_and_prepared_again() {
     for path in [&state, &root, &checkout] {
         fs::create_dir(path).unwrap();
     }
-    write_broker_config(
-        &state,
-        json!({
-            "bindings": {
-                "cgroup_slot": {
-                    "backend": "cgroup-v2",
-                    "kind": "generic",
-                    "mode": "required",
-                    "unit": "admission-unit",
-                }
-            },
-            "cgroup_root": root,
-        }),
-    );
+    write_broker_config(&state, cgroup_slot_config(&root));
     let mut broker = RunningBroker::start_with_options(
         &state,
         &[("jobs", 8), ("cpu", 4), ("cgroup_slot", 8)],
@@ -9257,6 +9380,507 @@ fn a_preempted_check_under_a_cgroup_binding_is_reclaimed_and_prepared_again() {
     // No leaf of either attempt is left behind.
     assert!(fs::read_dir(&root).unwrap().next().is_none());
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_victim_whose_leaf_is_not_reclaimed_ends_interrupted_with_its_receipt() {
+    let temporary = TestDirectory::new("preempt-unreclaimed");
+    let state = temporary.path().join("state");
+    let root = temporary.path().join("delegated");
+    let checkout = temporary.path().join("checkout");
+    for path in [&state, &root, &checkout] {
+        fs::create_dir(path).unwrap();
+    }
+    write_broker_config(&state, cgroup_slot_config(&root));
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 8), ("cpu", 4), ("cgroup_slot", 8)],
+        &["--cgroup-fixture", root.to_str().unwrap()],
+    );
+    let path = |name: &str| temporary.path().join(name);
+    let _releases = ReleaseFiles(vec![
+        path("holder-release"),
+        path("starving-release"),
+        path("victim-release"),
+    ]);
+    submit_check(
+        &state,
+        &checkout,
+        "check-holder",
+        "repo-a",
+        attempt_command(&path("holder-starts"), &path("holder-release")),
+        &[("cpu", 2)],
+    );
+    wait_status(&state, "check-holder", "running");
+    submit_check(
+        &state,
+        &checkout,
+        "check-starving",
+        "repo-a",
+        attempt_command(&path("starving-starts"), &path("starving-release")),
+        &[("cpu", 4)],
+    );
+    // Only the victim claims the bound resource, so its leaf is the only one.
+    submit_check(
+        &state,
+        &checkout,
+        "check-victim",
+        "repo-b",
+        attempt_command(&path("victim-starts"), &path("victim-release")),
+        &[("cpu", 2), ("cgroup_slot", 1)],
+    );
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("victim-starts")) == 1
+    });
+    // The victim's leaf gains a child group, so once the attempt is stopped the leaf is
+    // still populated and cannot be removed.
+    let leaf = only_cgroup_leaf(&root);
+    fs::create_dir(leaf.join("nested")).unwrap();
+
+    // The starving check preempts the victim.  Its processes are gone, but what the
+    // attempt held is not reclaimed, so it is not run again: it ends interrupted, and its
+    // receipt still says what failed.
+    fs::write(path("holder-release"), "release").unwrap();
+    wait_status(&state, "check-holder", "passed");
+    let ended = wait_status(&state, "check-victim", "interrupted");
+    assert_eq!(ended["exit_status"], 125);
+    assert_eq!(ended["failure_reason"], "preemption-reclaim-failed");
+    assert_eq!(ended["attempts"], 1);
+    assert_eq!(ended["preempted_by"], "check-starving");
+    let events = ended["resource_receipt"]["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|event| event["stage"] == "cleanup"
+            && event["status"] == "failed"
+            && event["code"] == "leaf-populated"),
+        "{events:?}"
+    );
+    let log = run_log(&state, "check-victim");
+    assert!(
+        log.contains("AGCoord: preempted by check-starving at ",)
+            && log.contains(
+                ", attempt 1; not requeued, because the resources of that attempt were not \
+             reclaimed cleanly (preemption-reclaim-failed)"
+            ),
+        "{log}"
+    );
+    assert!(!log.contains("requeued at its original position"), "{log}");
+    // The refused leaf is left in place rather than removed as if it were clean.
+    assert!(leaf.join("nested").is_dir());
+    assert!(!retained_environments(&state).contains(&"check-victim".to_owned()));
+
+    // The starving check runs; the victim never does again.
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("starving-starts")) == 1
+    });
+    fs::write(path("starving-release"), "release").unwrap();
+    wait_status(&state, "check-starving", "passed");
+    assert_eq!(attempts_started(&path("victim-starts")), 1);
+    assert_eq!(status(&state, "check-victim")["status"], "interrupted");
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_victim_that_ends_before_its_stop_is_delivered_keeps_its_verdict() {
+    let temporary = TestDirectory::new("preempt-ended-first");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    write_broker_config(&state, json!({"preempt_after": 0}));
+    // The broker stops itself right after it durably requests a preemption, before it
+    // delivers anything to the victim.
+    let mut broker = RunningBroker::start_with_options(
+        &state,
+        &[("jobs", 8), ("cpu", 4)],
+        &["--stop-after", "preemption-request"],
+    );
+    let path = |name: &str| temporary.path().join(name);
+    let _releases = ReleaseFiles(vec![
+        path("holder-release"),
+        path("starving-release"),
+        path("victim-release"),
+    ]);
+    submit_check(
+        &state,
+        &checkout,
+        "check-holder",
+        "repo-a",
+        attempt_command(&path("holder-starts"), &path("holder-release")),
+        &[("cpu", 2)],
+    );
+    wait_status(&state, "check-holder", "running");
+    submit_check(
+        &state,
+        &checkout,
+        "check-starving",
+        "repo-a",
+        attempt_command(&path("starving-starts"), &path("starving-release")),
+        &[("cpu", 4)],
+    );
+    submit_check(
+        &state,
+        &checkout,
+        "check-victim",
+        "repo-b",
+        verdict_command(&path("victim-starts"), &path("victim-release"), 3),
+        &[("cpu", 2)],
+    );
+    let admitted = wait_status(&state, "check-victim", "running");
+    let worker_pid = u64::try_from(admitted["worker_pid"].as_i64().unwrap()).unwrap();
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("victim-starts")) == 1
+    });
+
+    // The holder leaves, the starving check asks the victim to stop, and the owner pauses.
+    fs::write(path("holder-release"), "release").unwrap();
+    wait_for(Duration::from_secs(10), || {
+        process_state(u64::from(broker.pid())).as_deref() == Some("T")
+    });
+    let requested = status(&state, "check-victim");
+    assert_eq!(requested["status"], "running");
+    assert_eq!(requested["failure_reason"], "preempted");
+    assert_eq!(requested["preempted_by"], "check-starving");
+
+    // Meanwhile the victim finishes on its own with a verdict of its own.
+    fs::write(path("victim-release"), "release").unwrap();
+    wait_for(Duration::from_secs(10), || {
+        process_state(worker_pid).is_none_or(|state| state == "Z")
+    });
+    signal_process(broker.pid(), "-CONT");
+
+    // Nothing was stopped, so nothing is run again: the verdict stands.
+    let finished = wait_status(&state, "check-victim", "failed");
+    assert_eq!(finished["exit_status"], 3);
+    assert_eq!(finished["failure_reason"], Value::Null);
+    assert_eq!(finished["cancel_requested"], false);
+    assert_eq!(finished["attempts"], 1);
+    assert_eq!(finished["preempted_by"], Value::Null);
+    assert!(!run_log(&state, "check-victim").contains("preempted by"));
+    // The capacity it held reaches the starving check.
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("starving-starts")) == 1
+    });
+    fs::write(path("starving-release"), "release").unwrap();
+    wait_status(&state, "check-starving", "passed");
+    assert_eq!(attempts_started(&path("victim-starts")), 1);
+    assert!(retained_environments(&state).is_empty());
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_requeued_check_waits_preempt_after_again_before_it_preempts() {
+    let temporary = TestDirectory::new("preempt-requeued-clock");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let preempt_after = 4.0;
+    write_broker_config(&state, json!({"preempt_after": preempt_after}));
+    let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4), ("gpu", 4)]);
+    let path = |name: &str| temporary.path().join(name);
+    let _releases = ReleaseFiles(vec![
+        path("holder-release"),
+        path("starving-release"),
+        path("victim-release"),
+        path("later-release"),
+    ]);
+    submit_check(
+        &state,
+        &checkout,
+        "check-holder",
+        "repo-a",
+        attempt_command(&path("holder-starts"), &path("holder-release")),
+        &[("cpu", 2)],
+    );
+    wait_status(&state, "check-holder", "running");
+    submit_check(
+        &state,
+        &checkout,
+        "check-starving",
+        "repo-a",
+        attempt_command(&path("starving-starts"), &path("starving-release")),
+        &[("cpu", 4)],
+    );
+    submit_check(
+        &state,
+        &checkout,
+        "check-victim",
+        "repo-b",
+        attempt_command(&path("victim-starts"), &path("victim-release")),
+        &[("cpu", 2), ("gpu", 2)],
+    );
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("victim-starts")) == 1
+    });
+    // Every row here was submitted longer than `preempt_after` ago before the holder leaves.
+    thread::sleep(Duration::from_secs_f64(preempt_after + 0.2));
+
+    // The starving check preempts the victim and starts.
+    fs::write(path("holder-release"), "release").unwrap();
+    wait_status(&state, "check-holder", "passed");
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("starving-starts")) == 1
+    });
+    let requeued = status(&state, "check-victim");
+    assert_eq!(requeued["status"], "queued");
+    assert_eq!(requeued["attempts"], 2);
+    assert_eq!(requeued["preempted_by"], "check-starving");
+
+    // A later check that needs only GPUs takes three of the four.  Once the starving check
+    // ends, the victim lacks only the GPU that check holds, and stopping it would let the
+    // victim start.
+    submit_check(
+        &state,
+        &checkout,
+        "check-later",
+        "repo-c",
+        attempt_command(&path("later-starts"), &path("later-release")),
+        &[("gpu", 3)],
+    );
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("later-starts")) == 1
+    });
+    fs::write(path("starving-release"), "release").unwrap();
+    wait_status(&state, "check-starving", "passed");
+    assert_eq!(
+        status(&state, "check-victim")["blocked_by"],
+        json!(["resource:gpu"])
+    );
+
+    // The victim was submitted long ago, but it entered the queue again only now, so it
+    // waits `preempt_after` once more instead of stopping the later check at once.
+    thread::sleep(Duration::from_millis(500));
+    let spared = status(&state, "check-later");
+    assert_eq!(spared["status"], "running");
+    assert_eq!(spared["cancel_requested"], false);
+    assert_eq!(spared["attempts"], 1);
+    wait_for(Duration::from_secs(15), || {
+        attempts_started(&path("victim-starts")) == 2
+    });
+    let stopped = status(&state, "check-later");
+    assert_eq!(stopped["status"], "queued");
+    assert_eq!(stopped["attempts"], 2);
+    assert_eq!(stopped["preempted_by"], "check-victim");
+    let requeued_at = first_preemption_requested_at(&state, "check-victim", "check-starving");
+    let preempted_at = first_preemption_requested_at(&state, "check-later", "check-victim");
+    let waited = seconds_between(&requeued_at, &preempted_at);
+    assert!(
+        waited > preempt_after - 0.01,
+        "preempted {waited}s after it was requeued"
+    );
+
+    fs::write(path("victim-release"), "release").unwrap();
+    assert_eq!(wait_status(&state, "check-victim", "passed")["attempts"], 2);
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("later-starts")) == 2
+    });
+    fs::write(path("later-release"), "release").unwrap();
+    assert_eq!(wait_status(&state, "check-later", "passed")["attempts"], 2);
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_wide_check_waits_behind_back_to_back_fulls_and_nothing_is_reserved_for_it() {
+    let temporary = TestDirectory::new("preempt-starvation-gap");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    // The wide check may preempt at once, so only the fulls' exemption keeps it waiting.
+    write_broker_config(&state, json!({"preempt_after": 0}));
+    let mut broker = RunningBroker::start(&state, &[("jobs", 8), ("cpu", 4)]);
+    let path = |name: &str| temporary.path().join(name);
+    let fulls = ["full-1", "full-2", "full-3", "full-4"];
+    let mut releases: Vec<_> = fulls
+        .iter()
+        .map(|run_id| path(&format!("{run_id}-release")))
+        .collect();
+    releases.push(path("wide-release"));
+    let _releases = ReleaseFiles(releases);
+    let submit_full = |index: usize| {
+        let run_id = fulls[index];
+        submit_ok_in_worktree(
+            &state,
+            &Submission {
+                run_id,
+                kind: "full",
+                repository: &format!("repo-full-{index}"),
+                checkout: &checkout,
+                command: attempt_command(
+                    &path(&format!("{run_id}-starts")),
+                    &path(&format!("{run_id}-release")),
+                ),
+                gate_run_id: None,
+            },
+            &[("cpu", 2)],
+            None,
+        );
+        wait_for(Duration::from_secs(10), || {
+            attempts_started(&path(&format!("{run_id}-starts"))) == 1
+        });
+    };
+    let assert_waiting_on_capacity_alone = || {
+        let wide = status(&state, "check-wide");
+        assert_eq!(wide["status"], "queued");
+        assert_eq!(wide["blocked_by"], json!(["resource:cpu"]));
+        assert_eq!(wide["attempts"], 1);
+    };
+
+    submit_full(0);
+    submit_check(
+        &state,
+        &checkout,
+        "check-wide",
+        "repo-a",
+        attempt_command(&path("wide-starts"), &path("wide-release")),
+        &[("cpu", 4)],
+    );
+    assert_waiting_on_capacity_alone();
+    // Each later full fits beside the running one and starts first fit, so all four CPUs
+    // are never free at once.  The wide check lacks only capacity, may preempt at once, and
+    // keeps waiting: a full is never a victim, and nothing is held back for the wide check.
+    for index in 1..fulls.len() {
+        submit_full(index);
+        assert_waiting_on_capacity_alone();
+        fs::write(path(&format!("{}-release", fulls[index - 1])), "release").unwrap();
+        wait_status(&state, fulls[index - 1], "passed");
+        thread::sleep(Duration::from_millis(300));
+        assert_waiting_on_capacity_alone();
+        let running = status(&state, fulls[index]);
+        assert_eq!(running["status"], "running");
+        assert_eq!(running["cancel_requested"], false);
+        assert_eq!(running["attempts"], 1);
+    }
+    assert_eq!(attempts_started(&path("wide-starts")), 0);
+
+    // Once no full starts any more, the wide check runs.
+    fs::write(
+        path(&format!("{}-release", fulls[fulls.len() - 1])),
+        "release",
+    )
+    .unwrap();
+    wait_for(Duration::from_secs(10), || {
+        attempts_started(&path("wide-starts")) == 1
+    });
+    fs::write(path("wide-release"), "release").unwrap();
+    wait_status(&state, "check-wide", "passed");
+    for run_id in fulls {
+        assert_eq!(status(&state, run_id)["attempts"], 1);
+    }
+    assert!(broker.terminate().success());
+}
+
+#[test]
+fn a_starting_owner_drops_kept_environments_and_stops_of_rows_that_are_not_running() {
+    let temporary = TestDirectory::new("preempt-recovery");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1), ("cpu", 4)]);
+    let path = |name: &str| temporary.path().join(name);
+    let _releases = ReleaseFiles(vec![path("holder-release")]);
+    for run_id in ["check-preempted", "check-plain"] {
+        submit_check(
+            &state,
+            &checkout,
+            run_id,
+            "repo-a",
+            touch_command(&path(run_id)),
+            &[("cpu", 1)],
+        );
+        wait_status(&state, run_id, "passed");
+    }
+    // One queued row waits behind a running one when the owner stops.
+    submit_check(
+        &state,
+        &checkout,
+        "check-holder",
+        "repo-a",
+        attempt_command(&path("holder-starts"), &path("holder-release")),
+        &[("cpu", 1)],
+    );
+    wait_status(&state, "check-holder", "running");
+    submit_check(
+        &state,
+        &checkout,
+        "check-queued",
+        "repo-a",
+        touch_command(&path("check-queued")),
+        &[("cpu", 1)],
+    );
+    // While it runs, the holder's submission is kept so that it could be requeued.
+    assert_eq!(
+        retained_environments(&state),
+        vec!["check-holder".to_owned()]
+    );
+    // Stopping lets the holder finish and leaves the queued row for the next owner.
+    broker.signal_terminate();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(path("holder-release"), "release").unwrap();
+    assert!(broker.wait().success());
+    assert_eq!(status(&state, "check-holder")["status"], "passed");
+    assert_eq!(status(&state, "check-queued")["status"], "queued");
+    assert!(retained_environments(&state).is_empty());
+
+    // An earlier owner left records behind that do not match the rows: kept environments
+    // and requested stops of rows that are not running, and a record of a row that is gone.
+    let database = Connection::open(state.join("queue.sqlite3")).unwrap();
+    for (run_id, attempts, preempted_by) in [
+        ("check-preempted", 2, Some("check-elsewhere")),
+        ("check-plain", 1, None),
+        ("check-queued", 2, Some("check-elsewhere")),
+        ("check-forgotten", 1, None),
+    ] {
+        database
+            .execute(
+                "INSERT INTO run_preemptions
+                    (run_id, attempts, preempted_by, queued_at, stopping_for,
+                     stop_requested_at, abandoned, environment_json)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00.000Z', 'check-other',
+                         '2026-01-01T00:00:00.000Z', 1, '{\"SECRET\":\"1\"}')",
+                params![run_id, attempts, preempted_by],
+            )
+            .unwrap();
+    }
+    drop(database);
+
+    let mut replacement = RunningBroker::start(&state, &[("jobs", 1), ("cpu", 4)]);
+    let database = Connection::open(state.join("queue.sqlite3")).unwrap();
+    let record = |run_id: &str| {
+        database
+            .query_row(
+                "SELECT attempts, preempted_by, stopping_for, stop_requested_at, abandoned,
+                        environment_json
+                 FROM run_preemptions WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap()
+    };
+    // Nothing of a submission is kept for a row that is not running, and no stop is in
+    // flight for it; what a row reports about its attempts stays.
+    let preempted_record = Some((2, Some("check-elsewhere".to_owned()), None, None, 0, None));
+    assert_eq!(record("check-preempted"), preempted_record);
+    assert_eq!(record("check-plain"), None);
+    assert_eq!(record("check-forgotten"), None);
+    assert!(retained_environments(&state).is_empty());
+    assert_eq!(status(&state, "check-preempted")["attempts"], 2);
+    assert_eq!(
+        status(&state, "check-preempted")["preempted_by"],
+        "check-elsewhere"
+    );
+    // The queued row runs normally under the new owner, and nothing of it is kept after.
+    wait_status(&state, "check-queued", "passed");
+    assert!(retained_environments(&state).is_empty());
+    drop(database);
+    assert!(replacement.terminate().success());
 }
 
 #[test]

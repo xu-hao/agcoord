@@ -191,23 +191,24 @@
     {
       "id": "resources.greedy-admission",
       "domain": "resources",
-      "description": "Queued rows are admitted first fit in submission order across repositories and row kinds: a row whose complete claim fits starts although an older row is short, and no capacity is reserved for a waiting row. A row that also waits on its repository, or whose claim only an overflow pool could run, preempts nothing.",
+      "description": "Queued rows are admitted first fit in submission order across repositories and row kinds: a row whose complete claim fits starts although an older row is short, and no capacity is reserved for a waiting row, so a row whose shortage only work that is never preempted holds keeps waiting while such work keeps starting. A row that also waits on its repository, or whose claim only an overflow pool could run, preempts nothing.",
       "tests": {
         "rust_native": [
           "scheduler::rows_that_fit_start_while_an_older_row_of_any_kind_is_short",
           "scheduler::admission_follows_submission_order_across_repositories",
           "scheduler::a_repository_blocked_row_preempts_nothing",
-          "scheduler::an_overflow_only_claim_never_preempts_local_work"
+          "scheduler::an_overflow_only_claim_never_preempts_local_work",
+          "scheduler::a_wide_check_waits_behind_back_to_back_fulls_and_nothing_is_reserved_for_it"
         ]
       }
     },
     {
-      "id": "resources.bounded-preemption",
+      "id": "resources.check-preemption",
       "domain": "resources",
-      "description": "The oldest queued row that lacks only local capacity preempts once it has waited preempt_after, or at once when it is a land: the youngest later local checks that minimally cover its shortage are stopped like cancelled jobs and requeued at their original sequence on their next attempt, while later rows wait behind the preemption. Lands, fulls, merges, opted-out checks, and checks already preempted twice are never stopped; a pool with room is used first; a caller's cancellation wins; a victim that does not stop keeps its claim while its preemption is abandoned as an incident; a replacement owner completes a requested preemption; and a victim under an enforced binding is reclaimed and prepared again for its next attempt.",
+      "description": "The oldest queued row that lacks only local capacity preempts once it has been queued for preempt_after since it last entered the queue (by default the largest pool wait_threshold, never under 300 seconds), or at once when it is a land: the latest-submitted local checks that minimally cover its shortage are stopped like cancelled jobs and requeued at their original sequence on their next attempt, so a just-requeued check waits preempt_after again before it preempts, while later rows that claim what the starving row lacks wait behind the preemption. Lands, fulls, merges, opted-out checks, and checks already preempted twice are never stopped and keep no submitted environment; a pool with room is used first; a caller's cancellation wins; a victim that finishes before any stop reaches it keeps its verdict; a victim whose resources are not reclaimed cleanly ends interrupted as preemption-reclaim-failed with its receipt; a victim that does not stop within the bound counted from its delivered stop keeps its claim while its preemption is abandoned as an incident; a replacement owner completes a requested preemption; a starting owner drops kept environments and stops of rows that are not running; and a victim under an enforced binding is reclaimed and prepared again for its next attempt.",
       "tests": {
         "rust_native": [
-          "scheduler::a_starving_row_preempts_the_youngest_later_check_after_preempt_after",
+          "scheduler::a_starving_row_preempts_the_latest_submitted_check_after_preempt_after",
           "scheduler::a_starving_land_preempts_at_once_while_other_kinds_wait_preempt_after",
           "scheduler::lands_fulls_merges_and_opted_out_checks_are_never_preempted",
           "scheduler::only_a_check_may_opt_out_of_preemption",
@@ -216,7 +217,11 @@
           "scheduler::a_victim_that_does_not_stop_keeps_its_claim_and_its_preemption_is_abandoned",
           "scheduler::a_caller_cancellation_wins_over_a_preemption_that_is_still_stopping_the_row",
           "scheduler::a_replacement_owner_completes_a_requested_preemption",
-          "scheduler::a_preempted_check_under_a_cgroup_binding_is_reclaimed_and_prepared_again"
+          "scheduler::a_preempted_check_under_a_cgroup_binding_is_reclaimed_and_prepared_again",
+          "scheduler::a_victim_whose_leaf_is_not_reclaimed_ends_interrupted_with_its_receipt",
+          "scheduler::a_victim_that_ends_before_its_stop_is_delivered_keeps_its_verdict",
+          "scheduler::a_requeued_check_waits_preempt_after_again_before_it_preempts",
+          "scheduler::a_starting_owner_drops_kept_environments_and_stops_of_rows_that_are_not_running"
         ]
       }
     },

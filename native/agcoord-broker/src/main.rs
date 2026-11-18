@@ -395,6 +395,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
     let mut host_fixture_root = None;
     let mut host_executable = None;
     let mut crash_after = None;
+    let mut stop_after = None;
     let mut worker_fault = None;
     let mut cgroup_fixture = None;
     let mut project_quota_fixture = None;
@@ -463,6 +464,16 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
                     return Err(AppError::usage("unknown broker crash point"));
                 }
                 crash_after = Some(point);
+            }
+            "--stop-after" => {
+                if !cfg!(debug_assertions) {
+                    return Err(AppError::usage("unknown option: --stop-after"));
+                }
+                let point = option_value(arguments, &mut index, "--stop-after")?;
+                if point != "preemption-request" {
+                    return Err(AppError::usage("unknown broker stop point"));
+                }
+                stop_after = Some(point);
             }
             "--worker-fault" => {
                 if !cfg!(debug_assertions) {
@@ -546,6 +557,7 @@ fn parse_serve(arguments: &[String]) -> Result<ServeOptions> {
         idle_timeout,
         host_preflight,
         crash_after,
+        stop_after,
         worker_fault,
         cgroup_fixture,
         project_quota_fixture,

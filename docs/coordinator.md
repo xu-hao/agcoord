@@ -207,9 +207,10 @@ disables batch claiming so queued lands execute one at a time). `stop_grace` is 
 seconds from `0` to `2147483.647`, defaults to `600`, and bounds how long a gracefully stopping
 broker lets running jobs finish before it interrupts them; `0` interrupts them at once.
 `preempt_after` is a finite number of seconds from `0` to `2147483.647` and is how long the
-oldest queued job that lacks only local capacity waits before it may
-[preempt later checks](#first-fit-admission-and-bounded-preemption); it defaults to the largest
-`wait_threshold` among the configured overflow pools, and to `0` without a pool. An
+oldest queued job that lacks only local capacity waits, counted from when it last entered the
+queue, before it may [preempt later checks](#first-fit-admission-and-preemption); it defaults
+to the largest `wait_threshold` among the configured overflow pools, but never less than `300`,
+including on a host without a pool. A `land` does not wait for it. An
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
 defaults capacity to `jobs=2`.
 
@@ -283,7 +284,7 @@ fit is rejected rather than left queued forever, unless it allowed overflow and 
 [overflow pool](#overflow-pools) offers it. Scheduling does not infer resource use from
 labels or commands.
 
-### First-fit admission and bounded preemption
+### First-fit admission and preemption
 
 Admission is first fit. On each pass the scheduler walks the queue in submission order, across
 all repositories and row kinds, and starts every queued job whose blockers are empty: its
@@ -302,29 +303,34 @@ These blockers appear in `agc list --json`, `agc show`, and the TUI's selection 
 views.
 
 First fit keeps the machine busy, but by itself it lets one job wait indefinitely: a job that
-needs a large share of one resource stays short while later, smaller jobs keep fitting. A
-starvation guard bounds that wait by preempting checks.
+needs a large share of one resource stays short while later, smaller jobs keep fitting.
+Preemption shortens that wait when the later work is checks, which can be stopped and run
+again. It does not bound the wait; see [the starvation gap](#the-starvation-gap) below.
 
 - **The starving job.** Only one queued job may preempt at a time: the oldest job, by
   submission sequence across all repositories, that is blocked by `resource:*` shortages alone
   and whose complete claim fits this machine when idle. A job that also waits on its repository
   could not start even with the capacity, and a claim accepted only because an overflow pool
   offers it can never run here, so neither preempts anything.
-- **When.** The starving job may preempt once it has been queued for `preempt_after` seconds. A
-  `land` does not wait that long: it holds up every later landing in its repository, which
-  costs far more than restarting checks, so it may preempt as soon as it is the starving job.
+- **When.** The starving job may preempt once it has been queued for `preempt_after` seconds,
+  counted from when it last entered the queue: its submission, or the moment a preemption
+  returned it to the queue. A check that was just requeued therefore waits the whole
+  `preempt_after` again before it may stop other checks in its turn. A `land` does not wait: it
+  holds up every later landing in its repository, which costs far more than restarting checks,
+  so it may preempt as soon as it is the starving job.
 - **Overflow first.** In every pass the broker first admits everything that fits here, then
   places jobs in [overflow pools](#overflow-pools), and only then preempts. A starving job that
   a pool can take now is placed there instead. Because `preempt_after` defaults to the largest
   pool `wait_threshold`, every pool has by default had its chance before a job preempts.
 - **Victims.** Victims are running `check` jobs on this machine that were submitted after the
-  starving job. They are taken youngest start first, so the least work is lost, until their
-  claims cover every shortage; a victim whose claim is not needed after all is then spared,
-  oldest start first, so the set is minimal. When no set of victims would let the starving job
-  fit, nothing is preempted and it keeps waiting. A `land`, a `full`, and a retained `merge`
-  are never victims, because they hold barriers or produce reusable receipts. Neither is a job
-  placed in an overflow pool, a check submitted with `--no-preempt`, or a check that was
-  already preempted twice, which bounds how often one job is restarted.
+  starving job. They are taken latest submission first (among equal submissions, latest start
+  first) until their claims cover every shortage; a victim whose claim is not needed after all
+  is then spared, earliest submission first, so the set is minimal. The work that is restarted
+  thus belongs to the jobs that arrived last. When no set of victims would let the starving job
+  fit, nothing is preempted and it keeps waiting. A `land`, a `full`, and a retained `merge` are never victims, because they hold
+  barriers or produce reusable receipts. Neither is a job placed in an overflow pool, a check
+  submitted with `--no-preempt`, or a check that was already preempted twice, which bounds how
+  often one job is restarted.
 - **Stopping and requeueing.** A victim is stopped exactly like a cancelled job: its process
   group or cgroup is signalled, it keeps its claim until every descendant is gone, and its
   scratch and enforcement state are reclaimed. While it is being stopped the row stays
@@ -336,23 +342,56 @@ starvation guard bounds that wait by preempting checks.
   and the next attempt appends to the same log. The client that submitted the check keeps
   waiting and receives the final attempt's status. A caller's own `agc cancel` during the stop
   wins: the job ends `cancelled`.
-- **Nothing takes the capacity in between.** From the moment a preemption is requested until
-  its victims are gone, jobs submitted after the starving job are not admitted here and report
-  `preemption:<starving_run_id>` in `blocked_by`, so the capacity being released reaches the
-  starving job. Older jobs are unaffected, and a waiting job may still be placed in an overflow
-  pool.
-- **A victim that does not stop.** If a victim is still present five seconds after its stop was
-  requested, the broker abandons that preemption. Later jobs stop waiting behind it, and the
-  victim keeps its claim until it is really gone, so nothing is ever admitted into capacity it
-  still holds. The broker records
-  `AGCoord: incident: <victim> did not stop within 5 seconds of the preemption requested by <run>; …`
+- **A victim that finishes first.** A victim whose command ends on its own before the broker
+  has delivered any stop to it keeps its verdict: the requested stop is withdrawn, the row ends
+  `passed` or `failed` like any other check, and it is not run again.
+- **A victim that is not reclaimed.** A victim is requeued only when everything its attempt
+  held was reclaimed cleanly. If a resource backend fails to stop, measure, or remove what the
+  attempt held, for example a cgroup leaf that is still populated, the row ends `interrupted`
+  with exit status 125 and `failure_reason` `preemption-reclaim-failed`, its resource receipt
+  keeps the failed events, and its log receives
+  `AGCoord: preempted by <run> at <time>, attempt <n>; not requeued, because the resources of that attempt were not reclaimed cleanly (preemption-reclaim-failed)`.
+- **What waits while victims stop.** From the moment a preemption is requested until its
+  victims are gone, a job submitted after the starving job that claims a resource the starving
+  job still lacks is not admitted here and reports `preemption:<starving_run_id>` in
+  `blocked_by`, so the capacity being released reaches the starving job. A later job that claims
+  none of those resources, and every older job, is admitted as usual, and a waiting job may
+  still be placed in an overflow pool.
+- **A victim that does not stop.** If a victim is still present five seconds after the owning
+  broker first delivered its stop (its first signal, or the kill of its cgroup), the broker
+  abandons that preemption. The five seconds run from that delivery, not from the request, so a
+  replacement broker that completes a request its predecessor made gives the victim the whole
+  bound. Later jobs stop waiting behind the abandoned preemption, and the victim keeps its claim
+  until it is really gone, so nothing is ever admitted into capacity it still holds. The broker
+  records
+  `AGCoord: incident: <victim> was still running 5 seconds after it was told to stop for the preemption requested by <run>; …`
   in the victim's log and in its own diagnostics. The victim is still requeued once it
   disappears, and the starving job may preempt other checks meanwhile.
 
 A requested preemption is durable. A replacement broker adopts the live victim, stops it,
 requeues it, and only then admits the starving job. So that a preempted check can restart
 unchanged, the broker keeps the submitted environment of a running check that may still be
-preempted in the owner-only spool until that attempt ends.
+preempted in the owner-only spool until that attempt ends. It keeps none for a job that is
+never a victim, and a starting broker discards any environment or requested stop it finds kept
+for a row that is not running.
+
+A check that is safe to run twice is not necessarily safe to restart after it was killed. A
+victim's attempt is ended by `SIGTERM`, then `SIGKILL` after two seconds, or by the kill of its
+cgroup, so it can leave behind state that a clean finish would have removed, such as a stale
+`.git/index.lock`, and its next attempt starts in that state. Submit a check that is not safe
+in either sense with `--no-preempt`.
+
+#### The starvation gap
+
+Preemption never stops a `land`, a `full`, a `merge`, a check submitted with `--no-preempt`, or
+a check that was already preempted twice, and admission holds nothing back for a waiting job.
+A job whose shortage can be covered only by such work may therefore wait indefinitely, for as
+long as such work keeps starting. For example, on a host with four CPUs, a check that claims all
+four waits for as long as two-CPU `full` jobs from other repositories keep overlapping one
+another, because one of them always holds two CPUs and none of them is ever stopped. AGCoord
+accepts this gap rather than idling capacity for a job that cannot start yet; such a job starts
+once that work stops arriving, or earlier in an [overflow pool](#overflow-pools) when its
+submitter allowed overflow.
 
 ### Resource bindings and enforcement
 
@@ -506,7 +545,7 @@ capacity or requiring a capability `local` lacks is accepted at submission when 
 satisfies both the complete resource claim and every required capability together, and reaches
 that pool by the same rule. With `--no-overflow`, claims and capabilities must fit `local`.
 A job that waits behind an in-flight
-[preemption](#first-fit-admission-and-bounded-preemption) may overflow after that threshold:
+[preemption](#first-fit-admission-and-preemption) may overflow after that threshold:
 placement consumes the pool's capacity rather than local capacity, so it does not delay the job
 the preemption serves. A starving job preempts local checks only when no pool can take it. Pool
 allocations are excluded from local shortages, and a job placed in a pool is never a preemption
@@ -1254,8 +1293,9 @@ credential, network, or general security sandboxes.
 Fairness applies across lanes and capacity: a compatible check can overlap work in another
 repository or in another worktree of its own, but it cannot leapfrog an earlier land in its own
 worktree. Capacity is handed out in submission order to whatever fits, and
-[bounded preemption](#first-fit-admission-and-bounded-preemption) keeps an older job from
-waiting indefinitely behind later ones.
+[preemption](#first-fit-admission-and-preemption) lets an older job stop later checks that
+hold what it lacks. Nothing bounds how long a job waits behind later work that is never
+preempted; see [the starvation gap](#the-starvation-gap).
 
 ## Durable job shape
 
@@ -1310,7 +1350,7 @@ private spool state and never enter the public row;
 `capability:<name>`) currently preventing admission. `pool` is the
 name of the overflow pool the job was placed in, or null for a job that ran or will run on this
 machine. `attempts` is the number of the row's current or next attempt: `1` until a
-[preemption](#first-fit-admission-and-bounded-preemption) requeues the row, and one more after
+[preemption](#first-fit-admission-and-preemption) requeues the row, and one more after
 each. `preempted_by` is the run ID of the job that most recently preempted the row, including
 one whose stop is still in progress, or null. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
@@ -1367,7 +1407,7 @@ authorization.
 resource it requires. Capacities—not the fact that the job is named “full”—decide whether
 other work can overlap it.
 
-A check may be [preempted](#first-fit-admission-and-bounded-preemption): stopped and requeued
+A check may be [preempted](#first-fit-admission-and-preemption): stopped and requeued
 so that an older job that has waited long enough can start. The submitting client keeps waiting
 and reports the final attempt. Pass `--no-preempt` to `agc run`, or `preempt=False` to
 `CoordinatorClient.submit`, for a check that must not be restarted, such as one that is not safe

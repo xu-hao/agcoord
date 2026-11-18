@@ -41,6 +41,7 @@ pub struct ServeOptions {
     pub idle_timeout: Option<Duration>,
     pub host_preflight: Option<host::PreflightOptions>,
     pub crash_after: Option<String>,
+    pub stop_after: Option<String>,
     pub worker_fault: Option<WorkerFault>,
     pub cgroup_fixture: Option<PathBuf>,
     pub project_quota_fixture: Option<PathBuf>,
@@ -54,6 +55,7 @@ pub struct Broker {
     idle_timeout: Option<Duration>,
     managed_host: bool,
     crash_after: Option<String>,
+    stop_after: Option<String>,
     worker_fault: Option<WorkerFault>,
     resource_capabilities: Value,
     cgroup_backend: Option<cgroup::CgroupBackend>,
@@ -68,12 +70,14 @@ pub struct Broker {
     overflow_pools: Vec<Pool>,
     children: HashMap<String, NativeWorker>,
     pending_setups: HashMap<String, (PendingWorker, WorkerSetup)>,
+    /// When this owner first delivered each requested stop that is still in progress.
     cancellation_started: HashMap<String, Instant>,
     group_drain_started: HashMap<String, Instant>,
     stopped: Arc<AtomicBool>,
     stop_signals: usize,
     stop_grace: Duration,
-    /// How long the oldest starving row waits before it may preempt later checks.
+    /// How long the oldest starving row waits, from when it last entered the queue, before
+    /// it may preempt later checks.
     preempt_after: Duration,
     idle_since: Option<Instant>,
 }
@@ -333,6 +337,7 @@ impl Broker {
         connection
             .execute_batch("COMMIT")
             .map_err(map_database_error)?;
+        preempt::recover(&connection)?;
         validate_child_cpu_leases(&connection)?;
         maintain_child_cpu_leases(&connection)?;
         if cgroup_backend.is_none()
@@ -473,6 +478,7 @@ impl Broker {
             idle_timeout: options.idle_timeout,
             managed_host,
             crash_after: options.crash_after,
+            stop_after: options.stop_after,
             worker_fault: options.worker_fault,
             resource_capabilities,
             cgroup_backend,
@@ -495,6 +501,17 @@ impl Broker {
     fn crash(&self, point: &str) {
         if self.crash_after.as_deref() == Some(point) {
             std::process::exit(86);
+        }
+    }
+
+    /// Stop this process at a point a debug build was asked to stop at, until it is
+    /// continued.  A test uses the pause to act between two steps of one owner.
+    fn stop_at(&self, point: &str) {
+        if self.stop_after.as_deref() == Some(point) {
+            // SAFETY: raise only delivers a signal to the calling process.
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+            }
         }
     }
 
@@ -670,18 +687,17 @@ impl Broker {
                 continue;
             }
             let used = local_allocations(&state.active, &state.placed, &state.batch_followers);
-            // A preemption this pass is about to request holds later rows exactly as one in
-            // flight does: admitting them first would only add them to its victims.
+            // A preemption this pass decides on holds later rows from this moment, before
+            // its stops are requested: admitting a row that takes what the starving row
+            // lacks would only add that row to the victims.
             let plan = match &state.hold {
                 Some(_) => None,
                 None => self.preemption_plan(&connection, &state, &used)?,
             };
-            let hold = state.hold.clone().or_else(|| {
-                plan.as_ref().map(|plan| preempt::Hold {
-                    run_id: plan.starving.run_id.clone(),
-                    sequence: plan.starving.sequence,
-                })
-            });
+            let hold = state
+                .hold
+                .clone()
+                .or_else(|| plan.as_ref().map(|plan| preempt::Hold::of(&plan.starving)));
             // This machine is always preferred, then a pool: a row preempts only when
             // nothing more can be admitted or placed in this pass.
             let selected = match self.next_admissible(&state, &used, hold.as_ref()) {
@@ -709,8 +725,9 @@ impl Broker {
     /// Only the oldest queued row that fits this machine when idle and lacks nothing but
     /// local capacity is considered.  A land may preempt at once, because it holds up every
     /// later landing in its repository; any other row must first have waited
-    /// `preempt_after`.  Victims are running local checks submitted after that row whose
-    /// environment is still retained, so that they can be requeued.
+    /// `preempt_after` since it last entered the queue, so a check that was just requeued
+    /// does not stop another one in its turn.  Victims are running local checks submitted
+    /// after that row whose environment is still retained, so that they can be requeued.
     fn preemption_plan(
         &self,
         connection: &Connection,
@@ -721,10 +738,12 @@ impl Broker {
         else {
             return Ok(None);
         };
-        if starving.kind != "land"
-            && preempt::waited(connection, &starving.created_at)? < self.preempt_after.as_secs_f64()
-        {
-            return Ok(None);
+        if starving.kind != "land" {
+            let waited =
+                overflow::waited_seconds(connection, state.preemption.queued_since(starving))?;
+            if Duration::from_secs(waited) < self.preempt_after {
+                return Ok(None);
+            }
         }
         let candidates: Vec<&RunRecord> = state
             .active
@@ -751,19 +770,22 @@ impl Broker {
     /// Durably ask every planned victim to stop.  The ordinary cancellation path then ends
     /// each one as a complete process group, and its terminal transition requeues it.
     fn request_preemption(&self, plan: &PreemptionPlan) -> Result<bool> {
-        let connection = connect(&self.paths)?;
-        if !preempt::request(&connection, &plan.starving, &plan.victims)? {
-            return Ok(false);
+        let requested = preempt::request(&connect(&self.paths)?, &plan.starving, &plan.victims)?;
+        if requested {
+            self.crash("preemption-request");
+            self.stop_at("preemption-request");
         }
-        self.crash("preemption-request");
-        Ok(true)
+        Ok(requested)
     }
 
     /// Stop waiting for victims that outlive the stop bound, and say whether any did.
     ///
-    /// Such a victim keeps its claim until it is really gone, so nothing is ever admitted
-    /// into capacity it still holds.  Later rows stop waiting behind the preemption, and the
-    /// event is recorded as an incident in the victim's log and the broker's diagnostics.
+    /// The bound runs from the first stop this owner delivered to the victim, not from the
+    /// request: an owner that took over, or one whose pass stalled, has not yet given the
+    /// victim its chance to stop.  An overdue victim keeps its claim until it is really
+    /// gone, so nothing is ever admitted into capacity it still holds.  Later rows stop
+    /// waiting behind the preemption, and the event is recorded as an incident in the
+    /// victim's log and the broker's diagnostics.
     fn abandon_overdue_preemptions(
         &self,
         connection: &Connection,
@@ -771,17 +793,18 @@ impl Broker {
     ) -> Result<bool> {
         let mut abandoned = false;
         for stop in &preemption.stops {
-            if stop.abandoned
-                || stop.waited < preempt::STOP_BOUND.as_secs_f64()
-                || !preempt::abandon(connection, &stop.run_id)?
-            {
+            let overdue = self
+                .cancellation_started
+                .get(&stop.run_id)
+                .is_some_and(|delivered| delivered.elapsed() >= preempt::STOP_BOUND);
+            if stop.abandoned || !overdue || !preempt::abandon(connection, &stop.run_id)? {
                 continue;
             }
             abandoned = true;
             let incident = format!(
-                "AGCoord: incident: {victim} did not stop within {bound} seconds of the \
-                 preemption requested by {preemptor}; that preemption is abandoned and \
-                 {victim} keeps its claim until it is gone",
+                "AGCoord: incident: {victim} was still running {bound} seconds after it was \
+                 told to stop for the preemption requested by {preemptor}; that preemption \
+                 is abandoned and {victim} keeps its claim until it is gone",
                 victim = stop.run_id,
                 bound = preempt::STOP_BOUND.as_secs(),
                 preemptor = stop.preemptor,
@@ -940,7 +963,11 @@ impl Broker {
     fn observe(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
         if let Some((pending, setup)) = self.pending_setups.remove(&run.run_id) {
             if run.cancel_requested {
+                // Aborting the setup signals the worker, so this owner has delivered a stop.
                 let child = pending.abort();
+                self.cancellation_started
+                    .entry(run.run_id.clone())
+                    .or_insert_with(Instant::now);
                 self.children.insert(run.run_id.clone(), child);
             } else if pending.setup_ready() {
                 return self.complete_worker_setup(connection, run, pending, setup);
@@ -957,14 +984,15 @@ impl Broker {
             self.capture_resource_usage(connection, &refreshed)?;
         }
         if self.children.contains_key(&run.run_id) {
+            let withdrawn;
+            let run = if self.ended_before_its_preemption(connection, run)? {
+                withdrawn = load_run(connection, &run.run_id)?;
+                &withdrawn
+            } else {
+                run
+            };
             if run.cancel_requested {
-                if resource_managed {
-                    let refreshed = load_run(connection, &run.run_id)?;
-                    let _ = self.cancel_resources(connection, &refreshed)?;
-                }
-                if !cgroup_managed {
-                    Self::signal_cancel(&mut self.cancellation_started, run)?;
-                }
+                self.deliver_stop(connection, run)?;
             }
             let child = self.children.get_mut(&run.run_id).unwrap();
             let Some(exit) = child.try_wait().map_err(|error| {
@@ -1041,13 +1069,7 @@ impl Broker {
                 return Ok(());
             }
             if run.cancel_requested {
-                if resource_managed {
-                    let refreshed = load_run(connection, &run.run_id)?;
-                    let _ = self.cancel_resources(connection, &refreshed)?;
-                }
-                if !cgroup_managed {
-                    Self::signal_cancel(&mut self.cancellation_started, run)?;
-                }
+                self.deliver_stop(connection, run)?;
             }
             return Ok(());
         }
@@ -1079,6 +1101,53 @@ impl Broker {
         self.finish_run(connection, &run, status, exit_status, failure_reason)?;
         self.cancellation_started.remove(&run.run_id);
         self.group_drain_started.remove(&run.run_id);
+        Ok(())
+    }
+
+    /// Whether a preemption's victim ended on its own before this owner delivered any stop
+    /// to it.  Such a check is not stopped and run again: the requested stop is withdrawn,
+    /// and the caller finishes the row with the verdict its command produced.
+    fn ended_before_its_preemption(
+        &mut self,
+        connection: &Connection,
+        run: &RunRecord,
+    ) -> Result<bool> {
+        if !run.cancel_requested
+            || run.failure_reason.as_deref() != Some(preempt::PREEMPTED)
+            || self.cancellation_started.contains_key(&run.run_id)
+        {
+            return Ok(false);
+        }
+        let Some(child) = self.children.get_mut(&run.run_id) else {
+            return Ok(false);
+        };
+        let ended = child.try_wait().map_err(|error| {
+            AppError::new(
+                "broker-worker-observation-failed",
+                format!("cannot observe worker {}: {error}", run.run_id),
+            )
+        })?;
+        if ended.is_none() {
+            return Ok(false);
+        }
+        preempt::withdraw(connection, &run.run_id)?;
+        Ok(true)
+    }
+
+    /// Deliver a requested stop to a worker that may still be alive, and note when this
+    /// owner first did.  An enforced cgroup is killed as a whole; any other worker's
+    /// process group is signalled, first to terminate and after the grace period to die.
+    fn deliver_stop(&mut self, connection: &Connection, run: &RunRecord) -> Result<()> {
+        self.cancellation_started
+            .entry(run.run_id.clone())
+            .or_insert_with(Instant::now);
+        if !run.resource_state.is_empty() {
+            let refreshed = load_run(connection, &run.run_id)?;
+            let _ = self.cancel_resources(connection, &refreshed)?;
+        }
+        if !run.resource_state.contains_key(resources::CGROUP_BACKEND) {
+            Self::signal_cancel(&mut self.cancellation_started, run)?;
+        }
         Ok(())
     }
 
@@ -1152,26 +1221,37 @@ impl Broker {
                 format!("run {} changed while its worker was observed", run.run_id),
             ));
         }
-        if let Some(requeued) = preempt::requeue(connection, &current)? {
+        let stop = preempt::pending_stop(connection, &current)?;
+        // A victim returns to the queue only when the attempt that was stopped left nothing
+        // behind.  One whose cgroup or quota could not be reclaimed ends here instead, and
+        // keeps the receipt that says so.
+        let unreclaimed = stop.is_some() && preempt::reclaim_failed(&current.resource_receipt);
+        if let Some(stop) = stop.as_ref().filter(|_| !unreclaimed) {
             // The victim's process group is gone and its resources are reclaimed, exactly
             // as for a cancellation; only the outcome differs.  It waits again at its
             // original sequence, and its caller keeps waiting for the final attempt.
+            preempt::requeue(connection, &current, stop)?;
+            connection
+                .execute_batch("COMMIT")
+                .map_err(map_database_error)?;
+            // Written once the requeue is durable, so no pass that is repeated after a
+            // failed commit writes the line twice.
             self.append_run_log(
                 &run.run_id,
                 &format!(
                     "AGCoord: preempted by {} at {}, attempt {}; requeued at its original \
                      position as attempt {}",
-                    requeued.preemptor,
-                    requeued.requested_at,
-                    requeued.attempt,
-                    requeued.attempt + 1,
+                    stop.preemptor,
+                    stop.requested_at,
+                    stop.attempt,
+                    stop.attempt + 1,
                 ),
             );
-            return connection
-                .execute_batch("COMMIT")
-                .map_err(map_database_error);
+            return Ok(());
         }
-        let (status, exit_status, failure_reason) = if current.cancel_requested {
+        let (status, exit_status, failure_reason) = if unreclaimed {
+            ("interrupted", 125, Some(preempt::RECLAIM_FAILED))
+        } else if current.cancel_requested {
             Self::requested_stop_outcome(&current)
         } else {
             (status, exit_status, failure_reason)
@@ -1203,6 +1283,19 @@ impl Broker {
         connection
             .execute_batch("COMMIT")
             .map_err(map_database_error)?;
+        if let Some(stop) = stop.filter(|_| unreclaimed) {
+            self.append_run_log(
+                &run.run_id,
+                &format!(
+                    "AGCoord: preempted by {} at {}, attempt {}; not requeued, because the \
+                     resources of that attempt were not reclaimed cleanly ({})",
+                    stop.preemptor,
+                    stop.requested_at,
+                    stop.attempt,
+                    preempt::RECLAIM_FAILED,
+                ),
+            );
+        }
         for member_id in finalized_followers {
             copy_leader_log_to_member(&self.paths, &run.run_id, &member_id);
         }
