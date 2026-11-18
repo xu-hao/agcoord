@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.9.5 — 2026-11-18
+
+- Publish the coupled AGCoord `0.9.5` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases. Preemption is on by default:
+  pass `agc run --no-preempt` to a check that must not be stopped and run again. Upgrade the
+  client and then the broker with `agc host upgrade --download`. #372 — cut and publish the
+  coupled AGCoord 0.9.5 release.
+
 - Replace front-row reservations with first-fit admission and check preemption. Queued jobs
   now start in submission order, across repositories, whenever their whole claim fits; no
   capacity is held for a waiting job and the `reservation:*` blocker is gone. The oldest job
