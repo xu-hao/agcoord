@@ -181,7 +181,84 @@ def test_a_release_must_pin_the_broker_its_clients_will_download(
         RELEASE["_shipped_pin"](artifact, package, "0.5.0")
 
     _write_pin(pin, digest)
-    assert RELEASE["_shipped_pin"](artifact, package, "0.5.0") == digest
+    assert RELEASE["_shipped_pin"](artifact, package, "0.5.0") == (
+        digest,
+        digest,
+        "matched",
+    )
+
+
+def test_ci_release_candidate_reports_pin_status_without_requiring_match(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    artifact, package, digest = _pin_inputs(tmp_path)
+    pin = _write_pin(tmp_path / "native_host_pin.json", None)
+    _redirect_pin(monkeypatch, pin)
+    assert RELEASE["_shipped_pin"](artifact, package, "0.5.0", require_match=False) == (
+        None,
+        digest,
+        "unpinned",
+    )
+
+    _write_pin(pin, "b" * 64)
+    assert RELEASE["_shipped_pin"](artifact, package, "0.5.0", require_match=False) == (
+        "b" * 64,
+        digest,
+        "digest-mismatch",
+    )
+
+    _write_pin(pin, digest, version="0.4.9")
+    assert RELEASE["_shipped_pin"](artifact, package, "0.5.0", require_match=False) == (
+        digest,
+        digest,
+        "version-mismatch",
+    )
+
+    _, other_package, _ = _pin_inputs(tmp_path / "other", b"a different broker\n")
+    with pytest.raises(CandidateError, match="host package broker"):
+        RELEASE["_shipped_pin"](artifact, other_package, "0.5.0", require_match=False)
+
+
+def test_cli_require_pin_forwards_flag_to_verify_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[tuple[str | None, bool]] = []
+
+    def fake_verify_candidate(
+        python_dir: Path,
+        native_dir: Path,
+        host_dir: Path,
+        output: Path,
+        python: Path,
+        tag: str | None,
+        *,
+        require_pin: bool = False,
+    ) -> dict[str, str]:
+        calls.append((tag, require_pin))
+        return {"version": "0.5.0"}
+
+    monkeypatch.setitem(
+        RELEASE["main"].__globals__, "verify_candidate", fake_verify_candidate
+    )
+    base_args = [
+        str(SCRIPT),
+        "--python-dir",
+        str(tmp_path / "python"),
+        "--native-dir",
+        str(tmp_path / "native"),
+        "--host-dir",
+        str(tmp_path / "host"),
+        "--output-dir",
+        str(tmp_path / "output"),
+    ]
+    monkeypatch.setattr(sys, "argv", base_args)
+    assert RELEASE["main"]() == 0
+    monkeypatch.setattr(sys, "argv", [*base_args, "--require-pin"])
+    assert RELEASE["main"]() == 0
+    monkeypatch.setattr(sys, "argv", [*base_args, "--tag", "v0.5.0"])
+    assert RELEASE["main"]() == 0
+    assert calls == [(None, False), (None, True), ("v0.5.0", False)]
 
 
 def test_a_pin_that_names_another_broker_closes_the_release_gate(

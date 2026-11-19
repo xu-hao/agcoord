@@ -142,8 +142,9 @@ interface and must be smoke-tested from the built wheel.
    equals `sha256sum dist/native/agcoord-broker-x86_64-unknown-linux-musl`. Because that build is
    reproducible and the pin file is not an input to `scripts/native-source-id`, the digest can be
    computed before the release commit exists and recording it does not change the broker it
-   names. Between releases `broker_sha256` stays `null`; such a client refuses
-   `agc host install --download` instead of fetching bytes it cannot check. The
+   names. Between releases `broker_sha256` may remain at the previous release's pin or `null`
+   without blocking ordinary PR/push CI; any client built with `broker_sha256: null` or another
+   version refuses `agc host install --download` instead of fetching bytes it cannot check. The
    [pin contract](native_host.md#the-native-host-pin) explains what the pin establishes.
 
 6. From that still-clean source commit, assemble the candidate through the single artifact
@@ -151,6 +152,7 @@ interface and must be smoke-tested from the built wheel.
 
    ```bash
    ./scripts/verify-release-candidate \
+     --require-pin \
      --python-dir dist/python \
      --native-dir dist/native \
      --host-dir dist/host \
@@ -161,9 +163,12 @@ interface and must be smoke-tested from the built wheel.
    The verifier requires exactly two Python files, five native files, and eight host files. It
    rejects symlinks, extras, missing helpers, unsafe archive paths/modes, dirty source, unstable
    or unequal versions, a wrong wheel name/entry point, a copied broker in the wheel, changed
-   sidecars, non-static ELF, unreviewed dependencies, differing raw/host identities, and a
-   native-host pin that is absent, names another version, or does not match both the released
-   broker and the broker inside the host package. It then
+   sidecars, non-static ELF, unreviewed dependencies, differing raw/host identities, and differing
+   raw vs. packaged host broker executables. With `--require-pin` (or `--tag` in the `Release`
+   workflow), it also rejects a native-host pin that is absent, `null`, names another version, or
+   does not match the released broker; in untagged `CI` runs without `--require-pin`, it validates
+   pin structure and reports the pin comparison in `pin_status` without failing when the broker
+   source changed since the previous release. It then
    installs the wheel with `xdist` and the sdist into separate fresh environments outside the
    checkout, and verifies `agc`/module entry points and the pytest plugin. Only
    after those checks pass does it create `release-manifest.json` and aggregate `SHA256SUMS`.
