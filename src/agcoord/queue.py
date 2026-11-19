@@ -1888,6 +1888,19 @@ class CoordinatorClient:
             publication=(adapter, request),
             command=command,
         )
+        if adapter == "github":
+            from .github import SubmissionRefusal, verify_submission_head
+
+            try:
+                verify_submission_head(
+                    request,
+                    checkout=prepared.identity.checkout,
+                    branch=prepared.branch,
+                    head_sha=prepared.exact_head(),
+                    env=selected_environment,
+                )
+            except SubmissionRefusal as exc:
+                raise CoordinatorError(str(exc), code=exc.code) from exc
         result = self._native_invoke("submit", arguments)
         if not isinstance(result, dict) or result != {"run_id": run_id}:
             raise CoordinatorError("native broker returned an invalid land receipt")

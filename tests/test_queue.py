@@ -217,12 +217,13 @@ raw_input = sys.stdin.read()
 payload = json.loads(raw_input) if raw_input else None
 
 if arguments[:2] == ["pr", "view"]:
-    preflight_entered = os.environ.get("AGCOORD_TEST_PREFLIGHT_ENTERED")
-    if preflight_entered:
-        Path(preflight_entered).touch()
-    preflight_release = os.environ.get("AGCOORD_TEST_PREFLIGHT_RELEASE")
-    while preflight_release and not Path(preflight_release).exists():
-        time.sleep(0.01)
+    if os.environ.get("AGCOORD_RUN_ID"):
+        preflight_entered = os.environ.get("AGCOORD_TEST_PREFLIGHT_ENTERED")
+        if preflight_entered:
+            Path(preflight_entered).touch()
+        preflight_release = os.environ.get("AGCOORD_TEST_PREFLIGHT_RELEASE")
+        while preflight_release and not Path(preflight_release).exists():
+            time.sleep(0.01)
     head = os.environ["AGCOORD_TEST_HEAD"]
     if os.environ.get("AGCOORD_TEST_DYNAMIC_HEAD") == "1":
         observed = subprocess.run(
@@ -1724,6 +1725,8 @@ def test_land_submission_is_one_exact_head_publication_barrier(
 ):
     _broker, client = coordinator
     repository = _repository(tmp_path / "repository")
+    branch = _git(repository, "rev-parse", "--abbrev-ref", "HEAD")
+    bin_dir = _install_land_gh(tmp_path)
     entered = tmp_path / "entered"
     release = tmp_path / "release"
     blocker_id = _submit(
@@ -1733,7 +1736,13 @@ def test_land_submission_is_one_exact_head_publication_barrier(
     )
     wait_for(entered.exists, "the earlier repository job did not start")
     gate_command = _python("print('exact land gate')")
-    environment = caller_environment()
+    environment = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=_head(repository),
+        tag="exact-barrier",
+        event_log=tmp_path / "events",
+    )
     environment["AGCOORD_TEST_LAND_ENV"] = "captured-by-request"
 
     try:
@@ -3875,3 +3884,132 @@ def test_gate_tree_recovers_stale_tree_locks_and_unregistered_setup(coordinator,
     assert row["status"] == "passed", client.log(second)
     assert row["checkout"] == first_row["checkout"]
     assert not orphan.exists()
+
+
+def test_land_refuses_submitted_head_behind_before_queueing(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, _remote, branch, old_head = _publication_repository(tmp_path / "repository")
+    bin_dir = _install_land_gh(tmp_path)
+    sibling = tmp_path / "sibling"
+    subprocess.run(["git", "clone", "-q", "-b", branch, str(_remote), str(sibling)], check=True)
+    _git(sibling, "config", "user.name", "AGCoord test")
+    _git(sibling, "config", "user.email", "test@example.invalid")
+    (sibling / "sync.txt").write_text("merged target\n", encoding="utf-8")
+    _git(sibling, "add", "sync.txt")
+    _git(sibling, "commit", "-m", "Merge main into branch")
+    _git(sibling, "push", "origin", branch)
+    remote_head = _head(sibling)
+
+    env = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=remote_head,
+        tag="behind",
+        event_log=tmp_path / "events",
+    )
+    with pytest.raises(CoordinatorError) as refused:
+        client.submit_land(
+            "github",
+            101,
+            _python("raise SystemExit('must not queue')"),
+            checkout=str(checkout),
+            environment=env,
+        )
+    assert refused.value.code == "submitted-head-behind"
+    message = str(refused.value)
+    assert old_head in message
+    assert remote_head in message
+    assert f"git fetch && git merge --ff-only origin/{branch}" in message
+    snapshot = client.snapshot()
+    assert snapshot["active"] == []
+    assert snapshot["queued"] == []
+    assert snapshot["recent"] == []
+
+
+def test_land_refuses_submitted_head_diverged_before_queueing(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, _remote, branch, _ = _publication_repository(tmp_path / "repository")
+    bin_dir = _install_land_gh(tmp_path)
+    sibling = tmp_path / "sibling"
+    subprocess.run(["git", "clone", "-q", "-b", branch, str(_remote), str(sibling)], check=True)
+    _git(sibling, "config", "user.name", "AGCoord test")
+    _git(sibling, "config", "user.email", "test@example.invalid")
+    (sibling / "remote.txt").write_text("remote commit\n", encoding="utf-8")
+    _git(sibling, "add", "remote.txt")
+    _git(sibling, "commit", "-m", "remote commit")
+    _git(sibling, "push", "origin", branch)
+    remote_head = _head(sibling)
+
+    (checkout / "local.txt").write_text("local commit\n", encoding="utf-8")
+    _git(checkout, "add", "local.txt")
+    _git(checkout, "commit", "-m", "local diverged commit")
+    local_head = _head(checkout)
+
+    env = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=remote_head,
+        tag="diverged",
+        event_log=tmp_path / "events",
+    )
+    with pytest.raises(CoordinatorError) as refused:
+        client.submit_land(
+            "github",
+            102,
+            _python("raise SystemExit('must not queue')"),
+            checkout=str(checkout),
+            environment=env,
+        )
+    assert refused.value.code == "submitted-head-diverged"
+    message = str(refused.value)
+    assert local_head in message
+    assert remote_head in message
+    assert branch in message
+    snapshot = client.snapshot()
+    assert snapshot["active"] == []
+    assert snapshot["queued"] == []
+    assert snapshot["recent"] == []
+
+
+def test_land_refuses_forge_outage_after_retry_without_queueing(
+    coordinator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from agcoord import github
+
+    _broker, client = coordinator
+    checkout, _remote, branch, _ = _publication_repository(tmp_path / "repository")
+    monkeypatch.setattr(github, "SUBMISSION_RETRY_DELAYS", (0.0, 0.0))
+    failing_bin = tmp_path / "failing-gh"
+    failing_bin.mkdir()
+    gh = failing_bin / "gh"
+    calls = tmp_path / "gh-calls.txt"
+    gh.write_text(
+        f"#!/bin/sh\necho call >> '{calls}'\necho 'forge outage' >&2\nexit 1\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    env = caller_environment()
+    env["PATH"] = f"{failing_bin}{os.pathsep}{env['PATH']}"
+
+    with pytest.raises(CoordinatorError, match="forge outage") as refused:
+        client.submit_land(
+            "github",
+            103,
+            _python("raise SystemExit('must not queue')"),
+            checkout=str(checkout),
+            environment=env,
+        )
+    assert refused.value.code == "forge-unavailable"
+    assert len(calls.read_text(encoding="utf-8").splitlines()) == 3
+    snapshot = client.snapshot()
+    assert snapshot["active"] == []
+    assert snapshot["queued"] == []
+    assert snapshot["recent"] == []

@@ -387,3 +387,110 @@ else:
     assert created["sha"] == "e" * 40
     recorded = _calls(log)
     assert any("git/trees" in " ".join(c["args"]) for c in recorded)
+
+
+def test_verify_submission_head_checks_equal_behind_diverged_and_retry(
+    tmp_path: Path,
+):
+    import subprocess
+    from agcoord.github import SubmissionRefusal, verify_submission_head
+
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "feat/check", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "AGCoord"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.invalid"], check=True)
+    (repo / "f.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    base_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+    class _Client:
+        def __init__(self, heads: list[str | BaseException]):
+            self.heads = list(heads)
+
+        def pull_request(self, number: int) -> dict[str, object]:
+            nxt = self.heads.pop(0)
+            if isinstance(nxt, BaseException):
+                raise nxt
+            return {
+                "number": number,
+                "state": "OPEN",
+                "is_draft": False,
+                "base_ref": "main",
+                "head_ref": "feat/check",
+                "head_sha": nxt,
+                "same_repository": True,
+                "title": "PR",
+                "head_owner": "octo",
+            }
+
+    class _Publisher:
+        def __init__(self, behind: bool):
+            self.behind = behind
+            self.calls = 0
+
+        def create_merge_commit(self, **_kwargs):
+            raise AssertionError("unused")
+
+        def update_refs(self, _updates):
+            raise AssertionError("unused")
+
+        def is_ancestor(self, *, ancestor_sha: str, descendant_sha: str) -> bool:
+            self.calls += 1
+            return self.behind
+
+    # Equal head after transient failure retries and succeeds.
+    waits: list[float] = []
+    verify_submission_head(
+        10,
+        checkout=repo,
+        branch="feat/check",
+        head_sha=base_sha,
+        metadata_client=_Client([RuntimeError("502"), base_sha]),
+        publisher=_Publisher(False),
+        wait=waits.append,
+    )
+    assert len(waits) == 1
+
+    # Remote head descending from submitted head refuses submitted-head-behind.
+    pub_behind = _Publisher(True)
+    remote_sha = "b" * 40
+    with pytest.raises(SubmissionRefusal) as behind_refusal:
+        verify_submission_head(
+            10,
+            checkout=repo,
+            branch="feat/check",
+            head_sha=base_sha,
+            metadata_client=_Client([remote_sha]),
+            publisher=pub_behind,
+            wait=lambda _: None,
+        )
+    assert behind_refusal.value.code == "submitted-head-behind"
+    assert pub_behind.calls == 1
+    assert f"git fetch && git merge --ff-only origin/feat/check" in str(behind_refusal.value)
+
+    # Diverged head refuses submitted-head-diverged.
+    with pytest.raises(SubmissionRefusal) as diverged_refusal:
+        verify_submission_head(
+            10,
+            checkout=repo,
+            branch="feat/check",
+            head_sha=base_sha,
+            metadata_client=_Client(["c" * 40]),
+            publisher=_Publisher(False),
+            wait=lambda _: None,
+        )
+    assert diverged_refusal.value.code == "submitted-head-diverged"
+
+    # Persistent forge failure refuses forge-unavailable after 5 attempts.
+    with pytest.raises(SubmissionRefusal) as outage:
+        verify_submission_head(
+            10,
+            checkout=repo,
+            branch="feat/check",
+            head_sha=base_sha,
+            metadata_client=_Client([RuntimeError("timeout")] * 5),
+            publisher=_Publisher(False),
+            wait=lambda _: None,
+        )
+    assert outage.value.code == "forge-unavailable"
