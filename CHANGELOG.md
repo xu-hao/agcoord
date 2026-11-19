@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Shorten long `cgroup-v2` `tmpfs` `TMPDIR`/`TMP`/`TEMP` paths through a broker-owned short symlink
+  alias (preferring `/run/user/<uid>` when owner-only, else `/tmp`) when the direct scratch path
+  exceeds 48 bytes, keeping the physical mount, quotas, and terminal/recovery cleanup unchanged so
+  tools binding Unix-domain sockets beneath `TMPDIR` stay within `sun_path`. #237 — keep cgroup
+  scratch paths short enough for Unix-domain sockets.
+
 - Align remote overflow container process environments with local rows by applying `umask 0077`
   across the built-in SSH, GCP Batch, and GCP Cloud Run executors, passing
   `--security-opt=no-new-privileges` on Docker/Podman and GCP Batch containers, and documenting the

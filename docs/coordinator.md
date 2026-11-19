@@ -1104,7 +1104,9 @@ directory with explicit `size`, `nr_inodes`, `mode=700`, `uid`, and `gid`, plus
 `nosuid,nodev,noexec`. It verifies the mount type, options, ownership, and effective ceilings,
 reports success to the broker, and waits for a second release. Only then does AGCoord durably mark
 the tmpfs resources applied and let the command start. `TMPDIR`, `TMP`, and `TEMP` all name that
-mount; the private setup record and ownership token are removed from the command environment.
+mount (or, when the mount path exceeds 48 bytes, a short broker-owned symlink alias pointing to it
+so Unix-domain sockets created beneath `TMPDIR` stay within `sun_path`); the private setup record
+and ownership token are removed from the command environment.
 The `noexec` policy means tools must execute generated programs through an interpreter or place
 executables outside temporary scratch. A machine whose jobs legitimately execute what they write
 under `TMPDIR` — command doubles a test suite runs, throwaway virtual environments, plugin

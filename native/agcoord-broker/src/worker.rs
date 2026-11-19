@@ -1541,6 +1541,7 @@ mod tests {
         let log = File::create(scratch.join("log")).unwrap();
         let setup = TmpfsSetup {
             target,
+            alias: None,
             size: 1 << 20,
             inodes: 64,
             report: scratch.join("tmpfs.json"),
