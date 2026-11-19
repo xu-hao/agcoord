@@ -43,7 +43,7 @@ _NON_SOCKET_COMMANDS = frozenset(
     }
 )
 _RELEASE_BUILD = re.compile(r"^sha256:[0-9a-f]{64}$")
-_SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.9\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+_SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.10\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 _MAINTENANCE_NATIVE_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 _SUPPORTED_RELEASE_TARGET = "x86_64-unknown-linux-musl"
 _SUPPORTED_DEVELOPMENT_TARGETS = frozenset(

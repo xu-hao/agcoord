@@ -5,6 +5,16 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.0 — 2026-11-19
+
+- Publish the coupled AGCoord `0.10.0` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases. Advancing the client/broker
+  compatibility line to `0.10.x` carries the broker-private gate spool (`inspect`), the owner-only
+  Unix socket client-wire protocol (`broker.sock`, `wire: 1`), and everything recorded since
+  `0.9.5`. Upgrade the client (`pip install agcoord==0.10.0`) and the broker
+  (`agc host upgrade --download`) together. #387 — cut and publish the coupled AGCoord 0.10.0
+  release.
+
 - Preserve emission order in remote overflow row logs (`overflow-gcp-batch`, `overflow-gcp-run`,
   `overflow-ssh`). The container wrapper now merges standard error into standard output at capture
   and, for Cloud Logging executors, tags each emitted line or chunk with a per-job monotonic
