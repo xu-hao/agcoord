@@ -1045,3 +1045,55 @@ def test_native_client_uses_owner_socket_and_preserves_refusal_and_fallback(tmp_
         "source": "subprocess",
         "ok": True,
     }
+
+
+def test_native_client_falls_back_when_socket_closes_before_reply_on_readonly_command(
+    tmp_path: Path,
+):
+    import socket as pysocket
+    import threading
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    sock_path = state_dir / "broker.sock"
+    executable = _socket_identity_executable(tmp_path / "broker")
+    selected = NativeBrokerCommand.select(
+        NativeBrokerConfig(path=str(executable), allow_development=True)
+    )
+
+    server = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_SEQPACKET)
+    server.bind(str(sock_path))
+    sock_path.chmod(0o600)
+    server.listen(8)
+
+    def accept_and_reset():
+        try:
+            conn, _ = server.accept()
+            conn.recv(65536)
+            conn.close()
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=accept_and_reset, daemon=True)
+    thread.start()
+    try:
+        assert selected.invoke("snapshot", state_dir=state_dir) == {
+            "source": "subprocess",
+            "ok": True,
+        }
+    finally:
+        thread.join(timeout=2)
+
+    # Non-read-only commands do not blindly re-execute after the peer accepted their request.
+    sock_path.unlink()
+    server = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_SEQPACKET)
+    server.bind(str(sock_path))
+    sock_path.chmod(0o600)
+    server.listen(8)
+    thread = threading.Thread(target=accept_and_reset, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(NativeClientError, match="unexpected EOF"):
+            selected.invoke("cancel", state_dir=state_dir, arguments=("--run-id", "run-1"))
+    finally:
+        thread.join(timeout=2)

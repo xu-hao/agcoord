@@ -521,6 +521,12 @@ impl Broker {
     }
 
     pub fn serve(mut self) -> Result<()> {
+        let outcome = self.serve_loop();
+        self.socket.drain_and_close(&self.paths.state_dir);
+        outcome
+    }
+
+    fn serve_loop(&mut self) -> Result<()> {
         loop {
             if self.stop_signalled() {
                 return self.graceful_shutdown();

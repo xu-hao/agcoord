@@ -237,6 +237,12 @@ impl SocketListener {
         }
         served
     }
+
+    /// Unlink the socket path first so no new clients connect, then answer any queued connections.
+    pub fn drain_and_close(&self, state_dir: &Path) {
+        let _ = fs::remove_file(&self.path);
+        while self.serve_pending(state_dir, LISTEN_BACKLOG as usize) > 0 {}
+    }
 }
 
 impl Drop for SocketListener {
@@ -697,5 +703,55 @@ mod tests {
         .unwrap();
         let error = process_request_bytes(&raw, &dir.0).unwrap_err();
         assert_eq!(error.code, "broker-wire-unsupported");
+    }
+
+    #[test]
+    fn drain_and_close_serves_queued_backlog_clients_before_shutdown() {
+        let dir = TempDir::new("drain-backlog");
+        let sock_path = dir.0.join(SOCKET_NAME);
+        let listener = SocketListener::bind(&dir.0).unwrap();
+
+        let raw_client =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw_client >= 0);
+        let client = unsafe { OwnedFd::from_raw_fd(raw_client) };
+        let c_path = CString::new(sock_path.as_os_str().as_bytes()).unwrap();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in addr
+            .sun_path
+            .iter_mut()
+            .zip(c_path.as_bytes_with_nul().iter())
+        {
+            *slot = *byte as libc::c_char;
+        }
+        let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::connect(
+                    client.as_raw_fd(),
+                    (&raw const addr).cast::<libc::sockaddr>(),
+                    addr_len,
+                )
+            },
+            0
+        );
+        let request = serde_json::to_vec(&json!({
+            "wire": WIRE_VERSION,
+            "command": "inspect",
+            "arguments": ["--state-dir", dir.0.to_string_lossy()],
+        }))
+        .unwrap();
+        write_frame(client.as_raw_fd(), &request).unwrap();
+
+        listener.drain_and_close(&dir.0);
+        assert!(!sock_path.exists());
+        drop(listener);
+
+        let reply = read_frame(client.as_raw_fd()).unwrap();
+        let envelope: Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(envelope["wire"], json!(WIRE_VERSION));
+        assert_eq!(envelope["ok"], json!(false));
+        assert_eq!(envelope["code"], json!("broker-state-missing"));
     }
 }

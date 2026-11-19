@@ -42,6 +42,21 @@ _NON_SOCKET_COMMANDS = frozenset(
         "host-drain-hold",
     }
 )
+# Read-only commands can safely fall back to subprocess execution if a closing broker
+# resets the socket before returning a response.
+_SOCKET_READONLY_COMMANDS = frozenset(
+    {
+        "inspect",
+        "snapshot",
+        "status",
+        "log",
+        "lease-list",
+        "drain-status",
+        "batch-status",
+        "host-recover-status",
+        "host-drain-status",
+    }
+)
 _RELEASE_BUILD = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.10\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 _MAINTENANCE_NATIVE_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
@@ -260,8 +275,20 @@ class NativeBrokerCommand:
                 sock.connect(connect_target)
             except OSError:
                 return _SOCKET_FALLBACK
-            _send_socket_frame(sock, request_payload)
-            raw_response = _recv_socket_frame(sock)
+            try:
+                _send_socket_frame(sock, request_payload)
+            except _PreSendDisconnect:
+                return _SOCKET_FALLBACK
+            except NativeClientError as exc:
+                if exc.code == "broker-socket-failed" and command in _SOCKET_READONLY_COMMANDS:
+                    return _SOCKET_FALLBACK
+                raise
+            try:
+                raw_response = _recv_socket_frame(sock)
+            except NativeClientError as exc:
+                if exc.code == "broker-socket-failed" and command in _SOCKET_READONLY_COMMANDS:
+                    return _SOCKET_FALLBACK
+                raise
         finally:
             sock.close()
             if dir_fd is not None:
@@ -538,6 +565,10 @@ def _read_identity(path: Path, *, host_maintenance: bool = False) -> NativeBroke
     return NativeBrokerIdentity(**value)
 
 
+class _PreSendDisconnect(Exception):
+    """Peer reset the socket before any request byte was transmitted."""
+
+
 def _send_socket_frame(sock: socket.socket, payload: bytes) -> None:
     framed = struct.pack(">I", len(payload)) + payload
     try:
@@ -548,6 +579,13 @@ def _send_socket_frame(sock: socket.socket, payload: bytes) -> None:
                 raise NativeClientError(
                     "short write on native broker socket", code="broker-socket-failed"
                 )
+    except (BrokenPipeError, ConnectionResetError) as exc:
+        if offset == 0:
+            raise _PreSendDisconnect() from exc
+        raise NativeClientError(
+            f"cannot write native broker socket request: {exc}",
+            code="broker-socket-failed",
+        ) from exc
     except (OSError, TimeoutError) as exc:
         raise NativeClientError(
             f"cannot write native broker socket request: {exc}",
