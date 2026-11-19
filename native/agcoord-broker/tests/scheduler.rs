@@ -2251,6 +2251,114 @@ fn identity_commit_contention_never_orphans_a_started_worker() {
 }
 
 #[test]
+fn exhausted_identity_commit_contention_aborts_worker_and_allows_idle_exit() {
+    let temporary = TestDirectory::new("identity-contention-exhausted");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("config.json"), r#"{"database_timeout":0.05}"#).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    let marker = temporary.path().join("worker-must-not-run");
+    let mut broker =
+        RunningBroker::start_with_options(&state, &[("jobs", 1)], &["--idle-timeout", "0.4"]);
+    let fifo = state.join("logs/identity-exhausted.log");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "identity-exhausted",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || {
+        let row = status(&state, "identity-exhausted");
+        row["status"] == "running" && row["worker_pid"].is_null()
+    });
+
+    let locker = lock_queue_writes(&state);
+    let _fifo_reader = OpenOptions::new().read(true).open(&fifo).unwrap();
+    // Hold the write lock beyond the identity-commit retry bound so the broker must abort
+    // the unrecorded worker instead of spinning indefinitely.
+    thread::sleep(Duration::from_millis(2200));
+    assert!(
+        !marker.exists(),
+        "worker ran while identity commit was blocked"
+    );
+    locker.execute_batch("ROLLBACK").unwrap();
+    drop(locker);
+
+    let finished = wait_status(&state, "identity-exhausted", "interrupted");
+    assert_eq!(finished["exit_status"], 125);
+    assert_eq!(finished["failure_reason"], "worker-result-lost");
+    assert!(finished["worker_pid"].is_null());
+    assert!(!marker.exists());
+
+    // An unbacked running row must never defeat --idle-timeout once recovered.
+    wait_for(Duration::from_secs(5), || !broker.is_running());
+    assert!(broker.wait().success());
+}
+
+#[test]
+fn identity_commit_contention_honors_stop_signal_without_orphaning_worker() {
+    let temporary = TestDirectory::new("identity-contention-stop");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("config.json"), r#"{"database_timeout":0.05}"#).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    let marker = temporary.path().join("worker-must-not-run");
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let fifo = state.join("logs/identity-stop.log");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    submit_ok(
+        &state,
+        &Submission {
+            run_id: "identity-stop",
+            kind: "check",
+            repository: "repo-a",
+            checkout: &checkout,
+            command: touch_command(&marker),
+            gate_run_id: None,
+        },
+    );
+    wait_for(Duration::from_secs(5), || {
+        let row = status(&state, "identity-stop");
+        row["status"] == "running" && row["worker_pid"].is_null()
+    });
+
+    let locker = lock_queue_writes(&state);
+    let _fifo_reader = OpenOptions::new().read(true).open(&fifo).unwrap();
+    thread::sleep(Duration::from_millis(150));
+    broker.signal_terminate();
+    thread::sleep(Duration::from_millis(150));
+    locker.execute_batch("ROLLBACK").unwrap();
+    drop(locker);
+
+    assert!(broker.wait().success());
+    let finished = status(&state, "identity-stop");
+    assert_eq!(finished["status"], "interrupted");
+    assert_eq!(finished["failure_reason"], "worker-result-lost");
+    assert!(finished["worker_pid"].is_null());
+    assert!(!marker.exists());
+}
+
+#[test]
 fn native_owner_refuses_invalid_sections_in_the_shared_broker_config() {
     let temporary = TestDirectory::new("invalid-config");
     for (index, document) in [
