@@ -87,3 +87,49 @@ def test_container_command_enforces_umask_and_preserves_arguments():
     wrapped = container_command([sys.executable, "-c", "import os, sys; print(f'{os.umask(0o022):04o}', sys.argv[1:])", "a b", "c"])
     completed = subprocess.run(wrapped, capture_output=True, text=True, check=True)
     assert completed.stdout.strip() == "0077 ['a b', 'c']"
+
+
+def test_container_command_merges_stderr_and_sequence_tags_chunks(tmp_path):
+    import subprocess
+    import sys
+
+    wrapped = container_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys\n"
+                "print(f'umask={os.umask(0o022):04o}', flush=True)\n"
+                "print('err:%s\\\\n', file=sys.stderr, flush=True)\n"
+                "print('', flush=True)\n"
+                "print('Y' * 8500, flush=True)\n"
+                "print(sys.argv[1:], file=sys.stderr, flush=True)\n"
+                "sys.exit(9)\n"
+            ),
+            "x y",
+            "z",
+        ],
+        log_token="abc123",
+    )
+    completed = subprocess.run(wrapped, capture_output=True, text=True)
+    assert completed.returncode == 9
+    assert completed.stderr == ""
+    lines = completed.stdout.splitlines()
+    assert lines[0] == "abc123:0:c:umask=0077"
+    assert lines[1] == "abc123:1:c:err:%s\\n"
+    assert lines[2] == "abc123:2:c:"
+    assert lines[3] == "abc123:3:p:" + "Y" * 4000
+    assert lines[4] == "abc123:4:p:" + "Y" * 4000
+    assert lines[5] == "abc123:5:c:" + "Y" * 500
+    assert lines[6] == "abc123:6:c:['x y', 'z']"
+
+    # Also exercise the pure POSIX /bin/sh fallback when awk is absent on PATH.
+    fallback = subprocess.run(
+        wrapped,
+        env={"PATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert fallback.returncode == 9
+    assert fallback.stdout.startswith("abc123:0:c:umask=0077\n")
+    assert fallback.stdout.splitlines()[-1] == "abc123:4:c:['x y', 'z']"

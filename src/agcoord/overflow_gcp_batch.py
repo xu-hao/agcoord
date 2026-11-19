@@ -30,6 +30,7 @@ import sys
 from typing import Sequence
 
 from agcoord.overflow_gcp import (
+    CloudJobOutput,
     Gcloud,
     LogRelay,
     Registry,
@@ -83,9 +84,10 @@ def job_config(
     command: Sequence[str],
     placed: Placement,
     options: BatchOptions,
+    log_token: str | None = None,
 ) -> dict[str, object]:
     """Return the Batch job that runs one command in one container on one machine."""
-    wrapped_command = container_command(command)
+    wrapped_command = container_command(command, log_token=log_token)
     container: dict[str, object] = {
         "imageUri": image,
         # The first word replaces the image's entrypoint and the rest are its arguments, so
@@ -143,16 +145,16 @@ def job_config(
     }
 
 
-class BatchJob:
+class BatchJob(CloudJobOutput):
     """One submitted Batch job: its state, its output, and its verdict."""
 
     def __init__(self, gcloud: Gcloud, region: str, name: str) -> None:
+        super().__init__()
         self.gcloud = gcloud
         self.region = region
         self.name = name
         self.path = f"projects/{gcloud.project}/locations/{region}/jobs/{name}"
         self.uid = ""
-        self.output: LogRelay | None = None
 
     def submit(self, config: dict[str, object]) -> None:
         job = self.gcloud.json(
@@ -171,6 +173,7 @@ class BatchJob:
             self.gcloud,
             f'labels.job_uid="{self.uid}" AND log_id("batch_task_logs")',
             str(job.get("createTime") or ""),
+            log_token=self.log_token,
         )
 
     def state(self) -> str:
@@ -178,10 +181,6 @@ class BatchJob:
         if not isinstance(job, dict):
             raise ExecutorError("Batch returned an invalid job")
         return str((job.get("status") or {}).get("state") or "STATE_UNSPECIFIED")
-
-    def relay_output(self) -> int:
-        """Print the output lines that have arrived since the last call; return how many."""
-        return self.output.relay() if self.output is not None else 0
 
     def exit_status(self) -> int:
         """Return the command's exit status, or report that Batch produced no verdict."""
@@ -303,7 +302,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
         job = BatchJob(gcloud, args.region, resource_name("agcoord", placed.run_id))
         cleanup.append(job.delete_command())
-        job.submit(job_config(image=reference, command=command, placed=placed, options=options))
+        job.submit(
+            job_config(
+                image=reference,
+                command=command,
+                placed=placed,
+                options=options,
+                log_token=job.log_token,
+            )
+        )
         _say(f"submitted Batch job {job.name}; waiting for a machine")
 
         state = follow_job(
@@ -312,6 +319,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             finished=FINISHED,
             poll_interval=options.poll_interval,
             say=_say,
+            has_pending=job.has_pending_output,
+            flush=job.flush_output,
         )
         if state == "SUCCEEDED":
             status = 0

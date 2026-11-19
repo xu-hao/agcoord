@@ -64,6 +64,42 @@ if flaky.exists():
 # Like the real gcloud, report progress on standard error even with --quiet.
 sys.stderr.write(PROGRESS)
 
+def simulate_submitted_command(cmd, *, project, log_name_base, chunk_lines):
+    import subprocess
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    stdout_lines = proc.stdout[:-1].split("\\n") if proc.stdout.endswith("\\n") else (proc.stdout.split("\\n") if proc.stdout else [])
+    stderr_lines = proc.stderr[:-1].split("\\n") if proc.stderr.endswith("\\n") else (proc.stderr.split("\\n") if proc.stderr else [])
+    chunks = []
+    # Split stdout and stderr separately into multi-line upload chunks, then deliver later
+    # chunks before earlier ones with identical timestamps and rising receiveTimestamps.
+    for stream_name, lines in (("stdout", stdout_lines), ("stderr", stderr_lines)):
+        for start in range(0, len(lines), chunk_lines):
+            payload = "\\n".join(lines[start : start + chunk_lines]) + "\\n"
+            chunks.append((stream_name, payload))
+    batches = []
+    seen = []
+    for index, (stream_name, payload) in enumerate(reversed(chunks)):
+        log_name = (
+            f"projects/{{project}}/logs/run.googleapis.com%2F{{stream_name}}"
+            if log_name_base == "run"
+            else f"projects/{{project}}/logs/batch_task_logs"
+        )
+        minute, second = divmod(10 + index, 60)
+        seen.append(
+            {{
+                "insertId": f"chunk-{{index}}",
+                "timestamp": "2026-11-11T00:00:05Z",
+                "receiveTimestamp": f"2026-11-11T00:{{minute:02d}}:{{second:02d}}Z",
+                "logName": log_name,
+                "textPayload": payload,
+            }}
+        )
+        batches.append(list(seen))
+    batches.append([])
+    (state / "logs.json").write_text(json.dumps(batches))
+    return proc.returncode, len(chunks)
+
+
 verb = argv[:3]
 if argv[:2] == ["auth", "print-access-token"]:
     print("fake-access-token")
@@ -101,6 +137,21 @@ elif argv[:2] == ["logging", "read"]:
 # --- Batch
 elif verb == ["batch", "jobs", "submit"]:
     (state / "job.json").write_text(stdin)
+    if (state / "simulate-chunked-logs.json").exists():
+        cfg = json.loads((state / "simulate-chunked-logs.json").read_text())
+        job_doc = json.loads(stdin)
+        container = job_doc["taskGroups"][0]["taskSpec"]["runnables"][0]["container"]
+        cmd = [container["entrypoint"], *container["commands"]]
+        rc, chunk_count = simulate_submitted_command(
+            cmd,
+            project=cfg["project"],
+            log_name_base="batch",
+            chunk_lines=cfg["chunk_lines"],
+        )
+        (state / "exit-code").write_text(str(rc))
+        (state / "states.json").write_text(
+            json.dumps(["RUNNING"] * max(2, chunk_count) + ["SUCCEEDED" if rc == 0 else "FAILED"])
+        )
     print(json.dumps({{"uid": "job-uid-1", "createTime": "2026-11-11T00:00:00Z"}}))
 elif verb == ["batch", "jobs", "describe"]:
     state_name = next_of("states", ["QUEUED", "RUNNING", "SUCCEEDED"])
@@ -126,6 +177,21 @@ elif verb == ["run", "jobs", "describe"]:
         del task["maxRetries"]
     print(json.dumps(job))
 elif verb == ["run", "jobs", "execute"]:
+    if (state / "simulate-chunked-logs.json").exists():
+        cfg = json.loads((state / "simulate-chunked-logs.json").read_text())
+        job_doc = json.loads((state / "job.json").read_text())
+        container = job_doc["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]
+        cmd = [*container["command"], *container["args"]]
+        rc, chunk_count = simulate_submitted_command(
+            cmd,
+            project=cfg["project"],
+            log_name_base="run",
+            chunk_lines=cfg["chunk_lines"],
+        )
+        (state / "task-result.json").write_text(json.dumps({{"exitCode": rc}}))
+        (state / "states.json").write_text(
+            json.dumps(["RUNNING"] * max(2, chunk_count) + ["SUCCEEDED" if rc == 0 else "FAILED"])
+        )
     metadata = {{"name": argv[3] + "-x7k2p", "creationTimestamp": "2026-11-11T00:00:00Z"}}
     print(json.dumps({{"metadata": metadata, "status": {{}}}}))
 elif argv[:4] == ["run", "jobs", "executions", "describe"]:
@@ -263,6 +329,12 @@ class Cloud:
     def answer(self, name: str, answers: list[object]) -> None:
         """Make the fake ``gcloud`` give these answers in turn; the last one repeats."""
         self.state.joinpath(f"{name}.json").write_text(json.dumps(answers))
+
+    def simulate_chunked_logs(self, *, chunk_lines: int = 10) -> None:
+        """Run the submitted container command and deliver its logs in out-of-order chunks."""
+        self.state.joinpath("simulate-chunked-logs.json").write_text(
+            json.dumps({"project": PROJECT, "chunk_lines": chunk_lines})
+        )
 
     def fail_times(self, match: str, times: int) -> None:
         """Make the next ``times`` ``gcloud`` calls that contain ``match`` fail."""

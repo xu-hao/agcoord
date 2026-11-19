@@ -36,6 +36,7 @@ import tempfile
 from typing import Sequence
 
 from agcoord.overflow_gcp import (
+    CloudJobOutput,
     Gcloud,
     LogRelay,
     Registry,
@@ -140,9 +141,10 @@ def job_spec(
     placed: Placement,
     size: RunSize,
     options: RunOptions,
+    log_token: str | None = None,
 ) -> dict[str, object]:
     """Return the Cloud Run job that runs one command once in one container."""
-    wrapped_command = container_command(command)
+    wrapped_command = container_command(command, log_token=log_token)
     container: dict[str, object] = {
         "image": image,
         # The first word replaces the image's entrypoint and the rest are its arguments, so
@@ -195,15 +197,15 @@ def _task_spec(job: object) -> dict[str, object]:
     return node if isinstance(node, dict) else {}
 
 
-class RunJob:
+class RunJob(CloudJobOutput):
     """One Cloud Run job and its single execution: state, output, and verdict."""
 
     def __init__(self, gcloud: Gcloud, region: str, name: str) -> None:
+        super().__init__()
         self.gcloud = gcloud
         self.region = region
         self.name = name
         self.execution = ""
-        self.output: LogRelay | None = None
         self._failure = ""
 
     def create(self, spec: dict[str, object]) -> None:
@@ -239,6 +241,7 @@ class RunJob:
             is_output=lambda entry: str(entry.get("logName", "")).endswith(
                 ("%2Fstdout", "%2Fstderr", "/stdout", "/stderr")
             ),
+            log_token=self.log_token,
         )
 
     def state(self) -> str:
@@ -262,10 +265,6 @@ class RunJob:
         if status.get("cancelledCount"):
             return "CANCELLED"
         return "RUNNING" if status.get("runningCount") else "PENDING"
-
-    def relay_output(self) -> int:
-        """Print the output lines that have arrived since the last call; return how many."""
-        return self.output.relay() if self.output is not None else 0
 
     def exit_status(self) -> int:
         """Return the command's exit status, or report that Cloud Run produced no verdict."""
@@ -392,6 +391,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 placed=placed,
                 size=size,
                 options=options,
+                log_token=job.log_token,
             )
         )
         job.execute()
@@ -406,6 +406,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             finished=FINISHED,
             poll_interval=options.poll_interval,
             say=_say,
+            has_pending=job.has_pending_output,
+            flush=job.flush_output,
         )
         if state == "SUCCEEDED":
             status = 0
