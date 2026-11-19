@@ -27,6 +27,7 @@ RUN_ID_ENV = "AGCOORD_RUN_ID"
 # head is a real source change.
 PROPAGATION_WAIT_SECONDS = 30.0
 PROPAGATION_POLL_SECONDS = 2.0
+SUBMISSION_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
 Wait = Callable[[float], None]
 EXIT_STALE_MAIN = 75
 EXIT_HEAD_CHANGED = 76
@@ -77,6 +78,14 @@ class _MergeRefusal(RuntimeError):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+class SubmissionRefusal(RuntimeError):
+    """Typed refusal from checking a pull request head before queueing a land."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
 
 
 class _PreflightComplete(BaseException):
@@ -1075,11 +1084,153 @@ def prepare(
     return EXIT_STALE_MAIN, effective_head
 
 
+def _subprocess_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
+    if env is None:
+        return None
+    normalized = dict(env)
+    if "PATH" not in normalized and "PATH" in os.environ:
+        normalized["PATH"] = os.environ["PATH"]
+    return normalized
+
+
+def _has_commit(
+    checkout: Path,
+    commit_sha: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    result = _run(
+        ["git", "-C", str(checkout), "cat-file", "-e", f"{commit_sha}^{{commit}}"],
+        checkout=checkout,
+        env=env,
+    )
+    return result.returncode == 0
+
+
+def verify_submission_head(
+    pull_request: int,
+    *,
+    checkout: str | os.PathLike[str],
+    branch: str,
+    head_sha: str,
+    metadata_client: PullRequestMetadataClient | None = None,
+    publisher: MergePublisher | None = None,
+    wait: Wait | None = None,
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Verify before queueing that the submitted head still matches the pull request's head."""
+    submitted_head = _sha(head_sha, field="submitted head")
+    selected = Path(checkout).expanduser().resolve()
+    subproc_env = _subprocess_env(env)
+    client = metadata_client or GitHubMetadataClient(selected, env=subproc_env)
+    merge_publisher = publisher or GitHubMergePublisher(selected, env=subproc_env)
+    sleeper = wait or time.sleep
+
+    def read_with_retry(action: Callable[[], Any], *, subject: str) -> Any:
+        last_error: BaseException | None = None
+        for attempt in range(len(SUBMISSION_RETRY_DELAYS) + 1):
+            try:
+                return action()
+            except _MergeRefusal as exc:
+                if exc.status == EXIT_PR_NOT_READY:
+                    raise SubmissionRefusal(str(exc), code="pr-not-ready") from exc
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+            if attempt < len(SUBMISSION_RETRY_DELAYS):
+                sleeper(SUBMISSION_RETRY_DELAYS[attempt])
+        raise SubmissionRefusal(
+            f"{subject}: {last_error}; retry once GitHub is reachable",
+            code="forge-unavailable",
+        ) from last_error
+
+    record = read_with_retry(
+        lambda: _metadata(client.pull_request(pull_request), pull_request),
+        subject=f"cannot read pull request #{pull_request} before queueing",
+    )
+    if not record["same_repository"]:
+        raise SubmissionRefusal(
+            "coordinated land requires a branch in the same repository",
+            code="pr-not-ready",
+        )
+    pr_branch = str(record["head_ref"])
+    if pr_branch != branch:
+        raise SubmissionRefusal(
+            f"pull-request branch is {pr_branch!r}, expected {branch!r}",
+            code="pr-not-ready",
+        )
+    remote_head = str(record["head_sha"])
+    if remote_head == submitted_head:
+        return
+
+    if not _has_commit(selected, remote_head, env=subproc_env):
+        fetched = _run(
+            [
+                "git",
+                "-C",
+                str(selected),
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "origin",
+                remote_head,
+            ],
+            checkout=selected,
+            env=subproc_env,
+        )
+        if fetched.returncode != 0:
+            _run(
+                [
+                    "git",
+                    "-C",
+                    str(selected),
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "origin",
+                    f"refs/heads/{pr_branch}",
+                ],
+                checkout=selected,
+                env=subproc_env,
+            )
+
+    if _has_commit(selected, remote_head, env=subproc_env):
+        behind = _is_ancestor(selected, submitted_head, remote_head)
+    else:
+        behind = bool(
+            read_with_retry(
+                lambda: merge_publisher.is_ancestor(
+                    ancestor_sha=submitted_head,
+                    descendant_sha=remote_head,
+                ),
+                subject=f"cannot compare pull request #{pull_request} heads {submitted_head} and {remote_head}",
+            )
+        )
+
+    if behind:
+        raise SubmissionRefusal(
+            f"submitted head {submitted_head} is behind pull request #{pull_request} head "
+            f"{remote_head}; run `git fetch && git merge --ff-only origin/{pr_branch}` and resubmit",
+            code="submitted-head-behind",
+        )
+    raise SubmissionRefusal(
+        f"submitted head {submitted_head} has diverged from pull request #{pull_request} head "
+        f"{remote_head}; reconcile with `git fetch`, merge or push origin/{pr_branch}, and resubmit",
+        code="submitted-head-diverged",
+    )
+
+
 class GitHubMetadataClient:
     """Normalize the installed GitHub CLI's external record into the strict worker seam."""
 
-    def __init__(self, checkout: str | os.PathLike[str]):
+    def __init__(
+        self,
+        checkout: str | os.PathLike[str],
+        *,
+        env: Mapping[str, str] | None = None,
+    ):
         self.checkout = Path(checkout).expanduser().resolve()
+        self.env = dict(env) if env is not None else None
 
     def pull_request(self, number: int) -> dict[str, object]:
         fields = (
@@ -1089,6 +1240,7 @@ class GitHubMetadataClient:
         result = _run(
             ["gh", "pr", "view", str(number), "--json", fields],
             checkout=self.checkout,
+            env=self.env,
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -1114,8 +1266,14 @@ class GitHubMetadataClient:
 class GitHubMergePublisher:
     """Create the candidate object, then compare/update both GitHub refs atomically."""
 
-    def __init__(self, checkout: str | os.PathLike[str]):
+    def __init__(
+        self,
+        checkout: str | os.PathLike[str],
+        *,
+        env: Mapping[str, str] | None = None,
+    ):
         self.checkout = Path(checkout).expanduser().resolve()
+        self.env = dict(env) if env is not None else None
         self._repository_value: tuple[str, str] | None = None
         self._commit_trees: dict[str, str] = {}
 
@@ -1124,6 +1282,7 @@ class GitHubMergePublisher:
             ["gh", *arguments, "--input", "-"],
             checkout=self.checkout,
             input_text=json.dumps(payload, separators=(",", ":")),
+            env=self.env,
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -1139,6 +1298,7 @@ class GitHubMergePublisher:
         result = _run(
             ["gh", "repo", "view", "--json", "id,nameWithOwner"],
             checkout=self.checkout,
+            env=self.env,
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -1363,6 +1523,7 @@ class GitHubMergePublisher:
                 f"repos/{name_with_owner}/compare/{ancestor}...{descendant}",
             ],
             checkout=self.checkout,
+            env=self.env,
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"

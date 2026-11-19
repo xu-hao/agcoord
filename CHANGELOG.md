@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Verify that a submitted `agc land` head still matches the pull request's head on GitHub before
+  queueing the row, retrying transient forge read errors briefly and refusing behind heads
+  (`submitted-head-behind`), diverged/unpushed heads (`submitted-head-diverged`), or forge
+  outages (`forge-unavailable`) immediately while retaining the preflight `head-changed` guard.
+  #371 — refuse behind or diverged land heads before queueing.
+
 - Report `native_host_pin.json` match status informationally (`pin_status`, `built_broker_sha256`)
   during untagged `release-candidate` CI checks while keeping `--tag` and local `--require-pin`
   verification strict, so broker changes on `main` between releases do not break CI or require a

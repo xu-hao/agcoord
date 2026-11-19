@@ -1682,7 +1682,12 @@ The CLI defaults `--adapter` to `github` as a convenience, while the client API 
 publication record keep the adapter and request separate. The current GitHub adapter accepts
 a pull-request number; future adapters can normalize their own request shape. Submission
 requires a clean checkout at one full 40-hex `HEAD` and inserts exactly one `kind=land`
-repository barrier. Its command and environment are the gate, not a second queued job, and it
+repository barrier. Before queueing a GitHub land request, the optional GitHub adapter reads the
+pull request's current head (retrying transient forge errors with a bounded wait) and compares it
+to the submitted head: equal heads enter the queue normally, behind heads are refused as
+`submitted-head-behind` naming both heads and `git fetch && git merge --ff-only origin/<branch>`,
+diverged or unpushed heads are refused as `submitted-head-diverged`, and persistent forge read
+errors refuse as `forge-unavailable` without creating a row. Its command and environment are the gate, not a second queued job, and it
 is submitted with a null `gate_run_id`. The coordinator sets that field only when it authorizes
 [reuse of a full receipt](#reusing-a-full-receipt-as-the-land-gate), where it names the receipt
 the verdict came from; a land that ran its own gate keeps it null.

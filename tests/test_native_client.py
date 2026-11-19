@@ -706,6 +706,7 @@ def test_native_publication_preserves_a_virtualenv_python_entry_point(
 
     monkeypatch.setattr(client, "_native_invoke", capture)
     if operation == "land":
+        monkeypatch.setattr("agcoord.github.verify_submission_head", lambda *args, **kwargs: None)
         client.submit_land(
             "github",
             123,
