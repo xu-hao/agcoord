@@ -349,27 +349,22 @@ def _host_artifacts(directory: Path, version: str) -> dict[str, Any]:
     return manifest
 
 
-def _shipped_pin(native_artifact: Path, host_package: Path, version: str) -> str:
-    """Require the client to pin the exact broker this release publishes.
+def _shipped_pin(
+    native_artifact: Path,
+    host_package: Path,
+    version: str,
+    *,
+    require_match: bool = True,
+) -> tuple[str | None, str, str]:
+    """Validate the packaged broker consistency and shipped pin contract.
 
-    A downloaded bundle carries its own manifest and sidecars, so only a digest that
-    reached the operator through the Python distribution can establish that a bundle is
-    this release. That digest is checked in, and a release refuses to ship without it.
+    With ``require_match=True`` (tagged releases and ``--require-pin``), the client pin must
+    match ``version`` and the exact broker digest. Without it (ordinary CI runs between
+    releases), the pin still must be valid JSON naming ``format == 1`` and the host package
+    must carry the same broker executable as ``native_artifact``, while pin-to-broker match
+    status is reported informationally.
     """
-    try:
-        pin = json.loads(PIN_SOURCE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CandidateError(f"native-host pin is unreadable: {exc}") from exc
-    if not isinstance(pin, dict) or pin.get("format") != 1 or pin.get("version") != version:
-        raise CandidateError("native-host pin does not name this release version")
-    pinned = pin.get("broker_sha256")
-    if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned):
-        raise CandidateError(
-            "native-host pin carries no broker digest; record the reproducible broker "
-            "checksum in src/agcoord/native_host_pin.json before releasing"
-        )
-    if pinned != _sha256(native_artifact):
-        raise CandidateError("native-host pin does not match the released broker")
+    built_digest = _sha256(native_artifact)
     with tarfile.open(host_package, "r:gz") as archive:
         member = archive.extractfile("./usr/libexec/agcoord/agcoord-broker")
         if member is None:
@@ -377,9 +372,39 @@ def _shipped_pin(native_artifact: Path, host_package: Path, version: str) -> str
         reader = hashlib.sha256()
         for block in iter(lambda: member.read(1024 * 1024), b""):
             reader.update(block)
-    if reader.hexdigest() != pinned:
-        raise CandidateError("host package broker does not match the native-host pin")
-    return pinned
+    if reader.hexdigest() != built_digest:
+        raise CandidateError("host package broker does not match the native broker")
+    try:
+        pin = json.loads(PIN_SOURCE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CandidateError(f"native-host pin is unreadable: {exc}") from exc
+    if not isinstance(pin, dict) or pin.get("format") != 1:
+        raise CandidateError("native-host pin has invalid format metadata")
+    pin_version = pin.get("version")
+    if not isinstance(pin_version, str) or not pin_version:
+        raise CandidateError("native-host pin version must be a non-empty string")
+    pinned = pin.get("broker_sha256")
+    if pinned is not None and (
+        not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned)
+    ):
+        raise CandidateError("native-host pin broker_sha256 must be null or 64 lowercase hex digits")
+
+    if pin_version != version:
+        if require_match:
+            raise CandidateError("native-host pin does not name this release version")
+        return pinned, built_digest, "version-mismatch"
+    if pinned is None:
+        if require_match:
+            raise CandidateError(
+                "native-host pin carries no broker digest; record the reproducible broker "
+                "checksum in src/agcoord/native_host_pin.json before releasing"
+            )
+        return None, built_digest, "unpinned"
+    if pinned != built_digest:
+        if require_match:
+            raise CandidateError("native-host pin does not match the released broker")
+        return pinned, built_digest, "digest-mismatch"
+    return pinned, built_digest, "matched"
 
 
 def _clean_environment() -> dict[str, str]:
@@ -564,6 +589,8 @@ def verify_candidate(
     output: Path,
     python: Path,
     tag: str | None,
+    *,
+    require_pin: bool = False,
 ) -> dict[str, Any]:
     _assert_clean_source(tag)
     versions = source_versions()
@@ -578,7 +605,12 @@ def verify_candidate(
     _run([python, "-m", "twine", "check", wheel, sdist])
     native_identity = _native_artifacts(native_dir, version)
     host_manifest = _host_artifacts(host_dir, version)
-    pinned_broker = _shipped_pin(native_dir / NATIVE_NAME, host_dir / HOST_NAME, version)
+    pinned_broker, built_broker, pin_status = _shipped_pin(
+        native_dir / NATIVE_NAME,
+        host_dir / HOST_NAME,
+        version,
+        require_match=(tag is not None or require_pin),
+    )
     _clean_install_artifacts(
         python,
         wheel,
@@ -600,8 +632,10 @@ def verify_candidate(
     )
     return {
         "artifact_count": len(sources),
+        "built_broker_sha256": built_broker,
         "bundle": os.fspath(output),
         "manifest_sha256": _sha256(manifest_path),
+        "pin_status": pin_status,
         "pinned_broker_sha256": pinned_broker,
         "protocol": 5,
         "version": version,
@@ -618,8 +652,10 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--tag")
+    parser.add_argument("--require-pin", action="store_true")
     arguments = parser.parse_args()
     try:
+        kwargs = {"require_pin": True} if arguments.require_pin else {}
         receipt = verify_candidate(
             arguments.python_dir.expanduser().resolve(),
             arguments.native_dir.expanduser().resolve(),
@@ -627,6 +663,7 @@ def main() -> int:
             arguments.output_dir.expanduser().resolve(),
             Path(os.path.abspath(arguments.python.expanduser())),
             arguments.tag,
+            **kwargs,
         )
     except (CandidateError, OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
         print(f"release candidate refused: {exc}", file=sys.stderr)

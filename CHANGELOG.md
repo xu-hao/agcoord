@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Report `native_host_pin.json` match status informationally (`pin_status`, `built_broker_sha256`)
+  during untagged `release-candidate` CI checks while keeping `--tag` and local `--require-pin`
+  verification strict, so broker changes on `main` between releases do not break CI or require a
+  post-release reset commit. #374 — stop failing between-release CI on prior-release native-host
+  pins.
+
 - Serve the broker command set over an owner-only (`0600`) `AF_UNIX` `SOCK_SEQPACKET` socket at
   `broker.sock` (`wire: 1`) with `SO_PEERCRED` peer-UID verification, length-prefixed framing,
   state-directory matching, stale-socket recovery, and immediate scheduler wakeup via `poll` on

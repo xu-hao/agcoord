@@ -176,9 +176,10 @@ bundle is the artifact its client was released against.
 
 A development checkout, or a client whose pin names another version, carries no enforceable
 expectation. Such a client still installs a bundle passed by path, exactly as before, but refuses
-`--download` with `native-host-unpinned-client` rather than fetching bytes it cannot check. The
-release gate refuses to publish a version whose pin is absent or does not match the released
-broker, so a released client always carries a usable one.
+`--download` with `native-host-unpinned-client` rather than fetching bytes it cannot check. Tagged
+release builds (`--tag`) and local release checks (`--require-pin`) enforce that the pin matches
+the released broker before publishing, while ordinary untagged CI checks between releases report the
+comparison informationally without failing on post-release broker changes.
 
 `--broker-sha256 <digest>` supplies the expected digest for one operation, which is how a
 maintainer running a development client exercises the download path against a host bundle they
