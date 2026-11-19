@@ -5,6 +5,17 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- The gate spool is now private to the broker. `agc`, the TUI, and the pytest-xdist adapter
+  no longer open `queue.sqlite3` or `broker.lock` to learn the spool's generation, its live
+  owner, or an active drain; they ask the broker through its new `inspect` command. Two
+  implementations of what those bytes mean could disagree, and the client's half could only
+  invent refusals of its own, so a busy spool, a partly created one, or a spool left by a
+  release before the native broker was reported with a message no caller could match on and
+  no adapter could translate. Every such answer now carries the broker's stable code —
+  `broker-database-busy`, `broker-state-missing`, `broker-schema-invalid`, or
+  `broker-protocol-unsupported`, the last still naming the AGCoord release that migrates a
+  pre-native spool. #227 — make the spool private to the broker.
+
 - Grant the GCP overflow Terraform module's result-cache bucket least privilege. The job service
   account now holds `roles/storage.objectViewer` and `roles/storage.objectCreator` on it instead
   of `roles/storage.objectAdmin`, so no job can delete or overwrite a cached result; a new
