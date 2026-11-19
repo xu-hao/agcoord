@@ -29,6 +29,14 @@ locals {
     "roles/logging.viewer",
     "roles/run.developer",
   ])
+
+  # A result cache reads, lists, and adds entries; it never replaces or deletes one.  Object
+  # viewer and object creator allow exactly that: overwriting an object needs the delete
+  # permission, which neither grants.
+  result_cache_roles = toset([
+    "roles/storage.objectViewer",
+    "roles/storage.objectCreator",
+  ])
 }
 
 resource "google_project" "overflow" {
@@ -86,8 +94,8 @@ resource "google_artifact_registry_repository" "images" {
 }
 
 # The identity of a job machine.  It can report to Batch, write logs, read this one
-# repository, and use the result cache; it holds no forge credentials and cannot change the
-# project.
+# repository, and read and add to the result cache; it holds no forge credentials and cannot
+# change the project.
 resource "google_service_account" "runner" {
   project      = google_project.overflow.project_id
   account_id   = "agcoord-overflow-runner"
@@ -143,9 +151,11 @@ resource "google_service_account_iam_member" "submitter_runs_as_runner" {
   member             = each.value
 }
 
-# A private bucket that jobs and submitters share as a result cache, so a check's cache
-# survives the job machine that produced it.  Anyone who can write it can make a later job
-# reuse a result it never computed, so only the runner and the submitters may write it.
+# A private bucket that jobs and workstations share as a result cache, so a check's cache
+# survives the job machine that produced it.  Anyone who can add to it can make a later job
+# reuse a result it never computed, so only the runner and the result-cache client may add
+# to it, and neither may replace or delete an entry.  Deleting entries is left to project
+# owners, through their project role.
 resource "google_storage_bucket" "result_cache" {
   project                     = google_project.overflow.project_id
   name                        = "${google_project.overflow.project_id}-result-cache"
@@ -166,16 +176,29 @@ resource "google_storage_bucket" "result_cache" {
   depends_on = [google_project_service.enabled]
 }
 
-resource "google_storage_bucket_iam_member" "runner_uses_result_cache" {
+resource "google_storage_bucket_iam_member" "runner_result_cache_access" {
+  for_each = local.result_cache_roles
+
   bucket = google_storage_bucket.result_cache.name
-  role   = "roles/storage.objectAdmin"
+  role   = each.value
   member = google_service_account.runner.member
 }
 
-resource "google_storage_bucket_iam_member" "submitter_uses_result_cache" {
-  for_each = var.submitters
+# The identity a workstation uses for the result cache.  It holds no project role and no
+# grant beyond this bucket, so code that reads its key can do no more than a job can do to the
+# cache.  Its key is created outside Terraform, so no private key enters Terraform state.
+resource "google_service_account" "result_cache_client" {
+  project      = google_project.overflow.project_id
+  account_id   = "agcoord-result-cache-client"
+  display_name = "AGCoord result-cache client"
+
+  depends_on = [google_project_service.enabled]
+}
+
+resource "google_storage_bucket_iam_member" "client_result_cache_access" {
+  for_each = local.result_cache_roles
 
   bucket = google_storage_bucket.result_cache.name
-  role   = "roles/storage.objectAdmin"
-  member = each.value
+  role   = each.value
+  member = google_service_account.result_cache_client.member
 }

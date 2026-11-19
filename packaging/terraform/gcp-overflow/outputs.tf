@@ -29,6 +29,11 @@ output "runner_service_account" {
 }
 
 output "result_cache_url" {
-  description = "URL of the private result-cache bucket that the runner and the submitters may read and write."
+  description = "URL of the private result-cache bucket that the runner and the result-cache client may read and add to."
   value       = "gs://${google_storage_bucket.result_cache.name}"
+}
+
+output "result_cache_client_email" {
+  description = "Email of the service account whose key a workstation uses to read and add to the result cache."
+  value       = google_service_account.result_cache_client.email
 }
