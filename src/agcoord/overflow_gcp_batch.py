@@ -45,7 +45,9 @@ from agcoord.overflow_image import (
     Stopped,
     build_toolchain,
     command_line,
+    container_command,
     container_environment,
+    container_security_options,
     container_tool,
     ignore_stop_signals,
     load_repository_config,
@@ -83,18 +85,20 @@ def job_config(
     options: BatchOptions,
 ) -> dict[str, object]:
     """Return the Batch job that runs one command in one container on one machine."""
+    wrapped_command = container_command(command)
     container: dict[str, object] = {
         "imageUri": image,
         # The first word replaces the image's entrypoint and the rest are its arguments, so
         # the command runs exactly as submitted whatever the toolchain image declares.
-        "entrypoint": command[0],
-        "commands": list(command[1:]),
+        "entrypoint": wrapped_command[0],
+        "commands": wrapped_command[1:],
     }
-    limits = list(placed.limits.run_options())
-    if (options.privileged or placed.privileged) and "--privileged" not in limits:
-        limits.append("--privileged")
-    if limits:
-        container["options"] = " ".join(limits)
+    container_options = list(container_security_options())
+    if (options.privileged or placed.privileged) and "--privileged" not in container_options:
+        container_options.append("--privileged")
+    container_options.extend(placed.limits.run_options())
+    if container_options:
+        container["options"] = " ".join(container_options)
     runnable: dict[str, object] = {"container": container}
     variables = container_environment(os.environ, options.passed_environment, placed.limits)
     if variables:

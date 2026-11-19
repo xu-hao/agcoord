@@ -650,6 +650,23 @@ Whenever a built-in executor applies scratch, it sets `TMPDIR`, `TMP`, and `TEMP
 inside the container, overriding those names passed with `--env`. Admission-only or skipped
 scratch claims do not mount scratch or inject these variables.
 
+Remote container process contract:
+
+- **User:** runs as the `USER` configured in the repository's toolchain image (or container root
+  if the Dockerfile leaves `USER` unset).
+- **Umask:** `0077`, matching local managed broker rows; the built-in executors wrap the command
+  in `/bin/sh -c 'umask 0077 && exec "$@"'` before exec'ing user code.
+- **`no_new_privs`:** enabled (`--security-opt=no-new-privileges`, `NoNewPrivs=1`) on Docker/Podman
+  and GCP Batch containers, matching local rows. Cloud Run runs in its own sandbox without setuid
+  privilege escalation.
+- **Capabilities and `userns`:** unprivileged pools (`"privileged": false`, the default) do not
+  provide unprivileged user namespaces (`bwrap --unshare-user` fails inside default container
+  confinement). Jobs that need user namespaces must pass `--require-capability userns` so they
+  stay on `local` when supported or route only to a pool configured with `"privileged": true` (or
+  explicit `"capabilities": ["userns"]`).
+- **Checkout:** `/workspace` holds only tracked and untracked working-tree files (for `full` and
+  `land`, the exact clean commit); `.git`, gitignored files, and submodule contents are absent.
+
 #### SSH executor
 
 `agc overflow-ssh` runs a placed job in a container on another machine the operator owns:

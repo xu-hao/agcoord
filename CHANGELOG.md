@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Align remote overflow container process environments with local rows by applying `umask 0077`
+  across the built-in SSH, GCP Batch, and GCP Cloud Run executors, passing
+  `--security-opt=no-new-privileges` on Docker/Podman and GCP Batch containers, and documenting the
+  remote container process contract (user, umask, `no_new_privs`, `userns` routing, and
+  `/workspace` contents). #370 — align remote overflow process environment and contract docs.
+
 ## 0.9.5 — 2026-11-18
 
 - Publish the coupled AGCoord `0.9.5` PyPI distribution and native

@@ -51,6 +51,7 @@ from agcoord.overflow_image import (
     Stopped,
     build_toolchain,
     command_line,
+    container_command,
     container_environment,
     container_tool,
     ignore_stop_signals,
@@ -141,12 +142,13 @@ def job_spec(
     options: RunOptions,
 ) -> dict[str, object]:
     """Return the Cloud Run job that runs one command once in one container."""
+    wrapped_command = container_command(command)
     container: dict[str, object] = {
         "image": image,
         # The first word replaces the image's entrypoint and the rest are its arguments, so
         # the command runs exactly as submitted whatever the toolchain image declares.
-        "command": [command[0]],
-        "args": list(command[1:]),
+        "command": [wrapped_command[0]],
+        "args": wrapped_command[1:],
         "resources": {"limits": {"cpu": str(size.cpus), "memory": f"{size.memory_mib}Mi"}},
     }
     variables = container_environment(os.environ, options.passed_environment, placed.limits)

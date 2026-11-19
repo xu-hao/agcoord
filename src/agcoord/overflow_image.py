@@ -115,6 +115,23 @@ class ContainerLimits:
         return options
 
 
+DEFAULT_UMASK = "0077"
+NO_NEW_PRIVILEGES_OPTION = "--security-opt=no-new-privileges"
+
+
+def container_security_options() -> list[str]:
+    """Return runtime security options matching local worker ``no_new_privs`` confinement."""
+    return [NO_NEW_PRIVILEGES_OPTION]
+
+
+def container_command(command: Sequence[str]) -> list[str]:
+    """Wrap ``command`` so every container starts with local-matching ``umask 0077``."""
+    items = list(command)
+    if not items:
+        raise ExecutorError("an overflow executor needs a command after --")
+    return ["/bin/sh", "-c", f"umask {DEFAULT_UMASK} && exec \"$@\"", "agcoord", *items]
+
+
 def container_environment(
     environment: Mapping[str, str],
     passed_environment: Sequence[str],

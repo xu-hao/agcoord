@@ -29,7 +29,9 @@ from agcoord.overflow_image import (
     Stopped,
     build_toolchain,
     command_line,
+    container_command,
     container_environment,
+    container_security_options,
     container_tool,
     ignore_stop_signals,
     load_repository_config,
@@ -126,6 +128,7 @@ class SshExecutor:
     ) -> int:
         """Run the command in its limited container and return its exit status."""
         environment = container_environment(os.environ, self.passed_environment, limits)
+        wrapped_command = container_command(command)
         process = self.remote(
             [
                 # The destination enforces the runtime limit itself, so a lost connection
@@ -138,10 +141,11 @@ class SshExecutor:
                 "--rm",
                 f"--name={name}",
                 *(["--privileged"] if self.privileged else []),
+                *container_security_options(),
                 *limits.run_options(),
                 *(f"--env={name}={value}" for name, value in environment.items()),
                 image,
-                *command,
+                *wrapped_command,
             ],
             stdin=subprocess.DEVNULL,
         )
