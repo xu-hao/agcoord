@@ -5,6 +5,18 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Grant the GCP overflow Terraform module's result-cache bucket least privilege. The job service
+  account now holds `roles/storage.objectViewer` and `roles/storage.objectCreator` on it instead
+  of `roles/storage.objectAdmin`, so no job can delete or overwrite a cached result; a new
+  `agcoord-result-cache-client` service account holds the same two bucket roles and nothing else,
+  and its email is the new `result_cache_client_email` output. Members of `submitters` lose their
+  bucket grant: give each workstation a key for the client account, created with
+  `gcloud iam service-accounts keys create` outside Terraform and referenced by
+  `GOOGLE_APPLICATION_CREDENTIALS`. A repository's cache tool must add entries only when absent.
+  Deleting entries is left to project owners. Applying the change replaces the bucket grants and
+  adds the client account. #379 — least-privilege result-cache access and a dedicated client
+  service account.
+
 - Shorten long `cgroup-v2` `tmpfs` `TMPDIR`/`TMP`/`TEMP` paths through a broker-owned short symlink
   alias (preferring `/run/user/<uid>` when owner-only, else `/tmp`) when the direct scratch path
   exceeds 48 bytes, keeping the physical mount, quotas, and terminal/recovery cleanup unchanged so

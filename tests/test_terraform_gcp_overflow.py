@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -75,6 +76,15 @@ mock_provider "google" {
       member = "serviceAccount:agcoord-overflow-runner@overflow-example.iam.gserviceaccount.com"
     }
   }
+
+  override_resource {
+    target = google_service_account.result_cache_client
+    values = {
+      name   = "projects/overflow-example/serviceAccounts/agcoord-result-cache-client@overflow-example.iam.gserviceaccount.com"
+      email  = "agcoord-result-cache-client@overflow-example.iam.gserviceaccount.com"
+      member = "serviceAccount:agcoord-result-cache-client@overflow-example.iam.gserviceaccount.com"
+    }
+  }
 }
 
 variables {
@@ -125,19 +135,42 @@ run "result_cache_is_private_and_expires" {
 
   assert {
     condition = (
-      google_storage_bucket_iam_member.runner_uses_result_cache.role == "roles/storage.objectAdmin" &&
-      google_storage_bucket_iam_member.runner_uses_result_cache.member == "serviceAccount:agcoord-overflow-runner@overflow-example.iam.gserviceaccount.com"
+      toset([for grant in google_storage_bucket_iam_member.runner_result_cache_access : grant.role]) ==
+      toset(["roles/storage.objectViewer", "roles/storage.objectCreator"]) &&
+      alltrue([
+        for grant in google_storage_bucket_iam_member.runner_result_cache_access :
+        grant.bucket == google_storage_bucket.result_cache.name &&
+        grant.member == "serviceAccount:agcoord-overflow-runner@overflow-example.iam.gserviceaccount.com"
+      ])
     )
-    error_message = "the runner cannot read and write the result cache"
+    error_message = "the runner's result-cache roles are not exactly object viewer and object creator"
   }
 
   assert {
     condition = (
-      toset([for grant in google_storage_bucket_iam_member.submitter_uses_result_cache : grant.member]) ==
-      toset(["user:alice@example.com", "group:builders@example.com"]) &&
-      alltrue([for grant in google_storage_bucket_iam_member.submitter_uses_result_cache : grant.role == "roles/storage.objectAdmin"])
+      google_service_account.result_cache_client.account_id == "agcoord-result-cache-client" &&
+      length(google_service_account.result_cache_client.account_id) >= 6 &&
+      length(google_service_account.result_cache_client.account_id) <= 30
     )
-    error_message = "the result cache's writers are not exactly the runner and the submitters"
+    error_message = "the result-cache client account ID is not a valid service account ID"
+  }
+
+  assert {
+    condition     = output.result_cache_client_email == "agcoord-result-cache-client@overflow-example.iam.gserviceaccount.com"
+    error_message = "result_cache_client_email does not name the result-cache client account"
+  }
+
+  assert {
+    condition = (
+      toset([for grant in google_storage_bucket_iam_member.client_result_cache_access : grant.role]) ==
+      toset(["roles/storage.objectViewer", "roles/storage.objectCreator"]) &&
+      alltrue([
+        for grant in google_storage_bucket_iam_member.client_result_cache_access :
+        grant.bucket == google_storage_bucket.result_cache.name &&
+        grant.member == "serviceAccount:agcoord-result-cache-client@overflow-example.iam.gserviceaccount.com"
+      ])
+    )
+    error_message = "the client's result-cache roles are not exactly object viewer and object creator"
   }
 }
 
@@ -166,8 +199,22 @@ run "result_cache_retention_must_be_positive" {
 """
 
 
+# Every grant on the result-cache bucket the module declares.  An object admin could replace
+# or delete cached results, so the bucket is granted only to the runner and the client
+# account, each as object viewer and object creator; submitters use the client account, and
+# project owners reach the bucket through their project role.
+RESULT_CACHE_GRANTS = {
+    "google_storage_bucket_iam_member.client_result_cache_access",
+    "google_storage_bucket_iam_member.runner_result_cache_access",
+}
+
+# Every resource that refers to the client account.  Its key may sit on a workstation that
+# runs untrusted code, so its only grants are on the result-cache bucket.
+CLIENT_ACCOUNT_USERS = {"google_storage_bucket_iam_member.client_result_cache_access"}
+
+
 @needs_terraform
-def test_the_result_cache_is_private_written_only_by_runner_and_submitters(tmp_path: Path):
+def test_the_result_cache_is_private_and_only_readable_and_appendable(tmp_path: Path):
     module = tmp_path / "gcp-overflow"
     shutil.copytree(MODULE, module, ignore=shutil.ignore_patterns(".terraform*"))
     (module / "tests").mkdir()
@@ -178,6 +225,16 @@ def test_the_result_cache_is_private_written_only_by_runner_and_submitters(tmp_p
 
     tested = _terraform("test", "-no-color", cwd=module)
     assert tested.returncode == 0, tested.stdout + tested.stderr
+
+    # The graph lists every resource the module declares without contacting the provider.
+    graph = _terraform("graph", cwd=module)
+    assert graph.returncode == 0, graph.stdout + graph.stderr
+    bucket_grants = set(re.findall(r'"(google_storage_bucket_iam_[a-z_]+\.[a-z_]+)"', graph.stdout))
+    assert bucket_grants == RESULT_CACHE_GRANTS
+    client_account_users = set(
+        re.findall(r'"([a-z_]+\.[a-z_]+)" -> "google_service_account\.result_cache_client"', graph.stdout)
+    )
+    assert client_account_users == CLIENT_ACCOUNT_USERS
 
 
 def test_the_module_carries_no_operator_values_or_state():

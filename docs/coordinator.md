@@ -713,10 +713,11 @@ and an identity for the job machines. The Terraform module in
 - a private result-cache bucket, `PROJECT_ID-result-cache` in the module's region, described
   under [GCP result cache](#gcp-result-cache) below;
 - a service account for job machines that may only report to Batch, write logs, read that
-  repository, and read and write the result cache. It holds no forge credentials;
-- for each member of the optional `submitters` set, the grants to push images, start jobs as that
-  service account, read job output, and read and write the result cache. A project owner needs
-  none of them.
+  repository, and read and add to the result cache. It holds no forge credentials;
+- a result-cache client service account, `agcoord-result-cache-client`, that may only read and
+  add to the result cache, for workstations;
+- for each member of the optional `submitters` set, the grants to push images, start jobs as the
+  job service account, and read job output. A project owner needs none of them.
 
 Nothing the module creates runs or bills by itself; machines exist only while an executor runs
 a job, and stored images and cached results cost by size. The module has no provider configuration, so call it from
@@ -741,7 +742,8 @@ output "overflow" {
 `repository_id` to `agcoord-overflow`, and `org_id` or `folder_id` place the project when an
 organization requires it. The outputs are the facts an executor needs: `project_id`, `region`,
 `registry` (the image path prefix), `runner_service_account`, and the two package names, plus
-`result_cache_url`, the `gs://` URL of the result-cache bucket.
+`result_cache_url`, the `gs://` URL of the result-cache bucket, and `result_cache_client_email`,
+the email of the result-cache client service account.
 
 Terraform state and variable files name your project and billing account. They are operator
 state, like the broker's `config.json`: keep them in that root, never in a repository. The
@@ -758,19 +760,63 @@ everything again. The module's result-cache bucket gives such a cache a place th
 machine and that the submitting workstations share with the jobs they place.
 
 The bucket is private: uniform bucket-level access is on, so no object carries its own access
-list, and public access prevention is enforced, so no grant can make it public. Only the job
-service account and the members of `submitters` are granted `roles/storage.objectAdmin` on it;
-project owners reach it through their project role. Objects are deleted
-`result_cache_retention_days` (default 30) days after they were written; a job that misses an
-expired entry computes the result again. Using the bucket is optional: a repository that does
-not point its cache at it leaves it empty, and an empty bucket costs nothing.
+list, and public access prevention is enforced, so no grant can make it public. Objects are
+deleted `result_cache_retention_days` (default 30) days after they were written; a job that
+misses an expired entry computes the result again. Using the bucket is optional: a repository
+that does not point its cache at it leaves it empty, and an empty bucket costs nothing.
 
-Anyone who can write the bucket can cause cached results to be reused, so a writer can make a
-later check report a result it never computed. Only trusted runners and submitters get write
-access: grant `submitters` only to operators whose own checks you would accept, and do not grant
-the bucket to anyone else. A repository's cache should key its entries by everything that
-determines the result, so an entry is reused only for the same inputs, but that key does not
-protect against a writer who stores a false entry under a correct key.
+The module grants the bucket to exactly two identities, each with `roles/storage.objectViewer`
+(read and list objects) and `roles/storage.objectCreator` (create objects):
+
+- the job service account, so every command a job runs, including the code under test, holds
+  these powers;
+- the result-cache client service account, so any process that can read a workstation's key for
+  it holds them.
+
+Neither role can delete an object, and replacing an existing object needs the delete permission,
+so no automated identity can remove or overwrite a cached result. A repository's cache tool must
+therefore add each entry only when its name is absent, for example by uploading with the
+`ifGenerationMatch=0` precondition, and treat a refused write of an existing name as an entry
+that is already stored. Members of `submitters` get no grant on the bucket; their workstations
+use the client service account. Project owners keep full control through their project role, so
+deleting or replacing entries, such as removing a false entry or emptying the cache, is an
+administrator action that a project owner performs with their own credentials, for example
+`gcloud storage rm gs://my-overflow-project-result-cache/PATH`.
+
+Anyone who can add to the bucket can cause cached results to be reused, so a writer can make a
+later check report a result it never computed. Give the client service account's key only to
+workstations whose checks you would accept, and do not grant the bucket to anyone else. A
+repository's cache should key its entries by everything that determines the result, so an entry
+is reused only for the same inputs, but that key does not protect against a writer who stores a
+false entry under a correct key before the true one exists.
+
+A workstation reaches the bucket with a key for the client service account. A project owner
+creates it outside Terraform, so no private key enters Terraform state, and stores it readable
+only by the workstation's user:
+
+```bash
+umask 077
+mkdir -p ~/.config/agcoord
+gcloud iam service-accounts keys create ~/.config/agcoord/result-cache-client.json \
+  --iam-account=agcoord-result-cache-client@my-overflow-project.iam.gserviceaccount.com
+chmod 600 ~/.config/agcoord/result-cache-client.json
+export GOOGLE_APPLICATION_CREDENTIALS=~/.config/agcoord/result-cache-client.json
+```
+
+`--iam-account` takes the `result_cache_client_email` output. The repository's cache tool finds
+the key through `GOOGLE_APPLICATION_CREDENTIALS`, like any Google Cloud client library. If the
+organization enforces the `iam.disableServiceAccountKeyCreation` constraint, key creation fails
+until an organization policy administrator exempts the project. List and revoke keys with
+`gcloud iam service-accounts keys list` and `gcloud iam service-accounts keys delete`, passing the
+same `--iam-account`.
+
+A user's application default credentials do not confine a workstation the same way, even with
+service account impersonation. `gcloud auth application-default login
+--impersonate-service-account=EMAIL` writes a credential file whose source credential is the
+user's own refresh token; impersonation is only the first exchange the client library makes.
+Code that can read that file can use the refresh token directly and act as the user, with every
+role the user holds, which for a project owner is the whole project. A client service account
+key carries only the client account's two bucket roles.
 
 AGCoord itself never reads or writes the bucket; the repository's own cache tool does. To point
 a repository's cache at it:
@@ -778,14 +824,15 @@ a repository's cache at it:
 1. Give the repository's cache tool the bucket as its remote location, read from an environment
    variable the repository chooses, so the project's URL stays operator state rather than a
    committed value. A Batch or Cloud Run job reaches Cloud Storage as the job service account
-   through its machine's own credentials; a submitting workstation uses its own `gcloud` or
-   application default credentials.
+   through its machine's own credentials; a submitting workstation uses the client service
+   account's key.
 2. Set that variable to the `result_cache_url` output in the environment that submits the job,
    for example `CHECK_CACHE_URL=gs://my-overflow-project-result-cache`.
 3. Add `--env CHECK_CACHE_URL` to each Google Cloud pool's `executor`, so the variable reaches the
-   job's container; by default the container receives none of the submitter's environment.
+   job's container; by default the container receives none of the submitter's environment. Do
+   not pass `GOOGLE_APPLICATION_CREDENTIALS`: a job uses the job service account.
 
-A job that runs locally reads and writes the same bucket with the submitter's credentials, so
+A job that runs locally reads and adds to the same bucket with the workstation's client key, so
 local and overflow runs share one cache.
 
 #### GCP Batch executor
