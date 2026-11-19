@@ -471,7 +471,7 @@ impl Broker {
             started_at,
         ))?;
         let stop_grace = configured_stop_grace(&paths)?;
-        let preempt_after = configured_preempt_after(&paths, &overflow_pools)?;
+        let preempt_after = configured_preempt_after(&paths)?;
         Ok(Self {
             paths,
             capacities,
