@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 const OWNER_LOCK_STARTUP_RETRY: Duration = Duration::from_millis(250);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const IDENTITY_COMMIT_RETRY_BOUND: Duration = Duration::from_millis(1500);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// Failure reason of a job a stopping broker ended after its stop grace.
 const BROKER_STOPPED: &str = "broker-stopped";
@@ -2474,7 +2475,15 @@ impl Broker {
             .map_err(map_database_error)?;
         self.crash("admission-commit");
 
-        let current = load_run(&connection, &queued.run_id)?;
+        if let Err(error) = self.start_worker_post_admission(&queued.run_id, pool) {
+            return self.recover_aborted_start(&queued.run_id, error);
+        }
+        Ok(())
+    }
+
+    fn start_worker_post_admission(&mut self, run_id: &str, pool: Option<&Pool>) -> Result<()> {
+        let connection = connect(&self.paths)?;
+        let current = load_run(&connection, run_id)?;
         if current.cancel_requested {
             self.finish_run(&connection, &current, "cancelled", 130, None)?;
             return Ok(());
@@ -2662,42 +2671,8 @@ impl Broker {
         };
         let pid = pending.pid();
         let token = pending.start_token().to_owned();
-        loop {
-            match connection
-                .execute_batch("BEGIN IMMEDIATE")
-                .map_err(map_database_error)
-            {
-                Ok(()) => break,
-                Err(error) if error.code == "broker-database-busy" => {
-                    thread::sleep(POLL_INTERVAL);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let identity_commit = (|| {
-            let refreshed = load_run(&connection, &current.run_id)?;
-            if refreshed.status != "running" || refreshed.worker_pid.is_some() {
-                return Err(AppError::new(
-                    "broker-worker-identity-mismatch",
-                    format!(
-                        "run {} changed before worker identity commit",
-                        current.run_id
-                    ),
-                ));
-            }
-            connection
-                .execute(
-                    "UPDATE runs SET worker_pid = ?1, worker_start_token = ?2,
-                     environment_json = '{}' WHERE run_id = ?3",
-                    params![i64::from(pid), token, current.run_id],
-                )
-                .map_err(map_database_error)?;
-            connection
-                .execute_batch("COMMIT")
-                .map_err(map_database_error)
-        })();
-        if let Err(error) = identity_commit {
-            let _ = connection.execute_batch("ROLLBACK");
+        if let Err(error) = self.commit_worker_identity(&connection, &current.run_id, pid, &token) {
+            drop(pending);
             return Err(error);
         }
         self.crash("worker-identity-commit");
@@ -2730,6 +2705,85 @@ impl Broker {
         self.pending_setups
             .insert(current.run_id, (pending, worker_setup));
         Ok(())
+    }
+
+    /// Commits a spawned worker's PID and start token with a bounded retry under contention.
+    fn commit_worker_identity(
+        &mut self,
+        connection: &Connection,
+        run_id: &str,
+        pid: u32,
+        token: &str,
+    ) -> Result<()> {
+        let stopped = Arc::clone(&self.stopped);
+        let already_stopped = self.stop_signals > 0;
+        let result = retry_bounded_database_commit(
+            IDENTITY_COMMIT_RETRY_BOUND,
+            POLL_INTERVAL,
+            || already_stopped || stopped.load(Ordering::Relaxed),
+            || {
+                connection
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .map_err(map_database_error)?;
+                let attempt = (|| {
+                    let refreshed = load_run(connection, run_id)?;
+                    if refreshed.status != "running" || refreshed.worker_pid.is_some() {
+                        return Err(AppError::new(
+                            "broker-worker-identity-mismatch",
+                            format!("run {run_id} changed before worker identity commit"),
+                        ));
+                    }
+                    connection
+                        .execute(
+                            "UPDATE runs SET worker_pid = ?1, worker_start_token = ?2,
+                             environment_json = '{}' WHERE run_id = ?3",
+                            params![i64::from(pid), token, run_id],
+                        )
+                        .map_err(map_database_error)?;
+                    connection
+                        .execute_batch("COMMIT")
+                        .map_err(map_database_error)
+                })();
+                if attempt.is_err() {
+                    let _ = connection.execute_batch("ROLLBACK");
+                }
+                attempt
+            },
+        );
+        if stopped.load(Ordering::Relaxed) {
+            self.stop_signalled();
+        }
+        result
+    }
+
+    /// Reconciles an already-`running` row when post-admission startup fails before worker release.
+    fn recover_aborted_start(&mut self, run_id: &str, error: AppError) -> Result<()> {
+        let connection = connect(&self.paths)?;
+        let refreshed = load_run(&connection, run_id)?;
+        if refreshed.status != "running" {
+            return Ok(());
+        }
+        if !refreshed.resource_state.is_empty() {
+            let _ = self.finish_and_cleanup_resources(&connection, &refreshed);
+        }
+        let refreshed = load_run(&connection, run_id)?;
+        if refreshed.status == "running" {
+            self.finish_run(
+                &connection,
+                &refreshed,
+                "interrupted",
+                125,
+                Some("worker-result-lost"),
+            )?;
+        }
+        if matches!(
+            error.code,
+            "broker-database-busy" | "broker-stop-requested" | "broker-worker-identity-mismatch"
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 
     fn complete_worker_setup(
@@ -2935,5 +2989,99 @@ impl Broker {
                 |row| row.get(0),
             )
             .map_err(map_database_error)
+    }
+}
+
+fn retry_bounded_database_commit(
+    retry_bound: Duration,
+    poll_interval: Duration,
+    mut stop_requested: impl FnMut() -> bool,
+    mut attempt: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let deadline = Instant::now() + retry_bound;
+    loop {
+        if stop_requested() {
+            return Err(AppError::new(
+                "broker-stop-requested",
+                "broker stopping before worker identity commit",
+            ));
+        }
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code == "broker-database-busy" => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                thread::sleep(poll_interval.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_bounded_database_commit;
+    use crate::error::AppError;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn identity_commit_retries_transient_busy_then_succeeds() {
+        let attempts = Cell::new(0_u32);
+        let result = retry_bounded_database_commit(
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+            || false,
+            || {
+                let current = attempts.get() + 1;
+                attempts.set(current);
+                if current < 3 {
+                    Err(AppError::new(
+                        "broker-database-busy",
+                        "simulated busy commit",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn identity_commit_exhausts_retry_bound_on_sustained_busy() {
+        let attempts = Cell::new(0_u32);
+        let result = retry_bounded_database_commit(
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            || false,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AppError::new("broker-database-busy", "still busy"))
+            },
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "broker-database-busy");
+        assert!(attempts.get() >= 2);
+    }
+
+    #[test]
+    fn identity_commit_stops_promptly_on_stop_signal() {
+        let attempts = Cell::new(0_u32);
+        let result = retry_bounded_database_commit(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || attempts.get() >= 2,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AppError::new("broker-database-busy", "busy"))
+            },
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "broker-stop-requested");
+        assert_eq!(attempts.get(), 2);
     }
 }
