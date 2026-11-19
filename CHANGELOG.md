@@ -22,6 +22,12 @@ versioning; dates use ISO 8601.
 
 ## 0.10.0 — 2026-11-19
 
+- Drain queued `broker.sock` accept-backlog connections after unlinking the socket on broker
+  shutdown (`SocketListener::drain_and_close`), and fall back cleanly to subprocess execution when
+  an initial socket write fails before transmission or a closing broker resets a read-only command.
+  #393 — drain queued broker socket connections on shutdown and fall back on read-only socket
+  reset.
+
 - Publish the coupled AGCoord `0.10.0` PyPI distribution and native
   `x86_64-unknown-linux-musl` host bundle on GitHub Releases. Advancing the client/broker
   compatibility line to `0.10.x` carries the broker-private gate spool (`inspect`), the owner-only
