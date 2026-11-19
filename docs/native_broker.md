@@ -319,7 +319,11 @@ mount namespace ends with the worker tree. Submitted `_AGCOORD_*` variables
 are removed; the broker supplies only the public admission context itself. A land request's
 reserved facts — the target-sync opt-out and the commits avoided for that landing — are
 translated into the land worker's `--no-target-sync` and `--avoid` arguments before that removal,
-and an invalid setting is refused at submission. Debug builds can
+and an invalid setting is refused at submission. A submission's local-only variables, carried in
+`_AGCOORD_LOCAL_ENVIRONMENT` as a JSON object of ordinary names (none in AGCoord's own
+`AGCOORD_` or `_AGCOORD_` namespaces) to strings, are added to a run admitted on this machine
+wherever the submitter left the name unset, and never to a placed run's executor; an invalid
+object is refused at submission. Debug builds can
 inject bounded launcher, token, channel, privilege, descriptor, setup, and release failures;
 release builds do not accept those controls.
 

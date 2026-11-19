@@ -572,8 +572,10 @@ environment (after stripping any caller-supplied `AGCOORD_OVERFLOW_*` variables)
 `AGCOORD_OVERFLOW_RESOURCES` (the claim as a JSON object), `AGCOORD_OVERFLOW_CONTRACT` (the
 row's `resource_contract`, which gives each claim's kind and unit), and
 `AGCOORD_OVERFLOW_PRIVILEGED` (`1` when placed onto a `"privileged": true` pool, `0` on an
-unprivileged pool; unset on `local` runs). The executor runs the command
-on the pool's machine, relays its output, and exits with its status; that exit status, the log,
+unprivileged pool; unset on `local` runs). Variables a submission reserves for a run on this
+machine, such as the workstation key described under [GCP result cache](#gcp-result-cache), are
+added only to a job admitted locally and never reach a placed job's executor. The executor runs
+the command on the pool's machine, relays its output, and exits with its status; that exit status, the log,
 and cancellation are those of any other worker, so stopping the job signals the executor's
 process group and the executor must stop the remote run. An executor that cannot obtain a
 verdict at all, for example because the connection was lost or the remote machine was
@@ -793,24 +795,46 @@ is reused only for the same inputs, but that key does not protect against a writ
 false entry under a correct key before the true one exists.
 
 A workstation reaches the bucket with a key for the client service account. A project owner
-creates it outside Terraform, so no private key enters Terraform state, and stores it readable
-only by the workstation's user:
+creates it outside Terraform, so no private key enters Terraform state, with one command on the
+workstation:
 
 ```bash
-umask 077
-mkdir -p ~/.config/agcoord
-gcloud iam service-accounts keys create ~/.config/agcoord/result-cache-client.json \
-  --iam-account=agcoord-result-cache-client@my-overflow-project.iam.gserviceaccount.com
-chmod 600 ~/.config/agcoord/result-cache-client.json
-export GOOGLE_APPLICATION_CREDENTIALS=~/.config/agcoord/result-cache-client.json
+agc overflow-gcp-batch create-result-cache-key \
+  --project my-overflow-project \
+  --iam-account agcoord-result-cache-client@my-overflow-project.iam.gserviceaccount.com
 ```
 
-`--iam-account` takes the `result_cache_client_email` output. The repository's cache tool finds
-the key through `GOOGLE_APPLICATION_CREDENTIALS`, like any Google Cloud client library. If the
-organization enforces the `iam.disableServiceAccountKeyCreation` constraint, key creation fails
-until an organization policy administrator exempts the project. List and revoke keys with
-`gcloud iam service-accounts keys list` and `gcloud iam service-accounts keys delete`, passing the
-same `--iam-account`.
+`--project` takes the `project_id` output and `--iam-account` the `result_cache_client_email`
+output; `agc overflow-gcp-run create-result-cache-key` is the same command. It asks the operator's
+`gcloud` login for a new key and stores it at `~/.config/agcoord/result-cache-client.json`, or at
+`--output PATH`, readable only by the workstation's user: `gcloud` writes the key under umask
+`077` into a private directory beside that path, and only the complete key is moved into place,
+with mode `0600`, so a failure leaves no partial key behind. The command prints the new key's ID
+but never its private material, and it never writes the key to standard output. It refuses to
+overwrite an existing file. `--replace` puts a new key in its place and prints the replaced key's
+ID together with the `gcloud iam service-accounts keys delete` command that revokes it, because a
+replaced key stays valid until it is revoked. If the organization enforces the
+`iam.disableServiceAccountKeyCreation` constraint, key creation fails until an organization policy
+administrator exempts the project. List and revoke keys with `gcloud iam service-accounts keys
+list` and `gcloud iam service-accounts keys delete`, passing the same `--iam-account`.
+
+Jobs on the workstation then find the key without any shell profile or service environment. While
+the broker has a Google Cloud pool, one whose `executor` runs `agc overflow-gcp-batch` or
+`agc overflow-gcp-run`, and the key file exists, every `run`, `full`, and `land` job admitted on
+this machine receives `GOOGLE_APPLICATION_CREDENTIALS` naming it. A value the submitter's
+environment already sets, even an empty one, is kept instead. The repository's cache tool finds
+the key through that variable, like any Google Cloud client library. The default key is
+`.config/agcoord/result-cache-client.json` under the submitting environment's `HOME`; a key kept
+elsewhere is named by adding `--result-cache-key PATH` to each Google Cloud pool's `executor`,
+where a leading `~/` stands for that `HOME`. The first Google Cloud pool that names a key decides,
+and the executor itself ignores the option. Without a Google Cloud pool, or without the key file,
+jobs run with their environment unchanged and nothing warns about a missing key, so a machine that
+does not use Google Cloud overflow never needs one.
+
+The key never leaves the workstation. A job placed in a pool does not receive the variable, and
+the Google Cloud executors never pass `GOOGLE_APPLICATION_CREDENTIALS` into a job's container,
+even when an `executor` lists `--env GOOGLE_APPLICATION_CREDENTIALS`; they leave it out and say so
+in the job's log, so the job reaches Google Cloud as the job service account.
 
 A user's application default credentials do not confine a workstation the same way, even with
 service account impersonation. `gcloud auth application-default login
@@ -831,11 +855,11 @@ a repository's cache at it:
 2. Set that variable to the `result_cache_url` output in the environment that submits the job,
    for example `CHECK_CACHE_URL=gs://my-overflow-project-result-cache`.
 3. Add `--env CHECK_CACHE_URL` to each Google Cloud pool's `executor`, so the variable reaches the
-   job's container; by default the container receives none of the submitter's environment. Do
-   not pass `GOOGLE_APPLICATION_CREDENTIALS`: a job uses the job service account.
+   job's container; by default the container receives none of the submitter's environment.
+   `GOOGLE_APPLICATION_CREDENTIALS` is never passed: a job uses the job service account.
 
-A job that runs locally reads and adds to the same bucket with the workstation's client key, so
-local and overflow runs share one cache.
+A job that runs locally reads and adds to the same bucket with the workstation's client key,
+which the broker gives it as described above, so local and overflow runs share one cache.
 
 #### GCP Batch executor
 
@@ -867,7 +891,10 @@ it Batch chooses one that fits the job. `--spot` uses a Spot machine, which is c
 preempted. `--runtime` selects the local container tool, `--privileged` adds `--privileged` to
 the Batch container's `options` (also enabled automatically when `AGCOORD_OVERFLOW_PRIVILEGED=1`
 is set for a `"privileged": true` pool), `--env NAME` passes one environment
-variable into the container, and `--poll-interval` sets how often the job is checked.
+variable into the container except `GOOGLE_APPLICATION_CREDENTIALS`, and `--poll-interval` sets
+how often the job is checked. `--result-cache-key PATH` names the workstation's result-cache key
+for jobs that run on this machine, as described under [GCP result cache](#gcp-result-cache), and
+does nothing for a placed job.
 
 For each job the executor builds the job's image on this machine, pushes the repository's
 toolchain image as `toolchain` and the job's image as `run` in the registry, and submits one
@@ -910,7 +937,9 @@ row end the run without a verdict.
 #### GCP Cloud Run executor
 
 `agc overflow-gcp-run` runs a placed job as a Cloud Run job that exists only for that run. It
-takes the same project, region, registry, and service account as the Batch executor. It is
+takes the same project, region, registry, and service account as the Batch executor, and the
+same `--env` and `--result-cache-key` options, which never pass
+`GOOGLE_APPLICATION_CREDENTIALS` into the job either. It is
 not faster to start: measured once in `us-central1`, a job's first output arrived 89 seconds
 after the executor started, against 81 seconds on Batch. What it offers is no machine to manage,
 at the cost of being smaller and limiting less:

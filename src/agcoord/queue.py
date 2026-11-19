@@ -72,6 +72,8 @@ OVERFLOW_ENV = "_AGCOORD_OVERFLOW"
 NO_PREEMPT_ENV = "_AGCOORD_NO_PREEMPT"
 CAPABILITIES_ENV = "_AGCOORD_CAPABILITIES"
 RUNTIMES_ENV = "_AGCOORD_RUNTIMES"
+#: Variables, as a JSON object, that only a run admitted on this machine receives.
+LOCAL_ENVIRONMENT_ENV = "_AGCOORD_LOCAL_ENVIRONMENT"
 LOCAL_RUNTIME = "local"
 USERNS_CAPABILITY = "userns"
 LAND_AVOID_ENV = "_AGCOORD_LAND_AVOID"
@@ -941,8 +943,12 @@ def _placement_environment(
     require_capabilities: Sequence[str],
     runtimes: Sequence[str],
 ) -> tuple[dict[str, str], bool]:
-    """Validate runtime selectors and encode overflow + placement constraints."""
-    for reserved in (CAPABILITIES_ENV, RUNTIMES_ENV):
+    """Validate runtime selectors and encode overflow + placement constraints.
+
+    The encoded constraints include the variables only a run admitted on this machine
+    receives, which the broker leaves out of a placed run's environment.
+    """
+    for reserved in (CAPABILITIES_ENV, RUNTIMES_ENV, LOCAL_ENVIRONMENT_ENV):
         if reserved in environment:
             raise CoordinatorError(f"gate environment uses the reserved {reserved} name")
     known_runtimes = {
@@ -973,7 +979,33 @@ def _placement_environment(
             list(runtimes),
             separators=(",", ":"),
         )
+    local = _local_environment(owner, environment)
+    if local:
+        selected[LOCAL_ENVIRONMENT_ENV] = json.dumps(
+            local,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     return selected, effective_overflow
+
+
+def _local_environment(
+    owner: Mapping[str, Any],
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    """Return the variables only a run admitted on this machine may receive.
+
+    A configured pool's adapter may name such variables, such as a workstation credential
+    that must never travel with a job to another machine.  The broker adds them to a local
+    worker's environment wherever the submitter left the name unset, and never gives them
+    to a placed run's executor.  Without overflow pools there are none.
+    """
+    executors = [pool.get("executor") or () for pool in owner.get("overflow_pools", ())]
+    if not executors:
+        return {}
+    from .overflow_gcp_key import local_job_environment
+
+    return local_job_environment(executors, environment)
 
 
 def _overflow_environment(

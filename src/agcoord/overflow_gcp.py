@@ -56,13 +56,19 @@ class Gcloud:
     def command(self, *arguments: str) -> list[str]:
         return ["gcloud", *arguments, f"--project={self.project}", "--quiet"]
 
-    def run(self, *arguments: str, stdin: str | None = None) -> str:
+    def run(
+        self,
+        *arguments: str,
+        stdin: str | None = None,
+        umask: int | None = None,
+    ) -> str:
         """Run one command and return its output, or fail without a verdict.
 
         ``gcloud`` reports progress on standard error even with ``--quiet``: "Creating
         job... Done.", advice on what to run next, and console links that name the
         project.  The executor's standard error is the job's log, so what ``gcloud`` says
         there is kept out of it unless the command fails, when it explains the failure.
+        ``umask``, when given, is the file-creation mask ``gcloud`` runs with.
         """
         try:
             completed = subprocess.run(
@@ -72,6 +78,7 @@ class Gcloud:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                umask=-1 if umask is None else umask,
             )
         except FileNotFoundError as exc:
             raise ExecutorError("gcloud is not installed on this machine") from exc

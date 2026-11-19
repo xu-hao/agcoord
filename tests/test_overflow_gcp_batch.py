@@ -264,6 +264,28 @@ def test_spot_machine_type_and_passed_environment_reach_the_job(cloud: Cloud):
     assert runnable["environment"] == {"variables": {"CI": "1"}}
 
 
+def test_the_workstation_credentials_variable_never_reaches_the_job(cloud: Cloud):
+    key = "/home/operator/.config/agcoord/result-cache-client.json"
+    completed = cloud.run(
+        "true",
+        options=(
+            "--env=CI",
+            "--env=GOOGLE_APPLICATION_CREDENTIALS",
+            "--result-cache-key=/home/operator/keys/other.json",
+        ),
+        CI="1",
+        GOOGLE_APPLICATION_CREDENTIALS=key,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    runnable = cloud.job()["taskGroups"][0]["taskSpec"]["runnables"][0]
+    assert runnable["environment"] == {"variables": {"CI": "1"}}
+    sent = json.dumps(cloud.job())
+    assert key not in sent and "other.json" not in sent
+    # The job uses its machine's service account; the log says why the variable was dropped.
+    assert "GOOGLE_APPLICATION_CREDENTIALS is not passed" in completed.stderr
+
+
 @pytest.mark.parametrize("executable", [True, False, None])
 def test_scratch_mount_and_environment_reach_batch(cloud: Cloud, executable):
     binding = {"backend": "cgroup-v2", "kind": "tmpfs", "mode": "required", "unit": "bytes"}

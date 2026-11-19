@@ -395,6 +395,29 @@ def test_passed_environment_and_an_omitted_service_account(cloud: Cloud):
     assert task["containers"][0]["env"] == [{"name": "CI", "value": "1"}]
 
 
+def test_the_workstation_credentials_variable_never_reaches_the_job(cloud: Cloud):
+    key = "/home/operator/.config/agcoord/result-cache-client.json"
+    completed = cloud.run(
+        "true",
+        options=(
+            "--env=CI",
+            "--env=GOOGLE_APPLICATION_CREDENTIALS",
+            "--result-cache-key",
+            "/home/operator/keys/other.json",
+        ),
+        CI="1",
+        GOOGLE_APPLICATION_CREDENTIALS=key,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    task = _task(cloud)
+    assert task["containers"][0]["env"] == [{"name": "CI", "value": "1"}]
+    assert task["serviceAccountName"] == RUNNER
+    sent = json.dumps(cloud.job())
+    assert key not in sent and "other.json" not in sent
+    assert "GOOGLE_APPLICATION_CREDENTIALS is not passed" in completed.stderr
+
+
 def test_a_job_that_cannot_be_created_is_no_verdict_and_leaves_no_image(cloud: Cloud):
     cloud.state.joinpath("gcloud-fails").write_text("replace")
 

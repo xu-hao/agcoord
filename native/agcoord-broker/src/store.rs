@@ -3619,6 +3619,7 @@ pub(crate) fn validate_submit(request: &SubmitRequest, owner: &OwnerInfo) -> Res
             "only a check may opt out of preemption, and the setting must be 1",
         ));
     }
+    crate::overflow::parse_local_environment(&request.environment)?;
     let (allowed_runtimes, required_capabilities) =
         crate::overflow::parse_placement_constraints(&request.environment)?;
     if let Some(allowed) = &allowed_runtimes {

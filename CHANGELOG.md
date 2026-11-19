@@ -5,6 +5,21 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Set up a workstation's GCP result-cache client key with one command and give it to local jobs
+  automatically. `agc overflow-gcp-batch create-result-cache-key --project PROJECT --iam-account
+  EMAIL` (also under `overflow-gcp-run`) creates the key through the operator's `gcloud` at
+  `~/.config/agcoord/result-cache-client.json`, or `--output PATH`, with mode `0600` under umask
+  `077`; it refuses to overwrite an existing key without `--replace`, names a replaced key's ID
+  for revocation, and never prints private key material. While the broker has a Google Cloud
+  overflow pool and that key exists (or the one a pool executor names with the new
+  `--result-cache-key PATH` option), every local `run`, `full`, and `land` job receives
+  `GOOGLE_APPLICATION_CREDENTIALS` unless its submitter set the variable, so no `~/.bashrc`,
+  `~/.profile`, or systemd `environment.d` edit is needed. Machines without Google Cloud
+  overflow or without the key run jobs unchanged and see no warning. Jobs placed in a pool never
+  receive the key, and the Google Cloud executors now leave `GOOGLE_APPLICATION_CREDENTIALS` out
+  of a job's container even when an executor lists it with `--env`. #388 — automate workstation
+  result-cache client key setup and local-job credential injection.
+
 - Preserve emission order in remote overflow row logs (`overflow-gcp-batch`, `overflow-gcp-run`,
   `overflow-ssh`). The container wrapper now merges standard error into standard output at capture
   and, for Cloud Logging executors, tags each emitted line or chunk with a per-job monotonic

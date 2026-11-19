@@ -2601,6 +2601,16 @@ impl Broker {
         environment.retain(|name, _value| {
             !name.starts_with("_AGCOORD_") && !name.starts_with("AGCOORD_OVERFLOW_")
         });
+        if pool.is_none() {
+            // Variables meant only for a run on this machine, such as a workstation
+            // credential, fill in names the submitter left unset. A placed run's executor
+            // never receives them, so they cannot travel to another machine. Submission
+            // refused an invalid entry, so there is nothing else to report here.
+            let local = overflow::parse_local_environment(&current.environment).unwrap_or_default();
+            for (name, value) in local {
+                environment.entry(name).or_insert(value);
+            }
+        }
         environment
             .entry("PATH".to_owned())
             .or_insert_with(|| "/usr/bin:/bin".to_owned());
