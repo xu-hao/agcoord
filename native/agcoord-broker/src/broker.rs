@@ -14,7 +14,7 @@ use crate::store::{
     select_land_batch_candidates, starving_row, validate_child_cpu_leases,
 };
 use crate::worker::{NativeWorker, PendingWorker, WorkerFault, WorkerSetup};
-use crate::{cgroup, overflow, preempt, project_quota, resources};
+use crate::{cgroup, overflow, preempt, project_quota, resources, socket};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -61,6 +61,8 @@ pub struct Broker {
     resource_capabilities: Value,
     cgroup_backend: Option<cgroup::CgroupBackend>,
     project_quota_backend: Option<project_quota::ProjectQuotaBackend>,
+    // Drop the listener socket before releasing `_owner` so `broker.sock` is unlinked under the lock.
+    socket: socket::SocketListener,
     _owner: OwnerLock,
     /// Held for the owner's lifetime so its per-tick connections are never the spool's last.
     /// Closing the last connection to a WAL database checkpoints and deletes the WAL under an
@@ -458,6 +460,7 @@ impl Broker {
                 format!("cannot install SIGINT handler: {error}"),
             )
         })?;
+        let socket = socket::SocketListener::bind(&paths.state_dir)?;
         owner.publish(&format!(
             "pid={}\nprotocol=5\nimplementation=rust-native\nversion={}\nbuild={}\ncapacities={}\nresource_bindings={}\nresource_capabilities={}\nlocal_runtime={}\noverflow_pools={}\nstarted_at={}\n",
             std::process::id(),
@@ -484,6 +487,7 @@ impl Broker {
             resource_capabilities,
             cgroup_backend,
             project_quota_backend,
+            socket,
             _owner: owner,
             _spool_anchor: connection,
             overflow_pools,
@@ -521,10 +525,11 @@ impl Broker {
             if self.stop_signalled() {
                 return self.graceful_shutdown();
             }
+            self.socket.serve_pending(&self.paths.state_dir, 64);
             match self.pump_once() {
                 Ok(()) => {}
                 Err(error) if error.code == "broker-database-busy" => {
-                    thread::sleep(POLL_INTERVAL);
+                    let _ = self.socket.poll_or_sleep(POLL_INTERVAL);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -535,7 +540,7 @@ impl Broker {
             let (has_live, drained) = match self.check_idle_drain() {
                 Ok(status) => status,
                 Err(error) if error.code == "broker-database-busy" => {
-                    thread::sleep(POLL_INTERVAL);
+                    let _ = self.socket.poll_or_sleep(POLL_INTERVAL);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -553,7 +558,10 @@ impl Broker {
                     }
                 }
             }
-            thread::sleep(POLL_INTERVAL);
+            if self.socket.serve_pending(&self.paths.state_dir, 64) > 0 {
+                continue;
+            }
+            let _ = self.socket.poll_or_sleep(POLL_INTERVAL);
         }
     }
 
@@ -2907,6 +2915,7 @@ impl Broker {
         let mut interruption_committed = false;
         loop {
             self.stop_signalled();
+            self.socket.serve_pending(&self.paths.state_dir, 64);
             if !interruption_committed
                 && (self.stop_signals > 1 || stopping_since.elapsed() >= self.stop_grace)
             {
@@ -2922,7 +2931,7 @@ impl Broker {
                 Err(error) if error.code == "broker-database-busy" => {}
                 Err(error) => return Err(error),
             }
-            thread::sleep(POLL_INTERVAL);
+            let _ = self.socket.poll_or_sleep(POLL_INTERVAL);
         }
     }
 

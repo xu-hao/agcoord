@@ -3,8 +3,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -12640,6 +12641,310 @@ fn land_batch_retains_history_across_bisect_follower_views_and_requeue() {
     assert_eq!(
         recent_by_id["land-4"]["batch"]["steps"][0]["attributed"],
         json!([])
+    );
+
+    assert!(broker.terminate().success());
+}
+
+fn socket_rpc_call(state_dir: &Path, request: &Value) -> Value {
+    let sock_path = state_dir.join("broker.sock");
+    let raw_bytes = sock_path.as_os_str().as_bytes();
+    let c_path = std::ffi::CString::new(raw_bytes).unwrap();
+    let raw_fd =
+        unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    assert!(raw_fd >= 0);
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let mut _dir_fd = None;
+    let connect_c_path = if c_path.as_bytes_with_nul().len() <= addr.sun_path.len() {
+        c_path
+    } else {
+        let dir_c = std::ffi::CString::new(state_dir.as_os_str().as_bytes()).unwrap();
+        let raw_dir = unsafe {
+            libc::open(
+                dir_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(raw_dir >= 0);
+        let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_dir) };
+        let proc_path = format!("/proc/self/fd/{}/broker.sock", dir_fd.as_raw_fd());
+        _dir_fd = Some(dir_fd);
+        std::ffi::CString::new(proc_path).unwrap()
+    };
+    let path_bytes = connect_c_path.as_bytes_with_nul();
+    assert!(path_bytes.len() <= addr.sun_path.len());
+    for (slot, byte) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+        *slot = *byte as libc::c_char;
+    }
+    let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            addr_len,
+        )
+    };
+    assert_eq!(rc, 0, "connect failed: {}", std::io::Error::last_os_error());
+
+    let body = serde_json::to_vec(request).unwrap();
+    let mut framed = Vec::with_capacity(4 + body.len());
+    framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&body);
+    for chunk in framed.chunks(32 * 1024) {
+        let sent = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                chunk.as_ptr().cast::<libc::c_void>(),
+                chunk.len(),
+                0,
+            )
+        };
+        assert_eq!(sent as usize, chunk.len());
+    }
+
+    let mut response = Vec::new();
+    let mut packet = vec![0u8; 64 * 1024];
+    let mut expected_len = None;
+    loop {
+        if let Some(total) = expected_len
+            && response.len() >= 4 + total
+        {
+            break;
+        }
+        let n = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                packet.as_mut_ptr().cast::<libc::c_void>(),
+                packet.len(),
+                0,
+            )
+        };
+        assert!(n > 0);
+        response.extend_from_slice(&packet[..n as usize]);
+        if expected_len.is_none() && response.len() >= 4 {
+            expected_len =
+                Some(
+                    u32::from_be_bytes([response[0], response[1], response[2], response[3]])
+                        as usize,
+                );
+        }
+    }
+    serde_json::from_slice(&response[4..4 + expected_len.unwrap()]).unwrap()
+}
+
+#[test]
+fn socket_serves_commands_with_refusal_parity_and_owner_only_permissions() {
+    let temporary = TestDirectory::new("socket-commands");
+    let state = temporary.path().join("state");
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+
+    let sock_path = state.join("broker.sock");
+    let meta = fs::symlink_metadata(&sock_path).unwrap();
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    let inspect_resp = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "inspect",
+            "arguments": ["--state-dir", state_argument(&state)],
+        }),
+    );
+    assert_eq!(inspect_resp["ok"], true);
+    assert_eq!(inspect_resp["wire"], 1);
+    assert_eq!(inspect_resp["result"]["protocol"], 5);
+
+    // Refusal parity: unknown run status over socket must match CLI refusal code and message.
+    let cli_missing = run(&[
+        "status",
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "missing-run",
+    ]);
+    assert!(!cli_missing.status.success());
+    let cli_refusal: Value = serde_json::from_slice(&cli_missing.stderr).unwrap();
+    let sock_missing = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "status",
+            "arguments": ["--state-dir", state_argument(&state), "--run-id", "missing-run"],
+        }),
+    );
+    assert_eq!(sock_missing["ok"], false);
+    assert_eq!(sock_missing["code"], cli_refusal["code"]);
+    assert_eq!(sock_missing["message"], cli_refusal["message"]);
+
+    // Unsupported wire version and mismatched state-dir fail stably.
+    let bad_wire = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 99,
+            "command": "inspect",
+            "arguments": ["--state-dir", state_argument(&state)],
+        }),
+    );
+    assert_eq!(bad_wire["ok"], false);
+    assert_eq!(bad_wire["code"], "broker-wire-unsupported");
+
+    let other_state = temporary.path().join("other");
+    fs::create_dir(&other_state).unwrap();
+    let mismatch = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "inspect",
+            "arguments": ["--state-dir", state_argument(&other_state)],
+        }),
+    );
+    assert_eq!(mismatch["ok"], false);
+    assert_eq!(mismatch["code"], "broker-state-mismatch");
+
+    let unknown_cmd = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "not-a-command",
+            "arguments": ["--state-dir", state_argument(&state)],
+        }),
+    );
+    assert_eq!(unknown_cmd["ok"], false);
+    assert_eq!(unknown_cmd["code"], "broker-command-invalid");
+
+    assert!(broker.terminate().success());
+    assert!(!sock_path.exists());
+}
+
+#[test]
+fn socket_recovers_stale_socket_and_refuses_obstruction() {
+    let temporary = TestDirectory::new("socket-recovery");
+    let state = temporary.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let sock_path = state.join("broker.sock");
+    drop(std::os::unix::net::UnixListener::bind(&sock_path).unwrap());
+    assert!(
+        fs::symlink_metadata(&sock_path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let resp = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "inspect",
+            "arguments": ["--state-dir", state_argument(&state)],
+        }),
+    );
+    assert_eq!(resp["ok"], true);
+    assert!(broker.terminate().success());
+    assert!(!sock_path.exists());
+
+    fs::create_dir(&sock_path).unwrap();
+    let output = Command::new(BROKER)
+        .args([
+            "serve",
+            "--state-dir",
+            state_argument(&state),
+            "--capacity",
+            "jobs=1",
+            "--idle-timeout",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let refusal: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(refusal["code"], "broker-socket-failed");
+    assert!(sock_path.is_dir());
+}
+
+#[test]
+fn socket_submit_wakes_scheduler_and_completes_run() {
+    let temporary = TestDirectory::new("socket-submit");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+    let marker = temporary.path().join("ran");
+
+    let submitted = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "submit",
+            "arguments": [
+                "--state-dir",
+                state_argument(&state),
+                "--run-id",
+                "sock-check-1",
+                "--kind",
+                "check",
+                "--label",
+                "socket-check label",
+                "--repository-id",
+                "repo-sock",
+                "--repository",
+                "repo-sock",
+                "--worktree-id",
+                "worktree-repo-sock",
+                "--checkout",
+                state_argument(&checkout),
+                "--branch",
+                "ticket",
+                "--head",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--resource",
+                "jobs=1",
+                "--agent",
+                "tester",
+                "--caller-pid",
+                std::process::id().to_string(),
+                "--",
+                "/bin/sh",
+                "-c",
+                format!("echo ok-from-socket; : > '{}'", marker.display()),
+            ],
+        }),
+    );
+    assert_eq!(submitted["ok"], true, "{submitted}");
+    assert_eq!(submitted["result"]["run_id"], "sock-check-1");
+
+    let final_row = wait_status(&state, "sock-check-1", "passed");
+    assert_eq!(final_row["exit_status"], 0);
+    assert!(marker.exists());
+
+    let sock_status = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "status",
+            "arguments": ["--state-dir", state_argument(&state), "--run-id", "sock-check-1"],
+        }),
+    );
+    assert_eq!(sock_status["ok"], true);
+    assert_eq!(sock_status["result"]["status"], "passed");
+
+    let sock_log = socket_rpc_call(
+        &state,
+        &json!({
+            "wire": 1,
+            "command": "log",
+            "arguments": ["--state-dir", state_argument(&state), "--run-id", "sock-check-1"],
+        }),
+    );
+    assert_eq!(sock_log["ok"], true);
+    assert!(
+        sock_log["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ok-from-socket")
     );
 
     assert!(broker.terminate().success());

@@ -5,6 +5,15 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Serve the broker command set over an owner-only (`0600`) `AF_UNIX` `SOCK_SEQPACKET` socket at
+  `broker.sock` (`wire: 1`) with `SO_PEERCRED` peer-UID verification, length-prefixed framing,
+  state-directory matching, stale-socket recovery, and immediate scheduler wakeup via `poll` on
+  incoming connections. Python clients try the live socket first with CLI refusal parity and fall
+  back cleanly to subprocess invocation when no live socket or matching wire version is available
+  (keeping `identity --json` backwards-compatible; adding the client-wire protocol opens the next
+  minor release line when released). #228 — serve the broker command set on an owner-only Unix
+  socket and wake the scheduler on connections.
+
 - The gate spool is now private to the broker. `agc`, the TUI, and the pytest-xdist adapter
   no longer open `queue.sqlite3` or `broker.lock` to learn the spool's generation, its live
   owner, or an active drain; they ask the broker through its new `inspect` command. Two

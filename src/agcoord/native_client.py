@@ -14,7 +14,9 @@ import os
 from pathlib import Path
 import platform
 import re
+import socket
 import stat
+import struct
 import subprocess
 from typing import Any, Mapping, Sequence
 
@@ -22,8 +24,24 @@ from .config import DEFAULT_NATIVE_BROKER_PATH, NativeBrokerConfig
 
 
 NATIVE_PROTOCOL = 5
+NATIVE_WIRE_VERSION = 1
 NATIVE_IMPLEMENTATION = "rust-native"
+BROKER_SOCKET_NAME = "broker.sock"
 MAX_NATIVE_JSON_BYTES = 1024 * 1024
+MAX_SOCKET_FRAME_BYTES = MAX_NATIVE_JSON_BYTES + 4096
+_SOCKET_CHUNK_BYTES = 32 * 1024
+_SOCKET_RECV_BYTES = 64 * 1024
+_SOCKET_FALLBACK = object()
+_NON_SOCKET_COMMANDS = frozenset(
+    {
+        "serve",
+        "identity",
+        "host-preflight",
+        "host-client-preflight",
+        "host-recover-hold",
+        "host-drain-hold",
+    }
+)
 _RELEASE_BUILD = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SUPPORTED_NATIVE_VERSION = re.compile(r"^0\.9\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 _MAINTENANCE_NATIVE_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
@@ -170,6 +188,110 @@ class NativeBrokerCommand:
         return cls(path=path, identity=identity)
 
     def invoke(
+        self,
+        command: str,
+        *,
+        state_dir: str | os.PathLike[str],
+        arguments: Sequence[str] = (),
+    ) -> Any:
+        if command not in _NON_SOCKET_COMMANDS:
+            socket_result = self._socket_invoke(
+                command, state_dir=state_dir, arguments=arguments
+            )
+            if socket_result is not _SOCKET_FALLBACK:
+                return socket_result
+        return self._subprocess_invoke(command, state_dir=state_dir, arguments=arguments)
+
+    def _socket_invoke(
+        self,
+        command: str,
+        *,
+        state_dir: str | os.PathLike[str],
+        arguments: Sequence[str],
+    ) -> Any:
+        sock_path = Path(state_dir) / BROKER_SOCKET_NAME
+        try:
+            sock_stat = os.lstat(sock_path)
+        except OSError:
+            return _SOCKET_FALLBACK
+        if not stat.S_ISSOCK(sock_stat.st_mode):
+            return _SOCKET_FALLBACK
+        if sock_stat.st_uid != os.geteuid():
+            raise NativeClientError(
+                "broker socket belongs to another user",
+                code="broker-socket-unauthorized",
+            )
+        request_payload = json.dumps(
+            {
+                "wire": NATIVE_WIRE_VERSION,
+                "command": command,
+                "arguments": ["--state-dir", str(state_dir), *arguments],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(request_payload) > MAX_SOCKET_FRAME_BYTES:
+            raise NativeClientError(
+                f"native broker command {command!r} request exceeds maximum byte limit"
+            )
+        dir_fd: int | None = None
+        if len(os.fsencode(sock_path)) < 108:
+            connect_target = str(sock_path)
+        else:
+            try:
+                dir_fd = os.open(
+                    state_dir,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+                )
+            except OSError:
+                return _SOCKET_FALLBACK
+            connect_target = f"/proc/self/fd/{dir_fd}/{BROKER_SOCKET_NAME}"
+        try:
+            sock = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
+            )
+        except OSError:
+            if dir_fd is not None:
+                os.close(dir_fd)
+            return _SOCKET_FALLBACK
+        try:
+            sock.settimeout(30.0)
+            try:
+                sock.connect(connect_target)
+            except OSError:
+                return _SOCKET_FALLBACK
+            _send_socket_frame(sock, request_payload)
+            raw_response = _recv_socket_frame(sock)
+        finally:
+            sock.close()
+            if dir_fd is not None:
+                os.close(dir_fd)
+        response = _decode_json(
+            raw_response,
+            subject=f"native broker socket {command} result",
+            max_bytes=MAX_SOCKET_FRAME_BYTES,
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+            raise NativeClientError(
+                f"native broker socket command {command!r} returned an invalid envelope"
+            )
+        if response["ok"]:
+            if "result" not in response:
+                raise NativeClientError(
+                    f"native broker socket command {command!r} omitted result"
+                )
+            return response["result"]
+        code = response.get("code")
+        message = response.get("message")
+        if not isinstance(code, str) or not code or not isinstance(message, str) or not message:
+            raise NativeClientError(
+                f"native broker socket command {command!r} returned an invalid refusal"
+            )
+        if code == "broker-wire-unsupported":
+            return _SOCKET_FALLBACK
+        raise NativeClientError(message, code=code)
+
+    def _subprocess_invoke(
         self,
         command: str,
         *,
@@ -416,8 +538,68 @@ def _read_identity(path: Path, *, host_maintenance: bool = False) -> NativeBroke
     return NativeBrokerIdentity(**value)
 
 
-def _decode_json(raw: bytes, *, subject: str) -> Any:
-    if len(raw) > MAX_NATIVE_JSON_BYTES:
+def _send_socket_frame(sock: socket.socket, payload: bytes) -> None:
+    framed = struct.pack(">I", len(payload)) + payload
+    try:
+        for offset in range(0, len(framed), _SOCKET_CHUNK_BYTES):
+            chunk = framed[offset : offset + _SOCKET_CHUNK_BYTES]
+            sent = sock.send(chunk)
+            if sent != len(chunk):
+                raise NativeClientError(
+                    "short write on native broker socket", code="broker-socket-failed"
+                )
+    except (OSError, TimeoutError) as exc:
+        raise NativeClientError(
+            f"cannot write native broker socket request: {exc}",
+            code="broker-socket-failed",
+        ) from exc
+
+
+def _recv_socket_frame(sock: socket.socket) -> bytes:
+    buffer = bytearray()
+    expected_len: int | None = None
+    try:
+        while True:
+            if expected_len is not None and len(buffer) >= 4 + expected_len:
+                if len(buffer) > 4 + expected_len:
+                    raise NativeClientError(
+                        "native broker socket frame contains trailing bytes",
+                        code="broker-socket-failed",
+                    )
+                return bytes(buffer[4:])
+            chunk = sock.recv(_SOCKET_RECV_BYTES)
+            if not chunk:
+                raise NativeClientError(
+                    "unexpected EOF reading native broker socket response",
+                    code="broker-socket-failed",
+                )
+            if len(buffer) + len(chunk) > 4 + MAX_SOCKET_FRAME_BYTES:
+                raise NativeClientError(
+                    "native broker socket response exceeded maximum byte limit",
+                    code="broker-socket-failed",
+                )
+            buffer.extend(chunk)
+            if expected_len is None and len(buffer) >= 4:
+                expected_len = struct.unpack(">I", buffer[:4])[0]
+                if expected_len > MAX_SOCKET_FRAME_BYTES:
+                    raise NativeClientError(
+                        "native broker socket response exceeded maximum byte limit",
+                        code="broker-socket-failed",
+                    )
+    except (OSError, TimeoutError) as exc:
+        raise NativeClientError(
+            f"cannot read native broker socket response: {exc}",
+            code="broker-socket-failed",
+        ) from exc
+
+
+def _decode_json(
+    raw: bytes,
+    *,
+    subject: str,
+    max_bytes: int = MAX_NATIVE_JSON_BYTES,
+) -> Any:
+    if len(raw) > max_bytes:
         raise NativeClientError(f"{subject} is oversized")
     try:
         text = raw.decode("utf-8", errors="strict")

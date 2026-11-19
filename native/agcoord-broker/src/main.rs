@@ -9,6 +9,7 @@ mod preempt;
 mod project_quota;
 mod recovery;
 mod resources;
+mod socket;
 mod store;
 mod worker;
 
@@ -1416,6 +1417,141 @@ fn emit_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn dispatch_rpc_command(command: &str, rest: &[String]) -> Result<Value> {
+    match command {
+        "drain" => {
+            let (state_dir, drain_id, reason) = parse_drain(rest)?;
+            store::begin_drain(&state_dir, &drain_id, &reason)
+        }
+        "drain-status" => store::drain_status(&parse_state_only(rest)?),
+        "resume" => {
+            let (state_dir, drain_id) = parse_resume(rest)?;
+            store::resume(&state_dir, &drain_id)
+        }
+        "submit" => {
+            let (paths, request) = parse_submit(rest)?;
+            store::submit(&paths, &request)
+        }
+        "snapshot" => {
+            let (state_dir, filter) = parse_snapshot(rest)?;
+            let paths = Paths::new(&state_dir).configured()?;
+            store::snapshot(&paths, &filter)
+        }
+        "inspect" => {
+            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
+            store::inspect(&paths)
+        }
+        "status" => {
+            let (paths, run_id, _) = parse_run_selector(rest, false)?;
+            store::status(&paths, &run_id)
+        }
+        "log" => {
+            let (paths, run_id, offset, limit) = parse_log(rest)?;
+            store::log(&paths, &run_id, offset, limit)
+        }
+        "cancel" => {
+            let (paths, run_id, crash_after) = parse_run_selector(rest, true)?;
+            store::cancel(&paths, &run_id, crash_after)
+        }
+        "clear" => {
+            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
+            store::clear(&paths)
+        }
+        "host-recover-status" => {
+            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
+            recovery::status(&paths)
+        }
+        "host-recover-proof" => {
+            let (rest, id) = take_option(rest, "--recovery-id")?;
+            let (paths, request) = parse_submit(&rest)?;
+            recovery::submit_proof(&paths, &id, &request)
+        }
+        "host-recover-complete" => {
+            let (rest, id) = take_option(rest, "--recovery-id")?;
+            let paths = Paths::new(&parse_state_only(&rest)?).configured()?;
+            recovery::complete(&paths, &id)
+        }
+        "host-recover-park" => {
+            let (rest, id) = take_option(rest, "--recovery-id")?;
+            let (rest, reason) = take_option(&rest, "--reason")?;
+            let paths = Paths::new(&parse_state_only(&rest)?).configured()?;
+            recovery::park(&paths, &id, &reason)
+        }
+        "host-drain-check" => host::drain_check(&parse_state_only(rest)?),
+        "verify" => {
+            let (paths, request) = parse_admission(rest)?;
+            store::verify_admission(&paths, &request)
+        }
+        "phase" => {
+            let (paths, request) = parse_phase(rest)?;
+            store::advance_land_phase(&paths, &request)
+        }
+        "reuse-gate" => {
+            let (paths, request) = parse_reuse(rest)?;
+            store::reuse_gate(&paths, &request)
+        }
+        "report" => {
+            let (paths, request) = parse_land_result(rest)?;
+            store::report_land_result(&paths, &request)
+        }
+        "claim-batch" => {
+            let (paths, request) = parse_claim_batch(rest)?;
+            store::claim_batch(&paths, &request)
+        }
+        "record-batch-step" => {
+            let (paths, request) = parse_batch_step(rest)?;
+            store::record_batch_step(&paths, &request)
+        }
+        "set-batch-slice" => {
+            let (paths, request) = parse_batch_slice(rest)?;
+            store::set_batch_slice(&paths, &request)
+        }
+        "clear-batch-slice" => {
+            let (paths, request) = parse_batch_status(rest)?;
+            store::clear_batch_slice(&paths, &request)
+        }
+        "batch-status" => {
+            let (paths, request) = parse_batch_status(rest)?;
+            store::batch_status(&paths, &request)
+        }
+        "batch-phase" => {
+            let (paths, request) = parse_batch_phase(rest)?;
+            store::advance_batch_member_phase(&paths, &request)
+        }
+        "batch-reuse-gate" => {
+            let (paths, request) = parse_batch_reuse(rest)?;
+            store::reuse_batch_member_gate(&paths, &request)
+        }
+        "batch-finish" => {
+            let (paths, request) = parse_batch_finish(rest)?;
+            store::finish_batch_member(&paths, &request)
+        }
+        "lease-request" => {
+            let (paths, request) = parse_child_lease_request(rest)?;
+            store::request_child_cpu_lease(&paths, &request)
+        }
+        "lease-status" => {
+            let (paths, lease_id) = parse_child_lease_id(rest)?;
+            store::child_cpu_lease_status(&paths, &lease_id)
+        }
+        "lease-list" => {
+            let (paths, run_id, include_terminal) = parse_child_lease_list(rest)?;
+            store::child_cpu_leases(&paths, run_id.as_deref(), include_terminal)
+        }
+        "lease-release" => {
+            let (paths, request) = parse_child_lease_owner(rest)?;
+            store::finish_child_cpu_lease(&paths, &request, "released")
+        }
+        "lease-cancel" => {
+            let (paths, request) = parse_child_lease_owner(rest)?;
+            store::finish_child_cpu_lease(&paths, &request, "cancelled")
+        }
+        "migrate" => store::migrate(&parse_state_only(rest)?),
+        "rollback" => store::rollback(&parse_state_only(rest)?),
+        unknown => Err(AppError::usage(format!("unknown command: {unknown}"))),
+    }
+}
+
 fn run_command(arguments: &[String]) -> Result<()> {
     match arguments {
         [argument] if argument == "--version" || argument == "-V" => {
@@ -1427,46 +1563,6 @@ fn run_command(arguments: &[String]) -> Result<()> {
             Ok(())
         }
         [command, rest @ ..] if command == "serve" => Broker::start(parse_serve(rest)?)?.serve(),
-        [command, rest @ ..] if command == "drain" => {
-            let (state_dir, drain_id, reason) = parse_drain(rest)?;
-            emit_json(&store::begin_drain(&state_dir, &drain_id, &reason)?)
-        }
-        [command, rest @ ..] if command == "drain-status" => {
-            emit_json(&store::drain_status(&parse_state_only(rest)?)?)
-        }
-        [command, rest @ ..] if command == "resume" => {
-            let (state_dir, drain_id) = parse_resume(rest)?;
-            emit_json(&store::resume(&state_dir, &drain_id)?)
-        }
-        [command, rest @ ..] if command == "submit" => {
-            let (paths, request) = parse_submit(rest)?;
-            emit_json(&store::submit(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "snapshot" => {
-            let (state_dir, filter) = parse_snapshot(rest)?;
-            let paths = Paths::new(&state_dir).configured()?;
-            emit_json(&store::snapshot(&paths, &filter)?)
-        }
-        [command, rest @ ..] if command == "inspect" => {
-            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
-            emit_json(&store::inspect(&paths)?)
-        }
-        [command, rest @ ..] if command == "status" => {
-            let (paths, run_id, _) = parse_run_selector(rest, false)?;
-            emit_json(&store::status(&paths, &run_id)?)
-        }
-        [command, rest @ ..] if command == "log" => {
-            let (paths, run_id, offset, limit) = parse_log(rest)?;
-            emit_json(&store::log(&paths, &run_id, offset, limit)?)
-        }
-        [command, rest @ ..] if command == "cancel" => {
-            let (paths, run_id, crash_after) = parse_run_selector(rest, true)?;
-            emit_json(&store::cancel(&paths, &run_id, crash_after)?)
-        }
-        [command, rest @ ..] if command == "clear" => {
-            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
-            emit_json(&store::clear(&paths)?)
-        }
         [command, rest @ ..] if command == "host-preflight" => {
             emit_json(&host::preflight(&parse_host_preflight(rest)?)?)
         }
@@ -1475,118 +1571,11 @@ fn run_command(arguments: &[String]) -> Result<()> {
             let (rest, probe) = take_option(rest, "--probe")?;
             host::recover_hold(&parse_state_only(&rest)?, PathBuf::from(probe).as_path())
         }
-        [command, rest @ ..] if command == "host-recover-status" => {
-            let paths = Paths::new(&parse_state_only(rest)?).configured()?;
-            emit_json(&recovery::status(&paths)?)
-        }
-        [command, rest @ ..] if command == "host-recover-proof" => {
-            let (rest, id) = take_option(rest, "--recovery-id")?;
-            let (paths, request) = parse_submit(&rest)?;
-            emit_json(&recovery::submit_proof(&paths, &id, &request)?)
-        }
-        [command, rest @ ..] if command == "host-recover-complete" => {
-            let (rest, id) = take_option(rest, "--recovery-id")?;
-            let paths = Paths::new(&parse_state_only(&rest)?).configured()?;
-            emit_json(&recovery::complete(&paths, &id)?)
-        }
-        [command, rest @ ..] if command == "host-recover-park" => {
-            let (rest, id) = take_option(rest, "--recovery-id")?;
-            let (rest, reason) = take_option(&rest, "--reason")?;
-            let paths = Paths::new(&parse_state_only(&rest)?).configured()?;
-            emit_json(&recovery::park(&paths, &id, &reason)?)
-        }
-        [command, rest @ ..] if command == "host-drain-check" => {
-            emit_json(&host::drain_check(&parse_state_only(rest)?)?)
-        }
         [command, rest @ ..] if command == "host-drain-hold" => {
             host::drain_hold(&parse_state_only(rest)?)
         }
-        [command, rest @ ..] if command == "verify" => {
-            let (paths, request) = parse_admission(rest)?;
-            emit_json(&store::verify_admission(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "phase" => {
-            let (paths, request) = parse_phase(rest)?;
-            emit_json(&store::advance_land_phase(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "reuse-gate" => {
-            let (paths, request) = parse_reuse(rest)?;
-            emit_json(&store::reuse_gate(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "report" => {
-            let (paths, request) = parse_land_result(rest)?;
-            emit_json(&store::report_land_result(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "claim-batch" => {
-            let (paths, request) = parse_claim_batch(rest)?;
-            emit_json(&store::claim_batch(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "record-batch-step" => {
-            let (paths, request) = parse_batch_step(rest)?;
-            emit_json(&store::record_batch_step(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "set-batch-slice" => {
-            let (paths, request) = parse_batch_slice(rest)?;
-            emit_json(&store::set_batch_slice(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "clear-batch-slice" => {
-            let (paths, request) = parse_batch_status(rest)?;
-            emit_json(&store::clear_batch_slice(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "batch-status" => {
-            let (paths, request) = parse_batch_status(rest)?;
-            emit_json(&store::batch_status(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "batch-phase" => {
-            let (paths, request) = parse_batch_phase(rest)?;
-            emit_json(&store::advance_batch_member_phase(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "batch-reuse-gate" => {
-            let (paths, request) = parse_batch_reuse(rest)?;
-            emit_json(&store::reuse_batch_member_gate(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "batch-finish" => {
-            let (paths, request) = parse_batch_finish(rest)?;
-            emit_json(&store::finish_batch_member(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "lease-request" => {
-            let (paths, request) = parse_child_lease_request(rest)?;
-            emit_json(&store::request_child_cpu_lease(&paths, &request)?)
-        }
-        [command, rest @ ..] if command == "lease-status" => {
-            let (paths, lease_id) = parse_child_lease_id(rest)?;
-            emit_json(&store::child_cpu_lease_status(&paths, &lease_id)?)
-        }
-        [command, rest @ ..] if command == "lease-list" => {
-            let (paths, run_id, include_terminal) = parse_child_lease_list(rest)?;
-            emit_json(&store::child_cpu_leases(
-                &paths,
-                run_id.as_deref(),
-                include_terminal,
-            )?)
-        }
-        [command, rest @ ..] if command == "lease-release" => {
-            let (paths, request) = parse_child_lease_owner(rest)?;
-            emit_json(&store::finish_child_cpu_lease(
-                &paths, &request, "released",
-            )?)
-        }
-        [command, rest @ ..] if command == "lease-cancel" => {
-            let (paths, request) = parse_child_lease_owner(rest)?;
-            emit_json(&store::finish_child_cpu_lease(
-                &paths,
-                &request,
-                "cancelled",
-            )?)
-        }
-        [command, rest @ ..] if command == "migrate" => {
-            emit_json(&store::migrate(&parse_state_only(rest)?)?)
-        }
-        [command, rest @ ..] if command == "rollback" => {
-            emit_json(&store::rollback(&parse_state_only(rest)?)?)
-        }
         [command] if command == "identity" => Err(AppError::usage("identity requires --json")),
-        [unknown, ..] => Err(AppError::usage(format!("unknown command: {unknown}"))),
+        [command, rest @ ..] => emit_json(&dispatch_rpc_command(command, rest)?),
         [] => {
             print_help();
             Ok(())

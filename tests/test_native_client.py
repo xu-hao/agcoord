@@ -852,3 +852,115 @@ def test_managed_native_autostart_uses_the_user_service_and_never_spawns_directl
     with pytest.raises(CoordinatorError, match="did not start"):
         client.snapshot()
     assert calls == [["/usr/bin/systemctl", "--user", "start", "agcoord-broker.service"]]
+
+
+def _socket_identity_executable(path: Path) -> Path:
+    payload = {
+        "name": "agcoord-broker",
+        "version": __version__,
+        "protocol": 5,
+        "implementation": "rust-native",
+        "build": "development",
+        "target": "x86_64-unknown-linux-gnu",
+        "sqlite": "3.51.1",
+    }
+    identity = json.dumps(payload, separators=(",", ":"))
+    fallback_result = json.dumps({"source": "subprocess", "ok": True}, separators=(",", ":"))
+    path.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = identity ] && [ \"$2\" = --json ]; then\n"
+        f"  printf '%s\\n' '{identity}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = snapshot ]; then\n"
+        f"  printf '%s\\n' '{fallback_result}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _serve_one_seqpacket_thread(sock_path: Path, responses: list[dict[str, object]]):
+    import socket as pysocket
+    import struct
+    import threading
+
+    server = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_SEQPACKET)
+    server.bind(str(sock_path))
+    sock_path.chmod(0o600)
+    server.listen(8)
+    received: list[dict[str, object]] = []
+
+    def run():
+        try:
+            for item in responses:
+                conn, _ = server.accept()
+                with conn:
+                    buf = bytearray()
+                    expected = None
+                    while expected is None or len(buf) < 4 + expected:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        if expected is None and len(buf) >= 4:
+                            expected = struct.unpack(">I", buf[:4])[0]
+                    received.append(json.loads(buf[4 : 4 + (expected or 0)].decode("utf-8")))
+                    raw = json.dumps(item, separators=(",", ":")).encode("utf-8")
+                    conn.sendall(struct.pack(">I", len(raw)) + raw)
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, received
+
+
+def test_native_client_uses_owner_socket_and_preserves_refusal_and_fallback(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    sock_path = state_dir / "broker.sock"
+    executable = _socket_identity_executable(tmp_path / "broker")
+    selected = NativeBrokerCommand.select(
+        NativeBrokerConfig(path=str(executable), allow_development=True)
+    )
+
+    thread, received = _serve_one_seqpacket_thread(
+        sock_path,
+        [
+            {"ok": True, "wire": 1, "result": {"source": "socket"}},
+            {
+                "ok": False,
+                "wire": 1,
+                "code": "broker-state-missing",
+                "message": "refused from socket",
+            },
+            {
+                "ok": False,
+                "wire": 1,
+                "code": "broker-wire-unsupported",
+                "message": "unsupported wire",
+            },
+        ],
+    )
+    assert selected.invoke("snapshot", state_dir=state_dir) == {"source": "socket"}
+    with pytest.raises(NativeClientError, match="refused from socket") as refused:
+        selected.invoke("snapshot", state_dir=state_dir)
+    assert refused.value.code == "broker-state-missing"
+    # Unsupported wire version falls back cleanly to subprocess execution.
+    assert selected.invoke("snapshot", state_dir=state_dir) == {
+        "source": "subprocess",
+        "ok": True,
+    }
+    thread.join(timeout=2)
+    assert [req["command"] for req in received] == ["snapshot", "snapshot", "snapshot"]
+
+    # Unreachable or absent socket falls back cleanly to subprocess execution.
+    sock_path.unlink()
+    assert selected.invoke("snapshot", state_dir=state_dir) == {
+        "source": "subprocess",
+        "ok": True,
+    }
