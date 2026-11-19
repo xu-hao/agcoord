@@ -579,7 +579,7 @@ def test_client_routes_only_exact_admitted_status_through_the_callback_selector(
     monkeypatch.setattr(
         CoordinatorClient,
         "_inspect",
-        lambda _self: {"protocol": NATIVE_PROTOCOL, "owner": owner, "maintenance": None},
+        lambda _self, **_kwargs: {"protocol": NATIVE_PROTOCOL, "owner": owner, "maintenance": None},
     )
 
     def refuse_ordinary_selection(_cls, _configured):
@@ -625,7 +625,7 @@ def test_admitted_callback_never_autostarts_a_missing_broker(
     monkeypatch.setattr(
         CoordinatorClient,
         "_inspect",
-        lambda _self: {"protocol": NATIVE_PROTOCOL, "owner": None, "maintenance": None},
+        lambda _self, **_kwargs: {"protocol": NATIVE_PROTOCOL, "owner": None, "maintenance": None},
     )
     client = CoordinatorClient(
         state_dir=state_dir,
@@ -640,6 +640,86 @@ def test_admitted_callback_never_autostarts_a_missing_broker(
 
     with pytest.raises(CoordinatorError, match="no gate broker owns.*callback"):
         client.admitted_run_status("land-callback")
+
+
+def test_admitted_callback_inspects_spool_through_callback_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from agcoord.queue import CoordinatorClient, CoordinatorError
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "native_broker": {
+                    "path": str(tmp_path / "agcoord-broker"),
+                    "allow_development": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = "check-callback"
+    build = f"sha256:{'b' * 64}"
+    identity = NativeBrokerIdentity(
+        name="agcoord-broker",
+        version=__version__,
+        protocol=NATIVE_PROTOCOL,
+        implementation=NATIVE_IMPLEMENTATION,
+        build=build,
+        target="x86_64-unknown-linux-musl",
+        sqlite="3.53.2",
+    )
+    state_dir_path = state_dir.resolve()
+    owner = {
+        "protocol": NATIVE_PROTOCOL,
+        "pid": 4200,
+        "capacities": {"jobs": 1},
+        "resource_bindings": {},
+        "resource_capabilities": {},
+        "implementation": NATIVE_IMPLEMENTATION,
+        "version": identity.version,
+        "build": identity.build,
+    }
+    callback_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class CallbackCommand:
+        def __init__(self):
+            self.identity = identity
+
+        def invoke(self, command, *, state_dir, arguments=()):
+            assert Path(state_dir) == state_dir_path
+            callback_calls.append((command, tuple(arguments)))
+            if command == "inspect":
+                return {"protocol": NATIVE_PROTOCOL, "owner": owner, "maintenance": None}
+            if command == "status":
+                return {"run_id": run_id, "status": "running"}
+            raise AssertionError(f"unexpected callback command: {command}")
+
+    monkeypatch.setattr(
+        NativeBrokerCommand,
+        "select",
+        classmethod(
+            lambda _cls, _configured: (_ for _ in ()).throw(
+                NativeClientError("native broker executable must be owned by root")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        NativeBrokerCommand,
+        "select_for_admitted_callback",
+        classmethod(lambda _cls, _configured: CallbackCommand()),
+    )
+    monkeypatch.setenv("AGCOORD_RUN_ID", run_id)
+    monkeypatch.setenv("AGCOORD_STATE_DIR", str(state_dir_path))
+    client = CoordinatorClient(state_dir=state_dir_path, autostart=False)
+
+    assert client.admitted_run_status(run_id) == {"run_id": run_id, "status": "running"}
+    assert callback_calls == [("inspect", ()), ("status", ("--run-id", run_id))]
+    with pytest.raises(CoordinatorError, match="must be owned by root"):
+        client.status(run_id)
 
 
 @pytest.mark.parametrize("operation", ["land", "merge"])
