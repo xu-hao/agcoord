@@ -209,8 +209,7 @@ broker lets running jobs finish before it interrupts them; `0` interrupts them a
 `preempt_after` is a finite number of seconds from `0` to `2147483.647` and is how long the
 oldest queued job that lacks only local capacity waits, counted from when it last entered the
 queue, before it may [preempt later checks](#first-fit-admission-and-preemption); it defaults
-to the largest `wait_threshold` among the configured overflow pools, but never less than `300`,
-including on a host without a pool. A `land` does not wait for it. An
+to `300` seconds, independent of any overflow pool's `wait_threshold`. A `land` does not wait for it. An
 absent file uses `/usr/libexec/agcoord/agcoord-broker`, requires its release trust policy, and
 defaults capacity to `jobs=2`.
 
@@ -320,8 +319,8 @@ again. It does not bound the wait; see [the starvation gap](#the-starvation-gap)
   so it may preempt as soon as it is the starving job.
 - **Overflow first.** In every pass the broker first admits everything that fits here, then
   places jobs in [overflow pools](#overflow-pools), and only then preempts. A starving job that
-  a pool can take now is placed there instead. Because `preempt_after` defaults to the largest
-  pool `wait_threshold`, every pool has by default had its chance before a job preempts.
+  a pool can take now is placed there instead, even if `preempt_after` has elapsed, while the
+  default `preempt_after` (`300` seconds) stays independent of overflow `wait_threshold`.
 - **Victims.** Victims are running `check` jobs on this machine that were submitted after the
   starving job. They are taken latest submission first (among equal submissions, latest start
   first) until their claims cover every shortage; a victim whose claim is not needed after all
