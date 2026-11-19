@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -117,6 +118,8 @@ class ContainerLimits:
 
 DEFAULT_UMASK = "0077"
 NO_NEW_PRIVILEGES_OPTION = "--security-opt=no-new-privileges"
+#: Maximum characters per tagged chunk so multibyte lines stay under 16 KiB container log splits.
+_LOG_CHUNK_CHARS = 4000
 
 
 def container_security_options() -> list[str]:
@@ -124,12 +127,59 @@ def container_security_options() -> list[str]:
     return [NO_NEW_PRIVILEGES_OPTION]
 
 
-def container_command(command: Sequence[str]) -> list[str]:
-    """Wrap ``command`` so every container starts with local-matching ``umask 0077``."""
+def container_command(
+    command: Sequence[str], *, log_token: str | None = None
+) -> list[str]:
+    """Wrap ``command`` with ``umask 0077`` and capture-time ``stderr`` into ``stdout``.
+
+    When ``log_token`` is set, every emitted line or chunk is tagged at the source with a
+    monotonic sequence number so remote log collectors that reorder upload batches or streams
+    can be reassembled in emission order.
+    """
     items = list(command)
     if not items:
         raise ExecutorError("an overflow executor needs a command after --")
-    return ["/bin/sh", "-c", f"umask {DEFAULT_UMASK} && exec \"$@\"", "agcoord", *items]
+    if log_token is None:
+        return [
+            "/bin/sh",
+            "-c",
+            f"umask {DEFAULT_UMASK} && exec 2>&1 && exec \"$@\"",
+            "agcoord",
+            *items,
+        ]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", log_token):
+        raise ValueError(f"invalid log_token: {log_token!r}")
+    awk_body = (
+        "BEGIN{n=0}{s=$0;"
+        f"while(length(s)>{_LOG_CHUNK_CHARS}){{"
+        f'printf "%s:%d:p:%s\\n",t,n++,substr(s,1,{_LOG_CHUNK_CHARS});'
+        f"s=substr(s,{_LOG_CHUNK_CHARS + 1})"
+        "}"
+        'printf "%s:%d:c:%s\\n",t,n++,s'
+    )
+    script = (
+        f"umask {DEFAULT_UMASK} || exit\n"
+        "exec 4>&1\n"
+        "rc=$(\n"
+        "  {\n"
+        '    { "$@" 2>&1 3>&- 4>&-; echo $? >&3; } | {\n'
+        "      if awk 'BEGIN{fflush()}' </dev/null >/dev/null 2>&1; then\n"
+        f"        awk -v t='{log_token}' '{awk_body};fflush()}}' 3>&- >&4 2>&4\n"
+        "      elif command -v awk >/dev/null 2>&1; then\n"
+        f"        awk -v t='{log_token}' '{awk_body}}}' 3>&- >&4 2>&4\n"
+        "      else\n"
+        "        n=0\n"
+        '        while IFS= read -r l || [ -n "$l" ]; do\n'
+        f"          printf '%s:%d:c:%s\\n' '{log_token}' \"$n\" \"$l\"\n"
+        "          n=$((n+1))\n"
+        "        done 3>&- >&4 2>&4\n"
+        "      fi\n"
+        "    }\n"
+        "  } 3>&1\n"
+        ")\n"
+        'exit "$rc"'
+    )
+    return ["/bin/sh", "-c", script, "agcoord", *items]
 
 
 def container_environment(

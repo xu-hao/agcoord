@@ -61,14 +61,23 @@ def test_the_command_runs_as_one_batch_job_sized_to_the_claim(cloud: Cloud):
     job = cloud.job()
     (group,) = job["taskGroups"]
     task = group["taskSpec"]
+    import re
+
+    from agcoord.overflow_image import container_command
+
     assert group["taskCount"] == 1
+    assert len(task["runnables"]) == 1
+    container = task["runnables"][0]["container"]
+    token_match = re.search(r"-v t='([0-9a-f]+)'", container["commands"][1])
+    assert token_match is not None
+    expected_wrapped = container_command(["python", "-m", "pytest", "-q"], log_token=token_match.group(1))
     assert task["runnables"] == [
         {
             "container": {
                 # The machine pulls exactly the image that was built for this job.
                 "imageUri": JOB_IMAGE_DIGEST,
-                "entrypoint": "/bin/sh",
-                "commands": ["-c", 'umask 0077 && exec "$@"', "agcoord", "python", "-m", "pytest", "-q"],
+                "entrypoint": expected_wrapped[0],
+                "commands": expected_wrapped[1:],
                 "options": (
                     "--security-opt=no-new-privileges "
                     f"--cpus=4 --memory={MEMORY} --memory-swap={MEMORY}"
@@ -452,3 +461,86 @@ def test_an_invalid_privileged_environment_value_is_refused_without_building_or_
     assert "placement is invalid" in completed.stderr
     assert cloud.docker() == []
     assert cloud.gcloud() == []
+
+
+def test_chunked_interleaved_output_matches_local_row_emission_order(
+    cloud: Cloud, tmp_path: Path
+):
+    program = (
+        "import sys\n"
+        "print('=== HEADER: 40 entries follow ===', flush=True)\n"
+        "print('', flush=True)\n"
+        "for i in range(1, 41):\n"
+        "    stream = sys.stderr if i % 2 == 0 else sys.stdout\n"
+        "    print(f'entry {i:02d}', file=stream, flush=True)\n"
+        "print('LONG:' + 'x' * 9000, flush=True)\n"
+        "print('=== FOOTER ===', file=sys.stderr, flush=True)\n"
+    )
+    local_log = tmp_path / "local.log"
+    with local_log.open("wb") as combined:
+        subprocess.run(
+            [sys.executable, "-c", program],
+            stdout=combined,
+            stderr=combined,
+            check=True,
+        )
+    expected = local_log.read_text(encoding="utf-8")
+
+    cloud.simulate_chunked_logs(chunk_lines=10)
+    completed = cloud.run(sys.executable, "-c", program)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == expected
+
+
+def test_log_relay_holds_out_of_order_chunks_and_flushes_sequence_gaps(capsys):
+    from agcoord.overflow_gcp import LogRelay, follow_job
+
+    polls = iter(
+        [
+            [
+                {
+                    "insertId": "late-chunk",
+                    "timestamp": "2026-11-11T00:00:05Z",
+                    "receiveTimestamp": "2026-11-11T00:00:10Z",
+                    "textPayload": "tok1:2:c:third\ntok1:3:c:fourth\n",
+                }
+            ],
+            [
+                {
+                    "insertId": "late-chunk",
+                    "timestamp": "2026-11-11T00:00:05Z",
+                    "receiveTimestamp": "2026-11-11T00:00:10Z",
+                    "textPayload": "tok1:2:c:third\ntok1:3:c:fourth\n",
+                },
+                {
+                    "insertId": "first-chunk",
+                    "timestamp": "2026-11-11T00:00:05Z",
+                    "receiveTimestamp": "2026-11-11T00:00:12Z",
+                    "textPayload": "tok1:0:c:first\n",
+                },
+            ],
+            [],
+        ]
+    )
+
+    class StubGcloud:
+        def json(self, *args):
+            return next(polls, [])
+
+    relay = LogRelay(StubGcloud(), 'log_id("batch_task_logs")', "2026-11-11T00:00:00Z", log_token="tok1")
+    states = iter(["RUNNING", "SUCCEEDED"])
+    said: list[str] = []
+    final = follow_job(
+        state=lambda: next(states, "SUCCEEDED"),
+        relay=relay.relay,
+        finished={"SUCCEEDED"},
+        poll_interval=0.0,
+        say=said.append,
+        has_pending=relay.has_pending,
+        flush=relay.flush,
+    )
+    assert final == "SUCCEEDED"
+    captured = capsys.readouterr()
+    assert captured.out == "first\nthird\nfourth\n"
+    assert any("missing sequence numbers" in line for line in said)

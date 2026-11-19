@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -95,14 +96,20 @@ class Gcloud:
 RECEIVE_LOOKBACK_SECONDS = 30
 
 
+def new_log_token() -> str:
+    """Return a per-job correlation token for sequence-tagging remote output."""
+    return secrets.token_hex(6)
+
+
 class LogRelay:
-    """Print the Cloud Logging entries of one job as they arrive.
+    """Print the Cloud Logging entries of one job in emission order.
 
     Cloud Logging is read by polling.  ``timestamp>=`` stays anchored at the job's start
     so buffered lines or entries indexed out of emission-timestamp order are never skipped,
     while ``receiveTimestamp>=`` moves forward with a lookback window and ``insertId``
-    deduplication prints each entry once.  Entries are delivered seconds late, which is why
-    callers keep reading for a moment after a job ends.
+    deduplication processes each entry once.  When ``log_token`` is provided, sequence-tagged
+    lines are reassembled by contiguous sequence number so out-of-order upload chunks wait
+    for earlier chunks rather than being written prematurely to standard output.
     """
 
     def __init__(
@@ -111,6 +118,8 @@ class LogRelay:
         log_filter: str,
         since: str,
         is_output: Callable[[dict[str, object]], bool] = lambda entry: True,
+        *,
+        log_token: str | None = None,
     ) -> None:
         self.gcloud = gcloud
         self.log_filter = log_filter
@@ -118,9 +127,40 @@ class LogRelay:
         self._since = since or "1970-01-01T00:00:00Z"
         self._latest_received: datetime | None = None
         self._seen: set[str] = set()
+        self._tag_pattern = (
+            re.compile(rf"^{re.escape(log_token)}:(\d+):([cp]):(.*)$")
+            if log_token is not None
+            else None
+        )
+        self._next_seq = 0
+        self._pending: dict[int, str] = {}
+
+    def _emit_ready(self) -> None:
+        wrote = False
+        while self._next_seq in self._pending:
+            sys.stdout.write(self._pending.pop(self._next_seq))
+            self._next_seq += 1
+            wrote = True
+        if wrote:
+            sys.stdout.flush()
+
+    def has_pending(self) -> bool:
+        """Return whether out-of-order chunks are still waiting for an earlier sequence."""
+        return bool(self._pending)
+
+    def flush(self) -> bool:
+        """Emit any remaining buffered chunks in sequence order; report if a gap existed."""
+        if not self._pending:
+            return False
+        had_gap = min(self._pending) > self._next_seq
+        for seq in sorted(self._pending):
+            sys.stdout.write(self._pending.pop(seq))
+            self._next_seq = max(self._next_seq, seq + 1)
+        sys.stdout.flush()
+        return had_gap
 
     def relay(self) -> int:
-        """Print the entries that arrived since the last call and return how many.
+        """Read newly arrived entries, print ready output in sequence, and return item count.
 
         The job's own output goes to standard output unchanged.  Anything else the
         platform logged about the job goes to standard error, so it reaches the job's log
@@ -136,15 +176,17 @@ class LogRelay:
             query,
             "--order=asc",
         )
-        printed = 0
+        received = 0
+        wrote_stdout = False
+        wrote_stderr = False
         for entry in entries if isinstance(entries, list) else []:
             if not isinstance(entry, dict):
                 continue
-            received = _parse_rfc3339(str(entry.get("receiveTimestamp") or ""))
-            if received is not None and (
-                self._latest_received is None or received > self._latest_received
+            received_at = _parse_rfc3339(str(entry.get("receiveTimestamp") or ""))
+            if received_at is not None and (
+                self._latest_received is None or received_at > self._latest_received
             ):
-                self._latest_received = received
+                self._latest_received = received_at
             identity = str(entry.get("insertId") or "")
             if identity:
                 if identity in self._seen:
@@ -157,12 +199,51 @@ class LogRelay:
                 text = json.dumps(entry["jsonPayload"], separators=(",", ":"))
             else:
                 continue
-            stream = sys.stdout if self.is_output(entry) else sys.stderr
-            stream.write(text if text.endswith("\n") else text + "\n")
-            printed += 1
-        sys.stdout.flush()
-        sys.stderr.flush()
-        return printed
+            if not self.is_output(entry):
+                sys.stderr.write(text if text.endswith("\n") else text + "\n")
+                wrote_stderr = True
+                received += 1
+                continue
+            lines = text[:-1].split("\n") if text.endswith("\n") else text.split("\n")
+            for line in lines:
+                match = self._tag_pattern.fullmatch(line) if self._tag_pattern is not None else None
+                if match is None:
+                    sys.stdout.write(line + "\n")
+                    wrote_stdout = True
+                    received += 1
+                    continue
+                seq = int(match.group(1))
+                kind = match.group(2)
+                payload = match.group(3)
+                if seq >= self._next_seq and seq not in self._pending:
+                    self._pending[seq] = payload + ("\n" if kind == "c" else "")
+                received += 1
+        if wrote_stdout:
+            sys.stdout.flush()
+        if wrote_stderr:
+            sys.stderr.flush()
+        self._emit_ready()
+        return received
+
+
+class CloudJobOutput:
+    """Shared log-token and relay lifecycle for Google Cloud overflow jobs."""
+
+    def __init__(self) -> None:
+        self.log_token = new_log_token()
+        self.output: LogRelay | None = None
+
+    def relay_output(self) -> int:
+        """Relay newly arrived Cloud Logging entries; return how many arrived."""
+        return self.output.relay() if self.output is not None else 0
+
+    def has_pending_output(self) -> bool:
+        """Say whether any sequence-tagged chunks are waiting for an earlier sequence."""
+        return self.output.has_pending() if self.output is not None else False
+
+    def flush_output(self) -> bool:
+        """Flush any remaining buffered chunks in sequence order."""
+        return self.output.flush() if self.output is not None else False
 
 
 #: Consecutive failed checks of a job's state after which contact counts as lost.
@@ -180,6 +261,8 @@ def follow_job(
     finished: Collection[str],
     poll_interval: float,
     say: Callable[[str], None],
+    has_pending: Callable[[], bool] = lambda: False,
+    flush: Callable[[], bool] = lambda: False,
 ) -> str:
     """Relay a running job's output until the job ends, and return its final state.
 
@@ -190,32 +273,36 @@ def follow_job(
     """
     current = ""
     failures = 0
-    while current not in finished:
-        time.sleep(poll_interval)
-        try:
-            observed = state()
-        except ExecutorError as error:
-            failures += 1
-            if failures >= LOST_CONTACT_CHECKS:
-                raise ExecutorError(f"lost contact with the job: {error}") from error
-            continue
-        failures = 0
-        if observed != current:
-            current = observed
-            say(f"job is {current}")
-        try:
-            relay()
-        except ExecutorError:
-            pass
-    for drain_index in range(MAX_LOG_DRAIN_READS):
-        time.sleep(poll_interval)
-        try:
-            printed = relay()
-        except ExecutorError:
-            say("some of the job's output could not be read from Cloud Logging")
-            break
-        if drain_index + 1 >= LOG_DRAIN_READS and printed == 0:
-            break
+    try:
+        while current not in finished:
+            time.sleep(poll_interval)
+            try:
+                observed = state()
+            except ExecutorError as error:
+                failures += 1
+                if failures >= LOST_CONTACT_CHECKS:
+                    raise ExecutorError(f"lost contact with the job: {error}") from error
+                continue
+            failures = 0
+            if observed != current:
+                current = observed
+                say(f"job is {current}")
+            try:
+                relay()
+            except ExecutorError:
+                pass
+        for drain_index in range(MAX_LOG_DRAIN_READS):
+            time.sleep(poll_interval)
+            try:
+                printed = relay()
+            except ExecutorError:
+                say("some of the job's output could not be read from Cloud Logging")
+                break
+            if drain_index + 1 >= LOG_DRAIN_READS and printed == 0 and not has_pending():
+                break
+    finally:
+        if flush():
+            say("remote output had missing sequence numbers; remaining lines were written in sequence order")
     return current
 
 

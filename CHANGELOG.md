@@ -5,6 +5,13 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Preserve emission order in remote overflow row logs (`overflow-gcp-batch`, `overflow-gcp-run`,
+  `overflow-ssh`). The container wrapper now merges standard error into standard output at capture
+  and, for Cloud Logging executors, tags each emitted line or chunk with a per-job monotonic
+  sequence number; `LogRelay` strips the tags, buffers out-of-order chunks until earlier sequences
+  arrive, and flushes surviving lines in sequence order so stored overflow logs match local runs.
+  #383 — remote overflow row logs can be stored out of emission order.
+
 - Verify that a submitted `agc land` head still matches the pull request's head on GitHub before
   queueing the row, retrying transient forge read errors briefly and refusing behind heads
   (`submitted-head-behind`), diverged/unpushed heads (`submitted-head-diverged`), or forge

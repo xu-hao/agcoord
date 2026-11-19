@@ -882,11 +882,17 @@ The machine is sized to the job: its CPU and memory requirements are the job's e
 above. The task carries the pool's `max_runtime` as its own maximum run duration and is never
 retried, so a lost broker cannot leave a machine running and the command never runs twice.
 
-The job's output is relayed from Cloud Logging, so it appears a few seconds late. Reads stay
-anchored at the job's creation timestamp while advancing a `receiveTimestamp` lookback window
-and deduplicating by `insertId`, so buffered lines or entries indexed out of emission-timestamp
-order are still relayed, and the executor drains several polls after the job reaches a terminal
-state before deleting it. The executor
+The job's output is relayed from Cloud Logging, so it appears a few seconds late. To preserve
+the same line-for-line order as a local row (`stdout` and `stderr` merged onto one log file), the
+container wrapper merges standard error into standard output at capture and tags each emitted line
+or chunk with a per-run token and monotonic sequence number (splitting long lines under 16 KiB).
+Reads stay anchored at the job's creation timestamp while advancing a `receiveTimestamp` lookback
+window and deduplicating by `insertId`, so buffered lines or entries indexed out of
+emission-timestamp order are still collected; `LogRelay` strips the sequence tags, holds
+out-of-order chunks until earlier sequences arrive, drains several polls after the job reaches a
+terminal state before deleting it, and flushes any remaining lines in sequence order on finish
+(reporting on standard error if a sequence gap remained). `agc overflow-ssh` also merges standard
+error into standard output inside the container before streaming. The executor
 exits with the command's status. A job stopped by Batch at the runtime limit exits 124. Any other
 failure that is Batch's rather than the command's, such as a preempted Spot machine, a job that
 could not be submitted, or an image that could not be pushed, exits 125, so the run ends without

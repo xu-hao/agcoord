@@ -74,8 +74,16 @@ def test_the_command_runs_once_as_one_cloud_run_job_sized_to_the_claim(cloud: Cl
     assert job["apiVersion"] == "run.googleapis.com/v1"
     assert job["kind"] == "Job"
     assert job["metadata"]["name"] == JOB
+    import re
+
+    from agcoord.overflow_image import container_command
+
     assert job["spec"]["template"]["spec"]["taskCount"] == 1
-    assert _task(cloud) == {
+    spec = _task(cloud)
+    token_match = re.search(r"-v t='([0-9a-f]+)'", spec["containers"][0]["args"][1])
+    assert token_match is not None
+    expected_wrapped = container_command(["python", "-m", "pytest", "-q"], log_token=token_match.group(1))
+    assert spec == {
         # Cloud Run never runs the command a second time, and stops it at the pool's limit.
         "maxRetries": 0,
         "timeoutSeconds": 900,
@@ -84,8 +92,8 @@ def test_the_command_runs_once_as_one_cloud_run_job_sized_to_the_claim(cloud: Cl
             {
                 # The job runs exactly the image that was built for it.
                 "image": JOB_IMAGE_DIGEST,
-                "command": ["/bin/sh"],
-                "args": ["-c", 'umask 0077 && exec "$@"', "agcoord", "python", "-m", "pytest", "-q"],
+                "command": [expected_wrapped[0]],
+                "args": expected_wrapped[1:],
                 "resources": {"limits": {"cpu": "4", "memory": "3072Mi"}},
             }
         ],
@@ -492,3 +500,35 @@ def test_unprivileged_overflow_env_zero_runs_normally_on_cloud_run(cloud: Cloud)
     completed = cloud.run("true", AGCOORD_OVERFLOW_PRIVILEGED="0")
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_chunked_interleaved_output_matches_local_row_emission_order(
+    cloud: Cloud, tmp_path: Path
+):
+    import sys
+
+    program = (
+        "import sys\n"
+        "print('=== HEADER: 40 entries follow ===', flush=True)\n"
+        "print('', flush=True)\n"
+        "for i in range(1, 41):\n"
+        "    stream = sys.stderr if i % 2 == 0 else sys.stdout\n"
+        "    print(f'entry {i:02d}', file=stream, flush=True)\n"
+        "print('LONG:' + 'x' * 9000, flush=True)\n"
+        "print('=== FOOTER ===', file=sys.stderr, flush=True)\n"
+    )
+    local_log = tmp_path / "local.log"
+    with local_log.open("wb") as combined:
+        subprocess.run(
+            [sys.executable, "-c", program],
+            stdout=combined,
+            stderr=combined,
+            check=True,
+        )
+    expected = local_log.read_text(encoding="utf-8")
+
+    cloud.simulate_chunked_logs(chunk_lines=10)
+    completed = cloud.run(sys.executable, "-c", program)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == expected

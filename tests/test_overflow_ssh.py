@@ -215,7 +215,7 @@ def test_the_command_runs_in_a_container_sized_to_the_claim(destination: Destina
         "agcoord-run:check-0123456789ab",
         "/bin/sh",
         "-c",
-        'umask 0077 && exec "$@"',
+        'umask 0077 && exec 2>&1 && exec "$@"',
         "agcoord",
         "python",
         "-m",
