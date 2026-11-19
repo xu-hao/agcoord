@@ -43,6 +43,7 @@ def next_of(name, default):
 
 
 PROGRESS = {progress!r}
+PRIVATE_KEY = {private_key!r}
 
 
 def fail():
@@ -133,6 +134,28 @@ elif argv[:2] == ["logging", "read"]:
     if "--order=asc" in argv:
         selected.sort(key=lambda item: stamp_key(item.get("timestamp", "")))
     print(json.dumps(selected))
+
+# --- IAM: a service account key, written where the real gcloud would write it
+elif argv[:4] == ["iam", "service-accounts", "keys", "create"]:
+    account = next(word.split("=", 1)[1] for word in argv if word.startswith("--iam-account="))
+    key_id = next_of("key-ids", ["0123456789abcdef0123456789abcdef01234567"])
+    mask = os.umask(0)
+    os.umask(mask)
+    (state / "keys-create-umask").write_text(oct(mask))
+    with open(argv[4], "w", encoding="utf-8") as key:
+        json.dump(
+            {{
+                "type": "service_account",
+                "project_id": "example-project",
+                "private_key_id": key_id,
+                "private_key": PRIVATE_KEY,
+                "client_email": account,
+            }},
+            key,
+        )
+    sys.stderr.write(
+        f"created key [{{key_id}}] of type [json] as [{{argv[4]}}] for [{{account}}]\\n"
+    )
 
 # --- Batch
 elif verb == ["batch", "jobs", "submit"]:
@@ -262,6 +285,10 @@ JOB_IMAGE = f"{REGISTRY}/run:{RUN_ID}"
 JOB_IMAGE_DIGEST = f"{REGISTRY}/run@sha256:" + "12" * 32
 TOOLCHAIN_IMAGE = f"{REGISTRY}/toolchain:" + ("ab" * 32)[:24]
 MEMORY = 3 * 1024**3
+#: The private key material of every key the fake ``gcloud`` creates.  No output may show it.
+PRIVATE_KEY = (
+    "-----BEGIN PRIVATE KEY-----\nFAKEPRIVATEKEYMATERIALNEVERPRINTED\n-----END PRIVATE KEY-----\n"
+)
 #: What the real gcloud prints on standard error while it works, even with --quiet.
 GCLOUD_PROGRESS = (
     "Creating Cloud Run job [agcoord-run]... Done.\n"
@@ -304,7 +331,10 @@ class Cloud:
         for name, body in (("gcloud", FAKE_GCLOUD), ("docker", FAKE_DOCKER)):
             path = self.bin / name
             path.write_text(
-                body.format(python=sys.executable, progress=GCLOUD_PROGRESS), encoding="utf-8"
+                body.format(
+                    python=sys.executable, progress=GCLOUD_PROGRESS, private_key=PRIVATE_KEY
+                ),
+                encoding="utf-8",
             )
             path.chmod(0o755)
         self.repository = tmp_path / "repository"

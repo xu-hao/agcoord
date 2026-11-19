@@ -44,6 +44,14 @@ from agcoord.overflow_gcp import (
     publish_job_image,
     resource_name,
 )
+from agcoord.overflow_gcp_key import (
+    CREATE_COMMAND,
+    CREDENTIALS_ENV,
+    DEFAULT_KEY,
+    KEY_OPTION,
+    create_main,
+    passed_environment,
+)
 from agcoord.overflow_image import (
     EXIT_NO_VERDICT,
     EnforcementTarget,
@@ -313,6 +321,10 @@ def _parser() -> argparse.ArgumentParser:
             "AGCoord overflow executor: run a placed job as a Google Cloud Run job "
             "that exists only for that run."
         ),
+        epilog=(
+            "To create this workstation's result-cache client key, run "
+            f"agc overflow-gcp-run {CREATE_COMMAND} --help."
+        ),
     )
     parser.add_argument("--project", required=True, help="Google Cloud project ID")
     parser.add_argument("--region", required=True, help="region of the job, such as us-central1")
@@ -341,6 +353,15 @@ def _parser() -> argparse.ArgumentParser:
         help="pass this environment variable into the container (repeatable)",
     )
     parser.add_argument(
+        KEY_OPTION,
+        metavar="PATH",
+        help=(
+            "this workstation's result-cache client key, which jobs that run on this "
+            f"machine receive as {CREDENTIALS_ENV} (default: ~/{DEFAULT_KEY}); it never "
+            "reaches a job placed here"
+        ),
+    )
+    parser.add_argument(
         "--poll-interval",
         type=float,
         default=5.0,
@@ -352,7 +373,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(arguments)
+    selected = list(sys.argv[1:] if arguments is None else arguments)
+    if selected[:1] == [CREATE_COMMAND]:
+        return create_main("overflow-gcp-run", selected[1:])
+    args = _parser().parse_args(selected)
     cleanup: list[list[str]] = []
     job: RunJob | None = None
     stop_on_signals()
@@ -371,7 +395,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         options = RunOptions(
             region=args.region,
             service_account=args.service_account,
-            passed_environment=args.env,
+            passed_environment=passed_environment(args.env, _say),
             poll_interval=max(args.poll_interval, 0.01),
         )
 

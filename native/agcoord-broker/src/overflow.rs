@@ -21,6 +21,10 @@ pub const ELIGIBLE: &str = "_AGCOORD_OVERFLOW";
 pub const CAPABILITIES_ENV: &str = "_AGCOORD_CAPABILITIES";
 /// The reserved submission entry carrying allowed runtime names as a JSON array.
 pub const RUNTIMES_ENV: &str = "_AGCOORD_RUNTIMES";
+/// The reserved submission entry carrying, as a JSON object of names to values, variables
+/// that only a run admitted on this machine receives, such as a workstation credential that
+/// must never reach another machine through a pool's executor.
+pub const LOCAL_ENVIRONMENT_ENV: &str = "_AGCOORD_LOCAL_ENVIRONMENT";
 /// Executor placement variable set to `"1"` on privileged pools and `"0"` on unprivileged pools.
 pub const OVERFLOW_PRIVILEGED_ENV: &str = "AGCOORD_OVERFLOW_PRIVILEGED";
 /// Reserved runtime name for the native host execution target.
@@ -234,6 +238,40 @@ pub fn parse_placement_constraints(
         .transpose()?
         .unwrap_or_default();
     Ok((allowed_runtimes, required_capabilities))
+}
+
+/// Read the variables a submission gives only to a run admitted on this machine.
+///
+/// Each name must be an ordinary environment name outside AGCoord's own namespaces, so the
+/// entry can neither forge admission context nor carry another reserved entry.
+pub fn parse_local_environment(
+    environment: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let Some(raw) = environment.get(LOCAL_ENVIRONMENT_ENV) else {
+        return Ok(BTreeMap::new());
+    };
+    let invalid = || {
+        AppError::new(
+            "broker-submission-invalid",
+            "local-only environment must be a JSON object of ordinary variable names to strings",
+        )
+    };
+    let value: Value = serde_json::from_str(raw).map_err(|_| invalid())?;
+    let mut selected = BTreeMap::new();
+    for (name, value) in value.as_object().ok_or_else(invalid)? {
+        let value = value.as_str().ok_or_else(invalid)?;
+        if name.is_empty()
+            || name.contains('=')
+            || name.contains('\0')
+            || value.contains('\0')
+            || name.starts_with("AGCOORD_")
+            || name.starts_with("_AGCOORD_")
+        {
+            return Err(invalid());
+        }
+        selected.insert(name.clone(), value.to_owned());
+    }
+    Ok(selected)
 }
 
 /// Probe whether admitted local jobs on this host can create an unprivileged user namespace
@@ -1070,6 +1108,49 @@ mod tests {
             assert_eq!(
                 parse_pools(Some(&json!([bad]))).unwrap_err().code,
                 "broker-config-invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_environment_accepts_only_ordinary_names_and_string_values() {
+        let submitted = |raw: &str| {
+            BTreeMap::from([
+                ("PATH".to_owned(), "/usr/bin".to_owned()),
+                (LOCAL_ENVIRONMENT_ENV.to_owned(), raw.to_owned()),
+            ])
+        };
+        assert!(
+            parse_local_environment(&BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            parse_local_environment(&submitted(
+                r#"{"GOOGLE_APPLICATION_CREDENTIALS":"/home/a/key.json"}"#
+            ))
+            .unwrap(),
+            BTreeMap::from([(
+                "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                "/home/a/key.json".to_owned()
+            )])
+        );
+        for invalid in [
+            "not json",
+            r#"["GOOGLE_APPLICATION_CREDENTIALS"]"#,
+            r#"{"GOOGLE_APPLICATION_CREDENTIALS":1}"#,
+            r#"{"":"x"}"#,
+            r#"{"A=B":"x"}"#,
+            r#"{"AGCOORD_RUN_ID":"forged"}"#,
+            r#"{"_AGCOORD_OVERFLOW":"1"}"#,
+            "{\"NAME\":\"nul\\u0000value\"}",
+        ] {
+            assert_eq!(
+                parse_local_environment(&submitted(invalid))
+                    .unwrap_err()
+                    .code,
+                "broker-submission-invalid",
+                "{invalid}"
             );
         }
     }
