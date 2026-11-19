@@ -193,7 +193,7 @@ def test_selection_admits_this_release_line_and_refuses_the_previous_one(tmp_pat
     )
     assert selected.identity.version == __version__
 
-    previous = _identity_executable(tmp_path / "previous", version="0.8.3")
+    previous = _identity_executable(tmp_path / "previous", version="0.9.5")
     with pytest.raises(NativeClientError, match="version is unsupported"):
         NativeBrokerCommand.select(
             NativeBrokerConfig(path=str(previous), allow_development=True)
