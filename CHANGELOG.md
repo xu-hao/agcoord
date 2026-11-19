@@ -17,6 +17,11 @@ versioning; dates use ISO 8601.
   adds the client account. #379 — least-privilege result-cache access and a dedicated client
   service account.
 
+- Decouple the default `preempt_after` wait (`300` seconds) from configured overflow pool
+  `wait_threshold` values so overflow waits and local check preemption timing remain independent
+  unless `preempt_after` is configured explicitly. #376 — decouple default preempt_after from
+  overflow wait_threshold.
+
 - Bound worker-identity commit contention retries in the native broker, retry transient busy
   transactions cleanly without leaking started workers, reconcile aborted post-admission runs
   immediately as `interrupted` (`worker-result-lost`), and keep `--idle-timeout` responsive under

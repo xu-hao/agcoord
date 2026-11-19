@@ -14,7 +14,6 @@
 //! is a running check that may still be preempted, or after it was preempted at least once.
 
 use crate::error::{AppError, Result};
-use crate::overflow::Pool;
 use crate::resources::initial_receipt;
 use crate::store::{RunRecord, load_run, map_database_error, now};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -34,8 +33,8 @@ pub const MAX_PREEMPTIONS: u64 = 2;
 /// How long a victim may outlive the first stop its owner delivered before the preemption
 /// is abandoned.
 pub const STOP_BOUND: Duration = Duration::from_secs(5);
-/// The shortest default wait before a row other than a land may preempt.
-const DEFAULT_AFTER_FLOOR: u64 = 300;
+/// Default wait before a row other than a land may preempt.
+const DEFAULT_AFTER: u64 = 300;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS run_preemptions (
@@ -247,17 +246,10 @@ pub fn opted_out(environment: &BTreeMap<String, String>) -> bool {
         .is_some_and(|value| value == "1")
 }
 
-/// How long a row other than a land waits by default before it may preempt: as long as the
-/// slowest overflow pool takes to accept it, and never less than five minutes.
-pub fn default_after(pools: &[Pool]) -> Duration {
-    Duration::from_secs(
-        pools
-            .iter()
-            .map(|pool| pool.wait_threshold)
-            .max()
-            .unwrap_or(0)
-            .max(DEFAULT_AFTER_FLOOR),
-    )
+/// How long a row other than a land waits by default before it may preempt,
+/// independent of any overflow pool's `wait_threshold`.
+pub fn default_after() -> Duration {
+    Duration::from_secs(DEFAULT_AFTER)
 }
 
 fn attempts_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Attempts> {
@@ -736,12 +728,11 @@ pub fn forget_cleared(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Hold, default_after, ensure_schema, failed_cancels, plan, reclaim_failed};
-    use crate::overflow::Pool;
     use crate::resources::initial_receipt;
     use crate::store::RunRecord;
     use rusqlite::Connection;
     use serde_json::json;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -789,21 +780,6 @@ mod tests {
             worker_pid: Some(1),
             worker_start_token: Some("token".to_owned()),
             cancel_requested: false,
-        }
-    }
-
-    fn pool(name: &str, wait_threshold: u64) -> Pool {
-        Pool {
-            name: name.to_owned(),
-            capacities: claim(&[("jobs", 1)]),
-            max_claim: BTreeMap::new(),
-            executor: vec!["executor".to_owned()],
-            wait_threshold,
-            max_runtime: 60,
-            budget: None,
-            cpu_hour_price: None,
-            privileged: false,
-            capabilities: BTreeSet::new(),
         }
     }
 
@@ -939,16 +915,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_wait_is_the_slowest_pool_threshold_and_never_under_five_minutes() {
-        assert_eq!(default_after(&[]), Duration::from_secs(300));
-        assert_eq!(
-            default_after(&[pool("near", 0), pool("far", 120)]),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            default_after(&[pool("near", 60), pool("far", 900)]),
-            Duration::from_secs(900)
-        );
+    fn the_default_wait_is_five_minutes() {
+        assert_eq!(default_after(), Duration::from_secs(300));
     }
 
     #[test]

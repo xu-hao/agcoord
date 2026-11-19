@@ -972,11 +972,10 @@ pub fn configured_stop_grace(paths: &Paths) -> Result<Duration> {
 }
 
 /// How long the oldest queued row that lacks only local capacity waits, counted from when
-/// it last entered the queue, before it may preempt later checks.  The default is the
-/// longest overflow `wait_threshold`, so every pool has had its chance to take the row
-/// first, and never less than five minutes.
-pub fn configured_preempt_after(paths: &Paths, pools: &[Pool]) -> Result<Duration> {
-    let default = crate::preempt::default_after(pools);
+/// it last entered the queue, before it may preempt later checks. Defaults to 300 seconds,
+/// independent of overflow pool `wait_threshold`.
+pub fn configured_preempt_after(paths: &Paths) -> Result<Duration> {
+    let default = crate::preempt::default_after();
     let path = paths.state_dir.join("config.json");
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -6450,4 +6449,65 @@ pub fn rollback(state_dir: &Path) -> Result<Value> {
     load_runs(&connection)?;
     maintenance_record(&connection)?;
     Ok(json!({"changed": true, "from_protocol": PROTOCOL, "to_protocol": 4}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn configured_preempt_after_defaults_to_300_independent_of_overflow_wait_threshold() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "agcoord-store-preempt-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        let paths = Paths::new(&state_dir);
+
+        fs::write(
+            state_dir.join("config.json"),
+            serde_json::to_string(&json!({
+                "overflow_pools": [{
+                    "name": "slow",
+                    "capacities": {"jobs": 1, "cpu": 4},
+                    "executor": ["/bin/true"],
+                    "wait_threshold": 900,
+                    "max_runtime": 60,
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            configured_preempt_after(&paths).unwrap(),
+            Duration::from_secs(300)
+        );
+
+        fs::write(
+            state_dir.join("config.json"),
+            serde_json::to_string(&json!({
+                "preempt_after": 45,
+                "overflow_pools": [{
+                    "name": "slow",
+                    "capacities": {"jobs": 1, "cpu": 4},
+                    "executor": ["/bin/true"],
+                    "wait_threshold": 900,
+                    "max_runtime": 60,
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            configured_preempt_after(&paths).unwrap(),
+            Duration::from_secs(45)
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
 }
