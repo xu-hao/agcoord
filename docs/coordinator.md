@@ -575,10 +575,10 @@ row's `resource_contract`, which gives each claim's kind and unit), and
 unprivileged pool; unset on `local` runs). Variables a submission reserves for a run on this
 machine, such as the workstation key described under [GCP result cache](#gcp-result-cache), are
 added only to a job admitted locally and never reach a placed job's executor. The executor runs
-the command on the pool's machine, relays its output, and exits with its status; that exit status, the log,
-and cancellation are those of any other worker, so stopping the job signals the executor's
-process group and the executor must stop the remote run. An executor that cannot obtain a
-verdict at all, for example because the connection was lost or the remote machine was
+the command on the pool's machine, relays its output, and exits with its status; that exit
+status, the log, and cancellation are those of any other worker, so stopping the job signals the
+executor's process group and the executor must stop the remote run. An executor that cannot
+obtain a verdict at all, for example because the connection was lost or the remote machine was
 preempted, exits with status 125. The job then ends `interrupted` with
 `failure_reason=overflow-executor-failed` rather than `failed`, and for a `land` nothing is
 published and no gate verdict is claimed. A `land` keeps its local worker for preflight
@@ -938,11 +938,11 @@ row end the run without a verdict.
 
 `agc overflow-gcp-run` runs a placed job as a Cloud Run job that exists only for that run. It
 takes the same project, region, registry, and service account as the Batch executor, and the
-same `--env` and `--result-cache-key` options, which never pass
-`GOOGLE_APPLICATION_CREDENTIALS` into the job either. It is
-not faster to start: measured once in `us-central1`, a job's first output arrived 89 seconds
-after the executor started, against 81 seconds on Batch. What it offers is no machine to manage,
-at the cost of being smaller and limiting less:
+same `--env` and `--result-cache-key` options; `--env` never passes
+`GOOGLE_APPLICATION_CREDENTIALS` into the job here either. It is not faster to start: measured
+once in `us-central1`, a job's first output arrived 89 seconds after the executor started,
+against 81 seconds on Batch. What it offers is no machine to manage, at the cost of being smaller
+and limiting less:
 
 ```json
 {
