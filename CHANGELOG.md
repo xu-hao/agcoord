@@ -15,6 +15,12 @@ versioning; dates use ISO 8601.
   (`agc host upgrade --download`) together. #387 — cut and publish the coupled AGCoord 0.10.0
   release.
 
+- Route admitted-callback spool inspection (`_inspect(admitted_callback=True)`) through
+  `select_for_admitted_callback` so callbacks inside the restricted `agcoord-admitted` user
+  namespace attest `/usr/libexec/agcoord/agcoord-broker` cleanly instead of refusing the host
+  `overflowuid` view of `root`. #390 — route admitted-callback spool inspection through
+  select_for_admitted_callback.
+
 - Preserve emission order in remote overflow row logs (`overflow-gcp-batch`, `overflow-gcp-run`,
   `overflow-ssh`). The container wrapper now merges standard error into standard output at capture
   and, for Cloud Logging executors, tags each emitted line or chunk with a per-job monotonic

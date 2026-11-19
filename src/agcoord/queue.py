@@ -1257,7 +1257,7 @@ class CoordinatorClient:
                 "callback run does not match the admitted AGCoord context"
             )
 
-    def _inspect(self) -> dict[str, Any]:
+    def _inspect(self, *, admitted_callback: bool = False) -> dict[str, Any]:
         """Ask the broker what it owns: the generation, the live owner, and any drain.
 
         The spool belongs to the broker. A client that read it directly would need a second
@@ -1265,7 +1265,11 @@ class CoordinatorClient:
         contention or a generation this release does not own.
         """
         try:
-            result = self._native_invoke("inspect")
+            result = (
+                self._native_callback_invoke("inspect")
+                if admitted_callback
+                else self._native_invoke("inspect")
+            )
         except CoordinatorError as exc:
             if exc.code == "broker-protocol-unsupported":
                 raise _pre_native_spool_refusal(exc) from exc
@@ -1324,7 +1328,7 @@ class CoordinatorClient:
         maintenance: dict[str, Any] | None = None
         while True:
             try:
-                spool = self._inspect()
+                spool = self._inspect(admitted_callback=admitted_callback)
             except CoordinatorError as exc:
                 # A state directory holds no spool until its first broker creates one, so
                 # an absent spool is the ordinary state autostart exists to resolve rather
