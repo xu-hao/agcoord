@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.1 — 2026-11-20
+
+- Publish the coupled AGCoord `0.10.1` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases, enabling automated
+  `agc host upgrade --download` from `0.9.x` hosts to `0.10.x`. Upgrade the client
+  (`pip install --upgrade agcoord==0.10.1`) and then the broker (`agc host upgrade --download`).
+  #399 — cut and publish the coupled AGCoord 0.10.1 release.
+
 - Allow `host_maintenance` `drain`, `drain-status`, and `resume` invocations (used by
   `agc host upgrade`) to proceed when an outgoing pre-`0.10.0` broker rejects `inspect` with
   `broker-command-invalid`, while still translating `broker-protocol-unsupported` refusals and
