@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Allow `host_maintenance` `drain`, `drain-status`, and `resume` invocations (used by
+  `agc host upgrade`) to proceed when an outgoing pre-`0.10.0` broker rejects `inspect` with
+  `broker-command-invalid`, while still translating `broker-protocol-unsupported` refusals and
+  failing closed for ordinary clients. #397 — fix `agc host upgrade` against outgoing `0.9.x`
+  brokers.
+
 ## 0.10.0 — 2026-11-20
 
 - Publish the coupled AGCoord `0.10.0` PyPI distribution and native

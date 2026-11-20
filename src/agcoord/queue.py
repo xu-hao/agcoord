@@ -1315,12 +1315,33 @@ class CoordinatorClient:
             raise CoordinatorError("native broker returned an invalid spool inspection")
         return result
 
+    def _maintenance_invoke(self, command: str, arguments: Sequence[str] = ()) -> Any:
+        """Run one maintenance command, tolerating pre-0.10 outgoing brokers without ``inspect``."""
+        try:
+            self._inspect()
+        except CoordinatorError as exc:
+            if not (self.host_maintenance and exc.code == "broker-command-invalid"):
+                raise
+        try:
+            return self._native_invoke(command, arguments)
+        except CoordinatorError as exc:
+            if exc.code == "broker-protocol-unsupported":
+                raise _pre_native_spool_refusal(exc) from exc
+            raise
+
     def _maintenance_if_active(self) -> dict[str, Any] | None:
         try:
             spool = self._inspect()
         except CoordinatorError as exc:
             if exc.code == "broker-state-missing":
                 return None
+            if self.host_maintenance and exc.code == "broker-command-invalid":
+                try:
+                    return self.drain_status()
+                except CoordinatorError as status_exc:
+                    if status_exc.code in {"broker-not-draining", "broker-state-missing"}:
+                        return None
+                    raise
             raise
         maintenance = spool.get("maintenance")
         if maintenance is None:
@@ -2075,9 +2096,8 @@ class CoordinatorClient:
             raise CoordinatorError("maintenance wait must be boolean")
         if poll_interval <= 0:
             raise CoordinatorError("maintenance poll interval must be positive")
-        self._inspect()
         drain_id = f"drain-{uuid4().hex[:12]}"
-        result = self._native_invoke(
+        result = self._maintenance_invoke(
             "drain",
             ("--drain-id", drain_id, "--reason", reason.strip()),
         )
@@ -2100,15 +2120,13 @@ class CoordinatorClient:
 
     def drain_status(self) -> dict[str, Any]:
         """Return the validated durable drain status without starting a broker."""
-        self._inspect()
-        return _validated_maintenance_receipt(self._native_invoke("drain-status"))
+        return _validated_maintenance_receipt(self._maintenance_invoke("drain-status"))
 
     def resume(self, drain_id: str) -> dict[str, Any]:
         """Remove one exact draining or drained guard."""
         if not isinstance(drain_id, str) or not _DRAIN_ID.fullmatch(drain_id):
             raise CoordinatorError("maintenance drain ID is invalid")
-        self._inspect()
-        result = self._native_invoke(
+        result = self._maintenance_invoke(
             "resume",
             ("--drain-id", drain_id),
         )
