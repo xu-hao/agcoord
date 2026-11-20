@@ -1097,3 +1097,82 @@ def test_native_client_falls_back_when_socket_closes_before_reply_on_readonly_co
             selected.invoke("cancel", state_dir=state_dir, arguments=("--run-id", "run-1"))
     finally:
         thread.join(timeout=2)
+
+
+def test_host_maintenance_drain_tolerates_pre_inspect_outgoing_broker(tmp_path: Path):
+    from agcoord.queue import CoordinatorClient, CoordinatorError
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    identity = json.dumps(
+        {
+            "name": "agcoord-broker",
+            "version": "0.9.5",
+            "protocol": 5,
+            "implementation": "rust-native",
+            "build": "development",
+            "target": "x86_64-unknown-linux-gnu",
+            "sqlite": "3.53.2",
+        },
+        separators=(",", ":"),
+    )
+    drain_id_file = tmp_path / "drain_id.txt"
+    broker = tmp_path / "outgoing-0.9.5-broker"
+    broker.write_text(
+        "#!/bin/sh\n"
+        "cmd=\"$1\"; shift\n"
+        "if [ \"$cmd\" = identity ]; then\n"
+        f"  printf '%s\\n' '{identity}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$cmd\" = inspect ]; then\n"
+        "  printf '{\"code\":\"broker-command-invalid\",\"message\":\"unknown command: inspect\"}\\n' >&2\n"
+        "  exit 2\n"
+        "fi\n"
+        "if [ \"$cmd\" = drain ]; then\n"
+        "  drain_id=''\n"
+        "  while [ \"$#\" -gt 0 ]; do\n"
+        "    if [ \"$1\" = --drain-id ]; then drain_id=\"$2\"; shift 2; else shift; fi\n"
+        "  done\n"
+        f"  printf '%s' \"$drain_id\" > '{drain_id_file}'\n"
+        "  printf '{\"protocol\":5,\"state\":\"draining\",\"drain_id\":\"%s\",\"reason\":\"upgrade\",\"started_at\":\"2026-11-20T00:00:00Z\",\"live\":1,\"broker_pid\":1234}\\n' \"$drain_id\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$cmd\" = drain-status ]; then\n"
+        f"  drain_id=$(cat '{drain_id_file}')\n"
+        "  printf '{\"protocol\":5,\"state\":\"drained\",\"drain_id\":\"%s\",\"reason\":\"upgrade\",\"started_at\":\"2026-11-20T00:00:00Z\",\"live\":0,\"broker_pid\":null}\\n' \"$drain_id\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$cmd\" = resume ]; then\n"
+        f"  drain_id=$(cat '{drain_id_file}')\n"
+        "  printf '{\"state\":\"open\",\"drain_id\":\"%s\",\"resumed\":true}\\n' \"$drain_id\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    broker.chmod(0o755)
+    (state_dir / "config.json").write_text(
+        json.dumps({"native_broker": {"path": str(broker), "allow_development": True}}),
+        encoding="utf-8",
+    )
+
+    maintenance = CoordinatorClient(
+        state_dir=state_dir,
+        autostart=False,
+        host_maintenance=True,
+    )
+    receipt = maintenance.drain(reason="native host upgrade to 0.10.0", wait=True, poll_interval=0.01)
+    assert receipt["state"] == "drained"
+    assert receipt["live"] == 0
+    assert maintenance.drain_status()["drain_id"] == receipt["drain_id"]
+    assert maintenance.resume(receipt["drain_id"]) == {
+        "state": "open",
+        "drain_id": receipt["drain_id"],
+        "resumed": True,
+    }
+
+    # Ordinary (non-host-maintenance) clients still refuse an unsupported broker version.
+    ordinary = CoordinatorClient(state_dir=state_dir, autostart=False, host_maintenance=False)
+    with pytest.raises(CoordinatorError, match="version is unsupported"):
+        ordinary.drain(wait=False)
