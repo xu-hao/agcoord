@@ -5,6 +5,16 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.0 — 2026-11-20
+
+- Publish the coupled AGCoord `0.10.0` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases. Advancing the client/broker
+  compatibility line to `0.10.x` carries the broker-private gate spool (`inspect`), the owner-only
+  Unix socket client-wire protocol (`broker.sock`, `wire: 1`), and everything recorded since
+  `0.9.5`. Upgrade the client (`pip install agcoord==0.10.0`) and the broker
+  (`agc host upgrade --download`) together. #387 — cut and publish the coupled AGCoord 0.10.0
+  release.
+
 - Set up a workstation's GCP result-cache client key with one command and give it to local jobs
   automatically. `agc overflow-gcp-batch create-result-cache-key --project PROJECT --iam-account
   EMAIL` (also under `overflow-gcp-run`) creates the key through the operator's `gcloud` at
@@ -20,21 +30,11 @@ versioning; dates use ISO 8601.
   of a job's container even when an executor lists it with `--env`. #388 — automate workstation
   result-cache client key setup and local-job credential injection.
 
-## 0.10.0 — 2026-11-19
-
 - Drain queued `broker.sock` accept-backlog connections after unlinking the socket on broker
   shutdown (`SocketListener::drain_and_close`), and fall back cleanly to subprocess execution when
   an initial socket write fails before transmission or a closing broker resets a read-only command.
   #393 — drain queued broker socket connections on shutdown and fall back on read-only socket
   reset.
-
-- Publish the coupled AGCoord `0.10.0` PyPI distribution and native
-  `x86_64-unknown-linux-musl` host bundle on GitHub Releases. Advancing the client/broker
-  compatibility line to `0.10.x` carries the broker-private gate spool (`inspect`), the owner-only
-  Unix socket client-wire protocol (`broker.sock`, `wire: 1`), and everything recorded since
-  `0.9.5`. Upgrade the client (`pip install agcoord==0.10.0`) and the broker
-  (`agc host upgrade --download`) together. #387 — cut and publish the coupled AGCoord 0.10.0
-  release.
 
 - Route admitted-callback spool inspection (`_inspect(admitted_callback=True)`) through
   `select_for_admitted_callback` so callbacks inside the restricted `agcoord-admitted` user
