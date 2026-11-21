@@ -106,6 +106,152 @@ the retained Linux error number. A later worker-side refusal is normalized to th
 distinguish a kernel namespace refusal from an AppArmor denial. Controller metrics accept the
 kernel's dotted field names, including Linux 6.17's `core_sched.force_idle_usec` CPU statistic.
 
+### Updating configuration and overflow pools on a live host
+
+A live broker freezes `capacities`, `bindings`, `capabilities`, and `overflow_pools` when it
+acquires the spool, so edits to `${XDG_STATE_HOME:-~/.local/state}/agcoord/config.json` take
+effect only when a new broker starts.
+
+`agc host config` synthesizes only local host `capacities`, `bindings`, `cgroup_root`, and
+`native_broker` for initial setup. It refuses to replace an existing `config.json` without
+`--force`, and running `agc host config --write --force` overwrites the file with local-only
+settings rather than merging—discarding any configured `overflow_pools`, `capabilities`, or custom
+capacities and timeouts. Conversely, `agc host upgrade` validates and preserves `config.json`
+(including `overflow_pools`) in place without regenerating it. Day-2 changes—such as adding a pool
+or updating a pool's capacities, `max_claim`, `budget`, or `"privileged": true`—therefore modify
+the existing owner-only `config.json` in place across a maintenance drain.
+
+When wiring a [Google Cloud overflow project](coordinator.md#gcp-project-for-overflow-executors)
+managed from an operator root such as `~/.config/agcoord/gcp-overflow`, map the module outputs from
+`terraform -chdir=~/.config/agcoord/gcp-overflow output -json overflow` and raw integer resource
+units into an [overflow pool](coordinator.md#overflow-pools) entry:
+
+- `project_id` → `--project`, `region` → `--region`, `registry` → `--registry`, and
+  `runner_service_account` → `--service-account` in the pool's `executor` argv;
+- `capacities` and optional `max_claim` use raw positive integers (`jobs`, logical `cpu`, `memory`
+  and `tmpfs` in exact bytes, and `tmpfs_inodes` in inodes). Every resource a placed job claims must
+  appear in the pool's `capacities`, and each `max_claim` entry must be no larger than the pool's
+  capacity for that resource;
+- `"privileged": true` marks the pool's containers as privileged (supported by `agc overflow-ssh`
+  and `agc overflow-gcp-batch`, refused by `agc overflow-gcp-run`) and automatically implies the
+  `"userns"` capability without listing `"userns"` manually in `capabilities`;
+- optional `budget` sets `cpu_hours_per_day` and `rollover_utc` (`"HH:MM"` in UTC, default
+  `"00:00"`).
+
+Use the following sequence on a live managed host to preserve in-flight work and owner-only `0600`
+permissions:
+
+1. **Drain active work cleanly and record `drain_id`.** `drain` closes new submissions
+   (`broker-draining`), waits for accepted queued and running rows to finish normally without
+   cancelling them, and commits `state: "drained"` once `live` reaches `0`. At `drained`, the
+   outgoing managed broker yields `broker.lock` and exits cleanly (`Restart=on-failure` keeps the
+   service stopped while drained):
+
+   ```bash
+   drain_json=$(agc --json drain --reason "update broker configuration")
+   drain_id=$(jq -er 'select(.state == "drained" and .live == 0) | .drain_id' <<<"$drain_json")
+   ```
+
+2. **Back up `config.json` (`0600`) and write the updated JSON atomically.** Under `umask 077`,
+   save a mode-`0600` backup, merge or upsert the pool entry into a sibling temporary file beside
+   `config.json` while preserving `bindings`, `capacities`, `cgroup_root`, and `native_broker`,
+   validate the output, and `mv` it into place:
+
+   ```bash
+   (
+     set -euo pipefail
+     umask 077
+     state=${XDG_STATE_HOME:-$HOME/.local/state}/agcoord
+     tf_json=$(terraform -chdir="$HOME/.config/agcoord/gcp-overflow" output -json overflow)
+     cp -p "$state/config.json" "$state/config.json.bak"
+     chmod 0600 "$state/config.json.bak"
+     jq --argjson tf "$tf_json" '
+       ({
+         name: "gcp-batch",
+         capacities: {
+           jobs: 4,
+           cpu: 64,
+           memory: 274877906944,
+           tmpfs: 34359738368,
+           tmpfs_inodes: 4194304
+         },
+         max_claim: {
+           cpu: 32,
+           memory: 137438953472
+         },
+         executor: [
+           "agc", "overflow-gcp-batch",
+           "--project", $tf.project_id,
+           "--region", $tf.region,
+           "--registry", $tf.registry,
+           "--service-account", $tf.runner_service_account
+         ],
+         wait_threshold: 300,
+         max_runtime: 3600,
+         privileged: true,
+         budget: {
+           cpu_hours_per_day: 100,
+           rollover_utc: "00:00"
+         }
+       }) as $pool
+       | .overflow_pools = (
+           ((.overflow_pools // []) | map(select(.name != $pool.name))) + [$pool]
+         )
+     ' "$state/config.json" >"$state/config.json.tmp"
+     chmod 0600 "$state/config.json.tmp"
+     mv -f "$state/config.json.tmp" "$state/config.json"
+   )
+   ```
+
+   While the spool is still `drained`, `agc --json list` invokes `snapshot` directly against
+   `config.json` without starting a broker, validating both top-level sections and `overflow_pools`
+   before submissions reopen:
+
+   ```bash
+   agc --json list | jq '{maintenance, overflow_pools}'
+   ```
+
+3. **Reopen the drain guard and restart `agcoord-broker.service`.** A `drained` spool refuses
+   `agcoord-broker serve` with `broker-drained` until resumed, and `agc resume` on a `drained`
+   marker requires `broker.lock` to be unowned (`broker-resume-owner-live`), so clear the drain
+   marker first and then restart the managed user service to adopt the updated `config.json`:
+
+   ```bash
+   agc resume "$drain_id"
+   systemctl --user restart agcoord-broker.service
+   ```
+
+4. **Verify startup and active `overflow_pools` via `agc --json list`.** Confirm that a live owner
+   holds the spool (`broker_pid` is non-null, `maintenance` is `null`) and publishes the expected
+   pool capacities, budget, and implied `"userns"` capability:
+
+   ```bash
+   agc --json list | jq -e '
+     .broker_pid != null
+     and .maintenance == null
+     and (.overflow_pools | any(.name == "gcp-batch" and .privileged == true))
+   '
+   ```
+
+   If validation or `agcoord-broker.service` startup fails with `broker-config-invalid` or
+   `host-config-invalid` (inspect standard error, `journalctl --user -u agcoord-broker.service`, or
+   `${XDG_STATE_HOME:-~/.local/state}/agcoord/broker.log`), restore the `0600` backup atomically and
+   restart the service (running `agc resume "$drain_id"` first if the failure occurred before step 3
+   reopened the drain):
+
+   ```bash
+   (
+     set -euo pipefail
+     umask 077
+     state=${XDG_STATE_HOME:-$HOME/.local/state}/agcoord
+     cp -p "$state/config.json.bak" "$state/config.json.tmp"
+     chmod 0600 "$state/config.json.tmp"
+     mv -f "$state/config.json.tmp" "$state/config.json"
+   )
+   systemctl --user restart agcoord-broker.service
+   agc --json list | jq '{broker_pid, maintenance, overflow_pools}'
+   ```
+
 ## First install
 
 Install the exact matching Python client first, then let the client fetch its own bundle:
@@ -430,7 +576,10 @@ accepted work to zero through the installed outgoing broker's own identity, reta
 refreshes `sudo` authorization, stops the service, activates only against that drain, reloads,
 resumes the same ID, restarts, verifies the installed identity, waits for the restarted broker to
 own the spool, and runs the enforced-host proof. It refuses to run from an admitted job or against
-a nondefault, unsafe, fresh, or pre-protocol-5 spool. A failure before activation leaves the live
+a nondefault, unsafe, fresh, or pre-protocol-5 spool, and it validates and preserves the existing
+`config.json` (including `overflow_pools`) in place without regenerating it; see
+[updating configuration and overflow pools on a live host](#updating-configuration-and-overflow-pools-on-a-live-host)
+for day-2 configuration edits. A failure before activation leaves the live
 host unchanged; a failure after stop reports the exact drain ID and leaves the service stopped
 and coordinator drained unless the resume step had already succeeded.
 
