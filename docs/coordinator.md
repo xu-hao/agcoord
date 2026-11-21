@@ -527,7 +527,10 @@ capability names following the resource-name rules (as is top-level `"capabiliti
 the `HH:MM` UTC time at which a new budget day begins, default `00:00`. `cpu_hour_price` is an
 optional non-negative number that clients may use to display an estimated cost; the broker never
 enforces anything with it. Both `local` runtime metadata and pool metadata are published in the
-broker's ownership handshake. An invalid capability list or pool is `broker-config-invalid`.
+broker's ownership handshake. An invalid capability list or pool is `broker-config-invalid`. To add
+or update `overflow_pools` on an already-running managed host without disrupting active work or
+overwriting existing pools with `agc host config --write --force`, follow
+[updating configuration and overflow pools on a live host](native_host.md#updating-configuration-and-overflow-pools-on-a-live-host).
 
 A job submitted with `agc run`, `agc full`, or `agc land` is eligible for overflow by default
 when its checkout contains `.agcoord/overflow.json`. Pass `--no-overflow` to keep a job on this
@@ -754,7 +757,9 @@ state, like the broker's `config.json`: keep them in that root, never in a repos
 provider reads application default credentials, or a short-lived token from
 `GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token)"`. To adopt a project that already
 exists, `terraform import` it, and any repository or enabled API it already has, before the
-first apply.
+first apply. For mapping `terraform -chdir=~/.config/agcoord/gcp-overflow output -json overflow`
+and raw byte capacities into `~/.local/state/agcoord/config.json` on a running managed host, see
+[updating configuration and overflow pools on a live host](native_host.md#updating-configuration-and-overflow-pools-on-a-live-host).
 
 #### GCP result cache
 
