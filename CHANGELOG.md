@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.3 — 2026-11-22
+
+- Publish the coupled AGCoord `0.10.3` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases, shipping gate-tree removal
+  permission restoration and torn-entry recovery. Upgrade the client
+  (`pip install --upgrade agcoord==0.10.3`) and then the broker
+  (`agc host upgrade --download`). #411 — prepare, gate, and publish AGCoord 0.10.3.
+
 - Restore owner `0700` permissions on non-symlink directories before removing gate trees, remove
   `checkout/` before `owner.json` in `GateTree::remove`, and clean unprotected torn gate-tree
   entries missing `owner.json` during `GateTree::prepare` so read-only cached directories left by
