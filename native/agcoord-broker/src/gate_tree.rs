@@ -6,7 +6,7 @@ use crate::platform::prepare_private_directory;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -72,6 +72,36 @@ fn disk_bytes(path: &Path) -> Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+fn make_directories_writable(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failure(error.to_string())),
+    };
+    if !metadata.file_type().is_dir() {
+        return Ok(());
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))
+            .map_err(|error| failure(error.to_string()))?;
+    }
+    for entry in fs::read_dir(path).map_err(|error| failure(error.to_string()))? {
+        let entry = entry.map_err(|error| failure(error.to_string()))?;
+        make_directories_writable(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn remove_dir_all_writable(path: &Path) -> Result<()> {
+    make_directories_writable(path)?;
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failure(error.to_string())),
+    }
 }
 
 impl GateTree {
@@ -146,9 +176,12 @@ impl GateTree {
             }
             let tree = path.join("checkout");
             let metadata_path = path.join("owner.json");
-            if !metadata_path.exists() && !tree.exists() {
-                // A launcher may have died between mkdir and writing its ownership.
-                fs::remove_dir_all(&path).map_err(|error| failure(error.to_string()))?;
+            if !metadata_path.exists() {
+                if !protected.contains(&tree) || tree == self.checkout {
+                    // A launcher may have died between mkdir and writing its ownership, or an
+                    // earlier removal may have unlinked owner.json before failing on checkout/.
+                    remove_dir_all_writable(&path)?;
+                }
                 continue;
             }
             let record: Value = serde_json::from_slice(
@@ -235,6 +268,9 @@ impl GateTree {
         )
         .map_err(|error| failure(error.to_string()))?;
         if !self.checkout.join(".git").is_file() {
+            if self.checkout.exists() {
+                make_directories_writable(&self.checkout)?;
+            }
             // Only this spool's exact path is pruned, never another contributor's tree.
             let _ = git(
                 &self.source,
@@ -247,7 +283,7 @@ impl GateTree {
                 ],
             );
             if self.checkout.exists() {
-                fs::remove_dir_all(&self.checkout).map_err(|error| failure(error.to_string()))?;
+                remove_dir_all_writable(&self.checkout)?;
             }
             git(
                 &self.source,
@@ -297,6 +333,7 @@ impl GateTree {
 
     fn remove(directory: &Path, common: &Path) -> Result<()> {
         let tree = directory.join("checkout");
+        make_directories_writable(&tree)?;
         if common.is_dir() {
             let registered = git(common, &["worktree", "list", "--porcelain"])?;
             if registered
@@ -315,7 +352,10 @@ impl GateTree {
                 )?;
             }
         }
-        fs::remove_dir_all(directory).map_err(|error| failure(error.to_string()))
+        if fs::symlink_metadata(&tree).is_ok() {
+            remove_dir_all_writable(&tree)?;
+        }
+        remove_dir_all_writable(directory)
     }
 }
 
@@ -323,29 +363,47 @@ impl GateTree {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct Directory(PathBuf);
     impl Drop for Directory {
         fn drop(&mut self) {
+            fn unlock(path: &Path) {
+                let Ok(metadata) = fs::symlink_metadata(path) else {
+                    return;
+                };
+                if !metadata.file_type().is_dir() {
+                    return;
+                }
+                let _ = fs::set_permissions(
+                    path,
+                    fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+                );
+                if let Ok(entries) = fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        unlock(&entry.path());
+                    }
+                }
+            }
+            unlock(&self.0);
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
-    #[test]
-    fn disk_budget_refuses_materialization_without_touching_source() {
+    fn init_source_and_state(prefix: &str, branch: &str) -> (Directory, PathBuf, PathBuf, String) {
         let root = Directory(std::env::temp_dir().join(format!(
-                "agcoord-gate-budget-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )));
+            "agcoord-{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
         let source = root.0.join("source");
         fs::create_dir_all(&source).unwrap();
         for args in [
-            vec!["init", "-q", "-b", "ticket"],
+            vec!["init", "-q", "-b", branch],
             vec![
                 "-c",
                 "user.name=Test",
@@ -368,6 +426,12 @@ mod tests {
         )
         .unwrap();
         fs::write(state.join("gate-reservations.json"), "[]").unwrap();
+        (root, source, state, head)
+    }
+
+    #[test]
+    fn disk_budget_refuses_materialization_without_touching_source() {
+        let (_root, source, state, head) = init_source_and_state("gate-budget", "ticket");
         let tree = GateTree {
             source: source.clone(),
             checkout: GateTree::path(&state, "repo", "ticket"),
@@ -383,5 +447,137 @@ mod tests {
                 .unwrap()
                 .contains(tree.checkout.to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn prunes_gone_branch_tree_with_readonly_dirs_without_following_symlinks() {
+        let (root, source, state, head) = init_source_and_state("gate-prune-ro", "gone-branch");
+        let gone_tree = GateTree {
+            source: source.clone(),
+            checkout: GateTree::path(&state, "repo", "gone-branch"),
+            branch: "gone-branch".into(),
+            head: head.clone(),
+        };
+        gone_tree.prepare_bounded(16, MAX_BYTES).unwrap();
+
+        let frozen_parent = gone_tree.checkout.join(".pytest-telescope/frozen");
+        let frozen_nested = frozen_parent.join("nested");
+        fs::create_dir_all(&frozen_nested).unwrap();
+        let frozen_file = frozen_nested.join("tool.py");
+        fs::write(&frozen_file, "frozen\n").unwrap();
+        fs::set_permissions(&frozen_file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let external_dir = root.0.join("external-readonly");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external_file = external_dir.join("preserve.txt");
+        fs::write(&external_file, "untouched\n").unwrap();
+        fs::set_permissions(&external_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&external_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        symlink(&external_dir, frozen_parent.join("external-link")).unwrap();
+        fs::set_permissions(&frozen_nested, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&frozen_parent, fs::Permissions::from_mode(0o555)).unwrap();
+
+        git(&source, &["checkout", "-q", "-b", "active"]).unwrap();
+        git(&source, &["branch", "-D", "gone-branch"]).unwrap();
+
+        let active_tree = GateTree {
+            source: source.clone(),
+            checkout: GateTree::path(&state, "repo", "active"),
+            branch: "active".into(),
+            head,
+        };
+        active_tree.prepare_bounded(16, MAX_BYTES).unwrap();
+
+        assert!(!gone_tree.checkout.parent().unwrap().exists());
+        assert!(
+            !git(&source, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains(gone_tree.checkout.to_str().unwrap())
+        );
+        assert!(active_tree.checkout.exists());
+        assert_eq!(
+            fs::symlink_metadata(&external_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        assert_eq!(fs::read_to_string(&external_file).unwrap(), "untouched\n");
+    }
+
+    #[test]
+    fn evicts_lru_idle_tree_with_readonly_subdirectory() {
+        let (_root, source, state, head) = init_source_and_state("gate-evict-ro", "first");
+        git(&source, &["branch", "second"]).unwrap();
+
+        let first_tree = GateTree {
+            source: source.clone(),
+            checkout: GateTree::path(&state, "repo", "first"),
+            branch: "first".into(),
+            head: head.clone(),
+        };
+        first_tree.prepare_bounded(1, MAX_BYTES).unwrap();
+
+        let readonly_dir = first_tree.checkout.join(".pytest-telescope/readonly");
+        fs::create_dir_all(&readonly_dir).unwrap();
+        let readonly_file = readonly_dir.join("cached.bin");
+        fs::write(&readonly_file, "cached\n").unwrap();
+        fs::set_permissions(&readonly_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let second_tree = GateTree {
+            source: source.clone(),
+            checkout: GateTree::path(&state, "repo", "second"),
+            branch: "second".into(),
+            head,
+        };
+        second_tree.prepare_bounded(1, MAX_BYTES).unwrap();
+
+        assert!(!first_tree.checkout.parent().unwrap().exists());
+        assert!(
+            !git(&source, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains(first_tree.checkout.to_str().unwrap())
+        );
+        assert!(second_tree.checkout.exists());
+    }
+
+    #[test]
+    fn recovers_unprotected_torn_entry_missing_owner_metadata() {
+        let (_root, source, state, head) = init_source_and_state("gate-torn-ro", "ticket");
+        let torn = state.join("gate-trees").join("torn-entry");
+        let torn_readonly = torn.join("checkout/.pytest-telescope/frozen");
+        fs::create_dir_all(&torn_readonly).unwrap();
+        let torn_file = torn_readonly.join("tool");
+        fs::write(&torn_file, "stale\n").unwrap();
+        fs::set_permissions(&torn_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&torn_readonly, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let tree = GateTree {
+            source: source.clone(),
+            checkout: GateTree::path(&state, "repo", "ticket"),
+            branch: "ticket".into(),
+            head,
+        };
+        let self_incomplete = tree.checkout.join(".pytest-telescope/incomplete");
+        fs::create_dir_all(&self_incomplete).unwrap();
+        fs::write(
+            tree.checkout.parent().unwrap().join("owner.json"),
+            serde_json::to_vec(&json!({
+                "common": git(&source, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).unwrap(),
+                "branch": "ticket"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&self_incomplete, fs::Permissions::from_mode(0o555)).unwrap();
+
+        tree.prepare_bounded(16, MAX_BYTES).unwrap();
+
+        assert!(!torn.exists());
+        assert!(tree.checkout.exists());
+        assert!(tree.checkout.join(".git").is_file());
     }
 }
