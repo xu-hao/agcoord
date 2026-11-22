@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.2 — 2026-11-22
+
+- Publish the coupled AGCoord `0.10.2` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases, shipping bounded snapshot indexing,
+  consolidated client preflights, and non-contending `agc log` / `agc tui` log views. Upgrade the
+  client (`pip install --upgrade agcoord==0.10.2`) and then the broker
+  (`agc host upgrade --download`). #405 — cut and publish the coupled AGCoord 0.10.2 release.
+
 - Keep `snapshot`, `agc list`, `agc log`, and `agc tui` log views (`l`) fast as retained
   terminal history grows. `store::snapshot` now indexes terminal snapshot ordering and filter
   facets so it decodes only live rows and the bounded `recent` slice instead of deserializing
