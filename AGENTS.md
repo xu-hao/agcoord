@@ -6,8 +6,10 @@ procedures listed in [docs/index.md](docs/index.md).
 - Keep the core coordinator forge-neutral. Forge-specific metadata and publication
   behavior belong in optional adapters.
 - Tests own and stop every broker, worker, repository, and temporary state they create.
-  Set `AGCOORD_TEST_NATIVE_BROKER=/usr/libexec/agcoord/agcoord-broker` when reusing an
-  unchanged host broker binary to skip rebuilding Rust in pure-Python checks.
+  Set `AGCOORD_TEST_NATIVE_BROKER` to an absolute prebuilt debug `agcoord-broker`
+  binary (`cargo build --locked -p agcoord-broker`) to skip rebuilding Rust in
+  pure-Python checks; release binaries such as `/usr/libexec/agcoord/agcoord-broker`
+  omit `cfg!(debug_assertions)` test flags like `--local-userns`.
 - Never publish an AGCoord release—to PyPI or as a GitHub release—unless the user
   explicitly requests releasing. When a release is explicitly requested, always publish
   the PyPI upload and the matching GitHub release together; never leave one published
