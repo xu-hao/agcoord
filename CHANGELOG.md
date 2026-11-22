@@ -5,6 +5,17 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Keep `snapshot`, `agc list`, `agc log`, and `agc tui` log views (`l`) fast as retained
+  terminal history grows. `store::snapshot` now indexes terminal snapshot ordering and filter
+  facets so it decodes only live rows and the bounded `recent` slice instead of deserializing
+  every historical row and placement in `queue.sqlite3`. `CoordinatorClient` consolidates read
+  and cancellation spool preflights to a single `inspect` call and exposes single-preflight
+  multi-page log helpers (`read_log`, `iter_log_pages`), `agc log` and `follow` drain available
+  pages without per-page `status` checks or `0.1s` sleeps before `eof`, and `agc tui` paces
+  periodic refreshes from the completion of the previous snapshot (yielding while `l` reads a
+  log) instead of chaining back-to-back snapshots. #403 — eliminate full-history snapshot scans,
+  redundant client preflights, and TUI refresh/log contention.
+
 ## 0.10.1 — 2026-11-20
 
 - Publish the coupled AGCoord `0.10.1` PyPI distribution and native

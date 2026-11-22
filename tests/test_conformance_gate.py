@@ -46,9 +46,13 @@ def test_public_checker_lists_both_implementation_selector_sets():
     assert completed.returncode == 0, completed.stderr
     selectors = json.loads(completed.stdout)
     assert set(selectors) == {"rust_native"}
-    assert len(selectors["rust_native"]) == 90
+    assert len(selectors["rust_native"]) == 91
     assert (
         "client_compatibility::python_public_commands_keep_the_protocol_five_json_contract"
+        in selectors["rust_native"]
+    )
+    assert (
+        "scheduler::snapshots_and_log_reads_do_not_pay_for_terminal_history"
         in selectors["rust_native"]
     )
 

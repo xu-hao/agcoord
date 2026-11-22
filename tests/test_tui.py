@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -1588,3 +1589,70 @@ async def test_tui_renders_compact_batch_detail_and_live_modal_bisect_history():
         assert len(compact_lines[3]) <= 78, compact_lines[3]
         assert "batch 2/2 (3 slices, bisected)" in compact_after
         assert "batch: follower of land-leader01 (B=4)" in compact_after
+
+
+@pytest.mark.asyncio
+async def test_slow_periodic_refresh_waits_after_completion_and_log_uses_read_log():
+    snapshot = _snapshot()
+    snapshot["available_filters"] = {
+        "repositories": {"repo-dict-1": "github.com/example/from-dict"},
+        "agents": ["agent-7"],
+        "kinds": ["check"],
+        "pools": ["local"],
+    }
+
+    class SlowClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(snapshot)
+            self.windows: list[tuple[float, float]] = []
+            self.read_log_calls: list[tuple[str, int | None]] = []
+
+        def snapshot(self, **kwargs):
+            start = time.monotonic()
+            time.sleep(0.08)
+            result = super().snapshot(**kwargs)
+            self.windows.append((start, time.monotonic()))
+            return result
+
+        def read_log(self, run_id: str, *, offset: int = 0, max_bytes: int | None = None):
+            self.read_log_calls.append((run_id, max_bytes))
+            return {
+                "run_id": run_id,
+                "offset": offset,
+                "next_offset": 19,
+                "text": "single-preflight log",
+                "eof": True,
+                "truncated": False,
+            }
+
+    client = SlowClient()
+    app = build_app(lambda: client, refresh_interval=0.05)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        deadline = time.monotonic() + 2.0
+        while len(client.windows) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(client.windows) >= 2
+        periodic_gap = client.windows[1][0] - client.windows[0][1]
+        assert periodic_gap >= 0.035, (
+            f"periodic refresh chained immediately without waiting refresh_interval: "
+            f"gap={periodic_gap:.4f}s windows={client.windows}"
+        )
+
+        # Broker-format dict `available_filters["repositories"]` populates the repository picker.
+        await pilot.press("p")
+        await pilot.pause()
+        repo_options = app.screen.query_one("#filter-options", OptionList)
+        repo_prompts = [
+            str(repo_options.get_option_at_index(i).prompt)
+            for i in range(repo_options.option_count)
+        ]
+        assert "github.com/example/from-dict" in repo_prompts
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # Pressing `l` uses `read_log` in one bounded client call rather than paging `log` with repeated preflights.
+        await pilot.press("l")
+        await _settled(pilot)
+        assert client.read_log_calls == [("check-active", 1024 * 1024)]
+        assert "single-preflight log" in _screen_text(app)
