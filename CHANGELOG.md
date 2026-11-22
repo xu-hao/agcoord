@@ -5,6 +5,12 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Restore owner `0700` permissions on non-symlink directories before removing gate trees, remove
+  `checkout/` before `owner.json` in `GateTree::remove`, and clean unprotected torn gate-tree
+  entries missing `owner.json` during `GateTree::prepare` so read-only cached directories left by
+  killed gate jobs cannot fail eviction or wedge subsequent `full` and `land` setup. #409 —
+  restore owner write permissions and recover torn entries when removing gate trees.
+
 ## 0.10.2 — 2026-11-22
 
 - Publish the coupled AGCoord `0.10.2` PyPI distribution and native

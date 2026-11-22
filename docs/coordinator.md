@@ -185,7 +185,10 @@ under a spool-owned file lock. Before forking a gate launcher, the broker atomic
 publishes the active gate paths in `gate-reservations.json`; setup reads that snapshot
 under the lock without reopening the broker's inherited SQLite state. Only exact
 spool-owned worktree paths are removed; no
-repository-wide `git worktree prune` or contributor cleanup runs.
+repository-wide `git worktree prune` or contributor cleanup runs. When removing a gate tree or
+cleaning an unprotected torn entry missing `owner.json`, setup restores owner `0700` permissions on
+real directories inside that entry (without following symlinks) and removes `checkout/` before
+`owner.json`, while leaving directory permissions inside warm-reused trees untouched.
 
 The broker now has authority to update the source repository's `.git/worktrees` metadata
 and its own gate cache. On managed hosts, only the trusted launcher enters the fixed
