@@ -1,0 +1,9 @@
+# Tracked repository profile managed by gardenia.
+gate = "python -m pytest -q"
+cpu = 4
+memory_gb = 8
+no_overflow = true
+routing = "agroute"
+agcoord = "auto"
+docs_exemption = true
+claude_symlink = true
