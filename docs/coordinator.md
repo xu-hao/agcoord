@@ -2000,8 +2000,9 @@ Watching costs the host little while work waits. A following client polls a queu
 at an interval that doubles from a tenth of a second to one second, then streams the admitted
 job's log every tenth of a second; a `--json` wait, which streams nothing, backs off the same
 way for the job's whole life. The broker's scheduling tick and each `status` read only queued
-and running rows, so neither grows with the terminal history that accumulates until
-`agc clear`.
+and running rows, and `snapshot` (`agc list`, `agc tui`) and `log` decode only live rows and the
+bounded rows or log pages requested, so none of them grows with the terminal history that
+accumulates until `agc clear`.
 
 The native owner authenticates a worker with its PID, Linux start token, and requirement that
 the PID lead its recorded process group. Replacement recovery adopts only that exact live
@@ -2058,7 +2059,11 @@ legacy `pid:<positive integer>` fallback choices from older retained history; th
 visible in the unfiltered snapshot with their separate caller PID diagnostic intact.
 
 Refresh reconciles keyed rows in place, preserving the selected run and both viewport offsets
-when that row still exists without first painting a reset-to-top frame.
+when that row still exists without first painting a reset-to-top frame. Periodic refreshes wait
+the full `refresh_interval` after each completed snapshot (and yield while a log read is in
+flight) so a slow snapshot never chains back-to-back on the broker socket, while explicit `r`
+refreshes and filter selections still queue an immediate update. Pressing `l` reads up to 1 MiB
+of the selected job's log under a single spool preflight.
 At 80 columns the compact table is exactly
 `STATE · KIND · REPO · RUN · POOL · BRANCH · LABEL · AGE · DUR` and does not require horizontal
 navigation, including when a long queue also needs its vertical scrollbar. Adjacent columns

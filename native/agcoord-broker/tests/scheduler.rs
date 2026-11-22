@@ -435,19 +435,13 @@ fn process_cpu_seconds(pid: u32) -> f64 {
 }
 
 /// Runs one `status` query and returns its row with the CPU seconds that process consumed.
-fn status_with_cpu_seconds(state_dir: &Path, run_id: &str) -> (Value, f64) {
+fn command_with_cpu_seconds(state_dir: &Path, label: &str, arguments: &[&str]) -> (Value, f64) {
     let output = state_dir
         .parent()
         .unwrap()
-        .join(format!("{run_id}-status.json"));
+        .join(format!("{label}-output.json"));
     let child = Command::new(BROKER)
-        .args([
-            "status",
-            "--state-dir",
-            state_argument(state_dir),
-            "--run-id",
-            run_id,
-        ])
+        .args(arguments)
         .stdout(File::create(&output).unwrap())
         .spawn()
         .unwrap();
@@ -465,6 +459,20 @@ fn status_with_cpu_seconds(state_dir: &Path, run_id: &str) -> (Value, f64) {
     (
         serde_json::from_slice(&fs::read(&output).unwrap()).unwrap(),
         cpu,
+    )
+}
+
+fn status_with_cpu_seconds(state_dir: &Path, run_id: &str) -> (Value, f64) {
+    command_with_cpu_seconds(
+        state_dir,
+        &format!("{run_id}-status"),
+        &[
+            "status",
+            "--state-dir",
+            state_argument(state_dir),
+            "--run-id",
+            run_id,
+        ],
     )
 }
 
@@ -1642,6 +1650,179 @@ fn scheduling_ticks_and_status_polls_do_not_pay_for_terminal_history() {
     assert_eq!(status(&state, "history-1")["status"], "passed");
     wait_status(&state, "history-waiting", "passed");
     assert!(broker.terminate().success());
+}
+
+#[test]
+fn snapshots_and_log_reads_do_not_pay_for_terminal_history() {
+    // TUI refreshes and `agc list` call `snapshot` repeatedly, and pressing `l` reads `log`.
+    // Neither may deserialize every retained terminal row in SQLite.
+    const HISTORY: i64 = 10_000;
+    let temporary = TestDirectory::new("history-snapshot");
+    let state = temporary.path().join("state");
+    let checkout = temporary.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let mut broker = RunningBroker::start(&state, &[("jobs", 1)]);
+
+    let caller_pid = std::process::id().to_string();
+    let oldest = run(&[
+        "submit",
+        "--state-dir",
+        state_argument(&state),
+        "--run-id",
+        "history-oldest",
+        "--kind",
+        "check",
+        "--label",
+        "oldest retained row",
+        "--agent",
+        "oldest-agent",
+        "--repository-id",
+        "repo-oldest",
+        "--repository",
+        "github.com/example/oldest-repo/.git",
+        "--worktree-id",
+        "wt-oldest",
+        "--checkout",
+        checkout.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--caller-pid",
+        &caller_pid,
+        "--resource",
+        "jobs=1",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'oldest log line\\n'",
+    ]);
+    assert!(oldest.status.success());
+    wait_status(&state, "history-oldest", "passed");
+
+    let padding = "p".repeat(512);
+    let template = Submission {
+        run_id: "history-template",
+        kind: "check",
+        repository: "history",
+        checkout: &checkout,
+        command: touch_command(&temporary.path().join("template-ran")),
+        gate_run_id: None,
+    };
+    assert_submitted(
+        &template,
+        submit_with_environment(
+            &state,
+            &template,
+            &[
+                ("PADDING_A", &padding),
+                ("PADDING_B", &padding),
+                ("PADDING_C", &padding),
+                ("PADDING_D", &padding),
+            ],
+        ),
+    );
+    wait_status(&state, "history-template", "passed");
+
+    let entered = temporary.path().join("entered");
+    let release = temporary.path().join("release");
+    let running = Submission {
+        run_id: "history-running",
+        kind: "check",
+        repository: "live",
+        checkout: &checkout,
+        command: blocking_command(&entered, &release, None),
+        gate_run_id: None,
+    };
+    submit_ok(&state, &running);
+    wait_for(Duration::from_secs(10), || entered.exists());
+
+    let writer = lock_queue_writes(&state);
+    let columns = writer
+        .prepare(
+            "SELECT name FROM pragma_table_info('runs')
+             WHERE name NOT IN ('sequence', 'run_id', 'finished_at') ORDER BY cid",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join(", ");
+    writer
+        .execute(
+            &format!(
+                "WITH RECURSIVE copy(number) AS (
+                     SELECT 1 UNION ALL SELECT number + 1 FROM copy WHERE number < ?1
+                 )
+                 INSERT INTO runs (run_id, finished_at, {columns})
+                 SELECT 'history-' || number, '2099-01-01T00:00:00Z', {columns}
+                 FROM runs, copy
+                 WHERE run_id = 'history-template'"
+            ),
+            params![HISTORY],
+        )
+        .unwrap();
+    writer.execute_batch("COMMIT").unwrap();
+    drop(writer);
+
+    let (snap, snapshot_cpu) = command_with_cpu_seconds(
+        &state,
+        "unfiltered-snapshot",
+        &["snapshot", "--state-dir", state_argument(&state)],
+    );
+    let (repo_snap, repo_cpu) = command_with_cpu_seconds(
+        &state,
+        "repo-snapshot",
+        &[
+            "snapshot",
+            "--state-dir",
+            state_argument(&state),
+            "--repository",
+            "github.com/example/oldest-repo",
+        ],
+    );
+    let (log_page, log_cpu) = command_with_cpu_seconds(
+        &state,
+        "oldest-log",
+        &[
+            "log",
+            "--state-dir",
+            state_argument(&state),
+            "--run-id",
+            "history-oldest",
+        ],
+    );
+    fs::write(&release, "").unwrap();
+    wait_status(&state, "history-running", "passed");
+    assert!(broker.terminate().success());
+
+    assert_eq!(snap["recent"].as_array().unwrap().len(), 50);
+    assert_eq!(snap["recent"][0]["run_id"], format!("history-{HISTORY}"));
+    assert_eq!(
+        snap["available_filters"]["repositories"]["repo-oldest"],
+        "github.com/example/oldest-repo/.git"
+    );
+    assert!(
+        snap["available_filters"]["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("oldest-agent"))
+    );
+    assert_eq!(snap["available_filters"]["pools"], json!(["local"]));
+    assert_eq!(repo_snap["recent"].as_array().unwrap().len(), 1);
+    assert_eq!(repo_snap["recent"][0]["run_id"], "history-oldest");
+    assert_eq!(log_page["text"], "oldest log line\n");
+    assert!(
+        snapshot_cpu < 0.08,
+        "one unfiltered snapshot spent {snapshot_cpu:.3} CPU seconds beside {HISTORY} finished rows"
+    );
+    assert!(
+        repo_cpu < 0.08,
+        "one filtered snapshot spent {repo_cpu:.3} CPU seconds beside {HISTORY} finished rows"
+    );
+    assert!(
+        log_cpu < 0.08,
+        "one log read spent {log_cpu:.3} CPU seconds beside {HISTORY} finished rows"
+    );
 }
 
 #[test]

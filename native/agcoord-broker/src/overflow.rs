@@ -835,9 +835,77 @@ pub fn live_placements(connection: &Connection) -> Result<BTreeMap<String, Strin
     placements(connection, true)
 }
 
-/// The pool of every retained placement, including finished runs.
-pub fn all_placements(connection: &Connection) -> Result<BTreeMap<String, String>> {
-    placements(connection, false)
+/// The pool of each requested run ID that has a recorded placement.
+pub fn placements_for<'a>(
+    connection: &Connection,
+    run_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<BTreeMap<String, String>> {
+    if !schema_present(connection)? {
+        return Ok(BTreeMap::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT pool FROM overflow_placements WHERE run_id = ?1")
+        .map_err(map_database_error)?;
+    let mut selected = BTreeMap::new();
+    for run_id in run_ids {
+        let pool = statement
+            .query_row(params![run_id], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(map_database_error)?;
+        if let Some(pool) = pool {
+            selected.insert(run_id.to_owned(), pool);
+        }
+    }
+    Ok(selected)
+}
+
+/// All pool names (including `local`) represented across durable runs in the spool.
+pub fn known_pools(connection: &Connection) -> Result<BTreeSet<String>> {
+    if !schema_present(connection)? {
+        let any_run: bool = connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM runs)", [], |row| row.get(0))
+            .map_err(map_database_error)?;
+        return Ok(if any_run {
+            BTreeSet::from([LOCAL_RUNTIME.to_owned()])
+        } else {
+            BTreeSet::new()
+        });
+    }
+    let mut pools = BTreeSet::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT p.pool
+             FROM overflow_placements p
+             WHERE EXISTS (SELECT 1 FROM runs r WHERE r.run_id = p.run_id)",
+        )
+        .map_err(map_database_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_database_error)?;
+    for row in rows {
+        pools.insert(row.map_err(map_database_error)?);
+    }
+    let any_local: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM runs r
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM overflow_placements p WHERE p.run_id = r.run_id
+                 )
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_database_error)?;
+    if any_local {
+        pools.insert(LOCAL_RUNTIME.to_owned());
+    }
+    Ok(pools)
+}
+
+/// Whether the placements table exists in this spool.
+pub fn has_placements_table(connection: &Connection) -> Result<bool> {
+    schema_present(connection)
 }
 
 /// The summed claims of the running rows placed in one pool.

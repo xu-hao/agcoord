@@ -599,6 +599,8 @@ def build_app(
             self._known_kinds: set[str] = set()
             self._known_pools: set[str] = {"local"}
             self._refresh_pending = False
+            self._refresh_timer = None
+            self._log_reads_in_flight = 0
 
         def compose(self) -> ComposeResult:
             with Vertical():
@@ -642,7 +644,6 @@ def build_app(
             ):
                 table.add_column(label, width=width)
             self.action_refresh()
-            self.set_interval(refresh_interval, self.action_refresh)
 
         def _render_resized_table(self) -> None:
             if self._snapshot is not None:
@@ -654,9 +655,36 @@ def build_app(
                     self._client = self._client_factory()
                 return self._client
 
+        def _cancel_refresh_timer(self) -> None:
+            if self._refresh_timer is not None:
+                self._refresh_timer.stop()
+                self._refresh_timer = None
+
+        def _schedule_refresh(self) -> None:
+            self._cancel_refresh_timer()
+            if self.is_running:
+                self._refresh_timer = self.set_timer(
+                    refresh_interval,
+                    self._periodic_refresh,
+                )
+
+        def _periodic_refresh(self) -> None:
+            self._refresh_timer = None
+            if self._reading or self._log_reads_in_flight > 0:
+                self._schedule_refresh()
+                return
+            self._start_refresh()
+
         def action_refresh(self) -> None:
+            self._cancel_refresh_timer()
             if self._reading:
                 self._refresh_pending = True
+                return
+            self._start_refresh()
+
+        def _start_refresh(self) -> None:
+            self._cancel_refresh_timer()
+            if not self.is_running:
                 return
             self._reading = True
             repo_filter = self._repository_filter
@@ -682,7 +710,7 @@ def build_app(
             # `_reading` is the overlap guard. The Textual worker tracks the async delivery;
             # the bounded coordinator call itself stays off the paint/keyboard loop.
             self.run_worker(
-                work(),
+                work,
                 group="gate-snapshot",
             )
 
@@ -690,9 +718,6 @@ def build_app(
             if not self.is_running:
                 return
             self._reading = False
-            if self._refresh_pending:
-                self._refresh_pending = False
-                self.action_refresh()
             self._message = f"unavailable · {exc}"
             self.query_one("#gate-subject", Static).update("MACHINE │ AGCOORD │ unavailable")
             self.query_one("#gate-status", Static).update(self._message)
@@ -700,6 +725,11 @@ def build_app(
                 self.query_one("#gate-detail", Static).update(
                     "AGCoord unavailable\n" + str(exc)
                 )
+            if self._refresh_pending:
+                self._refresh_pending = False
+                self._start_refresh()
+            else:
+                self._schedule_refresh()
 
         def _selected_id(self) -> str | None:
             table = self.query_one("#gates", DataTable)
@@ -718,9 +748,15 @@ def build_app(
             self._reading = False
             available = snapshot.get("available_filters")
             if available is not None and isinstance(available, dict):
-                for repo in available.get("repositories", ()):
-                    if isinstance(repo, dict) and "id" in repo and "name" in repo:
-                        self._known_repositories[str(repo["id"])] = str(repo["name"])
+                repos = available.get("repositories", ())
+                if isinstance(repos, dict):
+                    for repo_id, repo_name in repos.items():
+                        if isinstance(repo_id, str) and isinstance(repo_name, str):
+                            self._known_repositories[repo_id] = repo_name
+                else:
+                    for repo in repos:
+                        if isinstance(repo, dict) and "id" in repo and "name" in repo:
+                            self._known_repositories[str(repo["id"])] = str(repo["name"])
                 for agent in available.get("agents", ()):
                     if isinstance(agent, str) and not _LEGACY_PID_AGENT.fullmatch(agent):
                         self._known_agents.add(agent)
@@ -756,7 +792,9 @@ def build_app(
             self._render_snapshot(snapshot)
             if self._refresh_pending:
                 self._refresh_pending = False
-                self.action_refresh()
+                self._start_refresh()
+            else:
+                self._schedule_refresh()
 
         def _render_snapshot(self, snapshot: dict) -> None:
             selected = self._selected_id()
@@ -1094,12 +1132,19 @@ def build_app(
             self.query_one("#gate-status", Static).update(f"reading log for {run_id} …")
 
             def read_log() -> str:
+                client = self._client_for_worker()
+                if hasattr(client, "read_log"):
+                    result = client.read_log(run_id, max_bytes=1024 * 1024)
+                    body = result["text"] or "(no output yet)"
+                    if result.get("truncated"):
+                        body += "\n\n[log view truncated at 1 MiB]"
+                    return body
                 offset = 0
                 pages: list[str] = []
                 total = 0
                 truncated = False
                 while total < 1024 * 1024:
-                    page = self._client_for_worker().log(run_id, offset=offset)
+                    page = client.log(run_id, offset=offset)
                     pages.append(page["text"])
                     total += len(page["text"].encode("utf-8"))
                     if page["eof"]:
@@ -1115,14 +1160,19 @@ def build_app(
                 return body
 
             async def work() -> None:
+                self._log_reads_in_flight += 1
                 try:
-                    body = await _off_loop(read_log)
-                except CoordinatorError as exc:
-                    self._operation_failed(exc)
-                    return
+                    try:
+                        body = await _off_loop(read_log)
+                    except CoordinatorError as exc:
+                        self._operation_failed(exc)
+                        return
+                finally:
+                    self._log_reads_in_flight -= 1
                 self._show_log(label, run_id, str(body))
 
-            self.run_worker(work(), group="gate-log", exclusive=True)
+            if self.is_running:
+                self.run_worker(work, group="gate-log", exclusive=True)
 
         def _show_log(self, label: str, run_id: str, body: str) -> None:
             if not self.is_running:

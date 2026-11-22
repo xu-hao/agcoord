@@ -38,18 +38,21 @@ pub struct SnapshotFilter {
     pub limit: Option<usize>,
 }
 
+fn repository_matches(repository_id: &str, repository: &str, expected: &str) -> bool {
+    repository == expected
+        || repository_id == expected
+        || repository.trim_end_matches("/.git") == expected.trim_end_matches("/.git")
+}
+
 fn matches_snapshot_filter(
     run: &RunRecord,
     filter: &SnapshotFilter,
     placed: &BTreeMap<String, String>,
 ) -> bool {
-    if let Some(expected_repo) = &filter.repository {
-        let repo_matched = run.repository == *expected_repo
-            || run.repository_id == *expected_repo
-            || run.repository.trim_end_matches("/.git") == expected_repo.trim_end_matches("/.git");
-        if !repo_matched {
-            return false;
-        }
+    if let Some(expected_repo) = &filter.repository
+        && !repository_matches(&run.repository_id, &run.repository, expected_repo)
+    {
+        return false;
     }
     if let Some(expected_agent) = &filter.agent
         && run.agent != *expected_agent
@@ -130,7 +133,36 @@ CREATE TABLE runs (
 );
 CREATE INDEX runs_status_sequence ON runs(status, sequence);
 CREATE INDEX runs_repository_sequence ON runs(repository_id, sequence);
+CREATE INDEX runs_terminal_snapshot
+    ON runs(
+        COALESCE(finished_at, created_at) DESC,
+        sequence DESC,
+        repository_id,
+        repository,
+        agent,
+        kind,
+        run_id
+    )
+    WHERE status IN ('passed', 'failed', 'cancelled', 'interrupted');
+CREATE INDEX runs_filter_agent ON runs(agent) WHERE agent != '';
+CREATE INDEX runs_filter_kind ON runs(kind) WHERE kind != '';
 CREATE TABLE coordinator_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"#;
+
+const SNAPSHOT_INDEXES_SCHEMA: &str = r#"
+CREATE INDEX IF NOT EXISTS runs_terminal_snapshot
+    ON runs(
+        COALESCE(finished_at, created_at) DESC,
+        sequence DESC,
+        repository_id,
+        repository,
+        agent,
+        kind,
+        run_id
+    )
+    WHERE status IN ('passed', 'failed', 'cancelled', 'interrupted');
+CREATE INDEX IF NOT EXISTS runs_filter_agent ON runs(agent) WHERE agent != '';
+CREATE INDEX IF NOT EXISTS runs_filter_kind ON runs(kind) WHERE kind != '';
 "#;
 
 const LEASE_SCHEMA: &str = r#"
@@ -1791,6 +1823,9 @@ pub fn initialize_native(paths: &Paths, capacities: &BTreeMap<String, u64>) -> R
     crate::preempt::ensure_schema(&connection)?;
     ensure_land_batch_schema(&connection)?;
     connection
+        .execute_batch(SNAPSHOT_INDEXES_SCHEMA)
+        .map_err(map_database_error)?;
+    connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(map_database_error)?;
     let selected: String = connection
@@ -2588,8 +2623,182 @@ pub fn public_run(
     })
 }
 
+fn snapshot_available_filters(connection: &Connection) -> Result<Value> {
+    let mut known_repositories = BTreeMap::new();
+    let mut repo_stmt = connection
+        .prepare(
+            "WITH RECURSIVE repos(repo_id) AS (
+                 SELECT MIN(repository_id) FROM runs
+                 UNION ALL
+                 SELECT (SELECT MIN(repository_id) FROM runs WHERE repository_id > repos.repo_id)
+                 FROM repos WHERE repos.repo_id IS NOT NULL
+             )
+             SELECT r.repository_id, r.repository
+             FROM repos
+             JOIN runs r ON r.sequence = (
+                 SELECT MAX(sequence) FROM runs WHERE repository_id = repos.repo_id
+             )
+             WHERE repos.repo_id IS NOT NULL",
+        )
+        .map_err(map_database_error)?;
+    let repo_rows = repo_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(map_database_error)?;
+    for row in repo_rows {
+        let (repo_id, repo_name) = row.map_err(map_database_error)?;
+        known_repositories.insert(repo_id, repo_name);
+    }
+
+    let mut known_agents = BTreeSet::new();
+    let mut agent_stmt = connection
+        .prepare(
+            "WITH RECURSIVE agents(agent) AS (
+                 SELECT MIN(agent) FROM runs WHERE agent != ''
+                 UNION ALL
+                 SELECT (SELECT MIN(agent) FROM runs WHERE agent != '' AND agent > agents.agent)
+                 FROM agents WHERE agents.agent IS NOT NULL
+             )
+             SELECT agent FROM agents WHERE agent IS NOT NULL",
+        )
+        .map_err(map_database_error)?;
+    let agent_rows = agent_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_database_error)?;
+    for row in agent_rows {
+        known_agents.insert(row.map_err(map_database_error)?);
+    }
+
+    let mut known_kinds = BTreeSet::new();
+    let mut kind_stmt = connection
+        .prepare(
+            "WITH RECURSIVE kinds(kind) AS (
+                 SELECT MIN(kind) FROM runs WHERE kind != ''
+                 UNION ALL
+                 SELECT (SELECT MIN(kind) FROM runs WHERE kind != '' AND kind > kinds.kind)
+                 FROM kinds WHERE kinds.kind IS NOT NULL
+             )
+             SELECT kind FROM kinds WHERE kind IS NOT NULL",
+        )
+        .map_err(map_database_error)?;
+    let kind_rows = kind_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_database_error)?;
+    for row in kind_rows {
+        known_kinds.insert(row.map_err(map_database_error)?);
+    }
+
+    let known_pools = crate::overflow::known_pools(connection)?;
+    Ok(json!({
+        "repositories": known_repositories,
+        "agents": known_agents,
+        "kinds": known_kinds,
+        "pools": known_pools,
+    }))
+}
+
+fn load_recent_terminal_runs(
+    connection: &Connection,
+    filter: &SnapshotFilter,
+    limit: usize,
+) -> Result<Vec<RunRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let has_placements = crate::overflow::has_placements_table(connection)?;
+    if let Some(expected_pool) = &filter.pool
+        && expected_pool != crate::overflow::LOCAL_RUNTIME
+        && !has_placements
+    {
+        return Ok(Vec::new());
+    }
+    let mut pool_stmt = if filter.pool.is_some() && has_placements {
+        Some(
+            connection
+                .prepare("SELECT pool FROM overflow_placements WHERE run_id = ?1")
+                .map_err(map_database_error)?,
+        )
+    } else {
+        None
+    };
+    let mut index_stmt = connection
+        .prepare(
+            "SELECT sequence, run_id, repository_id, repository, agent, kind
+             FROM runs
+             WHERE status IN ('passed', 'failed', 'cancelled', 'interrupted')
+             ORDER BY COALESCE(finished_at, created_at) DESC, sequence DESC",
+        )
+        .map_err(map_database_error)?;
+    let mut cursor = index_stmt.query([]).map_err(map_database_error)?;
+    let mut matched_sequences = Vec::with_capacity(limit);
+    while let Some(row) = cursor.next().map_err(map_database_error)? {
+        let sequence: i64 = row.get(0).map_err(map_database_error)?;
+        let run_id: String = row.get(1).map_err(map_database_error)?;
+        let repository_id: String = row.get(2).map_err(map_database_error)?;
+        let repository: String = row.get(3).map_err(map_database_error)?;
+        let agent: String = row.get(4).map_err(map_database_error)?;
+        let kind: String = row.get(5).map_err(map_database_error)?;
+
+        if let Some(expected_repo) = &filter.repository
+            && !repository_matches(&repository_id, &repository, expected_repo)
+        {
+            continue;
+        }
+        if let Some(expected_agent) = &filter.agent
+            && agent != *expected_agent
+        {
+            continue;
+        }
+        if let Some(expected_kind) = &filter.kind
+            && kind != *expected_kind
+        {
+            continue;
+        }
+        if let Some(expected_pool) = &filter.pool {
+            let actual_pool = match &mut pool_stmt {
+                Some(stmt) => stmt
+                    .query_row(params![run_id], |r| r.get::<_, String>(0))
+                    .optional()
+                    .map_err(map_database_error)?,
+                None => None,
+            };
+            if actual_pool
+                .as_deref()
+                .unwrap_or(crate::overflow::LOCAL_RUNTIME)
+                != expected_pool
+            {
+                continue;
+            }
+        }
+        matched_sequences.push(sequence);
+        if matched_sequences.len() >= limit {
+            break;
+        }
+    }
+    drop(cursor);
+    drop(index_stmt);
+
+    let mut row_stmt = connection
+        .prepare("SELECT * FROM runs WHERE sequence = ?1")
+        .map_err(map_database_error)?;
+    let mut selected = Vec::with_capacity(matched_sequences.len());
+    for sequence in matched_sequences {
+        let mut rows = row_stmt
+            .query(params![sequence])
+            .map_err(map_database_error)?;
+        if let Some(row) = rows.next().map_err(map_database_error)? {
+            selected.push(run_from_row(row)?);
+        }
+    }
+    Ok(selected)
+}
+
 pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     let connection = open_protocol5(paths)?;
+    connection
+        .execute_batch("BEGIN")
+        .map_err(map_database_error)?;
     let maintenance = maintenance_record(&connection)?;
     let owner = if live_owner_metadata(&paths.state_dir)?.is_some() {
         Some(owner_info(paths)?)
@@ -2602,38 +2811,27 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
             "no native broker owns this state directory",
         ));
     }
-    let runs = load_runs(&connection)?;
-    let placed = crate::overflow::all_placements(&connection)?;
-    let mut known_pools = BTreeSet::new();
-    let mut known_repositories = BTreeMap::new();
-    let mut known_agents = BTreeSet::new();
-    let mut known_kinds = BTreeSet::new();
-    for run in &runs {
-        known_pools.insert(
-            placed
-                .get(&run.run_id)
-                .map(String::as_str)
-                .unwrap_or("local")
-                .to_owned(),
-        );
-        known_repositories.insert(run.repository_id.clone(), run.repository.clone());
-        if !run.agent.is_empty() {
-            known_agents.insert(run.agent.clone());
-        }
-        if !run.kind.is_empty() {
-            known_kinds.insert(run.kind.clone());
-        }
-    }
-    let all_active: Vec<_> = runs
+    let available_filters = snapshot_available_filters(&connection)?;
+    let live_runs = load_live_runs(&connection)?;
+    let all_active: Vec<_> = live_runs
         .iter()
         .filter(|run| run.status == "running")
         .cloned()
         .collect();
-    let all_queued: Vec<_> = runs
+    let all_queued: Vec<_> = live_runs
         .iter()
         .filter(|run| run.status == "queued")
         .cloned()
         .collect();
+    let limit = filter.limit.unwrap_or(RECENT_LIMIT);
+    let recent_owned = load_recent_terminal_runs(&connection, filter, limit)?;
+    let placed = crate::overflow::placements_for(
+        &connection,
+        live_runs
+            .iter()
+            .chain(&recent_owned)
+            .map(|run| run.run_id.as_str()),
+    )?;
     let active: Vec<_> = all_active
         .iter()
         .filter(|run| matches_snapshot_filter(run, filter, &placed))
@@ -2644,18 +2842,6 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
         .filter(|run| matches_snapshot_filter(run, filter, &placed))
         .cloned()
         .collect();
-    let mut terminal: Vec<_> = runs
-        .iter()
-        .filter(|run| is_terminal(&run.status) && matches_snapshot_filter(run, filter, &placed))
-        .cloned()
-        .collect();
-    terminal.sort_by(|run_a, run_b| {
-        let finish_a = run_a.finished_at.as_deref().unwrap_or(&run_a.created_at);
-        let finish_b = run_b.finished_at.as_deref().unwrap_or(&run_b.created_at);
-        finish_b
-            .cmp(finish_a)
-            .then_with(|| run_b.sequence.cmp(&run_a.sequence))
-    });
     let capacities = if let Some(owner) = &owner {
         owner.capacities.clone()
     } else {
@@ -2698,8 +2884,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
     for name in capacities.keys() {
         selected_allocations.insert(name.clone(), used.get(name).copied().unwrap_or(0));
     }
-    let limit = filter.limit.unwrap_or(RECENT_LIMIT);
-    let recent_runs: Vec<_> = terminal.iter().take(limit).collect();
+    let recent_runs: Vec<_> = recent_owned.iter().collect();
     // Only the rows this snapshot reports are looked up, not every record history retains.
     let attempts = crate::preempt::attempts(
         &connection,
@@ -2776,12 +2961,7 @@ pub fn snapshot(paths: &Paths, filter: &SnapshotFilter) -> Result<Value> {
             (all_active.len() + all_queued.len()) as i64,
             owner.as_ref().map(|owner| owner.pid),
         )),
-        "available_filters": json!({
-            "repositories": known_repositories,
-            "agents": known_agents,
-            "kinds": known_kinds,
-            "pools": known_pools,
-        }),
+        "available_filters": available_filters,
         "active": active_public,
         "queued": queued_public,
         "recent": recent,
@@ -2830,7 +3010,7 @@ pub fn status(paths: &Paths, run_id: &str) -> Result<Value> {
         }
     };
     let live_placed = crate::overflow::live_placements(&connection)?;
-    let placed = crate::overflow::all_placements(&connection)?;
+    let placed = crate::overflow::placements_for(&connection, [run.run_id.as_str()])?;
     let batch_followers = active_batch_followers(&connection)?;
     let attempts = crate::preempt::attempts_of(&connection, &run.run_id)?;
     let hold = crate::preempt::live(&connection)?.hold(&queued);
@@ -6372,6 +6552,9 @@ pub fn migrate(state_dir: &Path) -> Result<Value> {
         .map_err(map_database_error)?;
     connection
         .pragma_update(None, "journal_mode", "WAL")
+        .map_err(map_database_error)?;
+    connection
+        .execute_batch(SNAPSHOT_INDEXES_SCHEMA)
         .map_err(map_database_error)?;
     let verified = open_protocol5(&paths)?;
     load_runs(&verified)?;

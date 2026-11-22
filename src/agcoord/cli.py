@@ -834,17 +834,37 @@ def run(args: argparse.Namespace, *, out: TextIO = sys.stdout) -> int:
         emit(result) if emit else print(f"AGCoord: cleared {result['cleared']} run(s)", file=out)
         return 0
     if args.command == "log":
+        if emit:
+            emit(client.log(args.run_id, offset=0))
+            return 0
+        if not args.follow and hasattr(client, "iter_log_pages"):
+            for page in client.iter_log_pages(args.run_id, offset=0):
+                if page["text"]:
+                    print(page["text"], end="", file=out)
+            return 0
         offset = 0
         while True:
             page = client.log(args.run_id, offset=offset)
-            if emit:
-                emit(page)
+            if page["text"]:
+                print(page["text"], end="", file=out, flush=args.follow)
+            next_offset = page["next_offset"]
+            if not page["eof"]:
+                if next_offset <= offset:
+                    raise CoordinatorError("gate log cursor did not advance")
+                offset = next_offset
+                continue
+            offset = next_offset
+            if not args.follow:
                 return 0
-            print(page["text"], end="", file=out)
-            offset = page["next_offset"]
             row = client.status(args.run_id)
-            if page["eof"] and (not args.follow or row["status"] not in {"queued", "running"}):
-                return 0
+            if row["status"] not in {"queued", "running"}:
+                trailing = client.log(args.run_id, offset=offset)
+                if trailing["text"]:
+                    print(trailing["text"], end="", file=out, flush=True)
+                if trailing["eof"] or trailing["next_offset"] <= offset:
+                    return 0
+                offset = trailing["next_offset"]
+                continue
             time.sleep(0.1)
 
     if not checkout.is_dir():

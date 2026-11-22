@@ -1849,3 +1849,66 @@ def test_a_claim_delegated_to_an_overflow_pool_is_labelled_delegated():
     }
 
     assert resource_enforcement_summary(receipt) == "delegated"
+
+
+def test_cli_log_drains_multipage_output_without_per_page_status_or_sleep(monkeypatch):
+    sleeps: list[float] = []
+    status_calls: list[str] = []
+    pages = ["chunk-1\n", "chunk-2\n", "chunk-3\n", "chunk-4\n"]
+    full_text = "".join(pages)
+    run_state = {"status": "running", "available": len("chunk-1\nchunk-2\nchunk-3\n")}
+
+    class PagedLogClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def log(self, run_id: str, *, offset: int = 0):
+            if run_id == "done-run":
+                for idx, chunk in enumerate(pages):
+                    start = sum(len(p) for p in pages[:idx])
+                    end = start + len(chunk)
+                    if offset == start:
+                        return {
+                            "run_id": run_id,
+                            "offset": offset,
+                            "next_offset": end,
+                            "text": chunk,
+                            "eof": idx == len(pages) - 1,
+                        }
+                return {"run_id": run_id, "offset": offset, "next_offset": offset, "text": "", "eof": True}
+
+            available = run_state["available"]
+            remaining = full_text[offset:available]
+            piece = remaining[:8]
+            next_off = offset + len(piece)
+            return {
+                "run_id": run_id,
+                "offset": offset,
+                "next_offset": next_off,
+                "text": piece,
+                "eof": next_off >= available,
+            }
+
+        def status(self, run_id: str):
+            status_calls.append(run_id)
+            return _row(run_id, run_state["status"], "check", "paged log")
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        run_state["available"] = len(full_text)
+        run_state["status"] = "passed"
+
+    monkeypatch.setattr(cli, "CoordinatorClient", PagedLogClient)
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    non_follow = StringIO()
+    assert cli.run(_args("log", "done-run"), out=non_follow) == 0
+    assert non_follow.getvalue() == full_text
+    assert sleeps == []
+    assert status_calls == []
+
+    followed = StringIO()
+    assert cli.run(_args("log", "live-run", "--follow"), out=followed) == 0
+    assert followed.getvalue() == full_text
+    # Sleeps once at the live EOF boundary rather than after each of the first three pages.
+    assert len(sleeps) == 1

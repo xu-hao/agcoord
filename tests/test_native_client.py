@@ -1176,3 +1176,128 @@ def test_host_maintenance_drain_tolerates_pre_inspect_outgoing_broker(tmp_path: 
     ordinary = CoordinatorClient(state_dir=state_dir, autostart=False, host_maintenance=False)
     with pytest.raises(CoordinatorError, match="version is unsupported"):
         ordinary.drain(wait=False)
+
+
+def test_client_reads_inspect_once_per_operation_and_once_across_multipage_read_log(
+    tmp_path: Path,
+):
+    import socket as pysocket
+    import struct
+    import threading
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    executable = _socket_identity_executable(tmp_path / "broker")
+    (state_dir / "config.json").write_text(
+        json.dumps({"native_broker": {"path": str(executable), "allow_development": True}}),
+        encoding="utf-8",
+    )
+    sock_path = state_dir / "broker.sock"
+    server = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_SEQPACKET)
+    server.bind(str(sock_path))
+    sock_path.chmod(0o600)
+    server.listen(16)
+    server.settimeout(5.0)
+
+    owner = {
+        "pid": 4321,
+        "protocol": NATIVE_PROTOCOL,
+        "implementation": NATIVE_IMPLEMENTATION,
+        "version": __version__,
+        "build": "development",
+        "capacities": {"jobs": 2},
+        "resource_bindings": {},
+        "resource_capabilities": {},
+    }
+    full_log = "".join(f"page-{i}:{'x' * 65528}\n"[:65536] for i in range(4))
+    received: list[str] = []
+    stop = threading.Event()
+
+    def serve():
+        try:
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                with conn:
+                    buf = bytearray()
+                    expected = None
+                    while expected is None or len(buf) < 4 + expected:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        if expected is None and len(buf) >= 4:
+                            expected = struct.unpack(">I", buf[:4])[0]
+                    if not buf:
+                        continue
+                    req = json.loads(buf[4 : 4 + (expected or 0)].decode("utf-8"))
+                    cmd = req["command"]
+                    args = req["arguments"]
+                    received.append(cmd)
+                    if cmd == "inspect":
+                        res = {"protocol": NATIVE_PROTOCOL, "owner": owner, "maintenance": None}
+                    elif cmd == "snapshot":
+                        res = {"protocol": NATIVE_PROTOCOL, "active": [], "queued": [], "recent": []}
+                    elif cmd == "status":
+                        res = {"run_id": "check-1", "status": "passed"}
+                    elif cmd == "cancel":
+                        res = {"run_id": "check-1", "status": "cancelled", "cancel_requested": True}
+                    elif cmd == "log":
+                        offset = int(args[args.index("--offset") + 1])
+                        limit = int(args[args.index("--limit") + 1])
+                        piece = full_log[offset : offset + limit]
+                        next_off = offset + len(piece)
+                        res = {
+                            "run_id": "check-1",
+                            "offset": offset,
+                            "next_offset": next_off,
+                            "text": piece,
+                            "eof": next_off >= len(full_log),
+                        }
+                    else:
+                        raise AssertionError(f"unexpected socket command {cmd}")
+                    raw = json.dumps({"ok": True, "wire": 1, "result": res}, separators=(",", ":")).encode("utf-8")
+                    for pos in range(0, 4 + len(raw), 32768):
+                        frame = struct.pack(">I", len(raw)) + raw
+                        conn.send(frame[pos : pos + 32768])
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        client = CoordinatorClient(state_dir=state_dir, autostart=False)
+        client.snapshot()
+        assert received == ["inspect", "snapshot"]
+        received.clear()
+
+        client.status("check-1")
+        assert received == ["inspect", "status"]
+        received.clear()
+
+        client.cancel("check-1")
+        assert received == ["inspect", "cancel"]
+        received.clear()
+
+        client.log("check-1", offset=0)
+        assert received == ["inspect", "log"]
+        received.clear()
+
+        whole = client.read_log("check-1", max_bytes=1024 * 1024)
+        assert whole["text"] == full_log
+        assert whole["truncated"] is False
+        assert received == ["inspect", "log", "log", "log", "log"]
+        received.clear()
+
+        capped = client.read_log("check-1", max_bytes=128 * 1024)
+        assert len(capped["text"]) == 128 * 1024
+        assert capped["truncated"] is True
+        assert received == ["inspect", "log", "log"]
+    finally:
+        stop.set()
+        server.close()
+        thread.join(timeout=2)

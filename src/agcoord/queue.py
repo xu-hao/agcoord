@@ -1369,6 +1369,49 @@ class CoordinatorClient:
             return refreshed
         return maintenance
 
+    def _ensure_readable_spool(self) -> None:
+        """Verify a live owner or readable maintenance spool in a single inspect call."""
+        deadline = time.monotonic() + self.connect_timeout
+        last_metadata_error: CoordinatorError | None = None
+        owner: dict[str, Any] | None = None
+        maintenance: dict[str, Any] | None = None
+        while True:
+            try:
+                spool = self._inspect()
+            except CoordinatorError as exc:
+                if exc.code == "broker-state-missing":
+                    spool = {"owner": None, "maintenance": None}
+                elif not _spool_starting(exc):
+                    raise
+                else:
+                    last_metadata_error = exc
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+                    continue
+            owner = spool.get("owner")
+            raw_maintenance = spool.get("maintenance")
+            maintenance = (
+                None
+                if raw_maintenance is None
+                else _validated_maintenance_receipt(raw_maintenance)
+            )
+            break
+        if owner is not None:
+            self._validate_native_owner(owner)
+            return
+        if maintenance is not None:
+            self._recover_native_drain(maintenance)
+            return
+        if not self.autostart:
+            if last_metadata_error is not None:
+                raise CoordinatorError(str(last_metadata_error))
+            raise CoordinatorError(
+                f"no gate broker owns {self.paths.state_dir}"
+            )
+        self._start_broker()
+        self.ping()
+
     def _ensure_broker(
         self,
         *,
@@ -1993,14 +2036,7 @@ class CoordinatorClient:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
                 raise CoordinatorError("limit must be a positive integer")
             arguments.extend(["--limit", str(limit)])
-        maintenance = self._maintenance_if_active()
-        if maintenance is not None:
-            maintenance = self._recover_native_drain(maintenance)
-            result = self._native_invoke("snapshot", arguments)
-            if not isinstance(result, dict):
-                raise CoordinatorError("native broker returned an invalid snapshot")
-            return result
-        self._ensure_broker()
+        self._ensure_readable_spool()
         result = self._native_invoke("snapshot", arguments)
         if not isinstance(result, dict):
             raise CoordinatorError("native broker returned an invalid snapshot")
@@ -2029,30 +2065,14 @@ class CoordinatorClient:
             if not isinstance(result, dict) or result.get("run_id") != run_id:
                 raise CoordinatorError("native broker returned an invalid run status")
             return result
-        maintenance = self._maintenance_if_active()
-        if maintenance is not None:
-            maintenance = self._recover_native_drain(maintenance)
-            result = self._native_invoke("status", ("--run-id", run_id))
-            if not isinstance(result, dict):
-                raise CoordinatorError("native broker returned an invalid run status")
-            return result
-        self._ensure_broker()
+        self._ensure_readable_spool()
         result = self._native_invoke("status", ("--run-id", run_id))
         if not isinstance(result, dict):
             raise CoordinatorError("native broker returned an invalid run status")
         return result
 
     def cancel(self, run_id: str) -> dict[str, Any]:
-        maintenance = self._maintenance_if_active()
-        if maintenance is not None:
-            maintenance = self._recover_native_drain(maintenance)
-            result = self._native_invoke("cancel", ("--run-id", run_id))
-            if not isinstance(result, dict):
-                raise CoordinatorError(
-                    "native broker returned an invalid cancellation receipt"
-                )
-            return result
-        self._ensure_broker()
+        self._ensure_readable_spool()
         result = self._native_invoke("cancel", ("--run-id", run_id))
         if not isinstance(result, dict):
             raise CoordinatorError("native broker returned an invalid cancellation receipt")
@@ -2675,37 +2695,13 @@ class CoordinatorClient:
             raise CoordinatorError("native broker returned an invalid land result receipt")
         return
 
-    def log(
+    def _invoke_log_page(
         self,
         run_id: str,
         *,
-        offset: int = 0,
-        limit: int = MAX_LOG_BYTES,
+        offset: int,
+        limit: int,
     ) -> dict[str, Any]:
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise CoordinatorError("gate log offset must be a non-negative integer")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LOG_BYTES:
-            raise CoordinatorError(
-                f"gate log limit must be between 1 and {MAX_LOG_BYTES}"
-            )
-        maintenance = self._maintenance_if_active()
-        if maintenance is not None:
-            maintenance = self._recover_native_drain(maintenance)
-            result = self._native_invoke(
-                "log",
-                (
-                    "--run-id",
-                    run_id,
-                    "--offset",
-                    str(offset),
-                    "--limit",
-                    str(limit),
-                ),
-            )
-            if not isinstance(result, dict):
-                raise CoordinatorError("native broker returned an invalid log page")
-            return result
-        self._ensure_broker()
         result = self._native_invoke(
             "log",
             (
@@ -2720,6 +2716,99 @@ class CoordinatorClient:
         if not isinstance(result, dict):
             raise CoordinatorError("native broker returned an invalid log page")
         return result
+
+    def log(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+        limit: int = MAX_LOG_BYTES,
+    ) -> dict[str, Any]:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise CoordinatorError("gate log offset must be a non-negative integer")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LOG_BYTES:
+            raise CoordinatorError(
+                f"gate log limit must be between 1 and {MAX_LOG_BYTES}"
+            )
+        self._ensure_readable_spool()
+        return self._invoke_log_page(run_id, offset=offset, limit=limit)
+
+    def iter_log_pages(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+    ) -> Iterable[dict[str, Any]]:
+        """Yield available log pages through EOF after a single spool preflight."""
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise CoordinatorError("gate log offset must be a non-negative integer")
+        self._ensure_readable_spool()
+        current_offset = offset
+        while True:
+            page = self._invoke_log_page(
+                run_id,
+                offset=current_offset,
+                limit=MAX_LOG_BYTES,
+            )
+            yield page
+            if page["eof"]:
+                break
+            next_offset = page["next_offset"]
+            if next_offset <= current_offset:
+                raise CoordinatorError("gate log cursor did not advance")
+            current_offset = next_offset
+
+    def read_log(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        """Read up to ``max_bytes`` of a run's log with a single spool preflight."""
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise CoordinatorError("gate log offset must be a non-negative integer")
+        if max_bytes is not None and (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes <= 0
+        ):
+            raise CoordinatorError("gate log max_bytes must be a positive integer")
+        self._ensure_readable_spool()
+        current_offset = offset
+        pages: list[str] = []
+        eof = False
+        truncated = False
+        while max_bytes is None or (current_offset - offset) < max_bytes:
+            page_limit = (
+                MAX_LOG_BYTES
+                if max_bytes is None
+                else min(MAX_LOG_BYTES, max_bytes - (current_offset - offset))
+            )
+            page = self._invoke_log_page(
+                run_id,
+                offset=current_offset,
+                limit=page_limit,
+            )
+            pages.append(page["text"])
+            next_offset = page["next_offset"]
+            eof = bool(page["eof"])
+            if eof:
+                current_offset = next_offset
+                break
+            if next_offset <= current_offset:
+                raise CoordinatorError("gate log cursor did not advance")
+            current_offset = next_offset
+        else:
+            truncated = True
+        return {
+            "run_id": run_id,
+            "offset": offset,
+            "next_offset": current_offset,
+            "text": "".join(pages),
+            "eof": eof,
+            "truncated": truncated,
+        }
 
     def ping(self) -> dict[str, Any]:
         owner = self._inspect().get("owner")
@@ -2971,12 +3060,17 @@ def follow(
                 time.sleep(interval)
                 interval = min(interval * 2, WAIT_POLL_MAX_SECONDS)
                 continue
-            page = _following_call(
-                lambda: client.log(run_id, offset=offset), run_id, retry
-            )
-            if page["text"]:
-                print(page["text"], end="", file=out, flush=True)
-            offset = page["next_offset"]
+            while True:
+                page = _following_call(
+                    lambda: client.log(run_id, offset=offset), run_id, retry
+                )
+                if page["text"]:
+                    print(page["text"], end="", file=out, flush=True)
+                next_offset = page["next_offset"]
+                if page["eof"] or next_offset <= offset:
+                    offset = next_offset
+                    break
+                offset = next_offset
             if status in TERMINAL_STATUSES and page["eof"]:
                 if status == "interrupted":
                     _report_interruption(row, err)
