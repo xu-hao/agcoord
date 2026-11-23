@@ -126,6 +126,7 @@ class _Lane:
     ) -> str:
         common = dict(
             checkout=str(self.repository),
+            label=f"result cache {self.kind}",
             resources={"cpu": cpu},
             environment=environment,
         )
@@ -296,6 +297,8 @@ def test_agc_run_gives_a_local_run_the_key_only_with_google_cloud_overflow_and_n
                 "-m",
                 "agcoord",
                 "run",
+                "--label",
+                "result cache home check",
                 "--state-dir",
                 str(running.paths.state_dir),
                 "--checkout",

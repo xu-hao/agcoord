@@ -1039,7 +1039,7 @@ delegated root and explicitly bind the capacity names before the broker starts:
 ```
 
 ```bash
-agc run --resource cpu=2 --resource pids=64 -- python -m pytest -q
+agc run --label "cgroup tests" --resource cpu=2 --resource pids=64 -- python -m pytest -q
 ```
 
 The root must be an absolute, real directory on the unified cgroup v2 hierarchy, writable by
@@ -1178,7 +1178,7 @@ same run:
 ```
 
 ```bash
-agc run --resource memory=1073741824 --resource tmpfs=536870912 \
+agc run --label "tmpfs scratch tests" --resource memory=1073741824 --resource tmpfs=536870912 \
   --resource tmpfs_inodes=65536 -- python -m pytest -q
 ```
 
@@ -1270,7 +1270,7 @@ the backend with the same enforcement mode:
 ```
 
 ```bash
-agc run --resource disk=8589934592 --resource disk_inodes=200000 \
+agc run --label "quota scratch tests" --resource disk=8589934592 --resource disk_inodes=200000 \
   -- python -m pytest -q
 ```
 
@@ -1364,7 +1364,7 @@ more scratch paths in the same broker file:
 ```
 
 ```bash
-agc run --resource read_bps=134217728 --resource write_bps=67108864 \
+agc run --label "block I/O tests" --resource read_bps=134217728 --resource write_bps=67108864 \
   --resource read_iops=2000 --resource write_iops=1000 -- python -m pytest -q
 ```
 
@@ -1476,9 +1476,14 @@ machine. `attempts` is the number of the row's current or next attempt: `1` unti
 each. `preempted_by` is the run ID of the job that most recently preempted the row, including
 one whose stop is still in progress, or null. Repository and
 worktree IDs are stable opaque identities, while their resolved values remain available for
-operators. `agent` is the explicit `--agent` value, then `AGCOORD_AGENT`, or the stable value
-`unnamed` when neither is set; `caller_pid` remains the exact submitting process diagnostic and
-is never used as the fallback identity. Missing times and kind-specific values are null rather
+operators. `label` is a required, non-empty human-readable string supplied explicitly via `--label`
+on `agc run`, `agc full`, and `agc land` (and as the required keyword-only `label` argument on
+`CoordinatorClient.submit` and `CoordinatorClient.submit_land`, or `--label` on
+`python -m agcoord.queue submit`); it has no fallback default, surrounding whitespace is stripped
+before queueing, and empty or whitespace-only values are refused before any broker starts or row is
+created (`runs.label TEXT NOT NULL` in protocol 5). `agent` is the explicit `--agent` value, then
+`AGCOORD_AGENT`, or the stable value `unnamed` when neither is set; `caller_pid` remains the exact
+submitting process diagnostic and is never used as the fallback identity. Missing times and kind-specific values are null rather
 than guessed. A queued
 position is one-based; active and terminal rows use null.
 
@@ -1714,11 +1719,11 @@ exact checkout/branch/head, gate command, private caller environment, and resour
 
 ```bash
 agc land 123 \
-  --label "gate and publish PR 123" \
+  --label "land #123 retry budget" \
   --checkout /absolute/path/to/worktree \
   --resource cpu=4 \
   -- ./scripts/test.sh
-agc land 123 --adapter github -- ./scripts/test.sh
+agc land 123 --adapter github --label "land #123 retry budget" -- ./scripts/test.sh
 ```
 
 The CLI defaults `--adapter` to `github` as a convenience, while the client API and durable
@@ -1884,7 +1889,7 @@ is discovered outside the repository lane barrier rather than while holding it. 
 keeps that pre-barrier check and stops paying for it twice:
 
 ```bash
-agc land 123 --reuse-full -- ./scripts/test.sh
+agc land 123 --label "land #123 retry budget" --reuse-full -- ./scripts/test.sh
 ```
 
 The worker never decides this. After preflight reaches its exact head it asks the coordinator,

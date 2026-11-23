@@ -419,9 +419,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="restrict execution to named runtimes: local or pool names (repeatable)",
         )
 
+    _label_help = (
+        "short plain-English summary for humans in agc list and agc tui "
+        "(lead with what is checked or landed; omit commit SHAs, branch names, and paths)"
+    )
+
     def submission(name: str, help_text: str) -> argparse.ArgumentParser:
         command = state(commands.add_parser(name, help=help_text))
-        command.add_argument("--label", default=name, help="short queue label")
+        command.add_argument("--label", required=True, help=_label_help)
         command.add_argument("--checkout", default=".", help="command working tree")
         command.add_argument("--repository", help="explicit stable repository identity")
         command.add_argument(
@@ -465,7 +470,7 @@ def build_parser() -> argparse.ArgumentParser:
     ))
     land.add_argument("request", type=int, help="adapter request (GitHub PR number)")
     land.add_argument("--adapter", default="github", help="publication adapter")
-    land.add_argument("--label", default="land", help="short queue label")
+    land.add_argument("--label", required=True, help=_label_help)
     land.add_argument("--checkout", default=".", help="ticket worktree")
     land.add_argument("--repository", help="explicit stable repository identity")
     land.add_argument(

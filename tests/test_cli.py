@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -15,7 +16,13 @@ import pytest
 from agcoord import cli
 from agcoord.queue import NATIVE_PROTOCOL, CoordinatorError
 
-from conftest import RunningCoordinator, caller_environment, wait_for
+from conftest import (
+    RunningCoordinator,
+    caller_environment,
+    native_broker_executable,
+    wait_for,
+    write_broker_config,
+)
 
 
 def _row(
@@ -274,7 +281,7 @@ def test_parser_and_submission_validation_use_agc_command_name(fake_client):
     assert parser.prog == "agc"
     assert parser.format_usage().startswith("usage: agc")
     with pytest.raises(CoordinatorError, match=r"^agc run needs a command after --$"):
-        cli.run(parser.parse_args(["run"]), out=StringIO())
+        cli.run(parser.parse_args(["run", "--label", "missing command"]), out=StringIO())
 
 
 def test_json_cli_keeps_the_machine_readable_drain_refusal(
@@ -299,6 +306,8 @@ def test_json_cli_keeps_the_machine_readable_drain_refusal(
             [
                 "--json",
                 "run",
+                "--label",
+                "drain refusal",
                 "--checkout",
                 str(tmp_path),
                 "--",
@@ -324,7 +333,125 @@ def test_submission_help_describes_the_stable_unnamed_agent_default(
         cli.main([command, "--help"])
 
     assert stopped.value.code == 0
-    assert "AGCOORD_AGENT or unnamed" in capsys.readouterr().out
+    help_text = capsys.readouterr().out
+    assert "AGCOORD_AGENT or unnamed" in help_text
+    assert "plain-English" in help_text
+    assert "agc list" in help_text
+    assert "agc tui" in help_text
+
+
+def _run_cli_subprocess(state_dir: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    env = caller_environment()
+    src_dir = str(Path(__file__).resolve().parent.parent / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing}" if existing else src_dir
+    return subprocess.run(
+        [sys.executable, "-m", "agcoord", "--state-dir", str(state_dir), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _stop_any_detached_broker(state_dir: Path) -> None:
+    lock = state_dir / "broker.lock"
+    if not lock.is_file():
+        return
+    for line in lock.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("pid="):
+            try:
+                os.kill(int(line.removeprefix("pid=")), 15)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
+def test_submission_commands_require_explicit_label_before_queueing_or_starting_broker(
+    tmp_path: Path,
+):
+    checkout = tmp_path / "checkout"
+    _clean_repository(checkout)
+    unstarted_state = tmp_path / "unstarted-state"
+    write_broker_config(
+        unstarted_state,
+        capacities={"jobs": 1, "cpu": 1},
+        native_broker={
+            "path": str(native_broker_executable()),
+            "allow_development": True,
+        },
+    )
+    running = RunningCoordinator(
+        tmp_path / "live-state",
+        capacities={"jobs": 1, "cpu": 1},
+    )
+    client = running.start()
+    invocations = (
+        ("run", "--checkout", str(checkout), "--resource", "cpu=1", "--", "true"),
+        ("full", "--checkout", str(checkout), "--resource", "cpu=1", "--", "true"),
+        ("land", "123", "--checkout", str(checkout), "--resource", "cpu=1", "--", "true"),
+    )
+    try:
+        for argv in invocations:
+            unstarted = _run_cli_subprocess(unstarted_state, *argv)
+            assert unstarted.returncode == 2, (argv, unstarted.stdout, unstarted.stderr)
+            assert "--label" in unstarted.stderr
+            assert not (unstarted_state / "broker.lock").exists()
+            assert not (unstarted_state / "queue.sqlite3").exists()
+
+            live = _run_cli_subprocess(running.paths.state_dir, *argv)
+            assert live.returncode == 2, (argv, live.stdout, live.stderr)
+            assert "--label" in live.stderr
+        snapshot = client.snapshot()
+        assert snapshot["active"] == []
+        assert snapshot["queued"] == []
+        assert snapshot["recent"] == []
+    finally:
+        _stop_any_detached_broker(unstarted_state)
+        running.stop()
+
+
+def test_submission_commands_reject_empty_or_whitespace_labels_before_queueing(
+    tmp_path: Path,
+):
+    checkout = tmp_path / "checkout"
+    _clean_repository(checkout)
+    unstarted_state = tmp_path / "unstarted-state"
+    write_broker_config(
+        unstarted_state,
+        capacities={"jobs": 1, "cpu": 1},
+        native_broker={
+            "path": str(native_broker_executable()),
+            "allow_development": True,
+        },
+    )
+    running = RunningCoordinator(
+        tmp_path / "live-state",
+        capacities={"jobs": 1, "cpu": 1},
+    )
+    client = running.start()
+    invocations = (
+        ("run", "--label", "   ", "--checkout", str(checkout), "--resource", "cpu=1", "--", "true"),
+        ("full", "--label", "", "--checkout", str(checkout), "--resource", "cpu=1", "--", "true"),
+        ("land", "123", "--label", "  ", "--checkout", str(checkout), "--resource", "cpu=1", "--", "true"),
+    )
+    try:
+        for argv in invocations:
+            unstarted = _run_cli_subprocess(unstarted_state, *argv)
+            assert unstarted.returncode == 2, (argv, unstarted.stdout, unstarted.stderr)
+            assert "label must be a non-empty string" in unstarted.stderr
+            assert not (unstarted_state / "broker.lock").exists()
+            assert not (unstarted_state / "queue.sqlite3").exists()
+
+            live = _run_cli_subprocess(running.paths.state_dir, *argv)
+            assert live.returncode == 2, (argv, live.stdout, live.stderr)
+            assert "label must be a non-empty string" in live.stderr
+        snapshot = client.snapshot()
+        assert snapshot["active"] == []
+        assert snapshot["queued"] == []
+        assert snapshot["recent"] == []
+    finally:
+        _stop_any_detached_broker(unstarted_state)
+        running.stop()
 
 
 def test_list_show_log_cancel_and_clear_use_stable_job_records(fake_client, tmp_path: Path):
@@ -657,7 +784,7 @@ def test_run_and_full_parse_repeatable_resources_and_follow_the_durable_job(
 
 
 def test_run_allows_overflow_only_when_the_submitter_asks(fake_client, tmp_path: Path):
-    args = _args("run", "--checkout", str(tmp_path), "--overflow", "--", "true")
+    args = _args("run", "--label", "overflow check", "--checkout", str(tmp_path), "--overflow", "--", "true")
 
     cli.run(args, out=StringIO())
 
@@ -665,21 +792,21 @@ def test_run_allows_overflow_only_when_the_submitter_asks(fake_client, tmp_path:
 
 
 def test_no_preempt_is_a_check_option_that_reaches_the_client(fake_client, tmp_path: Path):
-    cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=StringIO())
+    cli.run(_args("run", "--label", "preempt default", "--checkout", str(tmp_path), "--", "true"), out=StringIO())
     assert fake_client["submitted"][-1][1]["preempt"] is True
 
     cli.run(
-        _args("run", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
+        _args("run", "--label", "no preempt", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
         out=StringIO(),
     )
     assert fake_client["submitted"][-1][1]["preempt"] is False
 
     # A full gate or a land is never preempted, so neither command offers the option.
-    cli.run(_args("full", "--checkout", str(tmp_path), "--", "true"), out=StringIO())
+    cli.run(_args("full", "--label", "full gate", "--checkout", str(tmp_path), "--", "true"), out=StringIO())
     assert fake_client["submitted"][-1][1]["preempt"] is True
     for command in (
-        ("full", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
-        ("land", "7", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
+        ("full", "--label", "full gate", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
+        ("land", "7", "--label", "land #7", "--checkout", str(tmp_path), "--no-preempt", "--", "true"),
     ):
         with pytest.raises(SystemExit) as refused:
             _args(*command)
@@ -740,7 +867,7 @@ def test_inline_script_file_becomes_portable_shell_command(fake_client, tmp_path
     script = tmp_path / "check.sh"
     script.write_text("printf 'first\\n'\nprintf 'second\\n'\n", encoding="utf-8")
     cli.run(
-        _args(kind, "--checkout", str(tmp_path), "--script", str(script)),
+        _args(kind, "--label", "inline script", "--checkout", str(tmp_path), "--script", str(script)),
         out=StringIO(),
     )
     command, metadata = fake_client["submitted"][-1]
@@ -751,7 +878,7 @@ def test_inline_script_file_becomes_portable_shell_command(fake_client, tmp_path
 def test_inline_script_reads_utf8_from_stdin(fake_client, monkeypatch, tmp_path):
     monkeypatch.setattr(cli.sys, "stdin", StringIO("echo from stdin\n"))
     cli.run(
-        _args("run", "--checkout", str(tmp_path), "--script", "-"),
+        _args("run", "--label", "stdin script", "--checkout", str(tmp_path), "--script", "-"),
         out=StringIO(),
     )
     assert fake_client["submitted"][-1][0] == ["bash", "-ec", "echo from stdin\n"]
@@ -764,7 +891,7 @@ def test_inline_script_refuses_non_utf8_stdin(fake_client, monkeypatch, tmp_path
     monkeypatch.setattr(cli.sys, "stdin", BinaryStdin())
     with pytest.raises(CoordinatorError, match="UTF-8"):
         cli.run(
-            _args("run", "--checkout", str(tmp_path), "--script", "-"),
+            _args("run", "--label", "bad stdin", "--checkout", str(tmp_path), "--script", "-"),
             out=StringIO(),
         )
     assert fake_client["submitted"] == []
@@ -797,7 +924,7 @@ def test_inline_script_dispatches_supported_shebangs(
     script = tmp_path / "script"
     script.write_text(shebang, encoding="utf-8")
     cli.run(
-        _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+        _args("run", "--label", "shebang script", "--checkout", str(tmp_path), "--script", str(script)),
         out=StringIO(),
     )
     command = fake_client["submitted"][-1][0]
@@ -811,7 +938,7 @@ def test_inline_script_refuses_unsupported_shebang(fake_client, tmp_path):
     script.write_text("#!/usr/bin/perl\nprint 'wrong';\n", encoding="utf-8")
     with pytest.raises(CoordinatorError, match="unsupported script shebang"):
         cli.run(
-            _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+            _args("run", "--label", "bad shebang", "--checkout", str(tmp_path), "--script", str(script)),
             out=StringIO(),
         )
     assert fake_client["submitted"] == []
@@ -826,7 +953,7 @@ def test_inline_script_refuses_empty_or_nul_content(fake_client, tmp_path, body,
     script.write_text(body, encoding="utf-8")
     with pytest.raises(CoordinatorError, match=message):
         cli.run(
-            _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+            _args("run", "--label", "invalid script", "--checkout", str(tmp_path), "--script", str(script)),
             out=StringIO(),
         )
     assert fake_client["submitted"] == []
@@ -844,7 +971,7 @@ def test_inline_script_reports_file_read_errors(
         script.write_bytes(contents)
     with pytest.raises(CoordinatorError, match=message):
         cli.run(
-            _args("run", "--checkout", str(tmp_path), "--script", str(script)),
+            _args("run", "--label", "unreadable script", "--checkout", str(tmp_path), "--script", str(script)),
             out=StringIO(),
         )
     assert fake_client["submitted"] == []
@@ -856,7 +983,15 @@ def test_inline_script_and_worker_command_are_mutually_exclusive(fake_client, tm
     with pytest.raises(CoordinatorError, match="cannot be combined"):
         cli.run(
             _args(
-                "run", "--checkout", str(tmp_path), "--script", str(script), "--", "true"
+                "run",
+                "--label",
+                "conflicting script",
+                "--checkout",
+                str(tmp_path),
+                "--script",
+                str(script),
+                "--",
+                "true",
             ),
             out=StringIO(),
         )
@@ -870,7 +1005,7 @@ def test_inline_script_and_worker_command_are_mutually_exclusive(fake_client, tm
 def test_inline_script_preserves_overflow_selection(fake_client, tmp_path, option, expected):
     script = tmp_path / "script"
     script.write_text("true\n", encoding="utf-8")
-    args = ["run", "--checkout", str(tmp_path), "--script", str(script)]
+    args = ["run", "--label", "script overflow", "--checkout", str(tmp_path), "--script", str(script)]
     if option:
         args.append(option)
     cli.run(_args(*args), out=StringIO())
@@ -908,7 +1043,7 @@ def test_default_overflow_opt_in_sets_reserved_worker_environment(tmp_path):
 @pytest.mark.parametrize("option, expected", [(None, None), ("--overflow", True), ("--no-overflow", False)])
 def test_submission_overflow_options_reach_client(fake_client, tmp_path, kind, option, expected):
     arguments = [kind] + (["123"] if kind == "land" else [])
-    arguments += ["--checkout", str(tmp_path)]
+    arguments += ["--label", "overflow option", "--checkout", str(tmp_path)]
     if option:
         arguments.append(option)
     arguments += ["--", "true"]
@@ -921,13 +1056,15 @@ def test_submission_overflow_options_reach_client(fake_client, tmp_path, kind, o
 def test_overflow_options_are_mutually_exclusive(kind):
     arguments = [kind] + (["123"] if kind == "land" else [])
     with pytest.raises(SystemExit):
-        _args(*arguments, "--overflow", "--no-overflow", "--", "true")
+        _args(*arguments, "--label", "conflicting overflow", "--overflow", "--no-overflow", "--", "true")
 
 
 @pytest.mark.parametrize("kind", ["run", "full", "land"])
 def test_runtime_and_capability_selectors_reach_client(fake_client, tmp_path, kind):
     arguments = [kind] + (["123"] if kind == "land" else [])
     arguments += [
+        "--label",
+        "selector check",
         "--checkout",
         str(tmp_path),
         "--require-capability",
@@ -968,7 +1105,7 @@ def test_invalid_runtime_or_capability_arguments_fail_closed_before_client_const
     fake_client["submitted"].clear()
     fake_client["landed"].clear()
     arguments = [kind] + (["123"] if kind == "land" else [])
-    arguments += ["--checkout", str(tmp_path), f"{flag}={value}", "--", "true"]
+    arguments += ["--label", "invalid selector", "--checkout", str(tmp_path), f"{flag}={value}", "--", "true"]
     with pytest.raises(CoordinatorError):
         cli.run(_args(*arguments), out=StringIO())
     assert fake_client["submitted"] == []
@@ -986,7 +1123,7 @@ def test_resource_arguments_fail_closed_before_client_construction(
 ):
     fake_client["submitted"].clear()
     try:
-        args = _args("run", "--resource", resource, "--", "true")
+        args = _args("run", "--label", "invalid resource", "--resource", resource, "--", "true")
     except SystemExit:
         return
     with pytest.raises(CoordinatorError):
@@ -1028,6 +1165,7 @@ def test_public_full_refuses_a_dirty_checkout_before_accepting_a_receipt(
                 ["true"],
                 checkout=str(checkout),
                 kind="full",
+                label="dirty full",
                 resources={"cpu": 1},
             )
         snapshot = client.snapshot()
@@ -1113,6 +1251,8 @@ def test_land_dispatches_gate_and_publication_as_one_followed_request(
             _args(
                 "land",
                 "123",
+                "--label",
+                "explicit singleton bisect",
                 "--no-deductive-bisect",
                 "--checkout",
                 str(checkout),
@@ -1598,7 +1738,7 @@ def test_follow_retries_a_transient_coordinator_error_and_keeps_the_verdict(
     monkeypatch.setattr(cli, "CoordinatorClient", FlakyClient)
 
     output = StringIO()
-    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=output) == 0
+    assert cli.run(_args("run", "--label", "flaky check", "--checkout", str(tmp_path), "--", "true"), out=output) == 0
     assert "AGCoord: accepted check-flaky" in output.getvalue()
     assert "lost contact" not in capsys.readouterr().err
     assert calls["status"] >= 3
@@ -1629,7 +1769,7 @@ def test_follow_reports_a_lost_stream_and_exits_75_without_claiming_a_verdict(
     monkeypatch.setattr(cli, "CoordinatorClient", LockedClient)
 
     output = StringIO()
-    assert cli.run(_args("full", "--checkout", str(tmp_path), "--", "true"), out=output) == 75
+    assert cli.run(_args("full", "--label", "locked full", "--checkout", str(tmp_path), "--", "true"), out=output) == 75
     captured = capsys.readouterr()
     assert output.getvalue() == "AGCoord: accepted full-locked\n"
     assert "lost contact with the coordinator while following full-locked" in captured.err
@@ -1671,7 +1811,7 @@ def test_follow_backs_off_while_queued_and_streams_promptly_once_admitted(
     monkeypatch.setattr(cli, "CoordinatorClient", QueuedClient)
     monkeypatch.setattr(queue_module.time, "sleep", lambda seconds: sleeps.append((current(), seconds)))
 
-    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=StringIO()) == 0
+    assert cli.run(_args("run", "--label", "queued backoff", "--checkout", str(tmp_path), "--", "true"), out=StringIO()) == 0
     assert [seconds for status, seconds in sleeps if status == "queued"] == pytest.approx(
         [0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0]
     )
@@ -1730,7 +1870,7 @@ def test_follow_prints_a_preemption_notice_and_returns_the_final_attempt(
     monkeypatch.setattr(queue_module.time, "sleep", lambda _seconds: None)
 
     output = StringIO()
-    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=output) == 7
+    assert cli.run(_args("run", "--label", "preempted check", "--checkout", str(tmp_path), "--", "true"), out=output) == 7
     assert output.getvalue() == (
         "AGCoord: accepted check-preempted\n"
         "Gate queue: check-preempted running as pid 5100 in /worktrees/example\n"
@@ -1766,7 +1906,7 @@ def test_json_wait_backs_off_to_one_second_polls_until_the_final_row(
     monkeypatch.setattr(cli, "CoordinatorClient", WaitingClient)
     monkeypatch.setattr(queue_module.time, "sleep", sleeps.append)
 
-    assert cli.main(["--json", "run", "--checkout", str(tmp_path), "--", "true"]) == 0
+    assert cli.main(["--json", "run", "--label", "json wait", "--checkout", str(tmp_path), "--", "true"]) == 0
     assert polls["count"] == len(statuses)
     assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0])
 
@@ -1793,7 +1933,7 @@ def test_follow_reports_a_broker_stopped_job_as_no_verdict_and_returns_its_exit_
 
     monkeypatch.setattr(cli, "CoordinatorClient", StoppedClient)
 
-    assert cli.run(_args("run", "--checkout", str(tmp_path), "--", "true"), out=StringIO()) == 125
+    assert cli.run(_args("run", "--label", "stopped check", "--checkout", str(tmp_path), "--", "true"), out=StringIO()) == 125
     err = capsys.readouterr().err
     assert "check-stopped was interrupted (broker-stopped) and claims no verdict" in err
     assert "submit it again" in err
@@ -1820,7 +1960,7 @@ def test_json_wait_reports_a_lost_stream_as_a_coded_object_with_the_run_id(
 
     monkeypatch.setattr(cli, "CoordinatorClient", LockedClient)
 
-    assert cli.main(["--json", "run", "--checkout", str(tmp_path), "--", "true"]) == 75
+    assert cli.main(["--json", "run", "--label", "lost json wait", "--checkout", str(tmp_path), "--", "true"]) == 75
     captured = capsys.readouterr()
     assert captured.out == ""
     payload = json.loads(captured.err)

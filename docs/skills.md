@@ -22,9 +22,10 @@ After installing the skill, add this trigger to the repository's `AGENTS.md` or
 `CLAUDE.md` so agents use it for relevant work:
 
 ```text
-When running checks or landing pull requests, follow the agcoord skill: declare resources
-with agc run, keep checks portable for overflow, and use one agc land request for gate and
-publication. Never run agc inside an admitted job or merge a pull request directly.
+When running checks or landing pull requests, follow the agcoord skill: pass a short
+plain-English --label and declare resources with agc run, keep checks portable for
+overflow, and use one agc land request for gate and publication. Never run agc inside an
+admitted job or merge a pull request directly.
 ```
 
 ## Contributor validation

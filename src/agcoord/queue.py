@@ -1503,8 +1503,8 @@ class CoordinatorClient:
         command: Sequence[str],
         *,
         checkout: str,
+        label: str,
         kind: str = "check",
-        label: str = "run",
         resources: Mapping[str, int] | None = None,
         agent: str | None = None,
         repository: str | None = None,
@@ -1832,7 +1832,7 @@ class CoordinatorClient:
         command: Sequence[str],
         *,
         checkout: str,
-        label: str = "land",
+        label: str,
         resources: Mapping[str, int] | None = None,
         agent: str | None = None,
         repository: str | None = None,
@@ -3120,7 +3120,7 @@ def _build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--resources-json", default="{}")
     submit.add_argument("--kind", choices=("check", "full"), default="check")
     submit.add_argument("--head-sha")
-    submit.add_argument("--label", default="run")
+    submit.add_argument("--label", required=True)
     submit.add_argument("worker_command", nargs=argparse.REMAINDER)
     verify = commands.add_parser("verify-admission", help=argparse.SUPPRESS)
     verify.add_argument("--state-dir")

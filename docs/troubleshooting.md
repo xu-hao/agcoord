@@ -31,6 +31,8 @@ remain the authority for the behavior behind each entry, and the
 
 | What appears | Meaning | Next action |
 | --- | --- | --- |
+| `agc run: error: the following arguments are required: --label` (and `full`, `land`) | `--label` has no fallback default on job submissions. | Pass `--label "<short plain-English summary>"` naming what is checked or landed. |
+| `label must be a non-empty string` | `--label` was empty or whitespace-only. | Supply a concise non-empty plain-English summary. |
 | `<dir> is not inside a Git repository; agc schedules work per repository and worktree, so run it from a checkout or pass --checkout PATH` | `run`, `full`, and `land` need a repository and worktree identity. | Run from inside the checkout or pass `--checkout PATH`. |
 | `checkout does not exist: <path>` | `--checkout` named a missing directory. | Fix the path. |
 | `checkout is dirty; commit or remove changes before a full run` | `full` and `land` bind an exact clean head. | Commit or remove the changes; for `land`, push the head. |

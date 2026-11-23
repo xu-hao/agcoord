@@ -15,7 +15,12 @@ The short form covers a repository whose agents run checks and land pull request
 
 ```text
 Run every check through the local coordinator and declare what it uses:
-  PATH="<venv>/bin:$PATH" agc run --label "<what>" --resource cpu=2 -- pytest -q ...
+  PATH="<venv>/bin:$PATH" agc run --label "<short plain-English summary>" --resource cpu=2 -- pytest -q ...
+--label is required on agc run, agc full, and agc land, and humans read it in agc list
+and agc tui: lead with a short plain-English summary of what is checked or landed (for
+example, "API unit tests" or "land #123 retry budget"), and never stuff commit SHAs,
+branch names, "pre-land" tags, or raw directory paths into --label. Set AGCOORD_AGENT
+(or --agent) to your session or worker name when you have one.
 When .agcoord/overflow.json exists, agc run opts into overflow unless --no-overflow
 is passed. Built-in remote workers run in a container over a working-tree snapshot,
 without host venvs, host-local files, .git, or host daemons. Use bare executable names,
@@ -31,7 +36,7 @@ so a heavy suite can overflow cleanly. Declare scratch resources when needed, an
 for checks needing host files or venvs, .git, local services or daemons, or unbundled extras,
 and on agc full and agc land when gate scripts verify local admission.
 Land a pull request only through one gate-and-publish request; never merge directly:
-  agc land <pr> --resource cpu=4 -- <full test command>
+  agc land <pr> --label "land #<pr> <short summary>" --resource cpu=4 -- <full test command>
 Never run agc from inside an admitted job. A stale-main or head-changed refusal means:
 update the branch, push, and submit a new land request.
 A check can be preempted: stopped and requeued so that an older job can start, at most
@@ -46,7 +51,13 @@ The long form suits a repository with tickets, several agents, and an enforced h
 ## Coordinate every check and landing
 
 Run every check through the local coordinator and declare the resources it uses:
-  agc run --label "<ticket> <what>" --resource cpu=<n> -- <command>
+  agc run --label "<short plain-English summary>" --resource cpu=<n> -- <command>
+--label is required on `agc run`, `agc full`, and `agc land`, and humans read it in
+`agc list` and `agc tui`. Lead with a short plain-English summary of what is being checked
+or landed (for example, `--label "API unit tests"` or `--label "land #123 retry budget"`).
+Do not put commit SHAs, branch names, `"pre-land"` stage prefixes, or raw directory paths
+in `--label`—`KIND`, `REPO`, `BRANCH`, and `HEAD` already have separate columns, and
+leading boilerplate truncates the subject in narrow TUI views.
 When .agcoord/overflow.json exists, agc run opts into overflow unless --no-overflow
 is passed. Built-in remote workers run in a container over a working-tree snapshot,
 without host venvs, host-local files, .git, or host daemons. Keep commands portable:
@@ -63,7 +74,8 @@ bubblewrap (and --runtime NAME when targeting specific runtimes). Use
 --no-overflow for checks needing host files or venvs, .git, local services or daemons,
 or unbundled extras, and on agc full and agc land when gate scripts verify local
 admission.
-Use `agc full` for a clean exact-head verdict when you need one without publishing.
+Use `agc full --label "<short plain-English summary>" --resource cpu=<n> -- <full test command>`
+for a clean exact-head verdict when you need one without publishing.
 `full` and `land` execute in reusable coordinator-owned worktrees; checks use your
 checkout. Concurrent edits in your checkout cannot affect the gated files. The row's
 `checkout` names the executed tree, while receipt reuse keeps your logical worktree
@@ -75,7 +87,7 @@ for cache limits and setup refusals.
 
 Land only through one gate-and-publish request, from a clean checkout of the pushed
 head, after the pull request is open and ready:
-  agc land <pr> --label "<ticket> land" --resource cpu=<n> -- <full test command>
+  agc land <pr> --label "land #<pr> <short summary>" --resource cpu=<n> -- <full test command>
 Add --reuse-full when you already have a passed `agc full` for that exact head and the
 same gate command, and the gate does not depend on the clock, the network, or anything
 outside the commit; the coordinator then reuses that verdict instead of running it twice.
@@ -178,6 +190,8 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 
 | What appears | Meaning | Next action |
 | --- | --- | --- |
+| `agc run: error: the following arguments are required: --label` (and `full`, `land`) | `--label` has no default; every submission requires a human-readable summary. | Pass `--label "<short plain-English summary>"` describing what is checked or landed. |
+| `error: label must be a non-empty string` | `--label` was empty or whitespace-only. | Pass a concise non-empty plain-English label. |
 | `error: … is not inside a Git repository; agc schedules work per repository and worktree, so run it from a checkout or pass --checkout PATH` | The working directory is not in a Git repository. | Run from inside the checkout, or pass `--checkout PATH`. |
 | `error: checkout is dirty; commit or remove changes before a full run` | `full` and `land` bind an exact clean head. | Commit or remove the changes; for `land`, push the head first. |
 | `gate-tree-checkout-missing` / `gate-tree-head-missing` | The queued gate lost its source checkout or commit. | Restore the checkout and head, then resubmit. |
@@ -215,9 +229,14 @@ during the gate itself.
 ## Name the agent
 
 Set `AGCOORD_AGENT` in each agent's environment, or pass `--agent`, so every row records who
-submitted it. Without it the identity is the single value `unnamed`. Labels are free text and
-are the second thing a human reads in `agc list` and the TUI, so start them with the ticket
-or task name. The TUI's `a` and `p` keys filter by agent and repository.
+submitted it. Without it the identity is the single value `unnamed`. `--label` is required on
+`agc run`, `agc full`, and `agc land` with no fallback default, and it is what a human reads in
+`agc list` and `agc tui` to tell rows apart. Lead with a short plain-English summary of what is
+being checked or landed, such as `"API unit tests"` or `"land #123 retry budget"`. Do not stuff
+commit SHAs, branch names, `"pre-land"` stage prefixes, or raw directory paths into `--label`:
+`KIND`, `REPO`, `BRANCH`, and `HEAD` already have separate fields and columns, and leading
+boilerplate pushes the actual subject past the compact `LABEL` width in `agc tui`. The TUI's
+`a` and `p` keys filter by agent and repository.
 
 ## Size claims from receipts
 
@@ -278,10 +297,10 @@ Tools that run several agents in parallel worktrees, such as Claude Squad, Condu
 Kanban, and Nimbalyst, do not schedule the machine or gate merges. They compose with AGCoord
 in two places. The agents inside them read the repository's instruction file, so the paragraph
 above reaches them unchanged. And wherever such a tool takes a shell command for setup, tests,
-or checks, that command can be `agc run --label "…" --resource cpu=<n> -- <command>`, which
+or checks, that command can be `agc run --label "<short plain-English summary>" --resource cpu=<n> -- <command>`, which
 queues the work instead of running it immediately. Orchestrators that let agents land their
 own work, such as Gas Town rigs or Symphony runs, can point their configured test or landing
-step at `agc run` and `agc land` in the same way. Nothing in the coordinator needs to know
+step at `agc run` and `agc land` (always passing a human-readable `--label`) in the same way. Nothing in the coordinator needs to know
 which tool submitted the job.
 
 ## Repository gate wrappers

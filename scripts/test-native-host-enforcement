@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ -z ${AGCOORD_RUN_ID:-} || -z ${AGCOORD_STATE_DIR:-} ]]; then
     printf '%s\n' \
         'run this probe as an admitted job:' \
-        '  agc --json run --resource cpu=1 -- ./scripts/test-native-host-enforcement' >&2
+        '  agc --json run --label "native host enforcement" --resource cpu=1 -- ./scripts/test-native-host-enforcement' >&2
     exit 2
 fi
 

@@ -106,6 +106,7 @@ with client.acquire_child_cpu_lease(2, timeout=5) as lease:
 """,
             ],
             checkout=str(repository),
+            label="hold and release lease",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -224,6 +225,7 @@ Path(os.environ["LEASE_REPORT"]).write_text(json.dumps({
 """,
             ],
             checkout=str(repository),
+            label="partial and impossible lease",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -302,6 +304,7 @@ Path(os.environ["LEASE_REPORT"]).write_text(
 """,
             ],
             checkout=str(repository),
+            label="explicit lease cancellation",
             resources={"cpu": 1},
             caller_pid=os.getpid(),
             environment={
@@ -352,6 +355,7 @@ while not release.exists():
 """,
             ],
             checkout=str(repository),
+            label="spoofed lease context",
             resources={"cpu": 1},
             caller_pid=os.getpid(),
             environment={
@@ -467,6 +471,7 @@ if statuses != [0, 0, 0]:
         run_id = client.submit(
             [sys.executable, "-u", "-c", orchestrator],
             checkout=str(repository),
+            label="fifo bounded bypass",
             resources={"cpu": 4},
             caller_pid=os.getpid(),
             environment={
@@ -565,6 +570,7 @@ if waiter.wait() != 0:
         run_id = client.submit(
             [sys.executable, "-u", "-c", orchestrator],
             checkout=str(repository),
+            label="lease controller crash recovery",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -643,6 +649,7 @@ while True:
         run_id = client.submit(
             [sys.executable, "-u", "-c", orchestrator],
             checkout=str(repository),
+            label="parent cancellation lease cleanup",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -685,6 +692,7 @@ def test_replacement_broker_preserves_live_lease_without_minting_tokens(tmp_path
                 _CONTROLLER_SOURCE,
             ],
             checkout=str(repository),
+            label="replacement broker lease recovery",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
