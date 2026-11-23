@@ -62,8 +62,11 @@ procedures listed in [docs/index.md](docs/index.md).
   and no-direct-target-push rules still apply.
 - On Linux hosts with `agcoord` (`agc`), route checks and pull-request landing through
   the local coordinator with integer byte memory claims:
-  - Check: `agc run --no-overflow --resource cpu=4 --resource memory=8589934592 -- python -m pytest -q`
-  - Land: `agc land <pr> --no-overflow --resource cpu=4 --resource memory=8589934592 -- python -m pytest -q`
+  - Check: `agc run --label "<short plain-English summary>" --no-overflow --resource cpu=4 --resource memory=8589934592 -- python -m pytest -q`
+  - Land: `agc land <pr> --label "land #<pr> <short summary>" --no-overflow --resource cpu=4 --resource memory=8589934592 -- python -m pytest -q`
+  Give every job a short plain-English `--label` for humans in `agc list` and `agc tui`
+  (lead with what is checked or landed; omit commit SHAs, branch names, `"pre-land"` tags,
+  and file paths).
   Never submit coordinated work recursively inside an admitted job, and never bypass or
   separate the gate verdict from publication. On hosts without `agc`, run
   `python -m pytest -q` directly and merge through the forge after checks pass.
