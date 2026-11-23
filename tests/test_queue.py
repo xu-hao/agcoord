@@ -31,6 +31,7 @@ from agcoord.resources import ResourceMeasurement, ResourceObservation
 from conftest import (
     RunningCoordinator,
     caller_environment,
+    native_broker_executable,
     wait_for,
     write_broker_config,
 )
@@ -465,12 +466,14 @@ def test_unnamed_agent_is_stable_while_explicit_identity_and_caller_pid_are_kept
     first_id = client.submit(
         _python("print('first unnamed')"),
         checkout=str(repository),
+        label="first unnamed check",
         caller_pid=4101,
         environment=caller_environment(),
     )
     second_id = client.submit(
         _python("print('second unnamed')"),
         checkout=str(repository),
+        label="second unnamed check",
         caller_pid=4102,
         environment=caller_environment(),
     )
@@ -478,12 +481,14 @@ def test_unnamed_agent_is_stable_while_explicit_identity_and_caller_pid_are_kept
     environment_id = client.submit(
         _python("print('environment identity')"),
         checkout=str(repository),
+        label="environment agent check",
         caller_pid=4103,
         environment=caller_environment(),
     )
     explicit_id = client.submit(
         _python("print('explicit identity')"),
         checkout=str(repository),
+        label="explicit agent check",
         agent="explicit-agent",
         caller_pid=4104,
         environment=caller_environment(),
@@ -744,6 +749,7 @@ def test_explicit_repository_identity_joins_distinct_git_worktrees_to_one_lane(
         client.submit(
             _python("print('a')"),
             checkout=str(first),
+            label="worktree a check",
             repository="example/widgets",
             branch="feature/a",
             resources={"jobs": 1},
@@ -753,6 +759,7 @@ def test_explicit_repository_identity_joins_distinct_git_worktrees_to_one_lane(
         client.submit(
             _python("print('b')"),
             checkout=str(second),
+            label="worktree b check",
             repository="example/widgets",
             branch="feature/b",
             resources={"jobs": 1},
@@ -783,6 +790,7 @@ def test_impossible_or_nonpositive_resource_requests_are_never_queued(
             client.submit(
                 _python("raise SystemExit('must not run')"),
                 checkout=str(repository),
+                label="invalid resource request",
                 resources=resources,
                 caller_pid=os.getpid(),
                 environment=caller_environment(),
@@ -833,6 +841,7 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
             client.submit(
                 command,
                 checkout=str(repository),
+                label="missing overflow config",
                 resources={"cpu": 4},
                 caller_pid=os.getpid(),
                 environment=caller_environment(),
@@ -846,6 +855,7 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
         local_id = client.submit(
             command,
             checkout=str(repository),
+            label="local opt-out check",
             resources={"cpu": 1},
             caller_pid=os.getpid(),
             environment=caller_environment(),
@@ -857,6 +867,7 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
             client.submit(
                 command,
                 checkout=str(repository),
+                label="oversized local check",
                 resources={"cpu": 4},
                 caller_pid=os.getpid(),
                 environment=caller_environment(),
@@ -865,6 +876,7 @@ def test_an_overflow_submission_runs_through_the_pool_executor(tmp_path: Path):
         run_id = client.submit(
             command,
             checkout=str(repository),
+            label="overflow executor check",
             resources={"cpu": 4},
             caller_pid=os.getpid(),
             environment=caller_environment(),
@@ -895,7 +907,12 @@ def test_overflow_default_and_opt_out_validate_checkout(kind: str, tmp_path: Pat
     config = repository / ".agcoord" / "overflow.json"
 
     def submit(**kwargs):
-        common = dict(checkout=str(repository), resources={"cpu": 1}, environment=environment)
+        common = dict(
+            checkout=str(repository),
+            label=f"overflow {kind}",
+            resources={"cpu": 1},
+            environment=environment,
+        )
         if kind == "land":
             return client.submit_land("github", 101, _python("None"), **common, **kwargs)
         return client.submit(_python("None"), kind=kind, **common, **kwargs)
@@ -933,11 +950,24 @@ def test_overflow_default_and_opt_out_validate_checkout(kind: str, tmp_path: Pat
                 submit(overflow=invalid)
         with pytest.raises(CoordinatorError, match="reserved _AGCOORD_OVERFLOW"):
             if kind == "land":
-                client.submit_land("github", 101, _python("None"), checkout=str(repository),
-                                   environment={"_AGCOORD_OVERFLOW": "1"}, overflow=False)
+                client.submit_land(
+                    "github",
+                    101,
+                    _python("None"),
+                    checkout=str(repository),
+                    label=f"reserved overflow {kind}",
+                    environment={"_AGCOORD_OVERFLOW": "1"},
+                    overflow=False,
+                )
             else:
-                client.submit(_python("None"), checkout=str(repository), kind=kind,
-                              environment={"_AGCOORD_OVERFLOW": "1"}, overflow=False)
+                client.submit(
+                    _python("None"),
+                    checkout=str(repository),
+                    kind=kind,
+                    label=f"reserved overflow {kind}",
+                    environment={"_AGCOORD_OVERFLOW": "1"},
+                    overflow=False,
+                )
     finally:
         running.stop()
 
@@ -969,7 +999,12 @@ def test_exact_head_submission_defaults_to_pool_capacity(kind: str, tmp_path: Pa
         bin_dir, branch=branch, head_sha=_head(repository), tag="overflow",
         event_log=tmp_path / "events",
     )
-    common = dict(checkout=str(repository), resources={"cpu": 4}, environment=environment)
+    common = dict(
+        checkout=str(repository),
+        label=f"pool capacity {kind}",
+        resources={"cpu": 4},
+        environment=environment,
+    )
     try:
         with pytest.raises(CoordinatorError, match="capacity"):
             if kind == "land":
@@ -1034,6 +1069,7 @@ def test_overflow_submission_validates_dockerfile_build_context(tmp_path: Path):
                 client.submit(
                     command,
                     checkout=str(repository),
+                    label="invalid dockerfile context",
                     resources={"cpu": 4},
                     caller_pid=os.getpid(),
                     environment=caller_environment(),
@@ -1048,6 +1084,7 @@ def test_overflow_submission_validates_dockerfile_build_context(tmp_path: Path):
         run_id = client.submit(
             command,
             checkout=str(repository),
+            label="valid dockerfile context",
             resources={"cpu": 4},
             caller_pid=os.getpid(),
             environment=caller_environment(),
@@ -1155,6 +1192,7 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
             client.submit(
                 _python("None"),
                 checkout=str(repository),
+                label="missing overflow runtime check",
                 resources={"cpu": 1},
                 environment=caller_environment(),
                 runtimes=["batch-priv"],
@@ -1177,6 +1215,7 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
                 client.submit(
                     _python("None"),
                     checkout=str(repository),
+                    label="invalid runtime or capability",
                     environment=caller_environment(),
                     **bad_kwargs,
                 )
@@ -1192,6 +1231,7 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
                 env_probe,
             ),
             checkout=str(repository),
+            label="local capability check",
             resources={"cpu": 1},
             environment=local_env,
             overflow=False,
@@ -1206,6 +1246,7 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
         userns_id = client.submit(
             _python("None"),
             checkout=str(repository),
+            label="userns capability check",
             resources={"cpu": 1},
             environment=caller_environment(),
             require_capabilities=["userns"],
@@ -1217,6 +1258,7 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
         unpriv_id = client.submit(
             _python("None"),
             checkout=str(repository),
+            label="unprivileged pool check",
             resources={"cpu": 1},
             environment=caller_environment(),
             runtimes=["cloud-run"],
@@ -1228,6 +1270,7 @@ def test_unified_runtime_capabilities_and_privileged_pool_propagation(tmp_path: 
         wide_id = client.submit(
             _python("None"),
             checkout=str(repository),
+            label="wide overflow check",
             resources={"cpu": 6},
             environment=caller_environment(),
         )
@@ -1472,12 +1515,14 @@ def test_a_check_submitted_without_preemption_is_never_stopped_for_a_starving_ro
             client.submit(
                 _python("None"),
                 checkout=str(repository),
+                label="reserved no-preempt env",
                 environment=reserved,
             )
         with pytest.raises(CoordinatorError, match="preempt must be boolean"):
             client.submit(
                 _python("None"),
                 checkout=str(repository),
+                label="invalid preempt value",
                 environment=caller_environment(),
                 preempt=None,  # type: ignore[arg-type]
             )
@@ -1499,6 +1544,7 @@ def test_a_check_submitted_without_preemption_is_never_stopped_for_a_starving_ro
         later_id = client.submit(
             _blocking_command(*paths["later"], "later"),
             checkout=str(repository),
+            label="non-preemptible check",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment=caller_environment(),
@@ -1860,6 +1906,7 @@ Path(os.environ["AGCOORD_TEST_GATE_REPORT"]).write_text(
         123,
         gate,
         checkout=str(checkout),
+        label="land #123 target sync",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -1941,6 +1988,7 @@ def test_land_target_sync_opt_out_retains_the_stale_target_refusal(
             gate_marker,
         ),
         checkout=str(checkout),
+        label="land #123 target sync opt-out",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -1993,6 +2041,7 @@ def test_land_refuses_a_commit_avoided_for_one_landing_before_any_push(
             gate_marker,
         ),
         checkout=str(checkout),
+        label="land #125 avoided commit",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -2028,6 +2077,7 @@ def test_land_rejects_dirty_or_nested_requests_without_accepting_a_row(
             123,
             _python("raise SystemExit('must not run')"),
             checkout=str(checkout),
+            label="land #123 dirty checkout",
             head_sha=head_sha,
             caller_pid=os.getpid(),
             environment=caller_environment(),
@@ -2041,6 +2091,7 @@ def test_land_rejects_dirty_or_nested_requests_without_accepting_a_row(
             123,
             _python("raise SystemExit('must not run')"),
             checkout=str(checkout),
+            label="land #123 nested request",
             head_sha=head_sha,
             caller_pid=os.getpid(),
             environment=nested,
@@ -2173,6 +2224,7 @@ def test_land_cancellation_during_gating_publishes_nothing(
                 release=gate_release,
             ),
             checkout=str(checkout),
+            label="land #103 cancellable gate",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=_land_environment(
@@ -2221,6 +2273,7 @@ def test_land_cancellation_during_preflight_never_starts_the_gate(
             105,
             _land_gate_command(events, "preflight-cancelled"),
             checkout=str(checkout),
+            label="land #105 cancellable preflight",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=_land_environment(
@@ -2276,6 +2329,7 @@ def test_replacement_broker_finishes_one_recovered_land_without_rerunning_gate(
                 release=gate_release,
             ),
             checkout=str(checkout),
+            label="land #104 broker recovery",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=_land_environment(
@@ -2452,6 +2506,7 @@ def test_nested_coordinated_submission_is_rejected_without_a_row(
         client.submit(
             _python("raise SystemExit('must not run')"),
             checkout=str(repository),
+            label="nested check refusal",
             environment=environment,
         )
     snapshot = client.snapshot()
@@ -2485,6 +2540,7 @@ def _submit_through(client: CoordinatorClient, entry: str, repository: Path, env
             command,
             checkout=str(repository),
             kind="full",
+            label="refused full submission",
             environment=environment,
         )
     if entry == "submit_merge":
@@ -2499,6 +2555,7 @@ def _submit_through(client: CoordinatorClient, entry: str, repository: Path, env
         123,
         command,
         checkout=str(repository),
+        label="refused land submission",
         environment=environment,
     )
 
@@ -2601,6 +2658,7 @@ Path(sys.argv[1]).write_text(json.dumps({
             ),
             checkout=str(repository),
             kind=kind,
+            label=f"admission context {kind}",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=environment,
@@ -2724,6 +2782,7 @@ report.write_text(json.dumps({
                 wrong_state,
             ),
             checkout=str(checkout),
+            label="land #106 admission context",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=environment,
@@ -2765,6 +2824,7 @@ def test_first_client_refuses_a_missing_native_broker_without_python_fallback(
         client.submit(
             [sys.executable, "-c", "raise AssertionError('Python fallback ran')"],
             checkout=str(repository),
+            label="missing native broker check",
             environment=caller_environment(),
         )
 
@@ -2812,6 +2872,7 @@ while not release.exists():
             ),
             checkout=str(repository),
             kind=kind,
+            label=f"no scratch {kind}",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=environment,
@@ -2866,6 +2927,7 @@ Path(sys.argv[1]).write_text(json.dumps({
                 report,
             ),
             checkout=str(checkout),
+            label="land #124 no scratch",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=environment,
@@ -2933,6 +2995,7 @@ def test_land_avoid_commits_are_validated_before_any_broker_can_start(tmp_path: 
             123,
             _python("raise SystemExit('must not run')"),
             checkout=str(repository),
+            label="land #123 invalid avoid sha",
             avoid_commits=["not-a-sha"],
         )
     with pytest.raises(CoordinatorError, match="sequence"):
@@ -2941,6 +3004,7 @@ def test_land_avoid_commits_are_validated_before_any_broker_can_start(tmp_path: 
             123,
             _python("raise SystemExit('must not run')"),
             checkout=str(repository),
+            label="land #123 non-sequence avoid",
             avoid_commits="a" * 40,
         )
     assert not (state_dir / "broker.lock").exists()
@@ -2962,6 +3026,7 @@ def test_land_reserves_the_avoid_environment_name_for_the_coordinator(
             123,
             _python("raise SystemExit('must not run')"),
             checkout=str(repository),
+            label="land #123 reserved avoid env",
             environment=environment,
         )
     snapshot = client.snapshot()
@@ -3112,6 +3177,7 @@ def test_land_reuses_a_passed_full_receipt_for_the_same_exact_head(
         123,
         gate,
         checkout=str(checkout),
+        label="land #123 reused receipt",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -3173,6 +3239,7 @@ def test_land_reuse_gates_normally_when_the_target_advanced(
         123,
         gate,
         checkout=str(checkout),
+        label="land #123 synchronized target",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -3211,6 +3278,7 @@ def test_land_reuse_ignores_a_full_receipt_that_failed(coordinator, tmp_path: Pa
         123,
         failing,
         checkout=str(checkout),
+        label="land #123 failed receipt",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -3257,6 +3325,7 @@ def test_land_reuse_ignores_a_receipt_for_a_different_command(
         123,
         _counting_gate(ledger, "landing"),
         checkout=str(checkout),
+        label="land #123 different command",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -3294,6 +3363,7 @@ def test_land_reuse_never_accepts_a_check_receipt(coordinator, tmp_path: Path):
         123,
         gate,
         checkout=str(checkout),
+        label="land #123 check source",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -3333,6 +3403,7 @@ def test_land_without_the_opt_in_never_consults_a_full_receipt(
         123,
         gate,
         checkout=str(checkout),
+        label="land #123 default no reuse",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=environment,
@@ -3374,6 +3445,7 @@ def _reuse_land(
         123,
         gate,
         checkout=str(checkout),
+        label=f"land #123 reuse {tag}",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=_land_environment(
@@ -3470,6 +3542,7 @@ def test_land_reserves_the_gate_reuse_environment_name_for_the_coordinator(
             123,
             _python("raise SystemExit('must not run')"),
             checkout=str(repository),
+            label="land #123 reserved reuse env",
             environment=environment,
         )
     snapshot = client.snapshot()
@@ -3916,6 +3989,7 @@ def test_land_refuses_submitted_head_behind_before_queueing(
             101,
             _python("raise SystemExit('must not queue')"),
             checkout=str(checkout),
+            label="land #101 behind head",
             environment=env,
         )
     assert refused.value.code == "submitted-head-behind"
@@ -3964,6 +4038,7 @@ def test_land_refuses_submitted_head_diverged_before_queueing(
             102,
             _python("raise SystemExit('must not queue')"),
             checkout=str(checkout),
+            label="land #102 diverged head",
             environment=env,
         )
     assert refused.value.code == "submitted-head-diverged"
@@ -4005,6 +4080,7 @@ def test_land_refuses_forge_outage_after_retry_without_queueing(
             103,
             _python("raise SystemExit('must not queue')"),
             checkout=str(checkout),
+            label="land #103 forge outage",
             environment=env,
         )
     assert refused.value.code == "forge-unavailable"
@@ -4013,3 +4089,115 @@ def test_land_refuses_forge_outage_after_retry_without_queueing(
     assert snapshot["active"] == []
     assert snapshot["queued"] == []
     assert snapshot["recent"] == []
+
+
+def test_submit_and_submit_land_require_non_empty_keyword_label_and_strip_whitespace(
+    coordinator,
+    tmp_path: Path,
+):
+    _broker, client = coordinator
+    checkout, _remote, branch, head_sha = _publication_repository(tmp_path / "repository")
+    bin_dir = _install_land_gh(tmp_path)
+    land_env = _land_environment(
+        bin_dir,
+        branch=branch,
+        head_sha=head_sha,
+        tag="label-check",
+        event_log=tmp_path / "events",
+    )
+
+    with pytest.raises(TypeError, match=r"missing 1 required keyword-only argument: 'label'"):
+        client.submit(["true"], checkout=str(checkout), environment=caller_environment())  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match=r"missing 1 required keyword-only argument: 'label'"):
+        client.submit_land("github", 123, ["true"], checkout=str(checkout), environment=land_env)  # type: ignore[call-arg]
+
+    for bad_label in ("", "   ", "\t\n"):
+        with pytest.raises(CoordinatorError, match=r"^label must be a non-empty string$"):
+            client.submit(
+                ["true"],
+                checkout=str(checkout),
+                label=bad_label,
+                environment=caller_environment(),
+            )
+        with pytest.raises(CoordinatorError, match=r"^label must be a non-empty string$"):
+            client.submit_land(
+                "github",
+                123,
+                ["true"],
+                checkout=str(checkout),
+                label=bad_label,
+                environment=land_env,
+            )
+
+    snapshot = client.snapshot()
+    assert snapshot["active"] == []
+    assert snapshot["queued"] == []
+    assert snapshot["recent"] == []
+
+    check_id = client.submit(
+        _python("print('ok')"),
+        checkout=str(checkout),
+        label="  API unit tests \n ",
+        environment=caller_environment(),
+    )
+    assert _row(client, check_id, "passed")["label"] == "API unit tests"
+
+    land_id = client.submit_land(
+        "github",
+        123,
+        _python("print('ok')"),
+        checkout=str(checkout),
+        label=" \t land #123 retry budget  ",
+        environment=land_env,
+    )
+    assert _row(client, land_id, "passed")["label"] == "land #123 retry budget"
+
+
+def test_queue_cli_submit_requires_explicit_label_before_starting_broker(tmp_path: Path):
+    repository = _repository(tmp_path / "repository")
+    state_dir = tmp_path / "state"
+    write_broker_config(
+        state_dir,
+        capacities={"jobs": 1},
+        native_broker={
+            "path": str(native_broker_executable()),
+            "allow_development": True,
+        },
+    )
+    env = caller_environment()
+    src_dir = str(Path(__file__).resolve().parent.parent / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing}" if existing else src_dir
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "agcoord.queue",
+                "submit",
+                "--state-dir",
+                str(state_dir),
+                "--checkout",
+                str(repository),
+                "--",
+                "true",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert completed.returncode == 2
+        assert "--label" in completed.stderr
+        assert not (state_dir / "broker.lock").exists()
+        assert not (state_dir / "queue.sqlite3").exists()
+    finally:
+        lock = state_dir / "broker.lock"
+        if lock.is_file():
+            for line in lock.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("pid="):
+                    try:
+                        os.kill(int(line.removeprefix("pid=")), signal.SIGTERM)
+                    except (ProcessLookupError, ValueError):
+                        pass

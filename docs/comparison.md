@@ -106,7 +106,7 @@ the layer below it.
 | | Gas Town Refinery | AGCoord `agc land` |
 | --- | --- | --- |
 | What performs the landing | A Claude Code session following a fourteen-step [patrol prompt](https://github.com/steveyegge/gastown/blob/main/internal/formula/formulas/mol-refinery-patrol.formula.toml) with Go helpers. Its [role prompt](https://github.com/steveyegge/gastown/blob/main/internal/templates/roles/refinery.md.tmpl) says "You NEVER write application code. You merge branches mechanically." | A deterministic worker owned by the native broker. No model in the trust path. |
-| How work arrives | A polecat runs `gt done`; the Refinery wakes on events with 30 s to 15 min backoff. | Any agent or person runs `agc land <pr> -- <gate>`; the row is admitted when its lane and resources allow. |
+| How work arrives | A polecat runs `gt done`; the Refinery wakes on events with 30 s to 15 min backoff. | Any agent or person runs `agc land <pr> --label "…" -- <gate>`; the row is admitted when its lane and resources allow. |
 | Bringing the branch up to date | A merge rehearsal of the target into a temp branch; the role prompt instead says rebase then fast-forward. | One `--no-ff` merge of the current target into the request branch, pushed with a lease and recorded as the durable head. Never rebases or rewrites. |
 | Tests | Rig-configured commands. Flaky tests retry. A "pre-verified" request with a matching base skips all gates; `run_tests = "false"` skips them entirely. | The gate command is part of the request and runs exactly once. A verdict is never reused after either ref moves. |
 | When tests fail | The agent judges pre-existing versus branch-caused; pre-existing means file a bug and merge anyway. | `gate-failed`. Nothing is published. |
@@ -157,7 +157,7 @@ directory inside a sandboxed shell.
 Docker, one invocation at a time. [Dagger](https://github.com/dagger/dagger) (16k stars) runs
 programmable pipelines on a local engine with caching. Both run a pipeline; neither decides
 when pipelines may run across several submitters, and neither lands anything. They make good
-gate commands: `agc run -- act`, or `agc land 123 -- dagger call test`.
+gate commands: `agc run --label "workflow check" -- act`, or `agc land 123 --label "land #123 pipeline" -- dagger call test`.
 
 ## What the landscape says
 

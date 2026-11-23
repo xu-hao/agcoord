@@ -16,7 +16,7 @@ repository and worktree on the machine:
 
 - **Resource-aware admission.** A job declares the CPU, memory, and scratch it needs. It starts
   when the machine has room, and on a supported host cgroup v2 holds it to what it declared.
-- **Atomic landing.** `agc land 123 -- ./scripts/test.sh` brings the current target into the
+- **Atomic landing.** `agc land 123 --label "land #123 retry budget" -- ./scripts/test.sh` brings the current target into the
   pull-request branch, runs your gate once, and merges the pull request in the same durable
   step. A red gate publishes nothing. A moved target never reuses a green result.
 - **One record.** Every job has a stable ID, a combined log, and a row you can list, follow,
@@ -106,11 +106,13 @@ Agents follow the tools they are given. Paste this into your repository's `CLAUD
 
 ```text
 Run every check through the local coordinator and declare what it uses:
-  agc run --label "<what>" --resource cpu=2 -- <command>
+  agc run --label "<short plain-English summary>" --resource cpu=2 -- <command>
 Land a pull request only through one gate-and-publish request; never merge directly:
-  agc land <pr> --resource cpu=4 -- <full test command>
-Never run agc from inside an admitted job. A stale-main or head-changed refusal means:
-update the branch, push, and submit a new land request.
+  agc land <pr> --label "land #<pr> <short summary>" --resource cpu=4 -- <full test command>
+--label is required and read by humans in agc list and agc tui: lead with what is checked
+or landed (for example, "API unit tests" or "land #123 retry budget"), without commit SHAs,
+branch names, "pre-land" tags, or raw paths. Never run agc from inside an admitted job. A
+stale-main or head-changed refusal means: update the branch, push, and submit a new land request.
 ```
 
 Install the native [agcoord Agent Skill](docs/skills.md) for Codex, Claude Code, or
@@ -127,7 +129,7 @@ and what to do next, and notes for sandboxed shells. This repository's own
 ```bash
 agc run  --label "unit tests"   --resource cpu=2 -- python -m pytest -q   # an ordinary check
 agc full --label "release gate" --resource cpu=4 -- ./scripts/test.sh      # a clean exact-head receipt
-agc land 123 --label "land PR 123" --resource cpu=4 -- ./scripts/test.sh   # gate and publish, one row
+agc land 123 --label "land #123 retry budget" --resource cpu=4 -- ./scripts/test.sh  # gate and publish, one row
 agc list                                                                   # every job on the machine
 agc show check-0123456789ab                                                # one durable row (--json for JSON)
 agc log land-0123456789ab --follow                                         # one combined log

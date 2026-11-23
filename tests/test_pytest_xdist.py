@@ -172,6 +172,7 @@ def test_automatic_mode_uses_one_parent_lease_instead_of_gate_wide_environment(
         run_id = client.submit(
             _controller_command(*arguments),
             checkout=str(repository),
+            label="xdist auto workers",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -216,6 +217,7 @@ def test_explicit_worker_count_is_exact_and_an_impossible_count_fails_clearly(
         exact_id = client.submit(
             _controller_command("-n", "2"),
             checkout=str(repository),
+            label="exact xdist workers",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -238,6 +240,7 @@ def test_explicit_worker_count_is_exact_and_an_impossible_count_fails_clearly(
         impossible_id = client.submit(
             _controller_command("-n", "3"),
             checkout=str(repository),
+            label="impossible xdist workers",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -278,6 +281,7 @@ def test_plain_pytest_and_n_zero_stay_serial_without_a_lease(
         run_id = client.submit(
             _controller_command(*arguments),
             checkout=str(repository),
+            label="serial pytest check",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -402,6 +406,7 @@ if statuses != [0, 0]:
         run_id = client.submit(
             [sys.executable, "-u", "-c", orchestrator],
             checkout=str(repository),
+            label="contending xdist controllers",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={
@@ -478,6 +483,7 @@ def test_xdist_worker_restart_does_not_acquire_a_second_controller_lease(
         run_id = client.submit(
             _controller_command("-n", "1", "--max-worker-restart", "1"),
             checkout=str(repository),
+            label="xdist worker restart",
             resources={"cpu": 1},
             caller_pid=os.getpid(),
             environment={
@@ -524,6 +530,7 @@ def test_controller_cancellation_or_crash_reclaims_the_complete_lease(
         run_id = client.submit(
             _controller_command("-n", "2"),
             checkout=str(repository),
+            label="terminable xdist controller",
             resources={"cpu": 2},
             caller_pid=os.getpid(),
             environment={

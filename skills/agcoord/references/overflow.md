@@ -10,4 +10,4 @@ Overflow workers receive a working-tree snapshot, not your host environment. Use
 
 Pass a multi-line script already in the checkout with `--script <file>`, or use an inline `bash -ec '...'` command for a short script. Host virtual environments, `.git`, local services, ignored files, and host daemons are unavailable in overflow snapshots.
 
-Keep tiny checks that inspect `.git` or need host state separate and local, for example `agc run --no-overflow --resource cpu=1 -- <check>`. Submit heavy portable test suites separately so they can overflow when local capacity is full.
+Keep tiny checks that inspect `.git` or need host state separate and local, for example `agc run --label "validate plugin manifests" --no-overflow --resource cpu=1 -- <check>`. Submit heavy portable test suites separately so they can overflow when local capacity is full.

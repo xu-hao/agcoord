@@ -329,6 +329,7 @@ while not Path(sys.argv[2]).exists():
         ),
         kind="check",
         checkout=str(checkout),
+        label=f"hold {suffix}",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=caller_environment(),
@@ -372,8 +373,19 @@ if os.environ["BAD_PR"] and Path("p" + os.environ["BAD_PR"] + ".txt").exists():
     clear_log = tmp_path / "cleared-slices.jsonl"
     env = _env_with_gh(bin_dir, {"BATCH_GATE_LOG": str(gate_log), "BAD_PR": str(bad_pr or ""),
                                  "BATCH_CLEAR_LOG": str(clear_log)})
-    run_ids = {pr: client.submit_land("github", pr, gate, checkout=str(checkouts[pr]),
-                resources={"jobs": 1}, caller_pid=os.getpid(), environment=env) for pr in (1, 2)}
+    run_ids = {
+        pr: client.submit_land(
+            "github",
+            pr,
+            gate,
+            checkout=str(checkouts[pr]),
+            label=f"land #{pr} slice",
+            resources={"jobs": 1},
+            caller_pid=os.getpid(),
+            environment=env,
+        )
+        for pr in (1, 2)
+    }
     release.touch()
     _wait_terminal(client, hold_id, "passed")
     rows = {pr: _wait_terminal(client, run_ids[pr]) for pr in (1, 2)}
@@ -443,6 +455,7 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
             pr,
             gate_cmd,
             checkout=str(checkouts[pr]),
+            label=f"land #{pr} clean batch",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=env,
@@ -541,6 +554,7 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
             pr,
             gate_cmd,
             checkout=str(checkouts[pr]),
+            label=f"land #{pr} conflict drop",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=env,
@@ -630,6 +644,7 @@ if not ok:
             pr,
             gate_cmd,
             checkout=str(checkouts[pr]),
+            label=f"land #{pr} order bisect",
             resources={"jobs": 1},
             caller_pid=os.getpid(),
             environment=env,
@@ -731,6 +746,7 @@ while not Path(sys.argv[2]).exists():
         31,
         gate_cmd,
         checkout=str(checkouts[31]),
+        label="land #31 head-changed survivor",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=env,
@@ -740,6 +756,7 @@ while not Path(sys.argv[2]).exists():
         32,
         gate_cmd,
         checkout=str(checkouts[32]),
+        label="land #32 moving head",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=env,
@@ -795,6 +812,7 @@ while not Path(sys.argv[2]).exists():
         41,
         gate_cmd_b,
         checkout=str(checkouts_b[41]),
+        label="land #41 stale main",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=env_b,
@@ -804,6 +822,7 @@ while not Path(sys.argv[2]).exists():
         42,
         gate_cmd_b,
         checkout=str(checkouts_b[42]),
+        label="land #42 stale main",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=env_b,
@@ -862,10 +881,12 @@ def test_land_batch_records_publish_failure_reuse_full_and_requeued_follower_reb
     env_pf = _env_with_gh(bin_dir)
     r51 = client.submit_land(
         "github", 51, ["true"], checkout=str(checkouts[51]),
+        label="land #51 publish failure",
         resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_pf,
     )
     r52 = client.submit_land(
         "github", 52, ["true"], checkout=str(checkouts[52]),
+        label="land #52 publish failure",
         resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_pf,
     )
     hold_release.touch()
@@ -909,6 +930,7 @@ if Path("bad63.txt").exists():
         gate_cmd,
         kind="full",
         checkout=str(checkouts2[62]),
+        label="PR 62 full receipt",
         resources={"jobs": 1},
         caller_pid=os.getpid(),
         environment=_env_with_gh(bin_dir2),
@@ -918,11 +940,13 @@ if Path("bad63.txt").exists():
     hold_rq, release_rq = _submit_hold(client, tmp_path, checkouts2[61], "rq")
     r61 = client.submit_land(
         "github", 61, gate_cmd, checkout=str(checkouts2[61]),
+        label="land #61 cancelled leader",
         resources={"jobs": 1}, caller_pid=os.getpid(),
         environment=_env_with_gh(bin_dir2, {"PAUSE_FIRST": "1"}),
     )
     r62 = client.submit_land(
         "github", 62, gate_cmd, checkout=str(checkouts2[62]),
+        label="land #62 requeued follower",
         resources={"jobs": 1}, caller_pid=os.getpid(),
         reuse_full=True,
         environment=_env_with_gh(bin_dir2),
@@ -934,6 +958,7 @@ if Path("bad63.txt").exists():
     # Queue PR #63 before cancelling r61 so requeued r62 batches with r63!
     r63 = client.submit_land(
         "github", 63, gate_cmd, checkout=str(checkouts2[63]),
+        label="land #63 failing follower",
         resources={"jobs": 1}, caller_pid=os.getpid(),
         environment=_env_with_gh(bin_dir2),
     )
@@ -1002,6 +1027,7 @@ if bad:
                 pr,
                 gate_cmd,
                 checkout=str(checkouts[pr]),
+                label=f"land #{pr} {name}",
                 resources={"jobs": 1},
                 caller_pid=os.getpid(),
                 deductive_bisect=deductive,
@@ -1074,6 +1100,7 @@ if Path("p71.txt").exists() and not Path(sys.argv[1]).exists():
     ids_i = {
         pr: client.submit_land(
             "github", pr, inv_gate, checkout=str(checkouts_i[pr]),
+            label=f"land #{pr} drop invalidation",
             resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_i,
         )
         for pr in (71, 72, 73, 74)
@@ -1137,6 +1164,7 @@ if bad:
     ids_6 = {
         pr: client.submit_land(
             "github", pr, six_gate, checkout=str(checkouts_6[pr]),
+            label=f"land #{pr} adaptive batch",
             resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
         )
         for pr in range(81, 87)
@@ -1158,6 +1186,7 @@ if bad:
     for pr in (87, 88):
         rid = client.submit_land(
             "github", pr, six_gate, checkout=str(checkouts_6[pr]),
+            label=f"land #{pr} adaptive fail",
             resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
         )
         _wait_terminal(client, rid, "failed")
@@ -1165,10 +1194,12 @@ if bad:
     hold_b1, release_b1 = _submit_hold(client, six_dir, checkouts_6[89], "b1")
     r89 = client.submit_land(
         "github", 89, six_gate, checkout=str(checkouts_6[89]),
+        label="land #89 sequential",
         resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
     )
     r90 = client.submit_land(
         "github", 90, six_gate, checkout=str(checkouts_6[90]),
+        label="land #90 sequential",
         resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_6,
     )
     release_b1.touch()
@@ -1294,6 +1325,7 @@ if failures:
         ids = {
             pr: client.submit_land(
                 "github", pr, gate_cmd, checkout=str(checkouts[pr]),
+                label=f"land #{pr} {name}",
                 resources={"jobs": 1}, caller_pid=os.getpid(), environment=env,
             )
             for pr in (1, 2)
@@ -1385,6 +1417,7 @@ if failures:
     ids_m = {
         pr: client.submit_land(
             "github", pr, multi_gate, checkout=str(checkouts_m[pr]),
+            label=f"land #{pr} multi attribution",
             resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_m,
         )
         for pr in (1, 2, 3, 4)
@@ -1442,10 +1475,12 @@ if bad:
     env_a = _env_with_gh(bin_a, {"BATCH_GATE_LOG": str(ambig_log)})
     ra1 = client.submit_land(
         "github", 1, ambig_gate, checkout=str(checkouts_a[1]),
+        label="land #1 ambiguous attribution",
         resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_a,
     )
     ra2 = client.submit_land(
         "github", 2, ambig_gate, checkout=str(checkouts_a[2]),
+        label="land #2 ambiguous attribution",
         resources={"jobs": 1}, caller_pid=os.getpid(), environment=env_a,
     )
     release_a.touch()

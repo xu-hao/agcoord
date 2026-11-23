@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Require an explicit non-empty `--label` on `agc run`, `agc full`, and `agc land` (and keyword-only
+  `label` on `CoordinatorClient.submit` and `CoordinatorClient.submit_land`, plus `--label` on
+  `python -m agcoord.queue submit`) with no `"run"`, `"full"`, or `"land"` fallback default, clarify
+  `--label` `--help` text, and tighten agent skill and documentation guidance so labels lead with a
+  short plain-English summary of what is checked or landed rather than commit SHAs, branch names,
+  `"pre-land"` prefixes, or directory paths. #416 — require explicit --label on job submissions and
+  guide agents to write human-readable labels.
+
 ## 0.10.3 — 2026-11-22
 
 - Publish the coupled AGCoord `0.10.3` PyPI distribution and native

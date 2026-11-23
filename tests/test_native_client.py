@@ -792,6 +792,7 @@ def test_native_publication_preserves_a_virtualenv_python_entry_point(
             123,
             ["/bin/true"],
             checkout=str(checkout),
+            label="land python path",
             resources={"jobs": 1},
             environment={},
         )

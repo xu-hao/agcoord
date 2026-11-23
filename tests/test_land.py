@@ -54,7 +54,12 @@ def test_exact_head_overflow_hands_off_gate_tree_source(tmp_path: Path, kind: st
     try:
         environment = caller_environment()
         command = _python("assert open('tracked.txt').read() == 'candidate\\n'")
-        options = dict(checkout=str(checkout), resources={"cpu": 2}, caller_pid=os.getpid())
+        options = dict(
+            checkout=str(checkout),
+            label=f"isolated {kind}",
+            resources={"cpu": 2},
+            caller_pid=os.getpid(),
+        )
         if kind == "land":
             environment = _land_environment(
                 _install_land_gh(tmp_path), branch=branch, head_sha=head,
