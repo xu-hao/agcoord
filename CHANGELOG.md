@@ -9,7 +9,8 @@ versioning; dates use ISO 8601.
 
 - Publish the coupled AGCoord `0.10.4` PyPI distribution and native
   `x86_64-unknown-linux-musl` host bundle on GitHub Releases, shipping explicit `--label`
-  enforcement and human-readable agent label guidance. Upgrade the client
+  enforcement, human-readable agent label guidance, and the synced native dependency inventory
+  (`native/THIRD_PARTY_LICENSES.tsv` matching `Cargo.lock` after `#415`). Upgrade the client
   (`pip install --upgrade agcoord==0.10.4`) and then the broker
   (`agc host upgrade --download`). #418 — prepare, gate, and publish AGCoord 0.10.4.
 
