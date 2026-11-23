@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.4 — 2026-11-23
+
+- Publish the coupled AGCoord `0.10.4` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases, shipping explicit `--label`
+  enforcement and human-readable agent label guidance. Upgrade the client
+  (`pip install --upgrade agcoord==0.10.4`) and then the broker
+  (`agc host upgrade --download`). #418 — prepare, gate, and publish AGCoord 0.10.4.
+
 - Require an explicit non-empty `--label` on `agc run`, `agc full`, and `agc land` (and keyword-only
   `label` on `CoordinatorClient.submit` and `CoordinatorClient.submit_land`, plus `--label` on
   `python -m agcoord.queue submit`) with no `"run"`, `"full"`, or `"land"` fallback default, clarify
