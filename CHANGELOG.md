@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.5 — 2026-11-24
+
+- Publish the coupled AGCoord `0.10.5` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases, shipping pre-claim land-batch
+  mergeability screening (`#423`) and synced `AGENTS.md` `howhard` 5.0 policy (`#425`). Upgrade
+  the client (`pip install --upgrade agcoord==0.10.5`) and then the broker
+  (`agc host upgrade --download`). #427 — prepare, gate, and publish AGCoord 0.10.5.
+
 - Screen leaders and queued land candidates for clean three-way merges before claiming
   a batch, skipping conflicting peers so later compatible requests can fill it while
   preserving post-claim conflict drops. #423 — verify clean mergeability before claiming
