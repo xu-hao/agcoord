@@ -307,6 +307,9 @@ else:
 def _env_with_gh(bin_dir: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = caller_environment()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    # Workers run in test repositories: select this checkout rather than an installed copy.
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source, env.get("PYTHONPATH"))))
     if extra:
         env.update(extra)
     return env
