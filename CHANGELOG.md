@@ -5,6 +5,11 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Screen leaders and queued land candidates for clean three-way merges before claiming
+  a batch, skipping conflicting peers so later compatible requests can fill it while
+  preserving post-claim conflict drops. #423 — verify clean mergeability before claiming
+  land batch candidates.
+
 ## 0.10.4 — 2026-11-23
 
 - Publish the coupled AGCoord `0.10.4` PyPI distribution and native

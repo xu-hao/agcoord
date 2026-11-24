@@ -307,6 +307,9 @@ else:
 def _env_with_gh(bin_dir: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = caller_environment()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    # Workers run in test repositories: select this checkout rather than an installed copy.
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source, env.get("PYTHONPATH"))))
     if extra:
         env.update(extra)
     return env
@@ -518,85 +521,154 @@ with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
     assert sorted(len(c["payload"]["variables"]["input"]["refUpdates"]) for c in graphql_calls) == [2, 5]
 
 
-def test_land_batch_excludes_pre_gate_conflict_with_merge_error(
-    coordinator,
-    tmp_path: Path,
-):
-    _broker, client = coordinator
-    remote, state_file, checkouts, _ = _setup_remote_and_worktrees(
+def test_object_store_merges_preserve_checkout_without_git_identity(tmp_path, monkeypatch):
+    from agcoord import land
+
+    remote, _state, checkouts, _prs = _setup_remote_and_worktrees(
         tmp_path,
         [
-            {"pr": 10, "base": "main", "branch": "feat/clean-a", "files": {"a.txt": "a\n"}},
-            {"pr": 11, "base": "main", "branch": "feat/shared-first", "files": {"shared.txt": "first\n"}},
-            {"pr": 12, "base": "main", "branch": "feat/shared-conflict", "files": {"shared.txt": "conflict\n"}},
-            {"pr": 13, "base": "main", "branch": "feat/clean-b", "files": {"b.txt": "b\n"}},
+            {"pr": 1, "branch": "feat/one", "files": {"one.txt": "one\n"}},
+            {"pr": 2, "branch": "feat/two", "files": {"two.txt": "two\n"}},
         ],
     )
-    gh_log = tmp_path / "gh.jsonl"
-    bin_dir = _install_stateful_gh(tmp_path, remote, state_file, gh_log)
+    checkout = checkouts[1]
+    for key in ("user.name", "user.email"):
+        _git(checkout, "config", "--unset", key)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    (checkout / "staged.txt").write_text("staged\n")
+    _git(checkout, "add", "staged.txt")
+    (checkout / "base.txt").write_text("unstaged\n")
+    index = checkout / ".git" / "index"
+    before = (_head(checkout), _git(checkout, "status", "--porcelain"), index.read_bytes())
+    refs = ["refs/heads/main", "refs/heads/feat/one", "refs/heads/feat/two"]
+    fetched = land._fetch_preclaim_heads(checkout, [*refs, "refs/heads/deleted"])
+    assert set(fetched) == set(refs)
+    base = fetched[refs[0]]
+    first = land._merge_in_object_store(checkout, base, fetched[refs[1]])
+    assert first is not None
+    combined = land._merge_in_object_store(checkout, first, fetched[refs[2]])
+    assert combined is not None
+    assert _git(checkout, "show", f"{combined}:one.txt") == "one"
+    assert _git(checkout, "show", f"{combined}:two.txt") == "two"
+    assert land._merge_in_object_store(checkout, combined, fetched[refs[1]]) == combined
+    assert (_head(checkout), _git(checkout, "status", "--porcelain"), index.read_bytes()) == before
+    assert (checkout / "base.txt").read_text() == "unstaged\n"
+
+    git_batch = land._git_batch
+
+    def fail_one_fetch(path, *arguments):
+        if arguments[0] == "fetch" and arguments[-1] == refs[1]:
+            return subprocess.CompletedProcess(arguments, 1, "", "ref disappeared")
+        return git_batch(path, *arguments)
+
+    monkeypatch.setattr(land, "_git_batch", fail_one_fetch)
+    assert set(land._fetch_preclaim_heads(checkout, refs)) == {refs[0], refs[2]}
+
+
+@pytest.mark.parametrize("scenario", ["replacement", "fairness", "leader", "postclaim"])
+def test_land_batch_preclaim_merge_screening(coordinator, tmp_path: Path, scenario):
+    _broker, client = coordinator
+    specs = [
+        {"pr": 10, "branch": "feat/a", "files": {"a.txt": "a\n"}},
+        {"pr": 11, "branch": "feat/first", "files": {"shared.txt": "first\n"}},
+        {"pr": 12, "branch": "feat/second", "files": {"shared.txt": "second\n"}},
+        {"pr": 13, "branch": "feat/b", "files": {"b.txt": "b\n"}},
+        {"pr": 14, "branch": "feat/c", "files": {"c.txt": "c\n"}},
+    ]
+    if scenario == "leader":
+        specs = specs[:3]
+        specs[2]["files"] = {"other.txt": "other\n"}
+    elif scenario == "fairness":
+        specs = specs[:4]
+    elif scenario == "postclaim":
+        specs = specs[:2]
+    remote, state_file, checkouts, _ = _setup_remote_and_worktrees(tmp_path, specs)
+    bin_dir = _install_stateful_gh(tmp_path, remote, state_file, tmp_path / "gh.jsonl")
     gate_log = tmp_path / "gates.jsonl"
     gate_cmd = _python(
-        """
-import json, os
+        r"""
+import json, os, sys
 from pathlib import Path
-
 files = sorted(p.name for p in Path.cwd().iterdir() if p.name != ".git")
-with Path(os.environ["BATCH_GATE_LOG"]).open("a", encoding="utf-8") as s:
-    s.write(json.dumps({"files": files}) + "\\n")
-""",
+with Path(os.environ["BATCH_GATE_LOG"]).open("a") as stream:
+    stream.write(json.dumps(files) + "\n")
+if os.environ["SCENARIO"] == "fairness" and Path("shared.txt").exists():
+    sys.exit(1 if Path("shared.txt").read_text() == "first\n" else 0)
+"""
     )
-    hold_id, hold_release = _submit_hold(client, tmp_path, checkouts[10], "conflict")
-
-    env = _env_with_gh(bin_dir, {"BATCH_GATE_LOG": str(gate_log)})
+    extra = {"BATCH_GATE_LOG": str(gate_log), "SCENARIO": scenario}
+    if scenario in {"leader", "postclaim"}:
+        seed = tmp_path / "seed"
+        name = "a.txt" if scenario == "leader" else "shared.txt"
+        (seed / name).write_text("target conflict\n")
+        _git(seed, "add", name)
+        _git(seed, "commit", "-m", "concurrent target change")
+        _git(seed, "push", "origin", "HEAD:refs/heads/advance")
+        advance = _head(seed)
+        if scenario == "postclaim":
+            hook_dir = tmp_path / "claim-hook"
+            hook_dir.mkdir()
+            (hook_dir / "sitecustomize.py").write_text(
+                "import subprocess\n"
+                "from agcoord.queue import CoordinatorClient\n"
+                "_claim = CoordinatorClient.claim_batch\n"
+                "def claim(self, *args, **kwargs):\n"
+                "    result = _claim(self, *args, **kwargs)\n"
+                f"    subprocess.run([{GIT!r}, '--git-dir', {str(remote)!r}, "
+                f"'update-ref', 'refs/heads/main', {advance!r}], check=True)\n"
+                "    return result\n"
+                "CoordinatorClient.claim_batch = claim\n"
+            )
+            extra["PYTHONPATH"] = str(hook_dir) + os.pathsep + str(Path(__file__).resolve().parents[1] / "src")
+    hold_id, release = _submit_hold(client, tmp_path, checkouts[10], scenario)
+    env = _env_with_gh(bin_dir, extra)
     run_ids = {
         pr: client.submit_land(
-            "github",
-            pr,
-            gate_cmd,
-            checkout=str(checkouts[pr]),
-            label=f"land #{pr} conflict drop",
-            resources={"jobs": 1},
-            caller_pid=os.getpid(),
-            environment=env,
+            "github", pr, gate_cmd, checkout=str(checkouts[pr]),
+            label=f"land #{pr} merge screening", resources={"jobs": 1},
+            caller_pid=os.getpid(), environment=env,
         )
-        for pr in (10, 11, 12, 13)
+        for pr in checkouts
     }
-    hold_release.touch()
+    if scenario == "leader":
+        _git(remote, "update-ref", "refs/heads/main", advance)
+    release.touch()
     _wait_terminal(client, hold_id, "passed")
-
-    assert _wait_terminal(client, run_ids[10], "passed")
-    assert _wait_terminal(client, run_ids[11], "passed")
-    conflict_row = _wait_terminal(client, run_ids[12], "failed")
-    assert conflict_row["failure_reason"] == "merge-error"
-    assert conflict_row["exit_status"] == 79
-    assert _wait_terminal(client, run_ids[13], "passed")
-
-    gated_runs = [json.loads(line) for line in gate_log.read_text(encoding="utf-8").splitlines() if line]
-    assert len(gated_runs) == 1
-    assert set(gated_runs[0]["files"]) == {"base.txt", "a.txt", "shared.txt", "b.txt"}
-    assert (
-        _git(remote, "show", "refs/heads/main:shared.txt") == "first"
-    )
-    conflict_batch = conflict_row["batch"]
-    assert conflict_batch is not None
-    assert conflict_batch["role"] == "follower"
-    assert conflict_batch["members"][2]["status"] == "failed"
-    assert conflict_batch["members"][2]["failure_reason"] == "merge-error"
-    assert conflict_batch["steps"][0]["member_run_ids"] == [
-        run_ids[10],
-        run_ids[11],
-        run_ids[12],
-        run_ids[13],
-    ]
-    assert conflict_batch["steps"][0]["gated_member_run_ids"] == [
-        run_ids[10],
-        run_ids[11],
-        run_ids[13],
-    ]
-    assert conflict_batch["steps"][0]["dropped"] == [
-        {"run_id": run_ids[12], "reason": "merge-conflict"}
-    ]
-    assert conflict_batch["steps"][0]["outcome"] == "published"
+    failed = {"replacement": 12, "fairness": 11, "leader": 10, "postclaim": 11}[scenario]
+    rows = {
+        pr: _wait_terminal(client, run_id, "failed" if pr == failed else "passed")
+        for pr, run_id in run_ids.items()
+    }
+    bad = rows[failed]
+    assert bad["failure_reason"] == ("gate-failed" if scenario == "fairness" else "merge-error")
+    assert bad["exit_status"] == (1 if scenario == "fairness" else 79)
+    if scenario == "replacement":
+        assert bad["batch"] is None
+        batch = rows[10]["batch"]
+        assert [m["run_id"] for m in batch["members"]] == [run_ids[p] for p in (10, 11, 13, 14)]
+        assert len(batch["steps"]) == 1
+        assert batch["steps"][0]["outcome"] == "published"
+        assert batch["steps"][0]["gated_member_run_ids"] == [run_ids[p] for p in (10, 11, 13, 14)]
+        assert [json.loads(line) for line in gate_log.read_text().splitlines()] == [
+            ["a.txt", "b.txt", "base.txt", "c.txt", "shared.txt"]
+        ]
+        assert _git(remote, "show", "refs/heads/main:shared.txt") == "first"
+    elif scenario == "fairness":
+        assert [m["run_id"] for m in rows[10]["batch"]["members"]] == [run_ids[10], run_ids[11]]
+        assert rows[12]["batch"]["leader_run_id"] != rows[10]["batch"]["leader_run_id"]
+        assert _git(remote, "show", "refs/heads/main:shared.txt") == "second"
+    elif scenario == "leader":
+        assert bad["batch"] is None
+        assert [m["run_id"] for m in rows[11]["batch"]["members"]] == [run_ids[11], run_ids[12]]
+    else:
+        batch = bad["batch"]
+        assert batch is not None
+        step = batch["steps"][0]
+        assert step["dropped"] == [{"run_id": run_ids[11], "reason": "merge-conflict"}]
+        assert step["member_run_ids"] == [run_ids[10], run_ids[11]]
+        assert step["gated_member_run_ids"] == [run_ids[10]]
+        assert batch["members"][1]["failure_reason"] == "merge-error"
 
 
 def test_land_batch_binary_bisects_and_isolates_order_dependent_failure(
