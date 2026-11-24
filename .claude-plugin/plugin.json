@@ -1,6 +1,6 @@
 {
   "name": "agcoord",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "description": "Coordinate local and overflow checks, resource claims, and atomic PR landings with agc.",
   "author": {"name": "agcoord contributors"},
   "repository": "https://github.com/xu-hao/agcoord"
