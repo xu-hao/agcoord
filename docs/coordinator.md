@@ -1809,12 +1809,21 @@ to sequential single-PR runs above Ungar's ~38.2% group-testing crossover until 
 When $Q$ ready compatible `land` requests are available, the leader claims the largest power of two
 $\le \min(Q, B)$ (leaving trailing requests queued for the next batch):
 
-1. **Pre-gate assembly (`T_i = merge(T_{i-1}, P_i)`):** Starting from `T_0 = main`, the leader
-   inspects each candidate's live PR state and head SHA (skipping `pr-not-ready`,
-   `head-changed`, or `avoided-commit` rows without pulling them into the batch), claims a
-   power-of-two batch $\le B$, checks out `T_0`, and sequentially runs `git merge --no-ff` in the
-   coordinator gate tree. Any candidate that conflicts with `T_{i-1}` is recorded immediately as
-   `merge-error` and dropped so the remaining clean candidates continue assembling from `T_{i-1}`.
+1. **Pre-claim screening and pre-gate assembly (`T_i = merge(T_{i-1}, P_i)`):**
+   Starting from the fetched target `T_0`, the leader checks its own readiness, live
+   head, `--no-target-sync` ancestry, avoided commits on both head and target, and clean
+   mergeability before claiming followers. A failed leader check falls back to standalone
+   execution without claiming peers. Candidates receive the same checks in queue order,
+   including a clean three-way merge onto the accumulated tip using `git merge-tree --write-tree`
+   and synthetic commits in the object store, without changing `HEAD`, the index, or worktree.
+   Candidates failing readiness (`pr-not-ready`), changed-head (`head-changed`),
+   disabled target-sync (`stale-main`), avoided-commit, or mergeability screening stay queued;
+   later compatible requests can fill their places. The leader claims a power-of-two batch
+   $\le B$ from the screened requests, checks out the current target, and sequentially runs
+   `git merge --no-ff` in the gate tree.
+   If target movement after claiming or a later slice re-merge introduces a conflict, the
+   member is recorded as `merge-error` (exit `79`) and dropped with reason `merge-conflict`,
+   allowing remaining clean members to continue from the preceding tip.
 2. **Combined gating and atomic multi-PR publication:** The leader runs the gate command once on
    the combined merge tree `T_k`. When the gate succeeds and `main` plus all `P_1..P_k` head SHAs
    still match, the leader constructs chained merge commits `M_1..M_k` on GitHub and advances

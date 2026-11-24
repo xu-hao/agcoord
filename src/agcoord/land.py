@@ -1453,6 +1453,58 @@ class _BatchRunner:
         return False
 
 
+def _merge_in_object_store(checkout: Path, base_sha: str, head_sha: str) -> str | None:
+    """Return a synthetic merge tip without touching HEAD, index, or worktree."""
+    if _is_git_ancestor(checkout, head_sha, base_sha):
+        return base_sha
+    merged = _git_batch(checkout, "merge-tree", "--write-tree", base_sha, head_sha)
+    if merged.returncode != 0:
+        return None
+    tree_sha = merged.stdout.splitlines()[0].strip()
+    committed = _git_batch(
+        checkout,
+        "-c",
+        "user.name=AGCoord",
+        "-c",
+        "user.email=agcoord@localhost",
+        "commit-tree",
+        tree_sha,
+        "-p",
+        base_sha,
+        "-p",
+        head_sha,
+        "-m",
+        "Pre-claim batch merge",
+    )
+    return committed.stdout.strip() if committed.returncode == 0 else None
+
+
+def _fetch_preclaim_heads(checkout: Path, refs: list[str]) -> dict[str, str]:
+    """Fetch advertised refs independently so one disappearing peer cannot block others."""
+    listed = _git_batch(checkout, "ls-remote", "origin", *refs)
+    if listed.returncode != 0:
+        return {}
+    advertised: dict[str, str] = {}
+    for line in listed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] in refs:
+            advertised[parts[1]] = parts[0].lower()
+    fetched: dict[str, str] = {}
+    for ref, sha in advertised.items():
+        result = _git_batch(
+            checkout,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            ref,
+        )
+        if result.returncode == 0:
+            fetched[ref] = sha
+    return fetched
+
+
 def _execute_batch_if_applicable(
     *,
     args: argparse.Namespace,
@@ -1487,13 +1539,6 @@ def _execute_batch_if_applicable(
         or str(leader_pr.get("head_sha") or "").lower() != args.head_sha.lower()
     ):
         return None
-    if _avoid_refusal_for_heads(
-        Path(args.checkout).expanduser().resolve(),
-        heads={"leader head": args.head_sha},
-        avoided=avoid_commits,
-    ):
-        return None
-
     max_batch_size = (
         _largest_power_of_two_le(int(args.batch_max_size))
         if getattr(args, "batch_max_size", None) is not None
@@ -1502,8 +1547,37 @@ def _execute_batch_if_applicable(
     if max_batch_size <= 1:
         return None
 
-    selected_ids: list[str] = []
     checkout_path = Path(args.checkout).expanduser().resolve()
+    refs = [
+        f"refs/heads/{target_branch}",
+        f"refs/heads/{args.branch}",
+        *(
+            f"refs/heads/{entry['branch']}"
+            for entry in raw_candidates
+            if isinstance(entry, dict) and isinstance(entry.get("branch"), str)
+        ),
+    ]
+    remote_heads = _fetch_preclaim_heads(checkout_path, refs)
+    t0_sha = remote_heads.get(f"refs/heads/{target_branch}")
+    if (
+        not t0_sha
+        or remote_heads.get(f"refs/heads/{args.branch}") != args.head_sha.lower()
+        or (
+            not (target_sync and not args.no_target_sync)
+            and not _is_git_ancestor(checkout_path, t0_sha, args.head_sha)
+        )
+        or _avoid_refusal_for_heads(
+            checkout_path,
+            heads={"leader head": args.head_sha, "target": t0_sha},
+            avoided=avoid_commits,
+        )
+    ):
+        return None
+    acc_tip = _merge_in_object_store(checkout_path, t0_sha, args.head_sha)
+    if acc_tip is None:
+        return None
+
+    selected_ids: list[str] = []
     for entry in raw_candidates:
         if len(selected_ids) >= max_batch_size - 1:
             break
@@ -1531,12 +1605,23 @@ def _execute_batch_if_applicable(
             or str(cand_pr.get("head_sha") or "").lower() != cand_head.lower()
         ):
             continue
-        if _avoid_refusal_for_heads(
-            checkout_path,
-            heads={f"candidate #{cand_pr_num}": cand_head},
-            avoided=cand_avoid,
+        if (
+            remote_heads.get(f"refs/heads/{cand_branch}") != cand_head.lower()
+            or (
+                not bool(cand_opts.get("target_sync", True))
+                and not _is_git_ancestor(checkout_path, t0_sha, cand_head)
+            )
+            or _avoid_refusal_for_heads(
+                checkout_path,
+                heads={f"candidate #{cand_pr_num}": cand_head, "target": t0_sha},
+                avoided=cand_avoid,
+            )
         ):
             continue
+        merged_tip = _merge_in_object_store(checkout_path, acc_tip, cand_head)
+        if merged_tip is None:
+            continue
+        acc_tip = merged_tip
         selected_ids.append(cand_run_id)
 
     target_total = _largest_power_of_two_le(min(1 + len(selected_ids), max_batch_size))
