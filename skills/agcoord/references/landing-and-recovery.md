@@ -19,7 +19,7 @@ Apply the indicated recovery and submit a new landing request when needed:
 - `avoided-commit`: create a fresh branch from the current target that does not reach the avoided commit, then reapply the work as new commits.
 - `head-changed`: inspect the changed PR head, incorporate the intended changes into your branch, and push the resulting new head.
 - `pr-not-ready`: make the PR ready for the adapter's landing requirements, then retry.
-- `publish-failed`: inspect target and PR refs because the atomic publication did not complete; repair the branch/adapter state and submit a new landing request after confirming the intended head.
+- `publish-failed`: inspect target and PR refs because the atomic publication did not complete; repair the branch/adapter state and submit a new landing request after confirming the intended head. The GitHub adapter has already retried transient GitHub errors in the landing lane, so the log names the attempts and last error; if it says GitHub's outcome could not be confirmed, check whether the target already contains the head before resubmitting.
 - `gate-failed`: fix the failing gate, commit and push the fix, then request a new landing.
 
 Never rewrite existing commits to recover a handback. A normal target merge and push preserves their identities.

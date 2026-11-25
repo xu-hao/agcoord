@@ -1783,6 +1783,38 @@ A failed publication leaves the remote target untouched. If the exact `H` is alr
 ancestor of the remote target, recovery/retry is idempotent success even if forge metadata still
 says open or an auto-delete removed the source reference.
 
+#### Transient forge errors during publication
+
+The GitHub adapter reconciles and boundedly retries a transient failure inside the landing lane,
+so a passing gate is not lost to a momentary GitHub fault. It classifies every failed call. An
+internal GraphQL error (`Something went wrong while executing your query`), HTTP `500`, `502`,
+`503`, or `504`, and a connection-level failure with no answer (reset, timeout, DNS, unexpected
+EOF) are transient. Every other answer, such as a validation, permission, or policy refusal or a
+before-OID mismatch, is permanent and fails on its first attempt without a retry.
+
+Creating candidate `C`, and uploading any blob or tree it needs, is content-addressed and moves
+no reference, so a transient failure there is simply repeated. The atomic compare-and-update is
+different: GitHub may have applied it and lost only the response. After a transient failure of
+that request the adapter reads the remote refs before it sends anything again:
+
+| Remote refs after the failure | Result |
+| --- | --- |
+| Every ref the transaction moves already holds its new value (the target is at `C`) | GitHub applied it: publication succeeded, with no second mutation. A later branch cleanup does not revoke it. |
+| Every guarded ref still holds its old value (`M` and `H`) | Nothing was applied: the same transaction is sent again after the next wait. |
+| Any other value, such as an advanced target or a moved source branch | A compare-and-swap mismatch: fail at once without a retry, as `stale-main` or `head-changed` for a single land. |
+| The refs cannot be read | The outcome is unknown, so the transaction is never resent blind; the adapter re-reads after each wait. |
+
+A permanent refusal of a resend, which can be GitHub reporting the earlier attempt's success as
+a before-OID mismatch, is checked against the refs the same way before it is reported.
+
+The budget is four retries after waits of 0.5, 1, 2, and 4 seconds, so five attempts and at
+most 7.5 seconds of waiting. The gate never reruns, and the repository barrier and every
+resource allocation stay held throughout. Each retry and reconciliation is written to the
+landing log as a `GitHub publisher:` line. When transient errors outlast the budget the request
+fails as `publish-failed` and the log names the attempts and the last error. If the refs could
+not be read to the end, the log says GitHub's outcome could not be confirmed; check whether the
+target already contains `H` before resubmitting, which is idempotent when it does.
+
 The pre-gate merge is the only automatic worktree mutation: AGCoord never rebases, amends, or
 rewrites existing source commits, and it never moves the target without a green gate. A conflict
 or changed-head refusal hands control back to the agent. Resolve the branch or submit its new
@@ -1828,7 +1860,10 @@ $\le \min(Q, B)$ (leaving trailing requests queued for the next batch):
    the combined merge tree `T_k`. When the gate succeeds and `main` plus all `P_1..P_k` head SHAs
    still match, the leader constructs chained merge commits `M_1..M_k` on GitHub and advances
    `main` to `M_k` along with each PR's `avoid-commit` / closure ref via `update_refs` in one
-   atomic transaction, closing every member row as `passed` with the batch log.
+   atomic transaction, closing every member row as `passed` with the batch log. Commit creation
+   and that one transaction use the same
+   [bounded in-lane reconciliation and retry](#transient-forge-errors-during-publication) as a
+   single land, so a transient GitHub error neither drops the batch nor reruns its gate.
 3. **Deductive power-of-two bisection on gate failure:** If `T_k` fails its gate (`k > 1`), the
    slice splits at the largest power of two strictly less than `k` into `Left` and `Right`. `Left`
    is assembled and gated first against the current `main`; when every member of `Left` publishes

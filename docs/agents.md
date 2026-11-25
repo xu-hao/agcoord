@@ -216,7 +216,7 @@ with `agc --json show <id>` rather than parsing the log, and read the log for th
 | `failure_reason: pr-not-ready` | The pull request is closed, a draft, on another base, or not at this head. | Fix the pull request, make its head match the local head, and resubmit. |
 | `failure_reason: merge-error` | The pre-gate target merge conflicted; the checkout is restored and the log names the paths. | Merge the target locally, resolve, push, and resubmit. |
 | `failure_reason: avoided-commit` | The branch reaches a commit the operator removed from the target. | Rebuild the request as a fresh branch from the current target and resubmit. |
-| `failure_reason: publish-failed` | The forge rejected the atomic update; nothing moved. | Check `gh auth status`, branch protection, and the pull request, then resubmit. |
+| `failure_reason: publish-failed` | The forge rejected the atomic update, or transient GitHub errors outlasted the bounded in-lane retries (the log names the attempts and last error); nothing moved unless the log says the outcome could not be confirmed. | Check `gh auth status`, branch protection, and the pull request; if the outcome was unconfirmed, check whether the target already contains the head; then resubmit. |
 | `status: interrupted` | The worker vanished before reporting; no verdict is claimed. | Read the log; unless it says `LANDED`, submit again. |
 | `status: cancelled` | Someone ran `agc cancel`, or a graceful broker stop reaped a queued or gating job. | Resubmit when appropriate. |
 

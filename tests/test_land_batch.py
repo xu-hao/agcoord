@@ -161,6 +161,34 @@ def rev_parse(ref):
         res = git_remote("rev-parse", "--verify", ref)
     return res.stdout.decode().strip() if res.returncode == 0 else None
 
+def take_fault(kind):
+    \"\"\"Pop the next scripted fault for ``kind`` ("commit" or "update") from GH_FAULTS_FILE.
+
+    A fault is ``{{"stderr", "stdout", "exit"}}`` describing the failure the forge returns.
+    ``apply`` makes an ``update`` fault commit the transaction first (a dropped response),
+    and ``move`` is a ``{{"ref", "to"}}`` concurrent ref update made before the failure.
+    \"\"\"
+    faults_file = os.environ.get("GH_FAULTS_FILE")
+    if not faults_file or not Path(faults_file).exists():
+        return None
+    with Path(faults_file).open("r+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        scripted = json.load(stream)
+        queue = scripted.get(kind) or []
+        if not queue:
+            return None
+        fault = queue.pop(0)
+        scripted[kind] = queue
+        stream.seek(0)
+        stream.truncate()
+        json.dump(scripted, stream)
+    return fault
+
+def emit_fault(fault):
+    sys.stdout.write(fault.get("stdout", ""))
+    sys.stderr.write(fault.get("stderr", ""))
+    raise SystemExit(fault.get("exit", 1))
+
 args = sys.argv[1:]
 raw_stdin = sys.stdin.read()
 payload = json.loads(raw_stdin) if raw_stdin else None
@@ -184,6 +212,9 @@ if args[:2] == ["pr", "view"]:
 elif args[:2] == ["repo", "view"]:
     print(json.dumps({{"id": "R_batch_test", "nameWithOwner": "test/repository"}}))
 elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/commits"):
+    fault = take_fault("commit")
+    if fault:
+        emit_fault(fault)
     parents = payload["parents"]
     tree = payload["tree"]
     message = payload["message"]
@@ -262,6 +293,11 @@ elif args[:2] == ["api", "graphql"]:
         with open(os.environ["BATCH_CLEAR_LOG"], "a", encoding="utf-8") as cleared:
             cleared.write(json.dumps(row.get("batch_slice")) + "\\n")
     updates = payload["variables"]["input"]["refUpdates"]
+    fault = take_fault("update")
+    if fault and fault.get("move"):
+        git_remote("update-ref", fault["move"]["ref"], fault["move"]["to"])
+    if fault and not fault.get("apply"):
+        emit_fault(fault)
     # Atomically verify all beforeOid values and update remote refs + mark PRs MERGED.
     with STATE_FILE.open("r+", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
@@ -286,6 +322,8 @@ elif args[:2] == ["api", "graphql"]:
         stream.seek(0)
         stream.truncate()
         json.dump(pr_data, stream, indent=2)
+    if fault:
+        emit_fault(fault)
     mutation_id = payload["variables"]["input"]["clientMutationId"]
     print(json.dumps({{"data": {{"updateRefs": {{"clientMutationId": mutation_id}}}}}}))
 elif args[:1] == ["api"] and "/compare/" in args[1]:
