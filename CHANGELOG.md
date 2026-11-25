@@ -5,6 +5,16 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Reconcile and boundedly retry transient GitHub publication errors inside the landing lane.
+  An internal GraphQL error, HTTP `500`/`502`/`503`/`504`, or a connection-level failure while
+  creating the merge commit is repeated, and one during the atomic ref update first reads the
+  remote refs: refs already at their new values count as published without a second mutation,
+  refs still at their old values are retried, and any moved ref fails at once as a
+  compare-and-swap mismatch. Retries use waits of 0.5, 1, 2, and 4 seconds (five attempts), never
+  rerun the gate, and cover single lands and batches. Permanent refusals are never retried, and
+  exhausted retries report `publish-failed` naming the attempts and the last error. #429 —
+  reconcile and boundedly retry transient GitHub publication errors inside the landing lane.
+
 ## 0.10.5 — 2026-11-24
 
 - Publish the coupled AGCoord `0.10.5` PyPI distribution and native

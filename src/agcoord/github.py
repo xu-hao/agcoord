@@ -4,6 +4,12 @@ Before gating, the worker can merge an advanced target into the same-repository 
 branch with a lease-protected push. Publication then observes the exact synchronized head,
 asks the forge to create a merge commit whose tree is exactly that gated head, and atomically
 compares and updates both refs. A changed source or post-gate target rejects publication.
+
+GitHub can fail a publication request transiently (a transport error, an HTTP ``5xx``, or an
+internal GraphQL error), including after it already applied the request. The publisher
+therefore classifies each failure, retries a transient one a bounded number of times while the
+caller keeps the landing lane, and never resends the atomic ref transaction until it has read
+the remote refs and proved the forge did not apply it.
 """
 
 from __future__ import annotations
@@ -13,11 +19,12 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
 from io import StringIO
-from typing import Any, Callable, Mapping, Protocol, TextIO
+from typing import Any, Callable, Mapping, Protocol, TextIO, TypeVar
 from uuid import uuid4
 
 
@@ -28,7 +35,11 @@ RUN_ID_ENV = "AGCOORD_RUN_ID"
 PROPAGATION_WAIT_SECONDS = 30.0
 PROPAGATION_POLL_SECONDS = 2.0
 SUBMISSION_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+# Delays before each retry of a transient GitHub publication failure: four retries, so five
+# attempts in at most 7.5 seconds of waiting.
+PUBLICATION_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
 Wait = Callable[[float], None]
+_T = TypeVar("_T")
 EXIT_STALE_MAIN = 75
 EXIT_HEAD_CHANGED = 76
 EXIT_PR_NOT_READY = 77
@@ -61,6 +72,13 @@ class PullRequestMetadataClient(Protocol):
 
 
 class MergePublisher(Protocol):
+    """Forge seam for publication.
+
+    An implementation owns its forge's transient-failure policy: ``create_merge_commit`` and
+    ``update_refs`` either complete, or raise after any bounded reconciliation and retry the
+    forge needs, so a caller never has to tell a transient fault from a refusal itself.
+    """
+
     def create_merge_commit(
         self,
         *,
@@ -78,6 +96,89 @@ class _MergeRefusal(RuntimeError):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+class _TransientForgeError(RuntimeError):
+    """One GitHub failure that says nothing about whether the request was applied."""
+
+
+class _PublicationRetriesExhausted(RuntimeError):
+    """Transient GitHub failures outlasted the bounded publication retry budget."""
+
+
+_TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+_HTTP_STATUS = re.compile(r"\bHTTP\s*:?\s*(\d{3})\b|\((\d{3})\)", re.IGNORECASE)
+_SERVER_FAILURE = re.compile(
+    r"something went wrong while executing your query|bad gateway|service unavailable|"
+    r"gateway time-?out|server error",
+    re.IGNORECASE,
+)
+_INTERNAL_GRAPHQL_ERROR = re.compile(
+    r"something went wrong while executing your query", re.IGNORECASE
+)
+_TRANSPORT_FAILURE = re.compile(
+    r"connection (?:reset|refused|timed out|closed)|i/o timeout|timeout awaiting|"
+    r"tls handshake timeout|context deadline exceeded|client\.timeout|no such host|"
+    r"temporary failure in name resolution|network is unreachable|unexpected eof|\beof\b|"
+    r"broken pipe|server closed idle connection|error connecting to|timed out",
+    re.IGNORECASE,
+)
+
+
+def _graphql_error_messages(body: object) -> list[str] | None:
+    """Return the messages of a GraphQL ``errors`` response body, or None for any other body."""
+    if not isinstance(body, dict):
+        return None
+    errors = body.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+    return [
+        str(error.get("message", "")) if isinstance(error, dict) else str(error)
+        for error in errors
+    ]
+
+
+def _is_transient_failure(stdout: str, stderr: str) -> bool:
+    """Decide whether a failed ``gh`` call is a transport or server fault worth retrying.
+
+    A GraphQL error body or any HTTP status other than a server fault is GitHub's considered
+    answer and is permanent: validation, permission, policy, and compare-and-swap refusals
+    must never be retried. Only an internal GraphQL error, an HTTP ``500``, ``502``, ``503``,
+    or ``504``, and a connection-level failure with no answer at all are transient.
+    """
+    try:
+        messages = _graphql_error_messages(json.loads(stdout))
+    except ValueError:
+        messages = None
+    if messages is not None:
+        return any(_INTERNAL_GRAPHQL_ERROR.search(message) for message in messages)
+    text = f"{stderr}\n{stdout}"
+    statuses = {
+        int(code)
+        for match in _HTTP_STATUS.finditer(text)
+        for code in match.groups()
+        if code
+    }
+    if statuses & _TRANSIENT_HTTP_STATUSES:
+        return True
+    if statuses:
+        return False
+    return bool(_SERVER_FAILURE.search(text) or _TRANSPORT_FAILURE.search(text))
+
+
+def _gh_failure(result: subprocess.CompletedProcess[str]) -> RuntimeError:
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    if _is_transient_failure(result.stdout, result.stderr):
+        return _TransientForgeError(detail)
+    return RuntimeError(detail)
+
+
+def _attempts(count: int) -> str:
+    return f"{count} attempt" if count == 1 else f"{count} attempts"
+
+
+def _notify_stderr(message: str) -> None:
+    print(f"GitHub publisher: {message}", file=sys.stderr, flush=True)
 
 
 class SubmissionRefusal(RuntimeError):
@@ -919,7 +1020,9 @@ def execute(
             publisher.update_refs(updates)
         except Exception as exc:
             # The authenticated API can fail after accepting a transaction (for example,
-            # while its response is being returned). Re-observe only on an error: the exact
+            # while its response is being returned). The GitHub publisher already reconciles
+            # and boundedly retries transient failures, so an error that reaches here is a
+            # refusal or an exhausted retry budget. Re-observe only on an error: the exact
             # candidate on main proves this transaction landed, while any other movement is
             # a typed handback. A successful atomic API response is itself the publication
             # authority; a later branch cleanup or new push does not revoke that success.
@@ -1264,16 +1367,33 @@ class GitHubMetadataClient:
 
 
 class GitHubMergePublisher:
-    """Create the candidate object, then compare/update both GitHub refs atomically."""
+    """Create the candidate object, then compare/update both GitHub refs atomically.
+
+    A transient GitHub failure (see :func:`_is_transient_failure`) is retried inside the
+    caller's landing lane after each ``retry_delays`` wait, so ``len(retry_delays) + 1``
+    attempts at most. Creating a commit, blob, or tree is content-addressed and moves no ref,
+    so those requests are simply repeated. The atomic ref transaction may have been applied
+    even though its response was lost, so after a transient failure the remote refs are read
+    first: refs already at their new values mean the transaction was published, refs still at
+    their old values are retried, and any other value is a compare-and-swap mismatch that fails
+    at once. A permanent refusal is never retried. ``wait`` and ``notify`` are injectable so
+    tests neither sleep nor print.
+    """
 
     def __init__(
         self,
         checkout: str | os.PathLike[str],
         *,
         env: Mapping[str, str] | None = None,
+        wait: Wait | None = None,
+        retry_delays: tuple[float, ...] = PUBLICATION_RETRY_DELAYS,
+        notify: Callable[[str], None] | None = None,
     ):
         self.checkout = Path(checkout).expanduser().resolve()
         self.env = dict(env) if env is not None else None
+        self.wait: Wait = wait or time.sleep
+        self.retry_delays = tuple(retry_delays)
+        self.notify: Callable[[str], None] = notify or _notify_stderr
         self._repository_value: tuple[str, str] | None = None
         self._commit_trees: dict[str, str] = {}
 
@@ -1285,24 +1405,51 @@ class GitHubMergePublisher:
             env=self.env,
         )
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-            raise RuntimeError(detail)
+            raise _gh_failure(result)
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("GitHub returned malformed JSON") from exc
 
-    def _repository(self) -> tuple[str, str]:
+    def _retrying(self, action: Callable[[], _T], *, subject: str) -> _T:
+        """Repeat a side-effect-free request while GitHub fails it transiently."""
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return action()
+            except _TransientForgeError as exc:
+                if attempts > len(self.retry_delays):
+                    raise _PublicationRetriesExhausted(
+                        f"{subject} still failing after {_attempts(attempts)}: {exc}"
+                    ) from exc
+                delay = self.retry_delays[attempts - 1]
+                self.notify(
+                    f"transient GitHub error during {subject} (attempt {attempts} of "
+                    f"{len(self.retry_delays) + 1}): {exc}; retrying in {delay:g}s"
+                )
+                self.wait(delay)
+
+    def _invoke_retrying(
+        self, arguments: list[str], payload: dict[str, object], *, subject: str
+    ) -> object:
+        return self._retrying(lambda: self._invoke(arguments, payload), subject=subject)
+
+    def _repository(self, *, retry: bool = False) -> tuple[str, str]:
         if self._repository_value is not None:
             return self._repository_value
+        if retry:
+            return self._retrying(self._resolve_repository, subject="repository lookup")
+        return self._resolve_repository()
+
+    def _resolve_repository(self) -> tuple[str, str]:
         result = _run(
             ["gh", "repo", "view", "--json", "id,nameWithOwner"],
             checkout=self.checkout,
             env=self.env,
         )
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-            raise RuntimeError(detail)
+            raise _gh_failure(result)
         try:
             raw: Any = json.loads(result.stdout)
             repository_id = raw["id"]
@@ -1381,12 +1528,13 @@ class GitHubMergePublisher:
                 )
                 if blob_res.returncode != 0:
                     raise RuntimeError(f"cannot read blob {new_sha} for {path}")
-                blob_resp = self._invoke(
+                blob_resp = self._invoke_retrying(
                     ["api", "--method", "POST", f"repos/{name_with_owner}/git/blobs"],
                     {
                         "content": base64.b64encode(blob_res.stdout).decode("ascii"),
                         "encoding": "base64",
                     },
+                    subject="blob upload",
                 )
                 if not isinstance(blob_resp, dict) or not isinstance(blob_resp.get("sha"), str):
                     raise RuntimeError("GitHub returned a malformed blob response")
@@ -1398,9 +1546,10 @@ class GitHubMergePublisher:
                         "sha": blob_resp["sha"],
                     }
                 )
-        created = self._invoke(
+        created = self._invoke_retrying(
             ["api", "--method", "POST", f"repos/{name_with_owner}/git/trees"],
             {"base_tree": base_tree, "tree": tree_entries},
+            subject="tree upload",
         )
         if not isinstance(created, dict) or created.get("sha") != tree_sha:
             raise RuntimeError("GitHub tree upload did not match the expected gated tree")
@@ -1420,15 +1569,18 @@ class GitHubMergePublisher:
         selected_parents = tuple(
             _sha(parent, field="merge candidate parent") for parent in parent_shas
         )
-        _repository_id, name_with_owner = self._repository()
+        _repository_id, name_with_owner = self._repository(retry=True)
         commit_payload = {
             "message": message,
             "tree": selected_tree,
             "parents": list(selected_parents),
         }
         endpoint = ["api", "--method", "POST", f"repos/{name_with_owner}/git/commits"]
+        subject = "merge commit creation"
         try:
-            raw = self._invoke(endpoint, commit_payload)
+            raw = self._invoke_retrying(endpoint, commit_payload, subject=subject)
+        except _PublicationRetriesExhausted:
+            raise
         except RuntimeError as first_error:
             if "tree" not in str(first_error).lower() or not self.checkout.exists():
                 raise
@@ -1437,7 +1589,7 @@ class GitHubMergePublisher:
                 tree_sha=selected_tree,
                 base_commit=selected_parents[0],
             )
-            raw = self._invoke(endpoint, commit_payload)
+            raw = self._invoke_retrying(endpoint, commit_payload, subject=subject)
         if not isinstance(raw, dict):
             raise RuntimeError("GitHub returned a malformed merge commit")
         try:
@@ -1482,7 +1634,79 @@ class GitHubMergePublisher:
                 "force": force,
             })
 
-        repository_id, _name_with_owner = self._repository()
+        repository_id, _name_with_owner = self._repository(retry=True)
+        total_attempts = len(self.retry_delays) + 1
+        attempts = 0
+        retries = 0
+        resend = True
+        last_error: RuntimeError | None = None
+        read_failure = ""
+        while True:
+            if resend:
+                attempts += 1
+                try:
+                    self._send_update_refs(repository_id, normalized)
+                    return
+                except _TransientForgeError as exc:
+                    last_error = exc
+                except RuntimeError:
+                    if attempts == 1:
+                        raise
+                    # An earlier attempt failed transiently and may still have been in flight
+                    # when the refs were read, so this refusal can be GitHub reporting that
+                    # earlier attempt's success as a before-OID mismatch.
+                    if self._observe_refs(normalized)[0] != "published":
+                        raise
+                    self.notify(
+                        "GitHub applied the earlier atomic ref update after its error was "
+                        f"reported; remote refs are at their new values (after {_attempts(attempts)})"
+                    )
+                    return
+            # GitHub may have applied the transaction before the failure reached us, so the
+            # same request is only sent again once the remote refs prove it was not applied.
+            verdict, detail = self._observe_refs(normalized)
+            if verdict == "published":
+                self.notify(
+                    f"GitHub applied the atomic ref update before reporting {last_error}; "
+                    f"remote refs are already at their new values, so it is not resent "
+                    f"(after {_attempts(attempts)})"
+                )
+                return
+            if verdict == "moved":
+                raise RuntimeError(
+                    f"atomic ref update failed after {_attempts(attempts)} ({last_error}) and "
+                    f"the remote refs moved: {detail}; not retrying a compare-and-swap mismatch"
+                ) from last_error
+            resend = verdict == "unchanged"
+            read_failure = "" if resend else detail
+            if retries >= len(self.retry_delays):
+                break
+            delay = self.retry_delays[retries]
+            retries += 1
+            self.notify(
+                f"transient GitHub error during atomic ref update (attempt {attempts} of "
+                f"{total_attempts}): {last_error}; "
+                + (
+                    "remote refs unchanged"
+                    if resend
+                    else f"cannot read remote refs ({detail}), so it is not resent yet"
+                )
+                + f"; retrying in {delay:g}s"
+            )
+            self.wait(delay)
+        if read_failure:
+            raise _PublicationRetriesExhausted(
+                f"cannot confirm whether GitHub applied the atomic ref update after "
+                f"{_attempts(attempts)} (last error: {last_error}); the remote refs could "
+                f"not be read ({read_failure}), so it was not resent"
+            ) from last_error
+        raise _PublicationRetriesExhausted(
+            f"atomic ref update still failing after {_attempts(attempts)} with the remote "
+            f"refs unchanged; last error: {last_error}"
+        ) from last_error
+
+    def _send_update_refs(self, repository_id: str, normalized: list[dict[str, object]]) -> None:
+        """Send one atomic ref transaction exactly once and verify GitHub's acknowledgement."""
         mutation_id = f"agcoord-{uuid4().hex}"
         query = (
             "mutation UpdateRefs($input: UpdateRefsInput!) { "
@@ -1503,14 +1727,56 @@ class GitHubMergePublisher:
         )
         if not isinstance(raw, dict):
             raise RuntimeError("GitHub returned a malformed atomic-ref response")
-        if raw.get("errors"):
-            raise RuntimeError("GitHub rejected the atomic ref update")
+        messages = _graphql_error_messages(raw)
+        if messages is not None:
+            reason = f"GitHub rejected the atomic ref update: {'; '.join(messages)}"
+            if any(_INTERNAL_GRAPHQL_ERROR.search(message) for message in messages):
+                raise _TransientForgeError(reason)
+            raise RuntimeError(reason)
         try:
             returned_id = raw["data"]["updateRefs"]["clientMutationId"]
         except (KeyError, TypeError) as exc:
             raise RuntimeError("GitHub returned a malformed atomic-ref response") from exc
         if returned_id != mutation_id:
             raise RuntimeError("GitHub returned the wrong atomic-ref mutation identity")
+
+    def _observe_refs(self, updates: list[dict[str, object]]) -> tuple[str, str]:
+        """Read the remote refs and say what became of an uncertain atomic transaction.
+
+        Returns ``("published", "")`` when every ref that the transaction moves already holds
+        its new value (only that transaction can have created the candidate, so later branch
+        cleanup does not revoke it), ``("unchanged", "")`` when every ref still holds its
+        guarded old value, ``("moved", detail)`` for any other value (a compare-and-swap
+        mismatch), and ``("unreadable", detail)`` when the refs could not be read.
+        """
+        names = [str(update["name"]) for update in updates]
+        try:
+            result = _run(
+                ["git", "-C", str(self.checkout), "ls-remote", "--refs", "origin", *names],
+                checkout=self.checkout,
+                env=self.env,
+            )
+        except _MergeRefusal as exc:
+            return "unreadable", str(exc)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            return "unreadable", f"git ls-remote failed: {detail}"
+        current: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1] in names:
+                current[fields[1]] = fields[0].lower()
+        movers = [update for update in updates if update["beforeOid"] != update["afterOid"]]
+        if movers and all(current.get(str(u["name"])) == u["afterOid"] for u in movers):
+            return "published", ""
+        changed = [u for u in updates if current.get(str(u["name"])) != u["beforeOid"]]
+        if not changed:
+            return "unchanged", ""
+        return "moved", ", ".join(
+            f"{update['name']} is {current.get(str(update['name']), 'absent')} "
+            f"instead of {update['beforeOid']}"
+            for update in changed
+        )
 
     def is_ancestor(self, *, ancestor_sha: str, descendant_sha: str) -> bool:
         ancestor = _sha(ancestor_sha, field="ancestor commit")
