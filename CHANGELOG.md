@@ -5,6 +5,14 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+## 0.10.6 — 2026-11-26
+
+- Publish the coupled AGCoord `0.10.6` PyPI distribution and native
+  `x86_64-unknown-linux-musl` host bundle on GitHub Releases, shipping in-lane reconciliation and
+  bounded retry of transient GitHub publication errors (`#429`). Upgrade the client
+  (`pip install --upgrade agcoord==0.10.6`) and then the broker (`agc host upgrade --download`).
+  #431 — prepare, gate, and publish AGCoord 0.10.6.
+
 - Reconcile and boundedly retry transient GitHub publication errors inside the landing lane.
   An internal GraphQL error, HTTP `500`/`502`/`503`/`504`, or a connection-level failure while
   creating the merge commit is repeated, and one during the atomic ref update first reads the
