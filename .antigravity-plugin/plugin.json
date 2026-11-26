@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agcoord",
   "displayName": "agcoord",
-  "version": "0.10.5",
+  "version": "0.10.6",
   "description": "Coordinate local and overflow checks, resource claims, and atomic PR landings with agc.",
   "author": {"name": "agcoord contributors"},
   "repository": "https://github.com/xu-hao/agcoord"
