@@ -29,6 +29,7 @@ with tempfile.TemporaryDirectory(prefix="agcoord-native-plugin-") as directory:
     payload = Path(directory)
     shutil.copytree(root / ".antigravity-plugin", payload / ".antigravity-plugin")
     shutil.copytree(root / "skills", payload / "skills")
+    shutil.copy2(root / "AGENTS.snippet.md", payload / "AGENTS.snippet.md")
     strict = json.loads(run("agy", "plugin", "validate", str(payload), "--strict", "--json"))
     assert not any(finding["severity"] == "error" for finding in strict["findings"])
     assert strict["components"]["skills"] == 1
