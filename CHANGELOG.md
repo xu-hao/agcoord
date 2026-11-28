@@ -5,6 +5,15 @@ versioning; dates use ISO 8601.
 
 ## Unreleased
 
+- Ship the persistent agent trigger as a repository-root `AGENTS.snippet.md` that you can copy
+  into `AGENTS.md` or `CLAUDE.md`. The [native Agent Skill guide](docs/skills.md) now includes
+  that file instead of carrying its own copy, and the source distribution and the strictly
+  validated Antigravity payload contain it. The wording now names the installed `agcoord` skill,
+  asks for integer byte resource claims, and limits the overflow-portability rule to heavy checks
+  that are not host-bound. The `test` extra adds `setuptools` so packaging tests can build the
+  source distribution without network access. #435 — ship a canonical root `AGENTS.snippet.md`
+  and single-source the skill guide's trigger instructions.
+
 ## 0.10.6 — 2026-11-26
 
 - Publish the coupled AGCoord `0.10.6` PyPI distribution and native

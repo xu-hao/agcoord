@@ -19,13 +19,12 @@ For a local checkout, substitute `/path/to/agcoord` for `xu-hao/agcoord`. The ro
 ## Persistent agent instructions
 
 After installing the skill, add this trigger to the repository's `AGENTS.md` or
-`CLAUDE.md` so agents use it for relevant work:
+`CLAUDE.md` so agents use it for relevant work. It is shipped as the repository-root
+[`AGENTS.snippet.md`](https://github.com/xu-hao/agcoord/blob/main/AGENTS.snippet.md), which
+this section includes verbatim; command syntax stays in the skill.
 
-```text
-When running checks or landing pull requests, follow the agcoord skill: pass a short
-plain-English --label and declare resources with agc run, keep checks portable for
-overflow, and use one agc land request for gate and publication. Never run agc inside an
-admitted job or merge a pull request directly.
+```{literalinclude} ../AGENTS.snippet.md
+:language: text
 ```
 
 ## Contributor validation

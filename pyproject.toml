@@ -42,6 +42,8 @@ test = [
   "pytest>=8",
   "pytest-asyncio>=0.24",
   "pytest-xdist>=3.8",
+  # The packaging tests build the source distribution without network build isolation.
+  "setuptools>=77",
   "twine>=5",
 ]
 xdist = ["pytest-xdist>=3.8"]

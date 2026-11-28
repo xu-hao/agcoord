@@ -1,4 +1,5 @@
 include AGENTS.md
+include AGENTS.snippet.md
 include CHANGELOG.md
 include Cargo.lock
 include Cargo.toml
